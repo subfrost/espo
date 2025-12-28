@@ -1,11 +1,11 @@
-use crate::{ESPO_HEIGHT, SAFE_TIP};
 use crate::alkanes::metashrew::MetashrewAdapter;
 use crate::runtime::{
-    aof::{AofManager, AOF_REORG_DEPTH},
+    aof::{AOF_REORG_DEPTH, AofManager},
     dbpaths::get_sdb_path_for_metashrew,
     sdb::SDB,
 };
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
+use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::Result;
 use clap::Parser;
 use electrum_client::Client;
@@ -92,6 +92,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub reset_mempool_on_startup: bool,
 
+    /// Serve existing data without running the indexer or mempool service.
+    #[arg(long, default_value_t = false)]
+    pub view_only: bool,
+
     #[arg(short, long, default_value = "./db/tmp")]
     pub tmp_dbs_dir: String,
 
@@ -134,9 +138,7 @@ pub struct CliArgs {
     pub simulate_reorg: bool,
 }
 
-pub fn init_config() -> Result<()> {
-    let args = CliArgs::parse();
-
+pub fn init_config_from(args: CliArgs) -> Result<()> {
     // --- validations ---
     let db = Path::new(&args.readonly_metashrew_db_dir);
     if !db.exists() {
@@ -266,11 +268,21 @@ pub fn init_config() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("AOF manager already initialized"))?;
     }
 
+    init_block_source()?;
+
     Ok(())
+}
+
+pub fn init_config() -> Result<()> {
+    let args = CliArgs::parse();
+    init_config_from(args)
 }
 
 // UPDATED: no param; uses global NETWORK
 pub fn init_block_source() -> Result<()> {
+    if BLOCK_SOURCE.get().is_some() {
+        return Ok(());
+    }
     let args = get_config();
     let network = get_network();
     let src = BlkOrRpcBlockSource::new_with_config(
@@ -355,9 +367,7 @@ pub fn get_espo_next_height() -> u32 {
 }
 
 pub fn get_espo_indexed_height() -> Option<u32> {
-    ESPO_HEIGHT
-        .get()
-        .map(|cell| cell.load(Ordering::Relaxed).saturating_sub(1))
+    ESPO_HEIGHT.get().map(|cell| cell.load(Ordering::Relaxed).saturating_sub(1))
 }
 
 pub fn update_safe_tip(height: u32) {

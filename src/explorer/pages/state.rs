@@ -1,6 +1,6 @@
-use bitcoin::Network;
 use crate::config::get_network;
 use crate::runtime::mdb::Mdb;
+use bitcoin::Network;
 
 #[derive(Clone)]
 pub struct ExplorerState {

@@ -10,7 +10,8 @@
   --muted3: #818694;
   --text: #fff;
   --link: #aac8ff;
-  --link-dark: #5069ff;
+  --link-dark: #3774e0;
+  --link-dark2: #2a60be;
   --danger: #ff4141;
   --success: #33e183;
   --bg-success: #335c45;
@@ -73,6 +74,13 @@ a:hover {
   align-items: center;
   gap: 10px;
   font-size: 25px;
+}
+
+.navlinks-container {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 20px;
 }
 
 .brand-logo {
@@ -859,6 +867,7 @@ a:hover {
   margin-top: 12px;
 }
 .opret-toggle-summary {
+  user-select: none !important;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1155,6 +1164,82 @@ a:hover {
 .alkane-tab-panel .pager {
   margin-top: 12px;
   margin-bottom: 0;
+}
+.alkane-inspect-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.alkane-inspect-header {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  border-radius: 6px;
+}
+.alkane-inspect-name {
+  font-size: 18px;
+}
+.alkane-inspect-id {
+  color: var(--muted2);
+  font-size: 14px;
+  font-weight: 600;
+}
+.alkane-method-group {
+  display: flex;
+  flex-direction: column;
+}
+.alkane-method-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+.alkane-method-result {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.alkane-method-label {
+  color: var(--muted2);
+  font-weight: 600;
+  font-size: 15px;
+}
+.alkane-method-value {
+  font-weight: 500;
+  color: var(--muted2);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.alkane-method-result[data-status="success"] .alkane-method-value {
+  color: var(--text);
+}
+.alkane-method-result[data-status="loading"] .alkane-method-value {
+  color: var(--muted);
+}
+.alkane-method-result[data-status="failure"] .alkane-method-value {
+  color: var(--danger);
+}
+
+button {
+  transition: cubic-bezier(0, 0, 0, 1) 600ms;
+  font-size: 15px;
+  font-family: var(--sans);
+  background: var(--link-dark);
+  font-weight: 600;
+  padding: 8px 12px;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.alkane-method-btn {
+  margin-top: 15px;
+}
+button:hover {
+  transition: none;
+
+  background-color: var(--link-dark2);
 }
 
 .alkane-panel-empty {
@@ -1517,7 +1602,7 @@ a:hover {
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 20px;
+  gap: 10px;
 }
 
 /* Block carousel */

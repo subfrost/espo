@@ -1,14 +1,14 @@
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
-use maud::{Markup, html};
-use serde::Deserialize;
 use hex;
+use maud::{Markup, PreEscaped, html};
+use serde::Deserialize;
 
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::header::header_scripts;
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
-    icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_caret_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
@@ -18,6 +18,7 @@ use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::storage::{BalanceEntry, HolderId, load_creation_record};
 use crate::modules::essentials::utils::balances::{get_alkane_balances, get_holders_for_alkane};
+use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
 
 const ADDR_SUFFIX_LEN: usize = 8;
 
@@ -81,15 +82,15 @@ pub async fn alkane_page(
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
         .collect();
     balance_entries.sort_by(|a, b| {
-        a.alkane
-            .block
-            .cmp(&b.alkane.block)
-            .then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
+        a.alkane.block.cmp(&b.alkane.block).then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
     });
 
     let (total, circulating_supply, holders) =
-        get_holders_for_alkane(&state.essentials_mdb, alk, page, limit)
-            .unwrap_or((0, 0, Vec::new()));
+        get_holders_for_alkane(&state.essentials_mdb, alk, page, limit).unwrap_or((
+            0,
+            0,
+            Vec::new(),
+        ));
     let off = limit.saturating_mul(page.saturating_sub(1));
     let holders_len = holders.len();
     let has_prev = page > 1;
@@ -100,6 +101,11 @@ pub async fn alkane_page(
     let icon_url = meta.icon_url.clone();
     let coin_label = meta.name.value.clone();
     let holders_count = total;
+
+    let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
+    let (view_methods, write_methods) = split_methods(inspection);
+    let (factory_name, factory_id_str) =
+        resolve_factory_contract(inspection, &alk, &mut kv_cache, &state.essentials_mdb);
 
     let rows: Vec<Vec<Markup>> = holders
         .into_iter()
@@ -301,13 +307,72 @@ pub async fn alkane_page(
                                     }
                                 }
                             } @else {
-                                div class="alkane-panel alkane-panel-empty" { }
+                                div class="alkane-inspect-card" data-alkane-inspect="" data-alkane-id=(alk_str.clone()) {
+                                    div class="alkane-inspect-header" {
+                                        span class="alkane-inspect-name" { (factory_name.clone()) }
+                                        span class="alkane-inspect-id mono" { (factory_id_str.clone()) }
+                                    }
+                                    @if view_methods.is_empty() && write_methods.is_empty() {
+                                        p class="muted" { "No contract methods found." }
+                                    } @else {
+                                        div class="alkane-method-group" {
+                                            h3 class="alkane-method-title" { "Read methods:" }
+                                            @if view_methods.is_empty() {
+                                                p class="muted" { "No read methods." }
+                                            } @else {
+                                                @for method in &view_methods {
+                                                    details class="opret-toggle alkane-method-toggle" data-alkane-method=(method.name.clone()) data-alkane-opcode=(method.opcode) data-alkane-returns=(method.returns.clone()) data-alkane-view="1" {
+                                                        summary class="opret-toggle-summary" {
+                                                            span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
+                                                            span class="opret-toggle-label" { (method.name.clone()) }
+                                                            span class="trace-opcode" { (format!("opcode {}", method.opcode)) }
+                                                        }
+                                                        div class="opret-toggle-body" {
+                                                            div class="alkane-method-result" data-sim-result="" data-status="idle" {
+                                                                span class="alkane-method-label" { "Result:" }
+                                                                span class="alkane-method-value" data-sim-value="" { "—" }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div class="alkane-method-group" {
+                                            h3 class="alkane-method-title" { "Write methods:" }
+                                            @if write_methods.is_empty() {
+                                                p class="muted" { "No write methods." }
+                                            } @else {
+                                                @for method in &write_methods {
+                                                    details class="opret-toggle alkane-method-toggle" data-alkane-method=(method.name.clone()) data-alkane-opcode=(method.opcode) data-alkane-returns=(method.returns.clone()) data-alkane-view="0" {
+                                                        summary class="opret-toggle-summary" {
+                                                            span class="opret-toggle-caret" aria-hidden="true" { (icon_caret_right()) }
+                                                            span class="opret-toggle-label" { (method.name.clone()) }
+                                                            span class="trace-opcode" { (format!("opcode {}", method.opcode)) }
+                                                        }
+                                                        div class="opret-toggle-body" {
+                                                            div class="alkane-method-result" data-sim-result="" data-status="idle" {
+                                                                span class="alkane-method-label" { "Result:" }
+                                                                span class="alkane-method-value muted" data-sim-value="" data-default-text="Providing inputs to simulate methods is not currently supported on espo" {
+                                                                    "Providing inputs to write methods is not currently supported on Espo"
+                                                                }
+                                                            }
+                                                            button class="alkane-method-btn" type="button" { "Simulate anyways" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
             (header_scripts())
+            @if tab == AlkaneTab::Inspect {
+                (inspect_scripts())
+            }
         },
     )
 }
@@ -351,4 +416,136 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     let prefix = addr[..split_at].to_string();
     let suffix = addr[split_at..].to_string();
     (prefix, suffix)
+}
+
+fn split_methods(
+    inspection: Option<&crate::modules::essentials::utils::inspections::StoredInspectionResult>,
+) -> (Vec<StoredInspectionMethod>, Vec<StoredInspectionMethod>) {
+    let mut view = Vec::new();
+    let mut write = Vec::new();
+    if let Some(meta) = inspection.and_then(|i| i.metadata.as_ref()) {
+        for method in &meta.methods {
+            if method.name.starts_with("get_") {
+                view.push(method.clone());
+            } else {
+                write.push(method.clone());
+            }
+        }
+    }
+    (view, write)
+}
+
+fn resolve_factory_contract(
+    inspection: Option<&crate::modules::essentials::utils::inspections::StoredInspectionResult>,
+    alkane: &crate::schemas::SchemaAlkaneId,
+    meta_cache: &mut AlkaneMetaCache,
+    essentials_mdb: &crate::runtime::mdb::Mdb,
+) -> (String, String) {
+    let factory_id = inspection.and_then(|i| i.factory_alkane).unwrap_or(*alkane);
+    let factory_name = load_inspection(essentials_mdb, &factory_id)
+        .ok()
+        .flatten()
+        .and_then(|i| i.metadata.as_ref().map(|m| m.name.trim().to_string()))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let meta = alkane_meta(&factory_id, meta_cache, essentials_mdb);
+            meta.name.value.clone()
+        });
+    let factory_id_str = format!("{}:{}", factory_id.block, factory_id.tx);
+    (factory_name, factory_id_str)
+}
+
+fn inspect_scripts() -> Markup {
+    let script = r#"
+<script>
+(() => {
+  const root = document.querySelector('[data-alkane-inspect]');
+  if (!root) return;
+  const alkaneId = root.dataset.alkaneId || '';
+  if (!alkaneId) return;
+  const writeDefault = 'Providing inputs to simulate methods is not currently supported on espo';
+
+  const toggles = root.querySelectorAll('[data-alkane-method]');
+  const resetWrite = (details) => {
+    const button = details.querySelector('.alkane-method-btn');
+    if (button) {
+      button.style.display = '';
+    }
+    const resultWrap = details.querySelector('[data-sim-result]');
+    const valueNode = details.querySelector('[data-sim-value]');
+    if (resultWrap && valueNode) {
+      resultWrap.dataset.status = 'idle';
+      valueNode.textContent = valueNode.dataset.defaultText || writeDefault;
+    }
+  };
+
+  const runSim = async (details) => {
+    if (!details || details.dataset.loading === '1') return;
+    const opcode = details.dataset.alkaneOpcode || details.dataset.opcode;
+    const returnsType = details.dataset.alkaneReturns || '';
+    if (!opcode) return;
+    const resultWrap = details.querySelector('[data-sim-result]');
+    const valueNode = details.querySelector('[data-sim-value]');
+    if (!resultWrap || !valueNode) return;
+
+    details.dataset.loading = '1';
+    resultWrap.dataset.status = 'loading';
+    valueNode.textContent = 'Loading...';
+
+    try {
+      const payload = { alkane: alkaneId, opcode: Number(opcode) };
+      if (returnsType) {
+        payload.returns = returnsType;
+      }
+      const res = await fetch('/api/alkane/simulate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (!data || !data.ok) {
+        const msg = data && data.error ? data.error : 'Simulation failed';
+        resultWrap.dataset.status = 'failure';
+        valueNode.textContent = msg;
+      } else {
+        const status = data.status || 'success';
+        resultWrap.dataset.status = status;
+        valueNode.textContent = data.data || 'No data';
+      }
+    } catch (_) {
+      resultWrap.dataset.status = 'failure';
+      valueNode.textContent = 'Simulation failed';
+    } finally {
+      details.dataset.loading = '0';
+    }
+  };
+
+  toggles.forEach((details) => {
+    details.addEventListener('toggle', async () => {
+      if (!details.open) {
+        if (details.dataset.alkaneView !== '1') {
+          resetWrite(details);
+        }
+        return;
+      }
+      if (details.dataset.alkaneView !== '1') return;
+      await runSim(details);
+    });
+  });
+
+  const buttons = root.querySelectorAll('.alkane-method-btn');
+  buttons.forEach((button) => {
+    button.addEventListener('click', async (event) => {
+      event.preventDefault();
+      const details = button.closest('details');
+      if (!details) return;
+      details.open = true;
+      button.style.display = 'none';
+      await runSim(details);
+    });
+  });
+})();
+</script>
+"#;
+    PreEscaped(script.to_string())
 }

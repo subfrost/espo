@@ -6,15 +6,23 @@ use crate::core::blockfetcher::BlockSource;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::cellpack::Cellpack;
+use alkanes_support::id::AlkaneId;
 use alkanes_support::proto::alkanes;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
+use ordinals::{Artifact, Runestone};
+use protorune_support::protostone::Protostone;
+use protorune_support::utils::decode_varint_list;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
+use std::io::Cursor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -111,11 +119,22 @@ pub struct EspoAlkanesTransaction {
     pub transaction: Transaction,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EspoHostFunctionType {
+    BlockHeader = 0,
+    CoinbaseTxResponse = 1,
+    DieselMints = 2,
+    TotalMinerFee = 3,
+}
+
+pub type EspoHostFunctionValues = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 #[derive(Clone)]
 pub struct EspoBlock {
     pub is_latest: bool,
     pub height: u32,
     pub block_header: Header,
+    pub host_function_values: EspoHostFunctionValues,
     pub tx_count: usize,
     pub transactions: Vec<EspoAlkanesTransaction>,
 }
@@ -444,6 +463,88 @@ pub fn get_espo_block_with_opts(
 
     // Header from block source
     let block_header: Header = full_block.header.clone();
+    let host_function_values = {
+        let mut header_bytes = Vec::new();
+        full_block
+            .header
+            .consensus_encode(&mut header_bytes)
+            .context("consensus encode block header for host function values")?;
+
+        let coinbase_tx = full_block
+            .txdata
+            .get(0)
+            .cloned()
+            .context("block has no coinbase transaction for host function values")?;
+        let mut coinbase_bytes = Vec::new();
+        coinbase_tx
+            .consensus_encode(&mut coinbase_bytes)
+            .context("consensus encode coinbase tx for host function values")?;
+
+        let total_fees: u128 = coinbase_tx
+            .output
+            .iter()
+            .map(|out| out.value.to_sat() as u128)
+            .sum();
+        let total_fees_bytes = total_fees.to_le_bytes().to_vec();
+
+        let mut diesel_mints: u128 = 0;
+        for (tx_idx, tx) in full_block.txdata.iter().enumerate() {
+            if let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(tx) {
+                let protostones = match Protostone::from_runestone(runestone) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        if std::env::var_os("ESPO_LOG_DIESEL_MINTS").is_some() {
+                            eprintln!(
+                                "[TRACE::get_espo_block] diesel mint protostone parse failed: tx_index={tx_idx} txid={} err={err:#}",
+                                tx.compute_txid()
+                            );
+                        }
+                        continue;
+                    }
+                };
+                for protostone in protostones {
+                    if protostone.protocol_tag != 1 {
+                        continue;
+                    }
+                    let calldata: Vec<u8> = protostone
+                        .message
+                        .iter()
+                        .flat_map(|v| v.to_be_bytes())
+                        .collect();
+                    if calldata.is_empty() {
+                        continue;
+                    }
+                    let varint_list = match decode_varint_list(&mut Cursor::new(calldata)) {
+                        Ok(list) => list,
+                        Err(err) => {
+                            if std::env::var_os("ESPO_LOG_DIESEL_MINTS").is_some() {
+                                eprintln!(
+                                    "[TRACE::get_espo_block] diesel mint decode failed: txid={} err={err:#}",
+                                    tx.compute_txid()
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    if varint_list.len() < 2 {
+                        continue;
+                    }
+                    if let Ok(cellpack) = TryInto::<Cellpack>::try_into(varint_list) {
+                        if cellpack.target == AlkaneId::new(2, 0)
+                            && !cellpack.inputs.is_empty()
+                            && cellpack.inputs[0] == 77
+                        {
+                            diesel_mints = diesel_mints.saturating_add(1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let diesel_mints_bytes = diesel_mints.to_le_bytes().to_vec();
+
+        (header_bytes, coinbase_bytes, diesel_mints_bytes, total_fees_bytes)
+    };
 
     let (page_start, page_end) =
         opts.as_ref().map(|o| o.page_range(total_txs)).unwrap_or((0, total_txs));
@@ -519,6 +620,7 @@ pub fn get_espo_block_with_opts(
         block_header,
         tx_count: total_txs,
         transactions: txs,
+        host_function_values,
         height: block
             .try_into()
             .context("block height does not fit into u32 for EspoBlock::height")?,

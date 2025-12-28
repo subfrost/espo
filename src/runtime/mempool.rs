@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use bitcoin::block::Version as BlockVersion;
 use bitcoin::blockdata::block::Header;
 use bitcoin::blockdata::transaction::Version as TxVersion;
-use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::consensus::Encodable;
+use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{
     Address, Amount, Block, CompactTarget, Network, Sequence, Transaction, TxIn, TxMerkleNode,
@@ -21,8 +21,8 @@ use borsh::{BorshDeserialize, BorshSerialize, to_vec};
 use futures::{StreamExt, stream};
 use ordinals::{Artifact, Runestone};
 use prost::Message;
-use protorune_support::protostone::Protostone;
 use protorune_support::proto::protorune;
+use protorune_support::protostone::Protostone;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -77,10 +77,7 @@ pub fn get_mempool_mdb() -> &'static Mdb {
 }
 
 fn now_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn protostones_for_tx(tx: &Transaction) -> Vec<Protostone> {
@@ -142,34 +139,20 @@ fn build_preview_block_hex(tx: &Transaction) -> Result<String> {
     Ok(hex::encode(buf))
 }
 
-fn decode_trace_hex(
-    data_hex: &str,
-    txid: &Txid,
-    tx: &Transaction,
-    vout: u32,
-) -> Result<EspoTrace> {
+fn decode_trace_hex(data_hex: &str, txid: &Txid, tx: &Transaction, vout: u32) -> Result<EspoTrace> {
     let trimmed = data_hex.strip_prefix("0x").unwrap_or(data_hex);
     let bytes = hex::decode(trimmed)?;
-    let protobuf_trace =
-        alkanes_support::proto::alkanes::AlkanesTrace::decode(bytes.as_slice()).with_context(
-            || "failed to decode preview trace protobuf",
-        )?;
+    let protobuf_trace = alkanes_support::proto::alkanes::AlkanesTrace::decode(bytes.as_slice())
+        .with_context(|| "failed to decode preview trace protobuf")?;
     let events_json_str = prettyify_protobuf_trace_json(&protobuf_trace)?;
-    let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)
-        .context("deserialize preview trace events")?;
+    let events: Vec<EspoSandshrewLikeTraceEvent> =
+        serde_json::from_str(&events_json_str).context("deserialize preview trace events")?;
 
-    let sandshrew_trace =
-        EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
+    let sandshrew_trace = EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid, vout), events };
     let storage_changes = extract_alkane_storage(&protobuf_trace, tx)?;
-    let outpoint =
-        EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
+    let outpoint = EspoOutpoint { txid: txid.to_byte_array().to_vec(), vout, tx_spent: None };
 
-    Ok(EspoTrace {
-        sandshrew_trace,
-        protobuf_trace,
-        storage_changes,
-        outpoint,
-    })
+    Ok(EspoTrace { sandshrew_trace, protobuf_trace, storage_changes, outpoint })
 }
 
 fn collect_addresses(
@@ -299,13 +282,14 @@ fn reconstruct_traces(
     let mut traces = Vec::with_capacity(persisted.len());
     let tx_hex = txid.to_string();
     for p in persisted {
-        let proto = match alkanes_support::proto::alkanes::AlkanesTrace::decode(p.protobuf.as_slice()) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[mempool] decode persisted trace for {} failed: {:?}", txid, e);
-                continue;
-            }
-        };
+        let proto =
+            match alkanes_support::proto::alkanes::AlkanesTrace::decode(p.protobuf.as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[mempool] decode persisted trace for {} failed: {:?}", txid, e);
+                    continue;
+                }
+            };
         let outpoint_bytes = &p.outpoint;
         if outpoint_bytes.len() < 36 {
             eprintln!("[mempool] persisted outpoint too short for {}", txid);
@@ -400,12 +384,18 @@ async fn preview_traces_for_tx(
                         Ok(ok) => match ok.json().await {
                             Ok(v) => v,
                             Err(e) => {
-                                eprintln!("[mempool] preview decode failed for {}@{}: {:?}", txid, vout, e);
+                                eprintln!(
+                                    "[mempool] preview decode failed for {}@{}: {:?}",
+                                    txid, vout, e
+                                );
                                 return None;
                             }
                         },
                         Err(e) => {
-                            eprintln!("[mempool] preview HTTP error for {}@{}: {:?}", txid, vout, e);
+                            eprintln!(
+                                "[mempool] preview HTTP error for {}@{}: {:?}",
+                                txid, vout, e
+                            );
                             return None;
                         }
                     },
@@ -415,17 +405,19 @@ async fn preview_traces_for_tx(
                     }
                 };
 
-                let result_hex = resp_json
-                    .get("result")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str()));
+                let result_hex = resp_json.get("result").and_then(|v| v.as_str()).or_else(|| {
+                    resp_json.get("result").and_then(|v| v.get("trace")).and_then(|v| v.as_str())
+                });
                 let Some(result_hex) = result_hex else {
                     return None;
                 };
                 match decode_trace_hex(result_hex, &txid, tx, *vout) {
                     Ok(trace) => Some(trace),
                     Err(e) => {
-                        eprintln!("[mempool] decode preview trace {}@{} failed: {:?}", txid, vout, e);
+                        eprintln!(
+                            "[mempool] decode preview trace {}@{} failed: {:?}",
+                            txid, vout, e
+                        );
                         None
                     }
                 }
@@ -561,7 +553,11 @@ async fn build_processed_entries(
     processed
 }
 
-fn write_mempool_to_db(entries: &mut [ProcessedEntry], network: Network, rpc: &CoreClient) -> Result<()> {
+fn write_mempool_to_db(
+    entries: &mut [ProcessedEntry],
+    network: Network,
+    rpc: &CoreClient,
+) -> Result<()> {
     let mdb = get_mempool_mdb();
 
     // Build prev cache for address extraction
@@ -638,11 +634,7 @@ fn write_mempool_to_db(entries: &mut [ProcessedEntry], network: Network, rpc: &C
     Ok(())
 }
 
-fn delete_tx_from_store(
-    mdb: &Mdb,
-    txid: &Txid,
-    persisted: &PersistedMempoolTx,
-) -> Result<()> {
+fn delete_tx_from_store(mdb: &Mdb, txid: &Txid, persisted: &PersistedMempoolTx) -> Result<()> {
     let first_seen = persisted.first_seen;
     mdb.bulk_write(|wb| {
         wb.delete(&k_tx(txid));
@@ -660,7 +652,10 @@ fn prune_oversized_mempool(current_len: usize) -> Result<()> {
     }
     let mdb = get_mempool_mdb();
     let mut to_delete = current_len.saturating_sub(MEMPOOL_MAX_TXS);
-    eprintln!("[mempool] pruning {} oldest entries ({} -> {})", to_delete, current_len, MEMPOOL_MAX_TXS);
+    eprintln!(
+        "[mempool] pruning {} oldest entries ({} -> {})",
+        to_delete, current_len, MEMPOOL_MAX_TXS
+    );
 
     let mut removed = 0usize;
     let seen_prefix = b"seen/";
@@ -762,8 +757,9 @@ async fn refresh_mempool(
                                     if let Ok(prev_bytes) = hex::decode(prev_raw.trim()) {
                                         if let Ok(prev_tx) = deserialize::<Transaction>(&prev_bytes)
                                         {
-                                            if let Some(prev_out) =
-                                                prev_tx.output.get(vin.previous_output.vout as usize)
+                                            if let Some(prev_out) = prev_tx
+                                                .output
+                                                .get(vin.previous_output.vout as usize)
                                             {
                                                 input_total = input_total.and_then(|acc| {
                                                     acc.checked_add(prev_out.value.to_sat())
@@ -777,15 +773,15 @@ async fn refresh_mempool(
                                 }
                             }
                             if let Some(inputs) = input_total {
-                                    if let Some(fee) = inputs.checked_sub(out) {
-                                        let feerate = fee as f64 / vsize;
-                                        if feerate < MEMPOOL_MIN_FEE_RATE_SATS_VBYTE {
-                                            low_fee_skips += 1;
-                                            continue;
-                                        }
+                                if let Some(fee) = inputs.checked_sub(out) {
+                                    let feerate = fee as f64 / vsize;
+                                    if feerate < MEMPOOL_MIN_FEE_RATE_SATS_VBYTE {
+                                        low_fee_skips += 1;
+                                        continue;
                                     }
                                 }
                             }
+                        }
                         entries.push((txid, tx))
                     }
                     Err(e) => eprintln!("[mempool] decode tx {} failed: {}", txid, e),
@@ -793,10 +789,12 @@ async fn refresh_mempool(
             }
             Err(e) => eprintln!("[mempool] getrawtransaction {} failed: {}", txid, e),
         }
-
     }
     if low_fee_skips > 0 {
-        eprintln!("[mempool] skipped {} low-fee txs (< {:.2} sat/vB)", low_fee_skips, MEMPOOL_MIN_FEE_RATE_SATS_VBYTE);
+        eprintln!(
+            "[mempool] skipped {} low-fee txs (< {:.2} sat/vB)",
+            low_fee_skips, MEMPOOL_MIN_FEE_RATE_SATS_VBYTE
+        );
     }
 
     let mut processed: Vec<ProcessedEntry> = Vec::new();

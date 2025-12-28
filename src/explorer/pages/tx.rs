@@ -116,9 +116,7 @@ pub async fn tx_page(
             Err(e) => {
                 eprintln!("[tx_page] decode tx via electrum failed for {txid}: {e:?}");
                 match mempool_entry.as_ref() {
-                    Some(m) => {
-                        m.tx.clone()
-                    }
+                    Some(m) => m.tx.clone(),
                     None => {
                         return layout(
                             "Transaction",
@@ -131,9 +129,7 @@ pub async fn tx_page(
         Err(e) => {
             eprintln!("[tx_page] electrum raw fetch failed for {txid}: {e:?}");
             match mempool_entry.as_ref() {
-                Some(m) => {
-                    m.tx.clone()
-                }
+                Some(m) => m.tx.clone(),
                 None => {
                     return layout(
                         "Transaction",
@@ -230,17 +226,16 @@ pub async fn tx_page(
             }
         })
     } else {
-        mempool_entry
-            .as_ref()
-            .and_then(|m| m.traces.clone())
-            .or_else(|| match fetch_traces_for_tx_noheight(&txid, &tx) {
+        mempool_entry.as_ref().and_then(|m| m.traces.clone()).or_else(|| {
+            match fetch_traces_for_tx_noheight(&txid, &tx) {
                 Ok(v) if !v.is_empty() => Some(v),
                 Ok(_) => None,
                 Err(e) => {
                     eprintln!("[tx_page] failed to fetch traces (noheight) for {txid}: {e}");
                     None
                 }
-            })
+            }
+        })
     };
     let traces_ref: Option<&[EspoTrace]> = traces_for_tx.as_ref().map(|v| v.as_slice());
     let tx_pill = if tx_height.is_none() {

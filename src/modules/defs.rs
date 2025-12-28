@@ -7,8 +7,8 @@ use tarpc::context;
 use tokio::sync::RwLock;
 
 use crate::alkanes::trace::EspoBlock;
-use crate::runtime::mdb::Mdb;
 use crate::runtime::aof::AofManager;
+use crate::runtime::mdb::Mdb;
 use rocksdb::{DB, Options};
 
 /// Object-safe handler: (Context, JSON) -> JSON (async)

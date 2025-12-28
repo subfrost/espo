@@ -1,386 +1,356 @@
-// src/modules/essentials/utils/balances.rs
-
-use super::super::storage::{
-    BalanceEntry, HolderEntry, HolderId, addr_spk_key, alkane_balance_txs_by_token_key,
-    alkane_balance_txs_key, alkane_balances_key, balances_key, decode_balances_vec,
-    decode_holders_vec, encode_vec, holders_count_key, holders_key, mk_outpoint, outpoint_addr_key,
-    outpoint_balances_key, outpoint_balances_prefix, spk_to_address_str, utxo_spk_key,
+use super::defs::{EspoTraceType, SignedU128, SignedU128MapExt};
+use super::utils::{
+    Unallocated, compute_nets, is_op_return, parse_protostones, parse_short_id,
+    schema_id_from_parts, transfers_to_sheet, tx_has_op_return, u128_to_u32,
+};
+use crate::alkanes::trace::{
+    EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
+    EspoSandshrewLikeTraceStatus, EspoTrace,
 };
 use crate::config::{get_metashrew, get_network};
 use crate::modules::essentials::storage::get_holders_values_encoded;
+use crate::modules::essentials::storage::{
+    AlkaneBalanceTxEntry, BalanceEntry, HolderEntry, HolderId, addr_spk_key,
+    alkane_balance_txs_by_token_key, alkane_balance_txs_key, alkane_balances_key, balances_key,
+    decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, encode_vec,
+    holders_count_key, holders_key, mk_outpoint, outpoint_addr_key, outpoint_balances_key,
+    outpoint_balances_prefix, spk_to_address_str, utxo_spk_key,
+};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Result, anyhow};
 use bitcoin::{ScriptBuf, Transaction, Txid, hashes::Hash};
 use borsh::BorshDeserialize;
-use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
-use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-// Updated trace types
-use crate::alkanes::trace::{
-    EspoBlock, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
-    EspoSandshrewLikeTraceReturnData, EspoSandshrewLikeTraceStatus, EspoTrace,
-};
-
-#[inline]
-fn tx_has_op_return(tx: &Transaction) -> bool {
-    tx.output.iter().any(|o| is_op_return(&o.script_pubkey))
-}
-
-fn parse_protostones(tx: &Transaction) -> Result<Vec<Protostone>> {
-    let runestone = match Runestone::decipher(tx) {
-        Some(Artifact::Runestone(r)) => r,
-        _ => return Ok(vec![]),
-    };
-    let protos = Protostone::from_runestone(&runestone)
-        .map_err(|e| anyhow!("failed to parse protostones: {e}"))?;
-    Ok(protos)
-}
-
-#[derive(Default, Clone)]
-struct Unallocated {
-    map: HashMap<SchemaAlkaneId, u128>,
-}
-impl Unallocated {
-    fn add(&mut self, id: SchemaAlkaneId, amt: u128) {
-        *self.map.entry(id).or_default() =
-            self.map.get(&id).copied().unwrap_or(0).saturating_add(amt);
-    }
-    #[allow(dead_code)]
-    fn get(&self, id: &SchemaAlkaneId) -> u128 {
-        self.map.get(id).copied().unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
-    fn take(&mut self, id: &SchemaAlkaneId, amt: u128) -> u128 {
-        let cur = self.get(id);
-        let take = cur.min(amt);
-        if take == cur {
-            self.map.remove(id);
-        } else if let Some(e) = self.map.get_mut(id) {
-            *e = cur - take;
+fn clean_espo_sandshrew_like_trace(
+    trace: &EspoSandshrewLikeTrace,
+    host_function_values: &EspoHostFunctionValues,
+) -> Option<EspoSandshrewLikeTrace> {
+    let mut invokes = 0usize;
+    let mut returns = 0usize;
+    for ev in &trace.events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(_) => invokes += 1,
+            EspoSandshrewLikeTraceEvent::Return(_) => returns += 1,
+            EspoSandshrewLikeTraceEvent::Create(_) => {}
         }
-        take
     }
-    fn drain_all(&mut self) -> BTreeMap<SchemaAlkaneId, u128> {
-        let mut merged: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
-        for (rid, amt) in self.map.drain() {
-            if amt == 0 {
+
+    if invokes == returns {
+        return Some(trace.clone());
+    }
+    if returns < invokes {
+        return None;
+    }
+
+    let mut mismatch = returns.saturating_sub(invokes);
+
+    let (header, coinbase, diesel, fee) = host_function_values;
+    let host_values: [&[u8]; 4] = [header, coinbase, diesel, fee];
+    let mut candidates: Vec<Vec<usize>> = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+
+    let decode_data = |data: &str| -> Option<Vec<u8>> {
+        let trimmed = data.strip_prefix("0x").unwrap_or(data);
+        if trimmed.is_empty() {
+            return Some(Vec::new());
+        }
+        hex::decode(trimmed).ok()
+    };
+
+    for (idx, ev) in trace.events.iter().enumerate() {
+        let EspoSandshrewLikeTraceEvent::Return(ret) = ev else { continue };
+        if ret.status != EspoSandshrewLikeTraceStatus::Success {
+            continue;
+        }
+        if !ret.response.alkanes.is_empty() || !ret.response.storage.is_empty() {
+            continue;
+        }
+        let Some(data_bytes) = decode_data(&ret.response.data) else { continue };
+        for (slot, host_bytes) in host_values.iter().enumerate() {
+            if data_bytes.as_slice() == *host_bytes {
+                candidates[slot].push(idx);
+                break;
+            }
+        }
+    }
+
+    let total_candidates: usize = candidates.iter().map(|v| v.len()).sum();
+    if total_candidates < mismatch {
+        return None;
+    }
+
+    let mut remove_indices: HashSet<usize> = HashSet::new();
+
+    for slot in 0..candidates.len() {
+        if mismatch == 0 {
+            break;
+        }
+        if candidates[slot].len() == 1 {
+            if let Some(idx) = candidates[slot].pop() {
+                remove_indices.insert(idx);
+                mismatch = mismatch.saturating_sub(1);
+            }
+        }
+    }
+
+    let mut slot = 0usize;
+    while mismatch > 0 {
+        let mut removed = false;
+        for _ in 0..candidates.len() {
+            let cur = slot % candidates.len();
+            slot = slot.saturating_add(1);
+            if let Some(idx) = candidates[cur].pop() {
+                remove_indices.insert(idx);
+                mismatch = mismatch.saturating_sub(1);
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+
+    let mut cleaned_events =
+        Vec::with_capacity(trace.events.len().saturating_sub(remove_indices.len()));
+    for (idx, ev) in trace.events.iter().enumerate() {
+        if !remove_indices.contains(&idx) {
+            cleaned_events.push(ev.clone());
+        }
+    }
+
+    let mut cleaned_invokes = 0usize;
+    let mut cleaned_returns = 0usize;
+    for ev in &cleaned_events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(_) => cleaned_invokes += 1,
+            EspoSandshrewLikeTraceEvent::Return(_) => cleaned_returns += 1,
+            EspoSandshrewLikeTraceEvent::Create(_) => {}
+        }
+    }
+    if cleaned_invokes != cleaned_returns {
+        return None;
+    }
+
+    Some(EspoSandshrewLikeTrace { outpoint: trace.outpoint.clone(), events: cleaned_events })
+}
+
+pub(crate) fn accumulate_alkane_balance_deltas(
+    trace: &EspoSandshrewLikeTrace,
+    _txid: &Txid,
+    host_function_values: &EspoHostFunctionValues,
+) -> (bool, HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>) {
+    let Some(trace) = clean_espo_sandshrew_like_trace(trace, host_function_values) else {
+        return (false, HashMap::new());
+    };
+    if std::env::var_os("ESPO_LOG_HOST_FUNCTION_VALUES").is_some() {
+        let (header, coinbase, diesel, fee) = host_function_values;
+        eprintln!(
+            "[balances] host_function_values header={} coinbase={} diesel={} fee={}",
+            hex::encode(header),
+            hex::encode(coinbase),
+            hex::encode(diesel),
+            hex::encode(fee),
+        );
+    }
+
+    // We treat the trace as a call stack (invoke ... return), and only apply balance
+    // changes when a frame returns successfully. This lets us drop an entire subtree
+    // of effects if a parent frame fails or is static (reverts all children).
+    //
+    // Rules implemented:
+    // - Normal calls: incoming credits go to `myself`, outgoing debits come from `myself`.
+    // - Delegate calls: still credit `myself` for incoming, but the "parent" for both
+    //   incoming and outgoing is the nearest NORMAL ancestor frame (skip delegates).
+    // - Static calls: ignored completely (no effects, children ignored).
+    // - Create events: ignored.
+    // - Returned alkanes pay to the nearest normal parent (never to a delegate).
+    // - We allow negative deltas here; final balance checks happen later.
+    // - We never track `owner == token` deltas (self-token balances are not indexed).
+
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    enum FrameKind {
+        Normal,
+        Delegate,
+        Static,
+    }
+
+    #[derive(Clone)]
+    struct Frame {
+        kind: FrameKind,
+        owner: SchemaAlkaneId,
+        incoming: BTreeMap<SchemaAlkaneId, u128>,
+        parent_normal: Option<SchemaAlkaneId>,
+        deltas: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    }
+
+    // Find the nearest NORMAL frame in the current stack (delegates/statics are skipped).
+    fn nearest_normal_owner(stack: &[Frame]) -> Option<SchemaAlkaneId> {
+        stack.iter().rev().find_map(|frame| {
+            if matches!(frame.kind, FrameKind::Normal) {
+                Some(frame.owner)
+            } else {
+                None
+            }
+        })
+    }
+
+    // Add a signed delta for a (owner, token) pair, skipping self-token balances.
+    fn add_delta(
+        outflows: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+        owner: SchemaAlkaneId,
+        token: SchemaAlkaneId,
+        delta: SignedU128,
+    ) {
+        if token == owner || delta.is_zero() {
+            return;
+        }
+        let remove = {
+            let entry = outflows.entry(owner).or_default();
+            entry.add_signed(token, delta);
+            entry.is_empty()
+        };
+        if remove {
+            outflows.remove(&owner);
+        }
+    }
+
+    // Apply a transfer (amount of token) from -> to into a delta map.
+    fn apply_transfer(
+        outflows: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+        from: Option<SchemaAlkaneId>,
+        to: Option<SchemaAlkaneId>,
+        token: SchemaAlkaneId,
+        amount: u128,
+    ) {
+        if amount == 0 {
+            return;
+        }
+        if let Some(owner) = from {
+            add_delta(outflows, owner, token, SignedU128::negative(amount));
+        }
+        if let Some(owner) = to {
+            add_delta(outflows, owner, token, SignedU128::positive(amount));
+        }
+    }
+
+    // Merge a child's delta map into its parent (used to drop effects on failure/static).
+    fn merge_deltas(
+        target: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+        child: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+    ) {
+        for (owner, per_token) in child {
+            if per_token.is_empty() {
                 continue;
             }
-            *merged.entry(rid).or_default() =
-                merged.get(&rid).copied().unwrap_or(0).saturating_add(amt);
-        }
-        merged
-    }
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.map.values().all(|&v| v == 0)
-    }
-}
-
-impl fmt::Display for Unallocated {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Render entries sorted by SchemaAlkaneId for stable output.
-        // Format: {block:tx=amount, block:tx=amount, ...}
-        let mut items: Vec<_> = self.map.iter().filter(|&(_, &amt)| amt != 0).collect();
-
-        items.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        write!(f, "{{")?;
-        let mut first = true;
-        for (id, amt) in items {
-            if !first {
-                write!(f, ", ")?;
-            }
-            first = false;
-            write!(f, "{}={}", id, amt)?;
-        }
-        write!(f, "}}")
-    }
-}
-
-fn is_op_return(spk: &ScriptBuf) -> bool {
-    let b = spk.as_bytes();
-    !b.is_empty() && b[0] == bitcoin::opcodes::all::OP_RETURN.to_u8()
-}
-
-fn u128_to_u32(v: u128) -> Result<u32> {
-    u32::try_from(v).map_err(|_| anyhow!("downcast failed: {v} does not fit into u32"))
-}
-fn u128_to_u64(v: u128) -> Result<u64> {
-    u64::try_from(v).map_err(|_| anyhow!("downcast failed: {v} does not fit into u64"))
-}
-fn schema_id_from_parts(block_u128: u128, tx_u128: u128) -> Result<SchemaAlkaneId> {
-    Ok(SchemaAlkaneId { block: u128_to_u32(block_u128)?, tx: u128_to_u64(tx_u128)? })
-}
-
-// tolerant hex parsers
-fn parse_hex_u32(s: &str) -> Option<u32> {
-    let x = s.strip_prefix("0x").unwrap_or(s);
-    u32::from_str_radix(x, 16).ok()
-}
-fn parse_hex_u64(s: &str) -> Option<u64> {
-    let x = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(x, 16).ok()
-}
-fn parse_hex_u128(s: &str) -> Option<u128> {
-    let x = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(x, 16).ok()
-}
-
-fn i128_abs_u(v: i128) -> u128 {
-    let abs = v.wrapping_abs();
-    u128::try_from(abs)
-        .unwrap_or_else(|_| panic!("[balances] overflow computing abs for i128 value {v}"))
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum EspoTraceType {
-    NOTRACE,
-    REVERT,
-    SUCCESS,
-}
-
-//// Return (netin, netout):
-/// - netin  = first Invoke's context.incoming_alkanes (always present if a trace exists, per your note)
-/// - netout = last Return's response.alkanes (no status filtering)
-fn compute_nets(
-    trace: &EspoSandshrewLikeTrace,
-) -> (
-    Option<BTreeMap<SchemaAlkaneId, u128>>, // netin: first Invoke.incoming_alkanes
-    Option<BTreeMap<SchemaAlkaneId, u128>>, // netout: last Return.response.alkanes
-    EspoTraceType,                          // NO_TRACE | REVERT | SUCCESS
-) {
-    // ---- netin: from the FIRST Invoke ----
-    let mut netin: Option<BTreeMap<SchemaAlkaneId, u128>> = None;
-    for ev in &trace.events {
-        if let EspoSandshrewLikeTraceEvent::Invoke(inv) = ev {
-            let mut m = BTreeMap::new();
-            for t in &inv.context.incoming_alkanes {
-                if let (Some(blk), Some(tx), Some(val)) =
-                    (parse_hex_u32(&t.id.block), parse_hex_u64(&t.id.tx), parse_hex_u128(&t.value))
-                {
-                    let k = SchemaAlkaneId { block: blk, tx };
-                    *m.entry(k).or_default() =
-                        m.get(&k).copied().unwrap_or(0u128).saturating_add(val);
+            let remove = {
+                let entry = target.entry(owner).or_default();
+                for (token, delta) in per_token {
+                    entry.add_signed(token, delta);
                 }
-            }
-            netin = Some(m);
-            break; // only the first Invoke matters
-        }
-    }
-
-    // ---- last Return (for netout + status) ----
-    let mut last_ret: Option<&EspoSandshrewLikeTraceReturnData> = None;
-    for ev in &trace.events {
-        if let EspoSandshrewLikeTraceEvent::Return(r) = ev {
-            last_ret = Some(r);
-        }
-    }
-
-    let (netout, status): (Option<BTreeMap<SchemaAlkaneId, u128>>, EspoTraceType) = match last_ret {
-        None => (None, EspoTraceType::NOTRACE),
-        Some(r) => {
-            // Build netout from response.alkanes as-is
-            let mut m = BTreeMap::new();
-            for t in &r.response.alkanes {
-                if let (Some(blk), Some(tx), Some(val)) =
-                    (parse_hex_u32(&t.id.block), parse_hex_u64(&t.id.tx), parse_hex_u128(&t.value))
-                {
-                    let k = SchemaAlkaneId { block: blk, tx };
-                    *m.entry(k).or_default() =
-                        m.get(&k).copied().unwrap_or(0u128).saturating_add(val);
-                }
-            }
-            let cls = match r.status {
-                EspoSandshrewLikeTraceStatus::Failure => EspoTraceType::REVERT,
-                EspoSandshrewLikeTraceStatus::Success => EspoTraceType::SUCCESS,
+                entry.is_empty()
             };
-            (Some(m), cls)
-        }
-    };
-
-    (netin, netout, status)
-}
-
-#[derive(Default, Clone)]
-struct TraceFrame {
-    owner: SchemaAlkaneId,
-    incoming: BTreeMap<SchemaAlkaneId, u128>,
-    ignore_balances: bool,
-}
-
-fn parse_short_id(
-    id: &crate::alkanes::trace::EspoSandshrewLikeTraceShortId,
-) -> Option<SchemaAlkaneId> {
-    let block = parse_hex_u32(&id.block)?;
-    let tx = parse_hex_u64(&id.tx)?;
-    Some(SchemaAlkaneId { block, tx })
-}
-
-fn transfers_to_sheet(
-    transfers: &[crate::alkanes::trace::EspoSandshrewLikeTraceTransfer],
-) -> BTreeMap<SchemaAlkaneId, u128> {
-    let mut m = BTreeMap::new();
-    for t in transfers {
-        if let (Some(block), Some(tx), Some(val)) =
-            (parse_hex_u32(&t.id.block), parse_hex_u64(&t.id.tx), parse_hex_u128(&t.value))
-        {
-            let k = SchemaAlkaneId { block, tx };
-            *m.entry(k).or_default() = m.get(&k).copied().unwrap_or(0u128).saturating_add(val);
+            if remove {
+                target.remove(&owner);
+            }
         }
     }
-    m
-}
 
-fn accumulate_alkane_balance_deltas(
-    trace: &EspoSandshrewLikeTrace,
-    txid: &Txid,
-) -> (bool, HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, i128>>) {
-    let mut stack: Vec<TraceFrame> = Vec::new();
+    let mut outflows: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
+        HashMap::new();
+    let mut stack: Vec<Frame> = Vec::new();
     let mut root_reverted = false;
-    let mut local: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, i128>> = HashMap::new();
 
-    let mut idx = 0;
-    while idx < trace.events.len() {
-        let ev = &trace.events[idx];
+    for ev in &trace.events {
         match ev {
             EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                let typ = inv.typ.to_ascii_lowercase();
-                let ignore_balances = typ == "staticcall" || typ == "delegatecall";
-
-                let owner = if typ == "delegatecall" {
-                    stack.last().map(|f| f.owner).or_else(|| parse_short_id(&inv.context.myself))
-                } else {
-                    parse_short_id(&inv.context.myself)
+                // Determine call kind and the nearest normal parent BEFORE pushing the frame.
+                let kind = match inv.typ.to_ascii_lowercase().as_str() {
+                    "delegatecall" => FrameKind::Delegate,
+                    "staticcall" => FrameKind::Static,
+                    _ => FrameKind::Normal,
                 };
-                let Some(owner) = owner else { continue };
+                let Some(owner) = parse_short_id(&inv.context.myself) else { continue };
+                let parent_normal = nearest_normal_owner(&stack);
 
-                let incoming = if ignore_balances {
+                // Static calls are ignored, but we still push a frame to keep stack depth.
+                let incoming = if matches!(kind, FrameKind::Static) {
                     BTreeMap::new()
                 } else {
                     transfers_to_sheet(&inv.context.incoming_alkanes)
                 };
 
-                // Debit nearest balance-carrying ancestor (skip delegate/static frames)
-                if !ignore_balances && !incoming.is_empty() {
-                    if let Some(parent) = stack.iter_mut().rev().find(|frame| !frame.ignore_balances) {
-                        for (rid, amt) in &incoming {
-                            if *rid == parent.owner {
-                                // self-token tracked via metashrew; do not debit here
-                                continue;
-                            }
-                            let entry = parent.incoming.entry(*rid).or_default();
-                            if *entry < *amt {
-                                panic!(
-                                    "[balances] parent underflow debiting child incoming (txid={}, parent={}, token={}, have={}, need={})",
-                                    txid, parent.owner, rid, *entry, *amt
-                                );
-                            }
-                            *entry = entry.saturating_sub(*amt);
-                        }
-                    }
-                }
-
-                stack.push(TraceFrame { owner, incoming, ignore_balances });
+                stack.push(Frame {
+                    kind,
+                    owner,
+                    incoming,
+                    parent_normal,
+                    deltas: HashMap::new(),
+                });
             }
             EspoSandshrewLikeTraceEvent::Return(ret) => {
-                // If we are at the root frame and there are additional consecutive
-                // Return events, defer processing until the last one in that run.
-                if stack.len() == 1 {
-                    if let Some(next_ev) = trace.events.get(idx + 1) {
-                        if matches!(next_ev, EspoSandshrewLikeTraceEvent::Return(_)) {
-                            idx += 1;
-                            continue;
-                        }
-                    }
-                }
-
-                let Some(frame) = stack.pop() else {
-                    idx += 1;
+                let Some(mut frame) = stack.pop() else {
+                    // Mismatched return: treat as a reverted root.
+                    root_reverted = true;
                     continue;
                 };
 
-                // Failure: cancel frame, treat as if child never happened.
+                // Failed frames (and their children) are ignored.
                 if ret.status == EspoSandshrewLikeTraceStatus::Failure {
-                    if stack.is_empty() {
+                    if stack.is_empty() && matches!(frame.kind, FrameKind::Normal) {
                         root_reverted = true;
-                    } else if !frame.incoming.is_empty() {
-                        if let Some(parent) =
-                            stack.iter_mut().rev().find(|fr| !fr.ignore_balances)
-                        {
-                            for (rid, amt) in frame.incoming {
-                                *parent.incoming.entry(rid).or_default() =
-                                    parent.incoming.get(&rid).copied().unwrap_or(0).saturating_add(amt);
-                            }
-                        } else {
-                            panic!(
-                                "[balances] no balance-carrying ancestor to restore child incoming on revert (txid={}, child_owner={})",
-                                txid, frame.owner
-                            );
-                        }
                     }
                     continue;
                 }
 
-                if frame.ignore_balances {
-                    // maintain stack alignment, but do not account value transfer
+                // Static calls are ignored completely (including children).
+                if matches!(frame.kind, FrameKind::Static) {
                     continue;
                 }
 
+                // Incoming: transfer from nearest normal parent -> this frame's owner.
+                for (token, amount) in &frame.incoming {
+                    apply_transfer(
+                        &mut frame.deltas,
+                        frame.parent_normal,
+                        Some(frame.owner),
+                        *token,
+                        *amount,
+                    );
+                }
+
+                // Outgoing: transfer from this frame's owner -> nearest normal parent.
                 let outgoing = transfers_to_sheet(&ret.response.alkanes);
-
-                // kept = incoming - outgoing (signed)
-                let mut keys: BTreeMap<SchemaAlkaneId, ()> = BTreeMap::new();
-                for k in frame.incoming.keys() {
-                    keys.insert(*k, ());
-                }
-                for k in outgoing.keys() {
-                    keys.insert(*k, ());
-                }
-
-                let mut tmp: BTreeMap<SchemaAlkaneId, i128> = BTreeMap::new();
-                for rid in keys.keys() {
-                    if *rid == frame.owner {
-                        // self-mint/burn is derived from live adapter; skip indexing to avoid false negatives
-                        continue;
-                    }
-                    let in_amt = frame.incoming.get(rid).copied().unwrap_or(0);
-                    let out_amt = outgoing.get(rid).copied().unwrap_or(0);
-                    let kept: i128 = (in_amt.saturating_sub(out_amt)) as i128;
-                    // minted = out_amt.saturating_sub(in_amt) (informational only; not applied)
-                    if kept > 0 {
-                        *tmp.entry(*rid).or_default() += kept;
-                    }
+                for (token, amount) in &outgoing {
+                    apply_transfer(
+                        &mut frame.deltas,
+                        Some(frame.owner),
+                        frame.parent_normal,
+                        *token,
+                        *amount,
+                    );
                 }
 
-                if !tmp.is_empty() {
-                    let entry = local.entry(frame.owner).or_default();
-                    for (rid, kept) in tmp {
-                        *entry.entry(rid).or_default() += kept;
-                    }
-                }
-
-                if let Some(parent) = stack.iter_mut().rev().find(|fr| !fr.ignore_balances) {
-                    for (rid, amt) in outgoing {
-                        if amt == 0 {
-                            continue;
-                        }
-                        *parent.incoming.entry(rid).or_default() =
-                            parent.incoming.get(&rid).copied().unwrap_or(0).saturating_add(amt);
-                    }
+                // Merge this frame's (successful) subtree effects upward.
+                if let Some(parent) = stack.last_mut() {
+                    merge_deltas(&mut parent.deltas, frame.deltas);
+                } else {
+                    merge_deltas(&mut outflows, frame.deltas);
                 }
             }
-            _ => {}
+            EspoSandshrewLikeTraceEvent::Create(_) => {
+                // Create events are ignored per rules.
+            }
         }
-        idx += 1;
     }
 
-    if root_reverted { (false, HashMap::new()) } else { (true, local) }
+    if root_reverted || !stack.is_empty() {
+        return (false, HashMap::new());
+    }
+
+    (true, outflows)
 }
 
 /* -------------------------- Edicts + routing (multi-protostone, per your rules) -------------------------- */
@@ -764,36 +734,32 @@ fn holder_order_key(id: &HolderId) -> String {
 fn apply_holders_delta(
     mut holders: Vec<HolderEntry>,
     holder: &HolderId,
-    delta: i128,
+    delta: SignedU128,
 ) -> Vec<HolderEntry> {
     let idx = holders.iter().position(|h| h.holder == *holder);
-    match delta.cmp(&0) {
-        std::cmp::Ordering::Equal => return holders,
-        std::cmp::Ordering::Greater => {
-            let add = delta as u128;
-            if let Some(i) = idx {
-                holders[i].amount = holders[i].amount.saturating_add(add);
-            } else {
-                holders.push(HolderEntry { holder: holder.clone(), amount: add });
-            }
+    let (is_negative, amount) = delta.as_parts();
+    if amount == 0 {
+        return holders;
+    }
+    if !is_negative {
+        if let Some(i) = idx {
+            holders[i].amount = holders[i].amount.saturating_add(amount);
+        } else {
+            holders.push(HolderEntry { holder: holder.clone(), amount });
         }
-        std::cmp::Ordering::Less => {
-            let sub = i128_abs_u(delta);
-            if let Some(i) = idx {
-                let cur = holders[i].amount;
-                if sub > cur {
-                    panic!(
-                        "[balances] negative holder balance detected (holder={:?}, cur={}, sub={})",
-                        holders[i].holder, cur, sub
-                    );
-                }
-                let after = cur - sub;
-                if after == 0 {
-                    holders.swap_remove(i);
-                } else {
-                    holders[i].amount = after;
-                }
-            }
+    } else if let Some(i) = idx {
+        let cur = holders[i].amount;
+        if amount > cur {
+            panic!(
+                "[balances] negative holder balance detected (holder={:?}, cur={}, sub={})",
+                holders[i].holder, cur, amount
+            );
+        }
+        let after = cur - amount;
+        if after == 0 {
+            holders.swap_remove(i);
+        } else {
+            holders[i].amount = after;
         }
     }
     holders.sort_by(|a, b| match b.amount.cmp(&a.amount) {
@@ -819,30 +785,47 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
     let mut stat_minus_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
     let mut stat_plus_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
 
-    let push_balance_txid =
-        |map: &mut HashMap<SchemaAlkaneId, Vec<[u8; 32]>>, alk: SchemaAlkaneId, txid: [u8; 32]| {
-            let entry = map.entry(alk).or_default();
-            if !entry.iter().any(|b| b == &txid) {
-                entry.push(txid);
+    let push_balance_tx_entry = |map: &mut HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>,
+                                 alk: SchemaAlkaneId,
+                                 entry: AlkaneBalanceTxEntry| {
+        let entries = map.entry(alk).or_default();
+        if let Some(existing) = entries.iter_mut().find(|e| e.txid == entry.txid) {
+            if existing.outflow.is_empty() && !entry.outflow.is_empty() {
+                existing.outflow = entry.outflow;
             }
-        };
-    let push_balance_txid_pair = |map: &mut HashMap<(SchemaAlkaneId, SchemaAlkaneId), Vec<[u8; 32]>>,
-                                  owner: SchemaAlkaneId,
-                                  token: SchemaAlkaneId,
-                                  txid: [u8; 32]| {
-        let entry = map.entry((owner, token)).or_default();
-        if !entry.iter().any(|b| b == &txid) {
-            entry.push(txid);
+            return;
         }
+        entries.push(entry);
     };
+    let push_balance_tx_entry_pair =
+        |map: &mut HashMap<(SchemaAlkaneId, SchemaAlkaneId), Vec<AlkaneBalanceTxEntry>>,
+         owner: SchemaAlkaneId,
+         token: SchemaAlkaneId,
+         entry: AlkaneBalanceTxEntry| {
+            let entries = map.entry((owner, token)).or_default();
+            if let Some(existing) = entries.iter_mut().find(|e| e.txid == entry.txid) {
+                if existing.outflow.is_empty() && !entry.outflow.is_empty() {
+                    existing.outflow = entry.outflow;
+                }
+                return;
+            }
+            entries.push(entry);
+        };
 
-    // holders_delta[alk][addr] = i128 delta
-    let mut holders_delta: HashMap<SchemaAlkaneId, BTreeMap<HolderId, i128>> = HashMap::new();
-    let mut alkane_balance_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, i128>> =
+    // holders_delta[alk][addr] = SignedU128 delta
+    let mut holders_delta: HashMap<SchemaAlkaneId, BTreeMap<HolderId, SignedU128>> = HashMap::new();
+    let mut alkane_balance_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
         HashMap::new();
-    let mut alkane_balance_txids: HashMap<SchemaAlkaneId, Vec<[u8; 32]>> = HashMap::new();
-    let mut alkane_balance_txids_by_token: HashMap<(SchemaAlkaneId, SchemaAlkaneId), Vec<[u8; 32]>> =
+    let mut alkane_balance_tx_entries: HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>> =
         HashMap::new();
+    let mut alkane_balance_tx_entries_by_token: HashMap<
+        (SchemaAlkaneId, SchemaAlkaneId),
+        Vec<AlkaneBalanceTxEntry>,
+    > = HashMap::new();
+    let mut alkane_balance_delta_src: HashMap<
+        (SchemaAlkaneId, SchemaAlkaneId),
+        AlkaneBalanceTxEntry,
+    > = HashMap::new();
 
     // Records for inputs spent in this block (for persistence w/ tx_spent)
     #[derive(Clone)]
@@ -944,26 +927,26 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         let txid = tx.compute_txid();
         let txid_bytes = txid.to_byte_array();
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
-        let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, i128>> =
+        let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
             HashMap::new();
 
         let mut add_holder_delta =
             |alk: SchemaAlkaneId,
              holder: HolderId,
-             delta: i128,
+             delta: SignedU128,
              holder_changed: &mut HashSet<SchemaAlkaneId>| {
-                if delta == 0 {
+                if delta.is_zero() {
                     return;
                 }
                 if let HolderId::Alkane(a) = holder {
                     holder_changed.insert(a);
                 }
-                holders_delta
-                    .entry(alk)
-                    .or_default()
-                    .entry(holder)
-                    .and_modify(|d| *d += delta)
-                    .or_insert(delta);
+                let entry = holders_delta.entry(alk).or_default();
+                let slot = entry.entry(holder.clone()).or_insert_with(SignedU128::zero);
+                *slot += delta;
+                if slot.is_zero() {
+                    entry.remove(&holder);
+                }
             };
 
         // Seed from VIN balances only
@@ -988,7 +971,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                         add_holder_delta(
                             be.alkane,
                             HolderId::Address(addr.clone()),
-                            -(be.amount as i128),
+                            SignedU128::negative(be.amount),
                             &mut holder_alkanes_changed,
                         );
                         *stat_minus_by_alk.entry(be.alkane).or_default() = stat_minus_by_alk
@@ -1030,7 +1013,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                         add_holder_delta(
                             be.alkane,
                             HolderId::Address(addr.clone()),
-                            -(be.amount as i128),
+                            SignedU128::negative(be.amount),
                             &mut holder_alkanes_changed,
                         );
                         *stat_minus_by_alk.entry(be.alkane).or_default() = stat_minus_by_alk
@@ -1062,7 +1045,11 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
         if !traces_for_tx.is_empty() {
             for t in &traces_for_tx {
-                let (ok, deltas) = accumulate_alkane_balance_deltas(&t.sandshrew_trace, &txid);
+                let (ok, deltas) = accumulate_alkane_balance_deltas(
+                    &t.sandshrew_trace,
+                    &txid,
+                    &block.host_function_values,
+                );
                 if !ok {
                     local_alkane_delta.clear();
                     holder_alkanes_changed.clear();
@@ -1071,7 +1058,11 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 for (owner, per_token) in deltas {
                     let entry = local_alkane_delta.entry(owner).or_default();
                     for (tok, delta) in per_token {
-                        *entry.entry(tok).or_default() += delta;
+                        let slot = entry.entry(tok).or_insert_with(SignedU128::zero);
+                        *slot += delta;
+                        if slot.is_zero() {
+                            entry.remove(&tok);
+                        }
                     }
                 }
             }
@@ -1125,7 +1116,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                     add_holder_delta(
                         alkane_id,
                         HolderId::Address(address_str.clone()),
-                        delta_amount as i128,
+                        SignedU128::positive(delta_amount),
                         &mut holder_alkanes_changed,
                     );
                     *stat_plus_by_alk.entry(alkane_id).or_default() = stat_plus_by_alk
@@ -1139,9 +1130,11 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             }
         }
         for (holder_alk, per_token) in &local_alkane_delta {
+            let entry_outflow =
+                AlkaneBalanceTxEntry { txid: txid_bytes, outflow: per_token.clone() };
             let entry = alkane_balance_delta.entry(*holder_alk).or_default();
             for (token, delta) in per_token {
-                if *delta == 0 {
+                if delta.is_zero() {
                     continue;
                 }
                 add_holder_delta(
@@ -1150,30 +1143,45 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                     *delta,
                     &mut holder_alkanes_changed,
                 );
-                push_balance_txid_pair(
-                    &mut alkane_balance_txids_by_token,
+                push_balance_tx_entry_pair(
+                    &mut alkane_balance_tx_entries_by_token,
                     *holder_alk,
                     *token,
-                    txid_bytes,
+                    entry_outflow.clone(),
                 );
-                if *delta > 0 {
-                    *stat_plus_by_alk.entry(*token).or_default() = stat_plus_by_alk
-                        .get(token)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(*delta as u128);
-                } else {
-                    let amt = i128_abs_u(*delta);
+                let (is_negative, mag) = delta.as_parts();
+                if is_negative {
                     *stat_minus_by_alk.entry(*token).or_default() =
-                        stat_minus_by_alk.get(token).copied().unwrap_or(0).saturating_add(amt);
+                        stat_minus_by_alk.get(token).copied().unwrap_or(0).saturating_add(mag);
+                } else {
+                    *stat_plus_by_alk.entry(*token).or_default() =
+                        stat_plus_by_alk.get(token).copied().unwrap_or(0).saturating_add(mag);
                 }
-                *entry.entry(*token).or_default() += *delta;
+                let slot = entry.entry(*token).or_insert_with(SignedU128::zero);
+                *slot += *delta;
+                if slot.is_zero() {
+                    entry.remove(token);
+                }
+                alkane_balance_delta_src.insert((*holder_alk, *token), entry_outflow.clone());
             }
         }
 
         for owner in &holder_alkanes_changed {
-            push_balance_txid(&mut alkane_balance_txids, *owner, txid_bytes);
+            let outflow = local_alkane_delta.get(owner).cloned().unwrap_or_else(BTreeMap::new);
+            let entry = AlkaneBalanceTxEntry { txid: txid_bytes, outflow };
+            push_balance_tx_entry(&mut alkane_balance_tx_entries, *owner, entry);
         }
+    }
+
+    // Ensure txid indexes are recorded for every alkane/token delta we are about to persist.
+    for ((owner, token), entry) in &alkane_balance_delta_src {
+        push_balance_tx_entry(&mut alkane_balance_tx_entries, *owner, entry.clone());
+        push_balance_tx_entry_pair(
+            &mut alkane_balance_tx_entries_by_token,
+            *owner,
+            *token,
+            entry.clone(),
+        );
     }
 
     // Accumulate alkane holder deltas (alkane -> token) and prepare rows for persistence.
@@ -1203,21 +1211,26 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
             if let Some(delta_map) = alkane_balance_delta.get(owner) {
                 for (token, delta) in delta_map {
-                    if *delta == 0 {
+                    let (is_negative, mag) = delta.as_parts();
+                    if mag == 0 {
                         continue;
                     }
                     let cur = amounts.get(token).copied().unwrap_or(0);
-                    let updated = if *delta >= 0 {
-                        cur.saturating_add(*delta as u128)
+                    let updated = if !is_negative {
+                        cur.saturating_add(mag)
                     } else {
-                        let abs = i128_abs_u(*delta);
-                        if abs > cur {
+                        if mag > cur {
+                            let txid_str = alkane_balance_delta_src
+                                .get(&(*owner, *token))
+                                .map(|entry| Txid::from_byte_array(entry.txid))
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
                             panic!(
-                                "[balances] negative alkane balance detected (owner={}:{}, token={}:{}, cur={}, sub={})",
-                                owner.block, owner.tx, token.block, token.tx, cur, abs
+                                "[balances] negative alkane balance detected (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
+                                txid_str, owner.block, owner.tx, token.block, token.tx, cur, mag
                             );
                         }
-                        cur - abs
+                        cur - mag
                     };
                     if updated == 0 {
                         amounts.remove(token);
@@ -1237,12 +1250,36 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         }
     }
 
-    // Build balance-change txid rows (merge existing + new)
-    let mut alkane_balance_txs_rows: HashMap<SchemaAlkaneId, Vec<[u8; 32]>> = HashMap::new();
-    let mut alkane_balance_txs_by_token_rows: HashMap<(SchemaAlkaneId, SchemaAlkaneId), Vec<[u8; 32]>> =
+    // Build balance-change tx rows (merge existing + new)
+    let mut alkane_balance_txs_rows: HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>> =
         HashMap::new();
-    if !alkane_balance_txids.is_empty() {
-        let mut tokens: Vec<SchemaAlkaneId> = alkane_balance_txids.keys().copied().collect();
+    let mut alkane_balance_txs_by_token_rows: HashMap<
+        (SchemaAlkaneId, SchemaAlkaneId),
+        Vec<AlkaneBalanceTxEntry>,
+    > = HashMap::new();
+
+    fn merge_tx_entries(
+        existing: &mut Vec<AlkaneBalanceTxEntry>,
+        new_entries: &[AlkaneBalanceTxEntry],
+    ) {
+        let mut seen: HashMap<[u8; 32], usize> = HashMap::new();
+        for (idx, entry) in existing.iter().enumerate() {
+            seen.insert(entry.txid, idx);
+        }
+        for entry in new_entries {
+            if let Some(idx) = seen.get(&entry.txid).copied() {
+                if existing[idx].outflow.is_empty() && !entry.outflow.is_empty() {
+                    existing[idx].outflow = entry.outflow.clone();
+                }
+                continue;
+            }
+            seen.insert(entry.txid, existing.len());
+            existing.push(entry.clone());
+        }
+    }
+
+    if !alkane_balance_tx_entries.is_empty() {
+        let mut tokens: Vec<SchemaAlkaneId> = alkane_balance_tx_entries.keys().copied().collect();
         tokens.sort();
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(tokens.len());
         for tok in &tokens {
@@ -1251,24 +1288,15 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         let existing = mdb.multi_get(&keys)?;
 
         for (idx, tok) in tokens.iter().enumerate() {
-            let mut merged: Vec<[u8; 32]> = Vec::new();
-            let mut seen: HashSet<[u8; 32]> = HashSet::new();
-
+            let mut merged: Vec<AlkaneBalanceTxEntry> = Vec::new();
             if let Some(bytes) = &existing.get(idx).and_then(|v| v.as_ref()) {
-                if let Ok(cur) = Vec::<[u8; 32]>::try_from_slice(bytes) {
-                    for t in cur {
-                        seen.insert(t);
-                        merged.push(t);
-                    }
+                if let Ok(cur) = decode_alkane_balance_tx_entries(bytes) {
+                    merged = cur;
                 }
             }
 
-            if let Some(new) = alkane_balance_txids.get(tok) {
-                for t in new {
-                    if seen.insert(*t) {
-                        merged.push(*t);
-                    }
-                }
+            if let Some(new) = alkane_balance_tx_entries.get(tok) {
+                merge_tx_entries(&mut merged, new);
             }
 
             if !merged.is_empty() {
@@ -1276,9 +1304,9 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             }
         }
     }
-    if !alkane_balance_txids_by_token.is_empty() {
+    if !alkane_balance_tx_entries_by_token.is_empty() {
         let mut pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> =
-            alkane_balance_txids_by_token.keys().copied().collect();
+            alkane_balance_tx_entries_by_token.keys().copied().collect();
         pairs.sort();
         let mut keys: Vec<Vec<u8>> = Vec::with_capacity(pairs.len());
         for (owner, token) in &pairs {
@@ -1287,24 +1315,15 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         let existing = mdb.multi_get(&keys)?;
 
         for (idx, pair) in pairs.iter().enumerate() {
-            let mut merged: Vec<[u8; 32]> = Vec::new();
-            let mut seen: HashSet<[u8; 32]> = HashSet::new();
-
+            let mut merged: Vec<AlkaneBalanceTxEntry> = Vec::new();
             if let Some(bytes) = &existing.get(idx).and_then(|v| v.as_ref()) {
-                if let Ok(cur) = Vec::<[u8; 32]>::try_from_slice(bytes) {
-                    for t in cur {
-                        seen.insert(t);
-                        merged.push(t);
-                    }
+                if let Ok(cur) = decode_alkane_balance_tx_entries(bytes) {
+                    merged = cur;
                 }
             }
 
-            if let Some(new) = alkane_balance_txids_by_token.get(pair) {
-                for t in new {
-                    if seen.insert(*t) {
-                        merged.push(*t);
-                    }
-                }
+            if let Some(new) = alkane_balance_tx_entries_by_token.get(pair) {
+                merge_tx_entries(&mut merged, new);
             }
 
             if !merged.is_empty() {

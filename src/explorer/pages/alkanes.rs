@@ -5,8 +5,12 @@ use maud::{Markup, html};
 use serde::Deserialize;
 
 use crate::explorer::components::layout::layout;
-use crate::explorer::components::tx_view::{alkane_icon_fallback_url, alkane_icon_url, icon_onerror};
-use crate::explorer::components::svg_assets::{icon_left, icon_right, icon_skip_left, icon_skip_right};
+use crate::explorer::components::svg_assets::{
+    icon_left, icon_right, icon_skip_left, icon_skip_right,
+};
+use crate::explorer::components::tx_view::{
+    alkane_icon_fallback_url, alkane_icon_url, icon_onerror,
+};
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::storage::{
     HoldersCountEntry, alkane_creation_count_key, alkane_creation_ordered_prefix,
@@ -30,7 +34,10 @@ struct AlkaneRow {
     creation_txid: String,
 }
 
-pub async fn alkanes_page(State(state): State<ExplorerState>, Query(q): Query<PageQuery>) -> Html<String> {
+pub async fn alkanes_page(
+    State(state): State<ExplorerState>,
+    Query(q): Query<PageQuery>,
+) -> Html<String> {
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let offset = limit.saturating_mul(page.saturating_sub(1));
@@ -87,7 +94,10 @@ pub async fn alkanes_page(State(state): State<ExplorerState>, Query(q): Query<Pa
                 let fallback = if name == "Unnamed" {
                     '?'
                 } else {
-                    name.chars().find(|c| !c.is_whitespace()).map(|c| c.to_ascii_uppercase()).unwrap_or('?')
+                    name.chars()
+                        .find(|c| !c.is_whitespace())
+                        .map(|c| c.to_ascii_uppercase())
+                        .unwrap_or('?')
                 };
                 let creation_txid = hex::encode(rec.txid);
 
@@ -107,19 +117,11 @@ pub async fn alkanes_page(State(state): State<ExplorerState>, Query(q): Query<Pa
         seen += 1;
     }
 
-    let display_start = if total > 0 && offset < total as usize {
-        (offset + 1) as u64
-    } else {
-        0
-    };
+    let display_start = if total > 0 && offset < total as usize { (offset + 1) as u64 } else { 0 };
     let display_end = (offset as u64 + rows.len() as u64).min(total);
     let has_prev = page > 1;
     let has_next = (offset as u64 + rows.len() as u64) < total;
-    let last_page = if total > 0 {
-        ((total + limit as u64 - 1) / limit as u64).max(1)
-    } else {
-        1
-    };
+    let last_page = if total > 0 { ((total + limit as u64 - 1) / limit as u64).max(1) } else { 1 };
 
     let table: Markup = if rows.is_empty() {
         html! { p class="muted" { "No alkanes found." } }

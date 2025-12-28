@@ -254,7 +254,6 @@ impl MetashrewAdapter {
         self.read_uint_key::<4, u32>(tip_height_prefix)
     }
 
-
     /// Fetch all traces for a txid directly from the secondary DB, without needing block height.
     pub fn traces_for_tx(&self, txid: &Txid) -> Result<Vec<PartialEspoTrace>> {
         let db = get_metashrew_sdb();

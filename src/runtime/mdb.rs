@@ -164,12 +164,7 @@ impl Mdb {
         let prev = if self.aof.is_some() { self.db.get(&prefixed)? } else { None };
         self.db.put(&prefixed, v)?;
         if let Some(aof) = &self.aof {
-            aof.record_put(
-                &self.namespace_label,
-                prefixed,
-                prev.map(|p| p.to_vec()),
-                v.to_vec(),
-            );
+            aof.record_put(&self.namespace_label, prefixed, prev.map(|p| p.to_vec()), v.to_vec());
         }
         Ok(())
     }

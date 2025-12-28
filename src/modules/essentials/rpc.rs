@@ -3,9 +3,10 @@ use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::{
-    HolderId, HoldersCountEntry, alkane_balance_txs_by_token_key, alkane_balance_txs_key,
-    alkane_creation_ordered_prefix, decode_creation_record, holders_count_key, load_creation_record,
-    outpoint_addr_key, outpoint_balances_prefix, trace_count_key,
+    AlkaneBalanceTxEntry, HolderId, HoldersCountEntry, alkane_balance_txs_by_token_key,
+    alkane_balance_txs_key, alkane_creation_ordered_prefix, decode_alkane_balance_tx_entries,
+    decode_creation_record, holders_count_key, load_creation_record, outpoint_addr_key,
+    outpoint_balances_prefix, trace_count_key,
 };
 use crate::runtime::mempool::{
     MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
@@ -28,8 +29,8 @@ use super::utils::balances::{
 use super::utils::inspections::inspection_to_json;
 use crate::modules::essentials::storage::alkane_creation_count_key;
 
-use bitcoin::{Address, Txid};
 use bitcoin::hashes::Hash;
+use bitcoin::{Address, Txid};
 use hex;
 use std::str::FromStr;
 
@@ -92,9 +93,15 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         tokio::spawn(async move {
             reg_mem
                 .register("get_mempool_traces", move |_cx, payload| async move {
-                    let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-                    let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).max(1) as usize;
-                    let addr_raw = payload.get("address").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+                    let page =
+                        payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                    let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).max(1)
+                        as usize;
+                    let addr_raw = payload
+                        .get("address")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
                     let address = addr_raw.and_then(normalize_address);
 
                     log_rpc(
@@ -340,9 +347,13 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                 .register("get_all_alkanes", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_all);
                     async move {
-                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
-                        let limit =
-                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).clamp(1, 500) as usize;
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                            as usize;
+                        let limit = payload
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(100)
+                            .clamp(1, 500) as usize;
                         let offset = limit.saturating_mul(page.saturating_sub(1));
 
                         let total = mdb
@@ -400,7 +411,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                     }));
                                 }
                                 Err(e) => {
-                                    log_rpc("get_all_alkanes", &format!("decode creation record failed: {e}"));
+                                    log_rpc(
+                                        "get_all_alkanes",
+                                        &format!("decode creation record failed: {e}"),
+                                    );
                                 }
                             }
                             seen += 1;
@@ -569,13 +583,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             ),
                         );
 
-                        let (total, _supply, slice) = match get_holders_for_alkane(&mdb, alk, page, limit) {
-                            Ok(tup) => tup,
-                            Err(e) => {
-                                log_rpc("get_holders", &format!("failed: {e:?}"));
-                                return json!({"ok": false, "error": "internal_error"});
-                            }
-                        };
+                        let (total, _supply, slice) =
+                            match get_holders_for_alkane(&mdb, alk, page, limit) {
+                                Ok(tup) => tup,
+                                Err(e) => {
+                                    log_rpc("get_holders", &format!("failed: {e:?}"));
+                                    return json!({"ok": false, "error": "internal_error"});
+                                }
+                            };
 
                         let has_more = page.saturating_mul(limit) < total;
 
@@ -744,10 +759,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             }
                         };
 
-                        log_rpc(
-                            "get_alkane_balances",
-                            &format!("alkane={}:{}", alk.block, alk.tx),
-                        );
+                        log_rpc("get_alkane_balances", &format!("alkane={}:{}", alk.block, alk.tx));
 
                         let agg = match get_alkane_balances(&mdb, &alk) {
                             Ok(m) => m,
@@ -812,7 +824,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                     log_rpc(
                         "get_alkane_balance_metashrew",
-                        &format!("owner={}:{} target={}:{}", owner.block, owner.tx, target.block, target.tx),
+                        &format!(
+                            "owner={}:{} target={}:{}",
+                            owner.block, owner.tx, target.block, target.tx
+                        ),
                     );
 
                     match get_metashrew().get_latest_reserves_for_alkane(&owner, &target) {
@@ -869,12 +884,15 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                         log_rpc(
                             "get_alkane_balance_txs",
-                            &format!("alkane={}:{} page={} limit={}", alk.block, alk.tx, page, limit),
+                            &format!(
+                                "alkane={}:{} page={} limit={}",
+                                alk.block, alk.tx, page, limit
+                            ),
                         );
 
-                        let mut txs: Vec<[u8; 32]> = Vec::new();
+                        let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
                         if let Ok(Some(bytes)) = mdb.get(&alkane_balance_txs_key(&alk)) {
-                            if let Ok(list) = Vec::<[u8; 32]>::try_from_slice(&bytes) {
+                            if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
                                 txs = list;
                             }
                         }
@@ -888,9 +906,19 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                         let items: Vec<Value> = slice
                             .into_iter()
-                            .filter_map(|arr| Txid::from_slice(&arr).ok())
-                            .map(|txid| txid.to_string())
-                            .map(Value::String)
+                            .map(|entry| {
+                                let mut outflow: Map<String, Value> = Map::new();
+                                for (id, delta) in entry.outflow {
+                                    outflow.insert(
+                                        format!("{}:{}", id.block, id.tx),
+                                        Value::String(delta.to_string()),
+                                    );
+                                }
+                                json!({
+                                    "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                    "outflow": Value::Object(outflow),
+                                })
+                            })
                             .collect();
 
                         json!({
@@ -958,11 +986,11 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             ),
                         );
 
-                        let mut txs: Vec<[u8; 32]> = Vec::new();
+                        let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
                         if let Ok(Some(bytes)) =
                             mdb.get(&alkane_balance_txs_by_token_key(&owner, &token))
                         {
-                            if let Ok(list) = Vec::<[u8; 32]>::try_from_slice(&bytes) {
+                            if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
                                 txs = list;
                             }
                         }
@@ -976,9 +1004,19 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
 
                         let items: Vec<Value> = slice
                             .into_iter()
-                            .filter_map(|arr| Txid::from_slice(&arr).ok())
-                            .map(|txid| txid.to_string())
-                            .map(Value::String)
+                            .map(|entry| {
+                                let mut outflow: Map<String, Value> = Map::new();
+                                for (id, delta) in entry.outflow {
+                                    outflow.insert(
+                                        format!("{}:{}", id.block, id.tx),
+                                        Value::String(delta.to_string()),
+                                    );
+                                }
+                                json!({
+                                    "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                    "outflow": Value::Object(outflow),
+                                })
+                            })
                             .collect();
 
                         json!({

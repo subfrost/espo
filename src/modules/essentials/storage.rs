@@ -1,9 +1,11 @@
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
+use crate::modules::essentials::utils::balances::SignedU128;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use bitcoin::{Address, Network, ScriptBuf};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use anyhow::Result;
+use std::collections::BTreeMap;
 
 /// Identifier for a holder: either a Bitcoin address or another Alkane.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
@@ -24,6 +26,12 @@ pub struct HolderEntry {
 pub struct BalanceEntry {
     pub alkane: SchemaAlkaneId,
     pub amount: u128,
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct AlkaneBalanceTxEntry {
+    pub txid: [u8; 32],
+    pub outflow: BTreeMap<SchemaAlkaneId, SignedU128>,
 }
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -191,6 +199,18 @@ pub fn decode_balances_vec(bytes: &[u8]) -> Result<Vec<BalanceEntry>> {
     Ok(Vec::<BalanceEntry>::try_from_slice(bytes)?)
 }
 
+pub fn decode_alkane_balance_tx_entries(bytes: &[u8]) -> Result<Vec<AlkaneBalanceTxEntry>> {
+    if let Ok(parsed) = Vec::<AlkaneBalanceTxEntry>::try_from_slice(bytes) {
+        return Ok(parsed);
+    }
+
+    let legacy: Vec<[u8; 32]> = Vec::<[u8; 32]>::try_from_slice(bytes)?;
+    Ok(legacy
+        .into_iter()
+        .map(|txid| AlkaneBalanceTxEntry { txid, outflow: BTreeMap::new() })
+        .collect())
+}
+
 pub fn decode_holders_vec(bytes: &[u8]) -> Result<Vec<HolderEntry>> {
     if let Ok(parsed) = Vec::<HolderEntry>::try_from_slice(bytes) {
         return Ok(parsed);
@@ -260,7 +280,10 @@ pub fn decode_creation_record(bytes: &[u8]) -> Result<AlkaneCreationRecord> {
     })
 }
 
-pub fn load_creation_record(mdb: &crate::runtime::mdb::Mdb, alkane: &SchemaAlkaneId) -> Result<Option<AlkaneCreationRecord>> {
+pub fn load_creation_record(
+    mdb: &crate::runtime::mdb::Mdb,
+    alkane: &SchemaAlkaneId,
+) -> Result<Option<AlkaneCreationRecord>> {
     let key = alkane_creation_by_id_key(alkane);
     if let Some(bytes) = mdb.get(&key)? {
         let record = decode_creation_record(&bytes)?;

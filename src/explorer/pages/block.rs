@@ -156,10 +156,7 @@ pub async fn block_page(
         get_outpoint_balances_with_spent(&state.essentials_mdb, txid, vout).unwrap_or_default()
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
-        let mut dedup: Vec<Txid> = tx_items
-            .iter()
-            .map(|t| t.transaction.compute_txid())
-            .collect();
+        let mut dedup: Vec<Txid> = tx_items.iter().map(|t| t.transaction.compute_txid()).collect();
         dedup.sort();
         dedup.dedup();
         let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();

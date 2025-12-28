@@ -23,7 +23,6 @@ use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
 use crate::explorer::run_explorer;
-use bitcoincore_rpc::RpcApi;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
@@ -33,11 +32,14 @@ use crate::{
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
     runtime::aof::AOF_REORG_DEPTH,
+    runtime::mempool::{
+        purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
+    },
     runtime::rpc::run_rpc,
-    runtime::mempool::{purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service},
 };
-pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use bitcoin::Txid;
+use bitcoincore_rpc::RpcApi;
+pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use tokio::runtime::Builder as TokioBuilder;
 
 fn should_watch_for_reorg(next_height: u32, safe_tip: u32) -> bool {
@@ -103,24 +105,42 @@ fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
-    let network = get_network();
-    init_block_source()?;
     let cfg = get_config();
+    let network = get_network();
+    let view_only = cfg.view_only;
+    init_block_source()?;
+
+    if view_only {
+        eprintln!(
+            "[mode] view-only enabled: indexer and mempool are disabled; serving existing data only"
+        );
+    }
     let metashrew_sdb = get_metashrew_sdb();
 
     if cfg.simulate_reorg {
-        match get_aof_manager() {
-            Some(aof) => match aof.revert_all_blocks() {
-                Ok(Some(h)) => {
-                    eprintln!("[aof] simulate-reorg: reverted through height {}, will reindex", h);
-                    if let Err(e) = reset_mempool_store() {
-                        eprintln!("[mempool] failed to reset store after simulated reorg: {e:?}");
+        if view_only {
+            eprintln!("[aof] simulate-reorg ignored in view-only mode");
+        } else {
+            match get_aof_manager() {
+                Some(aof) => match aof.revert_all_blocks() {
+                    Ok(Some(h)) => {
+                        eprintln!(
+                            "[aof] simulate-reorg: reverted through height {}, will reindex",
+                            h
+                        );
+                        if let Err(e) = reset_mempool_store() {
+                            eprintln!(
+                                "[mempool] failed to reset store after simulated reorg: {e:?}"
+                            );
+                        }
                     }
+                    Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
+                    Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
+                },
+                None => {
+                    eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert")
                 }
-                Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
-                Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
-            },
-            None => eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert"),
+            }
         }
     }
 
@@ -173,6 +193,18 @@ async fn main() -> Result<()> {
         .set(height_cell.clone())
         .map_err(|_| anyhow::anyhow!("espo height client already initialized"))?;
     let mut next_height: u32 = start_height;
+
+    if view_only {
+        let indexed_height = start_height.saturating_sub(1);
+        update_safe_tip(indexed_height);
+        eprintln!(
+            "[mode] view-only: explorer/RPC running; indexed height {}, next height {}",
+            indexed_height, start_height
+        );
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
 
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let mut last_tip: Option<u32> = None;

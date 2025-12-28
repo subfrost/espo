@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bitcoin::BlockHash;
 use hex::FromHex;
-use rocksdb::{IteratorMode, Options, WriteBatch, DB};
+use rocksdb::{DB, IteratorMode, Options, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -58,8 +58,7 @@ impl AofManager {
         opts.create_if_missing(true);
         let log_db = Arc::new(DB::open(&opts, path)?);
 
-        let mgr =
-            Self { db, log_db, depth, state: Arc::new(Mutex::new(BlockState::default())) };
+        let mgr = Self { db, log_db, depth, state: Arc::new(Mutex::new(BlockState::default())) };
         // Clean up any files beyond our retention window on startup.
         mgr.prune_old(None)?;
         Ok(mgr)

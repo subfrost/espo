@@ -36,6 +36,8 @@ after the binary is built, you can run the indexer with the following command
   --bitcoind-blocks-dir {BITCOIN BLOCKS DIR}
 ```
 
+To serve the current database without running the indexer or mempool service, append `--view-only` to the command. This keeps the RPC server (and explorer if enabled) available for read-only access to the existing data.
+
 Espo will build indicies for the .blk files in your bitcoin blocks directory and start indexing, with a fallback to the bitcoin RPC. I have only tested espo on my machine which has 32 cores adn 192gb of ram, and I achieve an index in a little less than 2 hours. On older hardware you can expect an index between 6-12 hours.
 
 ## Modules

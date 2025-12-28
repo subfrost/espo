@@ -266,9 +266,10 @@ impl EsploraElectrumLike {
     }
 
     async fn fetch_outspends_batch(&self, txids: &[Txid]) -> Vec<Vec<Option<Txid>>> {
-        let futs = txids.iter().enumerate().map(|(idx, txid)| async move {
-            (idx, txid, self.fetch_outspends_single(txid).await)
-        });
+        let futs = txids
+            .iter()
+            .enumerate()
+            .map(|(idx, txid)| async move { (idx, txid, self.fetch_outspends_single(txid).await) });
         let mut out = vec![Vec::new(); txids.len()];
         for (idx, txid, res) in futures::future::join_all(futs).await {
             match res {

@@ -30,8 +30,10 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 (logo_espo())
                                 span class="brand-text" { "Espo" }
                             }
-                            a class="navlink" href="/" { "Blocks" }
-                            a class="navlink" href="/alkanes" { "Alkanes" }
+                            div class="navlinks-container" {
+                                a class="navlink" href="/" { "Blocks" }
+                                a class="navlink" href="/alkanes" { "Alkanes" }
+                            }
                         }
                     }
                 }
