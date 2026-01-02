@@ -146,10 +146,31 @@ impl MetashrewAdapter {
     pub fn get_alkanes_tip_height(&self) -> Result<u32> {
         let tip_height_key: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
 
+        eprintln!("[metashrew] looking for key: {:?}", String::from_utf8_lossy(&tip_height_key));
+
+        // Force catch up with primary before reading
+        let metashrew_sdb = get_metashrew_sdb();
+        if let Err(e) = metashrew_sdb.catch_up_now() {
+            eprintln!("[metashrew] catch_up error: {:?}", e);
+        }
+
         // First try direct read (non-SMT mode)
-        if let Ok(height) = self.read_uint_key::<4, u32>(tip_height_key.clone()) {
-            eprintln!("[metashrew] tip height (direct): {}", height);
-            return Ok(height);
+        match metashrew_sdb.get(&tip_height_key) {
+            Ok(Some(bytes)) => {
+                eprintln!("[metashrew] found key, value bytes: {:?} (len={})", hex::encode(&bytes), bytes.len());
+                if bytes.len() >= 4 {
+                    let arr: [u8; 4] = bytes[..4].try_into().unwrap();
+                    let height = u32::from_le_bytes(arr);
+                    eprintln!("[metashrew] tip height (direct): {}", height);
+                    return Ok(height);
+                }
+            }
+            Ok(None) => {
+                eprintln!("[metashrew] key not found via direct read");
+            }
+            Err(e) => {
+                eprintln!("[metashrew] error reading key: {:?}", e);
+            }
         }
 
         // Then try versioned format (SMT mode)
