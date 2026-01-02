@@ -1,9 +1,10 @@
-use axum::extract::Query;
 use axum::Json;
+use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, get_metashrew_rpc_url};
+use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::modules::essentials::storage::trace_count_key;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -12,16 +13,17 @@ use alkanes_support::id::AlkaneId;
 use alkanes_support::proto::alkanes::MessageContextParcel;
 use alkanes_support::proto::alkanes::SimulateResponse as SimulateProto;
 use anyhow::Context;
-use bitcoincore_rpc::RpcApi;
 use bitcoin::consensus::Encodable;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
+use bitcoincore_rpc::RpcApi;
 use ordinals::Runestone;
-use protorune_support::protostone::{Protostone, Protostones};
 use prost::Message;
+use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
 use serde_json::json;
+use std::collections::HashMap;
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -40,6 +42,35 @@ pub struct CarouselBlock {
 pub struct CarouselResponse {
     pub espo_tip: u64,
     pub blocks: Vec<CarouselBlock>,
+}
+
+#[derive(Deserialize)]
+pub struct SearchGuessQuery {
+    pub q: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SearchGuessItem {
+    pub label: String,
+    pub value: String,
+    pub href: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_letter: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SearchGuessGroup {
+    pub kind: String,
+    pub title: String,
+    pub items: Vec<SearchGuessItem>,
+}
+
+#[derive(Serialize)]
+pub struct SearchGuessResponse {
+    pub query: String,
+    pub groups: Vec<SearchGuessGroup>,
 }
 
 pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselResponse> {
@@ -82,6 +113,105 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     }
 
     Json(CarouselResponse { espo_tip, blocks })
+}
+
+pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuessResponse> {
+    let query = q.q.unwrap_or_default().trim().to_string();
+    if query.is_empty() {
+        return Json(SearchGuessResponse { query, groups: Vec::new() });
+    }
+
+    let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+    let mut meta_cache: AlkaneMetaCache = HashMap::new();
+    let mut blocks: Vec<SearchGuessItem> = Vec::new();
+    let mut alkanes: Vec<SearchGuessItem> = Vec::new();
+    let mut txid: Vec<SearchGuessItem> = Vec::new();
+
+    let mut push_alkane_item = |alk: &SchemaAlkaneId| {
+        let meta = alkane_meta(alk, &mut meta_cache, &essentials_mdb);
+        let id = format!("{}:{}", alk.block, alk.tx);
+        let known = meta.name.known;
+        let label = if known { meta.name.value.clone() } else { id.clone() };
+        let icon_url =
+            if known && !meta.icon_url.trim().is_empty() { Some(meta.icon_url.clone()) } else { None };
+        alkanes.push(SearchGuessItem {
+            label,
+            value: id.clone(),
+            href: Some(format!("/alkane/{id}")),
+            icon_url,
+            fallback_letter: Some(meta.name.fallback_letter().to_string()),
+        });
+    };
+
+    if let Ok(height) = query.parse::<u64>() {
+        let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
+        let href = if height <= espo_tip { Some(format!("/block/{height}")) } else { None };
+        blocks.push(SearchGuessItem {
+            label: format!("#{height}"),
+            value: height.to_string(),
+            href,
+            icon_url: None,
+            fallback_letter: None,
+        });
+
+        if height <= u32::MAX as u64 {
+            let alk = SchemaAlkaneId { block: height as u32, tx: 0 };
+            push_alkane_item(&alk);
+        }
+    }
+
+    if let Some(alk) = parse_alkane_id(&query) {
+        push_alkane_item(&alk);
+    }
+
+    if query.chars().all(|c| c.is_ascii_hexdigit()) {
+        let normalized = query.to_lowercase();
+        if normalized.len() <= 64 {
+            let label = if normalized.len() > 16 {
+                format!(
+                    "{}...{}",
+                    &normalized[..8],
+                    &normalized[normalized.len().saturating_sub(6)..]
+                )
+            } else {
+                normalized.clone()
+            };
+            let href =
+                if normalized.len() == 64 { Some(format!("/tx/{normalized}")) } else { None };
+            txid.push(SearchGuessItem {
+                label,
+                value: normalized,
+                href,
+                icon_url: None,
+                fallback_letter: None,
+            });
+        }
+    }
+
+    let mut groups = Vec::new();
+    if !blocks.is_empty() {
+        groups.push(SearchGuessGroup {
+            kind: "blocks".to_string(),
+            title: "Blocks".to_string(),
+            items: blocks,
+        });
+    }
+    if !alkanes.is_empty() {
+        groups.push(SearchGuessGroup {
+            kind: "alkanes".to_string(),
+            title: "Alkanes".to_string(),
+            items: alkanes,
+        });
+    }
+    if !txid.is_empty() {
+        groups.push(SearchGuessGroup {
+            kind: "transactions".to_string(),
+            title: "Transactions".to_string(),
+            items: txid,
+        });
+    }
+
+    Json(SearchGuessResponse { query, groups })
 }
 
 #[derive(Deserialize)]
@@ -134,7 +264,8 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
             });
         }
     };
-    let runestone = Runestone { protocol: Some(protocol_values), pointer: Some(0), ..Default::default() };
+    let runestone =
+        Runestone { protocol: Some(protocol_values), pointer: Some(0), ..Default::default() };
     let runestone_script = runestone.encipher();
 
     let dummy_tx = Transaction {
@@ -162,11 +293,12 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
         });
     }
 
+    let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let parcel = MessageContextParcel {
         alkanes: vec![],
         transaction: tx_bytes,
         block: vec![],
-        height: get_espo_next_height() as u64,
+        height: espo_tip,
         txindex: 0,
         calldata,
         vout: 0,
@@ -191,21 +323,31 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
         "params": [
             "simulate",
             format!("0x{}", hex::encode(parcel_bytes)),
-            "latest",
+            espo_tip,
         ],
     });
 
     let client = Client::new();
-    let resp_json: serde_json::Value = match client.post(get_metashrew_rpc_url()).json(&body).send().await {
-        Ok(resp) => match resp.error_for_status() {
-            Ok(ok) => match ok.json().await {
-                Ok(v) => v,
+    let resp_json: serde_json::Value =
+        match client.post(get_metashrew_rpc_url()).json(&body).send().await {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(ok) => match ok.json().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Json(SimulateResponse {
+                            ok: false,
+                            status: None,
+                            data: None,
+                            error: Some(format!("response_decode_failed: {e}")),
+                        });
+                    }
+                },
                 Err(e) => {
                     return Json(SimulateResponse {
                         ok: false,
                         status: None,
                         data: None,
-                        error: Some(format!("response_decode_failed: {e}")),
+                        error: Some(format!("metashrew_http_error: {e}")),
                     });
                 }
             },
@@ -214,19 +356,10 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                     ok: false,
                     status: None,
                     data: None,
-                    error: Some(format!("metashrew_http_error: {e}")),
+                    error: Some(format!("metashrew_request_failed: {e}")),
                 });
             }
-        },
-        Err(e) => {
-            return Json(SimulateResponse {
-                ok: false,
-                status: None,
-                data: None,
-                error: Some(format!("metashrew_request_failed: {e}")),
-            });
-        }
-    };
+        };
 
     let result_hex = resp_json.get("result").and_then(|v| v.as_str()).unwrap_or("");
     if result_hex.is_empty() {
@@ -265,20 +398,12 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
     let (status, data) = if !sim.error.is_empty() {
         ("failure".to_string(), sim.error)
     } else if let Some(exec) = sim.execution {
-        (
-            "success".to_string(),
-            format_simulation_data(&exec.data, req.returns.as_deref()),
-        )
+        ("success".to_string(), format_simulation_data(&exec.data, req.returns.as_deref()))
     } else {
         ("success".to_string(), "0x".to_string())
     };
 
-    Json(SimulateResponse {
-        ok: true,
-        status: Some(status),
-        data: Some(data),
-        error: None,
-    })
+    Json(SimulateResponse { ok: true, status: Some(status), data: Some(data), error: None })
 }
 
 fn format_simulation_data(bytes: &[u8], returns: Option<&str>) -> String {
@@ -289,9 +414,7 @@ fn format_simulation_data(bytes: &[u8], returns: Option<&str>) -> String {
 
     match normalized.as_str() {
         "string" => decode_utf8(bytes).unwrap_or_else(|| hex_string(bytes)),
-        "u128" => decode_u128(bytes)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| hex_string(bytes)),
+        "u128" => decode_u128(bytes).map(|v| v.to_string()).unwrap_or_else(|| hex_string(bytes)),
         "vec<u8>" => hex_string(bytes),
         "void" => decode_void(bytes),
         _ => decode_void(bytes),

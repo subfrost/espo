@@ -1451,6 +1451,7 @@ dependencies = [
  "hex",
  "lru",
  "maud",
+ "metashrew-support",
  "ordinals",
  "prost",
  "protobuf-json-mapping",

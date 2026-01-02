@@ -1,15 +1,20 @@
 use crate::alkanes::trace::PartialEspoTrace;
-use crate::config::get_metashrew_sdb;
+use crate::config::{get_block_source, get_metashrew_sdb, is_debug_mode};
+use crate::core::blockfetcher::BlockSource;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
 use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use anyhow::{Context, Result, anyhow};
+use bitcoin::{OutPoint, Transaction};
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use ordinals::{Artifact, Runestone};
 use prost::Message;
+use protorune_support::protostone::Protostone;
+use metashrew_support::utils::consensus_encode;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 fn try_decode_trace_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
@@ -259,129 +264,75 @@ impl MetashrewAdapter {
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before scanning traces_for_tx")?;
 
-        let tx_be = txid.to_byte_array().to_vec();
-        let mut tx_le = tx_be.clone();
-        tx_le.reverse();
+        let tx_le = txid.to_byte_array().to_vec();
 
-        // Metashrew stores individual events at /trace/<tx_le><vout_le>/<idx>,
-        // so we assemble per-trace event lists here.
-        let mut traces_by_outpoint: HashMap<
-            Vec<u8>,
-            BTreeMap<u64, BTreeMap<u64, AlkanesTraceEvent>>,
-        > = HashMap::new();
-
-        let parse_index = |bytes: &[u8]| -> Option<u64> {
-            if let Ok(s) = std::str::from_utf8(bytes) {
-                if let Ok(v) = s.parse::<u64>() {
-                    return Some(v);
-                }
-            }
-
-            match bytes.len() {
-                4 => {
-                    let mut arr = [0u8; 4];
-                    arr.copy_from_slice(bytes);
-                    Some(u32::from_le_bytes(arr) as u64)
-                }
-                8 => {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(bytes);
-                    Some(u64::from_le_bytes(arr))
-                }
-                _ => None,
-            }
+        let parse_ascii_len = |bytes: &[u8]| -> Option<usize> {
+            std::str::from_utf8(bytes).ok()?.parse::<usize>().ok()
         };
 
-        for search_bytes in [&tx_be, &tx_le] {
-            let mut prefix = b"/trace/".to_vec();
-            prefix.extend_from_slice(search_bytes);
-            let prefix = self.apply_label(prefix);
+        let mut prefix = b"/trace/".to_vec();
+        prefix.extend_from_slice(&tx_le);
+        let prefix = self.apply_label(prefix);
 
-            let mut ro = ReadOptions::default();
-            if let Some(ub) = self.next_prefix(prefix.clone()) {
-                ro.set_iterate_upper_bound(ub);
+        let mut ro = ReadOptions::default();
+        if let Some(ub) = self.next_prefix(prefix.clone()) {
+            ro.set_iterate_upper_bound(ub);
+        }
+        ro.set_total_order_seek(true);
+
+        let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
+        let mut outpoint_lengths: HashMap<Vec<u8>, usize> = HashMap::new();
+
+        while let Some(Ok((k, v))) = it.next() {
+            if !k.starts_with(&prefix) {
+                break;
             }
-            ro.set_total_order_seek(true);
 
-            let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-            while let Some(Ok((k, v))) = it.next() {
-                if !k.starts_with(&prefix) {
-                    break;
-                }
+            let suffix = &k[prefix.len()..];
+            if suffix.len() < 5 || suffix[4] != b'/' {
+                continue;
+            }
+            let tail = &suffix[5..];
+            if tail != b"length" {
+                continue;
+            }
 
-                let suffix = &k[prefix.len()..];
-                if suffix.len() < 5 || suffix[4] != b'/' {
-                    continue;
-                }
+            let mut outpoint = Vec::with_capacity(36);
+            outpoint.extend_from_slice(&tx_le);
+            outpoint.extend_from_slice(&suffix[..4]);
 
-                let remainder = &suffix[5..];
-                if remainder.is_empty() {
-                    continue;
-                }
-
-                let segments: Vec<&[u8]> = remainder.split(|b| *b == b'/').collect();
-                if segments.is_empty() || segments.iter().any(|s| *s == b"length") {
-                    continue;
-                }
-
-                let (trace_idx_bytes, event_idx_bytes) = if segments.len() >= 2 {
-                    (segments[0], segments[1])
-                } else {
-                    (&b"0"[..], segments[0])
-                };
-
-                let event_idx = match parse_index(event_idx_bytes) {
-                    Some(idx) => idx,
-                    None => continue,
-                };
-                let trace_idx = parse_index(trace_idx_bytes).unwrap_or(0);
-
-                let vout_le: [u8; 4] = suffix[..4].try_into().unwrap_or_default();
-                let mut outpoint: Vec<u8> = tx_le.clone();
-                outpoint.extend_from_slice(&vout_le);
-
-                if let Some(event) = decode_trace_event_blob(&v) {
-                    let trace_map =
-                        traces_by_outpoint.entry(outpoint.clone()).or_insert_with(BTreeMap::new);
-                    let events = trace_map.entry(trace_idx).or_insert_with(BTreeMap::new);
-                    events.entry(event_idx).or_insert(event);
-                    continue;
-                }
-
-                if let Some(trace) = decode_trace_blob(&v) {
-                    let trace_map =
-                        traces_by_outpoint.entry(outpoint).or_insert_with(BTreeMap::new);
-                    let events = trace_map.entry(trace_idx).or_insert_with(BTreeMap::new);
-                    for (idx, ev) in trace.events.into_iter().enumerate() {
-                        events.entry(idx as u64).or_insert(ev);
-                    }
-                }
+            if let Some(len) = parse_ascii_len(&v) {
+                outpoint_lengths.insert(outpoint, len);
             }
         }
 
-        let mut out: Vec<PartialEspoTrace> = Vec::new();
-        for (outpoint, trace_map) in traces_by_outpoint {
-            for (_trace_idx, events_map) in trace_map {
-                let events: Vec<AlkanesTraceEvent> =
-                    events_map.into_iter().map(|(_, ev)| ev).collect();
-                if events.is_empty() {
-                    continue;
-                }
-
-                out.push(PartialEspoTrace {
-                    protobuf_trace: AlkanesTrace { events },
-                    outpoint: outpoint.clone(),
-                });
+        let mut out: Vec<PartialEspoTrace> = Vec::with_capacity(outpoint_lengths.len());
+        for (outpoint, len) in outpoint_lengths {
+            if len == 0 {
+                continue;
             }
+            let idx = len.saturating_sub(1);
+            let mut key = Vec::with_capacity(7 + outpoint.len() + 1 + 20);
+            key.extend_from_slice(b"/trace/");
+            key.extend_from_slice(&outpoint);
+            key.push(b'/');
+            key.extend_from_slice(idx.to_string().as_bytes());
+            let key = self.apply_label(key);
+
+            let Some(bytes) = db.get(&key)? else { continue };
+            let Some(trace) = decode_trace_blob(&bytes) else { continue };
+            out.push(PartialEspoTrace { protobuf_trace: trace, outpoint });
         }
 
         Ok(out)
     }
 
-    pub fn get_latest_reserves_for_alkane(
+    pub fn get_reserves_for_alkane_with_db(
         &self,
+        db: &rocksdb::DB,
         who_alkane: &SchemaAlkaneId,
         what_alkane: &SchemaAlkaneId,
+        height: Option<u64>,
     ) -> Result<Option<u128>> {
         let u128_to_le16 = |x: u128| x.to_le_bytes();
 
@@ -408,8 +359,6 @@ impl MetashrewAdapter {
         let mut length_key = prefix.clone();
         length_key.extend_from_slice(b"/length");
 
-        let db = get_metashrew_sdb();
-
         let length_bytes = match db.get(&length_key)? {
             Some(bytes) => bytes,
             None => return Ok(None),
@@ -421,35 +370,87 @@ impl MetashrewAdapter {
             .parse()
             .map_err(|e| anyhow!("parse balances length '{length_str}': {e}"))?;
 
-        let Some(latest_idx) = length.checked_sub(1) else { return Ok(None) };
+        let Some(last_idx) = length.checked_sub(1) else { return Ok(None) };
 
-        let mut entry_key = prefix.clone();
-        entry_key.push(b'/');
-        entry_key.extend_from_slice(latest_idx.to_string().as_bytes());
-
-        let entry_bytes = match db.get(&entry_key)? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
+        let entry_key_for_index = |idx: u64| {
+            let mut entry_key = prefix.clone();
+            entry_key.push(b'/');
+            entry_key.extend_from_slice(idx.to_string().as_bytes());
+            entry_key
         };
 
-        let entry_str = std::str::from_utf8(&entry_bytes)
-            .map_err(|e| anyhow!("utf8 decode balance entry: {e}"))?;
-        let (height_str, hex_part) =
-            entry_str.split_once(':').ok_or_else(|| anyhow!("balance entry missing ':'"))?;
+        let parse_entry = |entry_bytes: &[u8]| -> Result<(u64, u128)> {
+            let entry_str = std::str::from_utf8(entry_bytes)
+                .map_err(|e| anyhow!("utf8 decode balance entry: {e}"))?;
+            let (height_str, hex_part) =
+                entry_str.split_once(':').ok_or_else(|| anyhow!("balance entry missing ':'"))?;
 
-        let _updated_height: u64 = height_str
-            .parse()
-            .map_err(|e| anyhow!("parse balance height '{height_str}': {e}"))?;
+            let updated_height: u64 = height_str
+                .parse()
+                .map_err(|e| anyhow!("parse balance height '{height_str}': {e}"))?;
 
-        let raw_balance = hex::decode(hex_part)
-            .map_err(|e| anyhow!("hex decode balance payload '{hex_part}': {e}"))?;
-        if raw_balance.len() != 16 {
-            return Err(anyhow!("balance payload length {}, expected 16 bytes", raw_balance.len()));
+            let raw_balance = hex::decode(hex_part)
+                .map_err(|e| anyhow!("hex decode balance payload '{hex_part}': {e}"))?;
+            if raw_balance.len() != 16 {
+                return Err(anyhow!(
+                    "balance payload length {}, expected 16 bytes",
+                    raw_balance.len()
+                ));
+            }
+            let mut bal_bytes = [0u8; 16];
+            bal_bytes.copy_from_slice(&raw_balance);
+
+            Ok((updated_height, u128::from_le_bytes(bal_bytes)))
+        };
+
+        let read_entry_at = |idx: u64| -> Result<Option<(u64, u128)>> {
+            let entry_key = entry_key_for_index(idx);
+            let entry_bytes = match db.get(&entry_key)? {
+                Some(bytes) => bytes,
+                None => return Ok(None),
+            };
+            parse_entry(&entry_bytes).map(Some)
+        };
+
+        let Some(target_height) = height else {
+            return read_entry_at(last_idx).map(|opt| opt.map(|(_, bal)| bal));
+        };
+
+        let mut low = 0u64;
+        let mut high = last_idx;
+        let mut best: Option<(u64, u128)> = None;
+
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let Some((entry_height, entry_balance)) = read_entry_at(mid)? else {
+                return Ok(None);
+            };
+
+            if entry_height <= target_height {
+                best = Some((entry_height, entry_balance));
+                if mid == u64::MAX {
+                    break;
+                }
+                low = mid + 1;
+            } else {
+                if mid == 0 {
+                    break;
+                }
+                high = mid - 1;
+            }
         }
-        let mut bal_bytes = [0u8; 16];
-        bal_bytes.copy_from_slice(&raw_balance);
 
-        Ok(Some(u128::from_le_bytes(bal_bytes)))
+        Ok(best.map(|(_, bal)| bal))
+    }
+
+    pub fn get_reserves_for_alkane(
+        &self,
+        who_alkane: &SchemaAlkaneId,
+        what_alkane: &SchemaAlkaneId,
+        height: Option<u64>,
+    ) -> Result<Option<u128>> {
+        let db = get_metashrew_sdb();
+        self.get_reserves_for_alkane_with_db(db.as_db(), who_alkane, what_alkane, height)
     }
 
     pub fn traces_for_block_as_prost(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
@@ -472,12 +473,8 @@ impl MetashrewAdapter {
             None
         };
 
-        let is_length_bucket = |key: &[u8], prefix: &[u8]| -> bool {
-            if key.len() < prefix.len() + 1 + 4 {
-                return false;
-            }
-            let bucket = &key[prefix.len()..key.len() - 4];
-            bucket == b"length"
+        let parse_ascii_len = |bytes: &[u8]| -> Option<usize> {
+            std::str::from_utf8(bytes).ok()?.parse::<usize>().ok()
         };
 
         let db = get_metashrew_sdb();
@@ -492,79 +489,374 @@ impl MetashrewAdapter {
         ro.set_total_order_seek(true);
 
         let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        let mut outpoints: Vec<Vec<u8>> = Vec::new();
+        let mut pointer_lengths: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut pointer_idxs_seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut bad_lengths = 0usize;
+        let mut legacy_pointer_values: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
         while let Some(Ok((k, v))) = it.next() {
             if !k.starts_with(&prefix) {
                 break;
             }
 
-            if is_length_bucket(&k, &prefix) {
-                continue;
-            }
-
             let suffix = &k[prefix.len()..];
+            if suffix == b"length" {
+                continue;
+            }
+
+            // Keys under /trace/<height>/ are per-index pointers, and each pointer
+            // is versioned with /length and /<ver> (reorg-safe).
             let parts: Vec<&[u8]> = suffix.split(|b| *b == b'/').collect();
-            if parts.len() != 2 {
+            if parts.is_empty() {
                 continue;
             }
 
-            if parts[1] == b"length" {
+            let idx = parts[0];
+            pointer_idxs_seen.insert(idx.to_vec());
+            if parts.len() == 1 {
+                // Legacy layout: /trace/<height>/<idx> => pointer value
+                legacy_pointer_values.insert(idx.to_vec(), v.to_vec());
                 continue;
             }
+            if parts.len() == 2 && parts[1] == b"length" {
+                match parse_ascii_len(&v) {
+                    Some(len) => {
+                        pointer_lengths.insert(idx.to_vec(), len);
+                    }
+                    None => {
+                        bad_lengths = bad_lengths.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+        }
 
-            let trace_idx = match std::str::from_utf8(parts[1]) {
-                Ok(s) => s,
-                Err(_) => continue,
+        let mut missing_pointer_values = 0usize;
+        let mut missing_trace_blobs = 0usize;
+        let mut final_traces: Vec<PartialEspoTrace> = Vec::new();
+        let mut seen_outpoints: HashSet<Vec<u8>> = HashSet::new();
+
+        for (idx, len) in &pointer_lengths {
+            if *len == 0 {
+                continue;
+            }
+            // /trace/<height>/<idx>/length is a count; latest pointer lives at len-1.
+            let ver = len.saturating_sub(1);
+            let mut pointer_key = Vec::with_capacity(prefix.len() + idx.len() + 1 + 20);
+            pointer_key.extend_from_slice(&prefix);
+            pointer_key.extend_from_slice(idx);
+            pointer_key.push(b'/');
+            pointer_key.extend_from_slice(ver.to_string().as_bytes());
+
+            let pointer_value = match db.get(&pointer_key)? {
+                Some(bytes) => bytes,
+                None => {
+                    missing_pointer_values = missing_pointer_values.saturating_add(1);
+                    continue;
+                }
             };
 
-            let val_str = std::str::from_utf8(&v)
-                .map_err(|e| anyhow!("utf8 decode trace pointer for block {block}: {e}"))?;
-            let (_block_str, hex_part) = val_str
-                .split_once(':')
-                .ok_or_else(|| anyhow!("trace pointer missing ':' for block {block}"))?;
+            let outpoint_bytes = if let Ok(s) = std::str::from_utf8(&pointer_value) {
+                if let Some((_block_str, hex_part)) = s.split_once(':') {
+                    hex::decode(hex_part).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+            .or_else(|| {
+                if pointer_value.len() >= 36 {
+                    Some(pointer_value[..36].to_vec())
+                } else {
+                    None
+                }
+            });
 
-            let hex_bytes = hex::decode(hex_part)
-                .map_err(|e| anyhow!("hex decode trace pointer for block {block}: {e}"))?;
-            if hex_bytes.len() < 36 {
+            let Some(mut outpoint) = outpoint_bytes else {
+                missing_pointer_values = missing_pointer_values.saturating_add(1);
+                continue;
+            };
+            if outpoint.len() > 36 {
+                outpoint.truncate(36);
+            }
+            if !seen_outpoints.insert(outpoint.clone()) {
                 continue;
             }
 
-            let (tx_be, vout) = hex_bytes.split_at(32);
+            // /trace/<outpoint>/length => latest trace version for this outpoint.
+            let mut trace_len_key = Vec::with_capacity(7 + outpoint.len() + 7);
+            trace_len_key.extend_from_slice(b"/trace/");
+            trace_len_key.extend_from_slice(&outpoint);
+            trace_len_key.extend_from_slice(b"/length");
+            let trace_len_key = self.apply_label(trace_len_key);
+            let trace_len = db
+                .get(&trace_len_key)?
+                .and_then(|v| parse_ascii_len(&v))
+                .unwrap_or(0);
+            if trace_len == 0 {
+                missing_trace_blobs = missing_trace_blobs.saturating_add(1);
+                continue;
+            }
+            let trace_idx = trace_len.saturating_sub(1);
+            let mut trace_key = Vec::with_capacity(7 + outpoint.len() + 1 + 20);
+            trace_key.extend_from_slice(b"/trace/");
+            trace_key.extend_from_slice(&outpoint);
+            trace_key.push(b'/');
+            trace_key.extend_from_slice(trace_idx.to_string().as_bytes());
+            let trace_key = self.apply_label(trace_key);
 
-            let mut key = Vec::with_capacity(7 + tx_be.len() + vout.len() + 1 + trace_idx.len());
-            key.extend_from_slice(b"/trace/");
-            key.extend_from_slice(tx_be);
-            key.extend_from_slice(vout);
-            key.push(b'/');
-            key.extend_from_slice(trace_idx.as_bytes());
-            keys.push(self.apply_label(key));
-
-            // Pointer payload stores txid in little-endian already; keep as-is for outpoint.
-            let mut outpoint = tx_be.to_vec();
-            outpoint.extend_from_slice(vout);
-            outpoints.push(outpoint);
+            match db.get(&trace_key)? {
+                Some(bytes) => {
+                    if let Some(protobuf_trace) = decode_trace_blob(&bytes) {
+                        final_traces.push(PartialEspoTrace { protobuf_trace, outpoint });
+                    } else {
+                        missing_trace_blobs = missing_trace_blobs.saturating_add(1);
+                    }
+                }
+                None => {
+                    missing_trace_blobs = missing_trace_blobs.saturating_add(1);
+                }
+            }
         }
 
-        let values = db.multi_get(keys.iter())?;
+        for (idx, pointer_value) in legacy_pointer_values {
+            if pointer_lengths.contains_key(&idx) {
+                continue;
+            }
+            let outpoint_bytes = if let Ok(s) = std::str::from_utf8(&pointer_value) {
+                if let Some((_block_str, hex_part)) = s.split_once(':') {
+                    hex::decode(hex_part).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+            .or_else(|| {
+                if pointer_value.len() >= 36 {
+                    Some(pointer_value[..36].to_vec())
+                } else {
+                    None
+                }
+            });
 
-        let traces: Vec<PartialEspoTrace> = values
-            .into_iter()
-            .zip(outpoints.iter())
-            .filter_map(|(maybe_bytes, outpoint)| {
-                maybe_bytes.as_deref().and_then(decode_trace_blob).map(|protobuf_trace| {
-                    PartialEspoTrace { protobuf_trace, outpoint: outpoint.clone() }
-                })
-            })
-            .collect();
-        if traces.is_empty() {
+            let Some(mut outpoint) = outpoint_bytes else {
+                missing_pointer_values = missing_pointer_values.saturating_add(1);
+                continue;
+            };
+            if outpoint.len() > 36 {
+                outpoint.truncate(36);
+            }
+            if !seen_outpoints.insert(outpoint.clone()) {
+                continue;
+            }
+
+            let mut trace_len_key = Vec::with_capacity(7 + outpoint.len() + 7);
+            trace_len_key.extend_from_slice(b"/trace/");
+            trace_len_key.extend_from_slice(&outpoint);
+            trace_len_key.extend_from_slice(b"/length");
+            let trace_len_key = self.apply_label(trace_len_key);
+            let trace_len = db
+                .get(&trace_len_key)?
+                .and_then(|v| parse_ascii_len(&v))
+                .unwrap_or(0);
+            if trace_len == 0 {
+                missing_trace_blobs = missing_trace_blobs.saturating_add(1);
+                continue;
+            }
+            let trace_idx = trace_len.saturating_sub(1);
+            let mut trace_key = Vec::with_capacity(7 + outpoint.len() + 1 + 20);
+            trace_key.extend_from_slice(b"/trace/");
+            trace_key.extend_from_slice(&outpoint);
+            trace_key.push(b'/');
+            trace_key.extend_from_slice(trace_idx.to_string().as_bytes());
+            let trace_key = self.apply_label(trace_key);
+
+            match db.get(&trace_key)? {
+                Some(bytes) => {
+                    if let Some(protobuf_trace) = decode_trace_blob(&bytes) {
+                        final_traces.push(PartialEspoTrace { protobuf_trace, outpoint });
+                    } else {
+                        missing_trace_blobs = missing_trace_blobs.saturating_add(1);
+                    }
+                }
+                None => {
+                    missing_trace_blobs = missing_trace_blobs.saturating_add(1);
+                }
+            }
+        }
+
+        let pointer_len = pointer_lengths.len();
+        if final_traces.is_empty() {
             eprintln!(
-                "[metashrew] block {block}: pointers={} keys={} traces=0",
-                outpoints.len(),
-                keys.len()
+                "[metashrew] block {block}: pointers={} traces=0",
+                pointer_len
             );
         }
-        Ok(traces)
+
+        let missing_lengths = pointer_idxs_seen.len().saturating_sub(pointer_len);
+        let needs_fallback = missing_trace_blobs > 0
+            || missing_pointer_values > 0
+            || missing_lengths > 0
+            || bad_lengths > 0;
+
+        if needs_fallback {
+            let mut reason = String::new();
+            if missing_trace_blobs > 0 {
+                reason.push_str(&format!("missing_trace_blobs={missing_trace_blobs}"));
+            }
+            if missing_pointer_values > 0 {
+                if !reason.is_empty() {
+                    reason.push_str(", ");
+                }
+                reason.push_str(&format!("missing_pointers={missing_pointer_values}"));
+            }
+            if missing_lengths > 0 {
+                if !reason.is_empty() {
+                    reason.push_str(", ");
+                }
+                reason.push_str(&format!("missing_lengths={missing_lengths}"));
+            }
+            if bad_lengths > 0 {
+                if !reason.is_empty() {
+                    reason.push_str(", ");
+                }
+                reason.push_str(&format!("bad_lengths={bad_lengths}"));
+            }
+            eprintln!(
+                "[metashrew] block {block}: trace index looks incomplete ({reason}); recomputing shadow vouts"
+            );
+
+            let block_source = get_block_source();
+            let h32: u32 = block
+                .try_into()
+                .context("block height does not fit into u32 for trace fallback")?;
+            let full_block = match block_source.get_block_by_height(h32, h32) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!(
+                        "[metashrew] block {block}: fallback failed to fetch block ({e:?}); using indexed traces"
+                    );
+                    return Ok(final_traces);
+                }
+            };
+
+            let mut fallback_traces: Vec<PartialEspoTrace> = Vec::new();
+            let mut expected_outpoints = 0usize;
+            let mut missing_keys = 0usize;
+            let mut decode_failures = 0usize;
+            let mut parse_failures = 0usize;
+
+            let mut protostone_count = |tx: &Transaction| -> usize {
+                let runestone = match Runestone::decipher(tx) {
+                    Some(Artifact::Runestone(r)) => r,
+                    _ => return 0,
+                };
+                match Protostone::from_runestone(&runestone) {
+                    Ok(protos) => protos.len(),
+                    Err(e) => {
+                        parse_failures = parse_failures.saturating_add(1);
+                        if is_debug_mode() {
+                            eprintln!(
+                                "[metashrew] block {block}: protostone parse failed txid={} err={e:#}",
+                                tx.compute_txid()
+                            );
+                        }
+                        0
+                    }
+                }
+            };
+
+            for tx in &full_block.txdata {
+                let count = protostone_count(tx);
+                if count == 0 {
+                    continue;
+                }
+                let n_outputs = tx.output.len() as u32;
+                let shadow_base = n_outputs.saturating_add(1);
+                let txid = tx.compute_txid();
+                let outpoint_bytes = |vout: u32| -> Result<Vec<u8>> {
+                    let op = OutPoint::new(txid, vout);
+                    consensus_encode(&op).map_err(|e| anyhow!("encode outpoint: {e}"))
+                };
+
+                for i in 0..count {
+                    let vout = shadow_base + i as u32;
+                    expected_outpoints = expected_outpoints.saturating_add(1);
+
+                    let outpoint = outpoint_bytes(vout)?;
+                    let mut key_base = Vec::with_capacity(7 + outpoint.len());
+                    key_base.extend_from_slice(b"/trace/");
+                    key_base.extend_from_slice(&outpoint);
+                    let key_base = self.apply_label(key_base);
+
+                    let mut candidates: Vec<(u32, AlkanesTrace)> = Vec::new();
+                    let mut length_key = key_base.clone();
+                    length_key.extend_from_slice(b"/length");
+                    let latest_idx = db
+                        .get(&length_key)?
+                        .and_then(|v| parse_ascii_len(&v))
+                        .and_then(|len| len.checked_sub(1));
+                    if let Some(idx) = latest_idx {
+                        let mut key = key_base.clone();
+                        key.push(b'/');
+                        key.extend_from_slice(idx.to_string().as_bytes());
+                        match db.get(&key)? {
+                            Some(bytes) => {
+                                if let Some(trace) = decode_trace_blob(&bytes) {
+                                    candidates.push((idx as u32, trace));
+                                } else {
+                                    decode_failures = decode_failures.saturating_add(1);
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+
+                    let mut uniq: HashMap<Vec<u8>, (u32, AlkanesTrace)> = HashMap::new();
+                    for (idx, trace) in candidates {
+                        let mut buf = Vec::with_capacity(trace.encoded_len());
+                        if trace.encode(&mut buf).is_err() {
+                            decode_failures = decode_failures.saturating_add(1);
+                            continue;
+                        }
+                        uniq.entry(buf)
+                            .or_insert_with(|| (idx, trace));
+                    }
+
+                    if uniq.is_empty() {
+                        missing_keys = missing_keys.saturating_add(1);
+                        continue;
+                    }
+                    let mut uniq_traces: Vec<(u32, AlkanesTrace)> =
+                        uniq.into_values().collect();
+                    uniq_traces.sort_by_key(|(idx, _)| *idx);
+                    for (_idx, trace) in uniq_traces {
+                        fallback_traces.push(PartialEspoTrace {
+                            protobuf_trace: trace,
+                            outpoint: outpoint.clone(),
+                        });
+                    }
+                }
+            }
+
+            eprintln!(
+                "[metashrew] block {block}: fallback traces={} expected_outpoints={} missing_keys={} decode_failures={} parse_failures={}",
+                fallback_traces.len(),
+                expected_outpoints,
+                missing_keys,
+                decode_failures,
+                parse_failures
+            );
+
+            if fallback_traces.is_empty() {
+                return Ok(final_traces);
+            }
+
+            return Ok(fallback_traces);
+        }
+
+        Ok(final_traces)
     }
 }

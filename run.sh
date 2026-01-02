@@ -1,5 +1,5 @@
 cargo run --release -- \
-  --readonly-metashrew-db-dir /data/.metashrew/v9/.metashrew-v9 \
+  --readonly-metashrew-db-dir /data/.metashrew/v9-exp \
   --port 5778 \
   --electrs-esplora-url http://127.0.0.1:4332 \
   --bitcoind-rpc-url http://127.0.0.1:8332 \
@@ -7,7 +7,8 @@ cargo run --release -- \
   --bitcoind-rpc-pass admin \
   --network mainnet \
   --block-source-mode rpc \
-  --metashrew-rpc-url http://127.0.0.1:7044 \
+  --metashrew-rpc-url http://127.0.0.1:7045 \
   --explorer-host 0.0.0.0:5779 \
-  --enable-aof
+  --enable-aof \
+  --debug
 # Add --view-only to disable indexing/mempool and serve existing data only.

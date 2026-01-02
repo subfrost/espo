@@ -5,7 +5,7 @@ mod pages;
 
 use std::net::SocketAddr;
 
-use api::{carousel_blocks, simulate_contract};
+use api::{carousel_blocks, search_guess, simulate_contract};
 use axum::Router;
 use axum::routing::{get, post};
 use pages::address::address_page;
@@ -30,6 +30,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/alkane/{alkane}", get(alkane_page))
         .route("/alkanes", get(alkanes_page))
         .route("/api/blocks/carousel", get(carousel_blocks))
+        .route("/api/search/guess", get(search_guess))
         .route("/api/alkane/simulate", post(simulate_contract))
         .route("/static/style.css", get(style))
         .with_state(state)

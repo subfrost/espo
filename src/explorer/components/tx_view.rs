@@ -13,8 +13,8 @@ use crate::explorer::components::svg_assets::{
     arrow_svg, icon_arrow_bend_down_right, icon_caret_right, icon_magic_wand,
 };
 use crate::explorer::consts::{
-    ALKANE_ICON_BASE, ALKANE_ICON_FALLBACK_BASE, alkane_contract_name_overrides,
-    alkane_icon_overrides, alkane_name_overrides,
+    ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
+    alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
 };
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
 use crate::modules::essentials::storage::{BalanceEntry, load_creation_record};
@@ -110,6 +110,15 @@ const UPGRADEABLE_METHODS: [(&str, u128); 3] =
     [("initialize", 32767), ("upgrade", 32766), ("forward", 36863)];
 const UPGRADEABLE_NAME: &str = "Upgradeable";
 const UPGRADEABLE_NAME_ALT: &str = "Upgradable";
+const TOKEN_METHOD_OPCODES: [u128; 6] = [99, 100, 101, 102, 103, 104];
+const TOKEN_METHOD_NAMES: [&str; 6] = [
+    "get_name",
+    "get_symbol",
+    "get_total_supply",
+    "get_cap",
+    "get_minted",
+    "get_value_per_mint",
+];
 
 fn decode_op_return_payload(spk: &ScriptBuf) -> Option<OpReturnDecoded> {
     let mut instructions = spk.instructions();
@@ -344,6 +353,21 @@ fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
     })
 }
 
+fn is_token_contract(inspection: Option<&StoredInspectionResult>) -> bool {
+    let Some(meta) = inspection.and_then(|i| i.metadata.as_ref()) else { return false };
+    let has_all_opcodes = TOKEN_METHOD_OPCODES
+        .iter()
+        .all(|opcode| meta.methods.iter().any(|m| m.opcode == *opcode));
+    if has_all_opcodes {
+        return true;
+    }
+    TOKEN_METHOD_NAMES.iter().all(|name| {
+        meta.methods
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(name))
+    })
+}
+
 fn contract_name_override(id: &SchemaAlkaneId) -> Option<String> {
     let key = format!("{}:{}", id.block, id.tx);
     for (id_s, name) in alkane_contract_name_overrides() {
@@ -407,33 +431,64 @@ fn method_display_name(
     meta.methods.iter().find(|m| m.opcode == opcode).map(|m| m.name.clone())
 }
 
-pub(crate) fn alkane_icon_url(id: &SchemaAlkaneId) -> String {
-    icon_url_with_base(id, ALKANE_ICON_BASE)
+pub(crate) fn alkane_icon_url(id: &SchemaAlkaneId, mdb: &Mdb) -> String {
+    alkane_icon_url_with_policy(id, mdb, false)
 }
 
-pub(crate) fn alkane_icon_fallback_url(id: &SchemaAlkaneId) -> String {
-    icon_url_with_base(id, ALKANE_ICON_FALLBACK_BASE)
+pub(crate) fn alkane_icon_url_unfiltered(id: &SchemaAlkaneId, mdb: &Mdb) -> String {
+    alkane_icon_url_with_policy(id, mdb, true)
 }
 
-fn icon_url_with_base(id: &SchemaAlkaneId, base: &str) -> String {
+fn alkane_icon_url_with_policy(
+    id: &SchemaAlkaneId,
+    mdb: &Mdb,
+    ignore_factory_blacklist: bool,
+) -> String {
+    if let Some(url) = icon_override_url(id) {
+        return url;
+    }
+    let inspection = load_inspection(mdb, id).ok().flatten();
+    if !ignore_factory_blacklist && is_factory_icon_blacklisted(inspection.as_ref()) {
+        return String::new();
+    }
+    let base = if is_token_contract(inspection.as_ref()) {
+        ALKANE_TOKEN_ICON_BASE
+    } else {
+        ALKANE_CONTRACT_ICON_BASE
+    };
+    icon_url_with_base(id, base)
+}
+
+fn icon_override_url(id: &SchemaAlkaneId) -> Option<String> {
     let key = format!("{}:{}", id.block, id.tx);
     for (id_s, url) in alkane_icon_overrides() {
         if *id_s == key {
-            return url.to_string();
+            return Some(url.to_string());
         }
     }
+    None
+}
+
+fn is_factory_icon_blacklisted(inspection: Option<&StoredInspectionResult>) -> bool {
+    let Some(factory_id) = inspection.and_then(|i| i.factory_alkane) else { return false };
+    let key = format!("{}:{}", factory_id.block, factory_id.tx);
+    alkane_factory_icon_blacklist().iter().any(|id_s| *id_s == key)
+}
+
+fn icon_url_with_base(id: &SchemaAlkaneId, base: &str) -> String {
     format!("{}/{}_{}", base, id.block, id.tx)
 }
 
-pub(crate) fn icon_onerror(fallback_url: &str) -> String {
-    format!(
-        "if(!this.dataset.fallback){{this.dataset.fallback=1;this.src='{}';}}else{{this.remove();}}",
-        fallback_url
-    )
+pub(crate) fn icon_bg_style(icon_url: &str) -> String {
+    if icon_url.trim().is_empty() {
+        String::new()
+    } else {
+        format!("background-image: url(\"{}\");", icon_url)
+    }
 }
 
-fn contract_icon_url(id: &SchemaAlkaneId) -> String {
-    alkane_icon_url(id)
+fn contract_icon_url(id: &SchemaAlkaneId, mdb: &Mdb) -> String {
+    alkane_icon_url(id, mdb)
 }
 
 fn summarize_contract_call(
@@ -547,7 +602,7 @@ fn summarize_contract_call(
         factory_created_meta: created_meta,
         link_id,
         contract_name: effective_name,
-        icon_url: contract_icon_url(&icon_id),
+        icon_url: contract_icon_url(&icon_id, mdb),
         method_name,
         opcode,
         call_type,
@@ -573,14 +628,13 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
         method_label = "factory clone".to_string();
     }
     let fallback_letter = summary.contract_name.fallback_letter();
-    let fallback_icon_url = alkane_icon_fallback_url(&summary.contract_id);
 
     html! {
         div class="trace-summary" {
             span class="trace-summary-label" { "Contract call:" }
             div class="trace-contract-row" {
                 div class="trace-contract-icon" aria-hidden="true" {
-                    img class="trace-contract-img" src=(summary.icon_url.clone()) alt=(summary.contract_name.value.clone()) loading="lazy" onerror=(icon_onerror(&fallback_icon_url)) {}
+                    span class="trace-contract-img" style=(icon_bg_style(&summary.icon_url)) {}
                     span class="trace-icon-letter" { (fallback_letter) }
                 }
                 div class="trace-contract-meta" {
@@ -614,15 +668,14 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
             @if let Some(created) = summary.factory_created {
                 @let created_path = format!("/alkane/{}:{}", created.block, created.tx);
                 @let created_meta = summary.factory_created_meta.as_ref();
-                @let created_icon = created_meta.map(|m| m.icon_url.clone()).unwrap_or_else(|| contract_icon_url(&created));
+                @let created_icon = created_meta.map(|m| m.icon_url.clone()).unwrap_or_default();
                 @let created_name = created_meta.map(|m| m.name.value.clone()).unwrap_or_else(|| format!("{}:{}", created.block, created.tx));
                 @let created_letter = created_meta.map(|m| m.name.fallback_letter()).unwrap_or('?');
-                @let created_fallback_icon = alkane_icon_fallback_url(&created);
                 div class="trace-factory-clone" {
                     span class="factory-clone-arrow muted" { (icon_arrow_bend_down_right()) }
                     a class="trace-contract-name link" href=(created_path.clone()) {
                         div class="trace-contract-icon" aria-hidden="true" {
-                            img class="trace-contract-img" src=(created_icon.clone()) alt=(created_name.clone()) loading="lazy" onerror=(icon_onerror(&created_fallback_icon)) {}
+                            span class="trace-contract-img" style=(icon_bg_style(&created_icon)) {}
                             span class="trace-icon-letter" { (created_letter) }
                         }
                         span class="trace-contract-name" { (created_name) }
@@ -632,6 +685,26 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
             div class=(format!("trace-status {}", status_class)) {
                 span class="trace-status-icon" aria-hidden="true" { (icon_arrow_bend_down_right()) }
                 span class="trace-status-text" { (status_text) }
+            }
+        }
+    }
+}
+
+pub fn render_trace_summaries(traces: &[EspoTrace], essentials_mdb: &Mdb) -> Markup {
+    if traces.is_empty() {
+        return html! {};
+    }
+    let mut inspection_cache: InspectionCache = HashMap::new();
+    let mut meta_cache: AlkaneMetaCache = HashMap::new();
+    let mut impl_cache: AlkaneImplCache = HashMap::new();
+
+    html! {
+        div class="trace-summary-list" {
+            @for trace in traces {
+                @let summary = summarize_contract_call(trace, &mut inspection_cache, &mut meta_cache, &mut impl_cache, essentials_mdb);
+                @if let Some(s) = summary {
+                    (render_trace_summary(&s))
+                }
             }
         }
     }
@@ -943,14 +1016,13 @@ fn balances_list(
                 @let meta = alkane_meta(&be.alkane, meta_cache, essentials_mdb);
                 @let alk = format!("{}:{}", be.alkane.block, be.alkane.tx);
                 @let fallback_letter = meta.name.fallback_letter();
-                @let fallback_icon_url = alkane_icon_fallback_url(&be.alkane);
                 @let inner = html! {
                     div class="alk-line" {
                         @if show_arrow {
                             span class="alk-arrow" aria-hidden="true" { (icon_arrow_bend_down_right()) }
                         }
                         div class="alk-icon-wrap" aria-hidden="true" {
-                            img class="alk-icon-img" src=(meta.icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror=(icon_onerror(&fallback_icon_url)) {}
+                            span class="alk-icon-img" style=(icon_bg_style(&meta.icon_url)) {}
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
@@ -1000,7 +1072,7 @@ pub(crate) fn alkane_meta(
     let known = name.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
     let value = name.unwrap_or_else(|| key.clone());
     let sym = symbol.unwrap_or_else(|| value.clone());
-    let icon_url = alkane_icon_url(id);
+    let icon_url = alkane_icon_url(id, essentials_mdb);
     let meta = AlkaneMetaDisplay { name: ResolvedName { value, known }, symbol: sym, icon_url };
     meta_cache.insert(*id, meta.clone());
     meta

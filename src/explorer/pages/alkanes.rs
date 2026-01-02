@@ -8,9 +8,8 @@ use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
     icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::{
-    alkane_icon_fallback_url, alkane_icon_url, icon_onerror,
-};
+use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
+use crate::explorer::components::tx_view::alkane_icon_url;
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::storage::{
     HoldersCountEntry, alkane_creation_count_key, alkane_creation_ordered_prefix,
@@ -23,23 +22,12 @@ pub struct PageQuery {
     pub limit: Option<usize>,
 }
 
-struct AlkaneRow {
-    id: String,
-    name: String,
-    holders: u64,
-    icon_url: String,
-    fallback_icon_url: String,
-    fallback: char,
-    creation_height: u32,
-    creation_txid: String,
-}
-
 pub async fn alkanes_page(
     State(state): State<ExplorerState>,
     Query(q): Query<PageQuery>,
 ) -> Html<String> {
     let page = q.page.unwrap_or(1).max(1);
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let limit = q.limit.unwrap_or(50).clamp(1, 50);
     let offset = limit.saturating_mul(page.saturating_sub(1));
 
     let total: u64 = state
@@ -58,7 +46,7 @@ pub async fn alkanes_page(
         })
         .unwrap_or(0);
 
-    let mut rows: Vec<AlkaneRow> = Vec::new();
+    let mut rows: Vec<AlkaneTableRow> = Vec::new();
     let prefix_full = state.essentials_mdb.prefixed(alkane_creation_ordered_prefix());
     let it = state.essentials_mdb.iter_prefix_rev(&prefix_full);
     let mut seen: usize = 0;
@@ -89,8 +77,7 @@ pub async fn alkanes_page(
                     .map(|hc| hc.count)
                     .unwrap_or(0);
 
-                let icon_url = alkane_icon_url(&rec.alkane);
-                let fallback_icon_url = alkane_icon_fallback_url(&rec.alkane);
+                let icon_url = alkane_icon_url(&rec.alkane, &state.essentials_mdb);
                 let fallback = if name == "Unnamed" {
                     '?'
                 } else {
@@ -101,12 +88,11 @@ pub async fn alkanes_page(
                 };
                 let creation_txid = hex::encode(rec.txid);
 
-                rows.push(AlkaneRow {
+                rows.push(AlkaneTableRow {
                     id,
                     name,
                     holders,
                     icon_url,
-                    fallback_icon_url,
                     fallback,
                     creation_height: rec.creation_height,
                     creation_txid,
@@ -122,45 +108,12 @@ pub async fn alkanes_page(
     let has_prev = page > 1;
     let has_next = (offset as u64 + rows.len() as u64) < total;
     let last_page = if total > 0 { ((total + limit as u64 - 1) / limit as u64).max(1) } else { 1 };
+    let show_creation_block = has_prev || has_next;
 
     let table: Markup = if rows.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
     } else {
-        let header = ["Alkane", "Creation block", "Creation tx", "Holders"];
-        html! {
-            div class="alkanes-card" {
-                table class="table" {
-                    thead {
-                        tr { @for h in header { th { (h) } } }
-                    }
-                    tbody {
-                        @for row in rows {
-                            tr {
-                                td {
-                                    div class="alk-line" {
-                                        div class="alk-icon-wrap" aria-hidden="true" {
-                                            img class="alk-icon-img" src=(row.icon_url.clone()) alt="" loading="lazy" onerror=(icon_onerror(&row.fallback_icon_url)) {}
-                                            span class="alk-icon-letter" { (row.fallback) }
-                                        }
-                                        a class="alk-sym link mono alkane-name-link" href=(format!("/alkane/{}", row.id)) { (row.name.clone()) }
-                                        div class="muted mono" { (row.id.clone()) }
-                                    }
-                                }
-                                td {
-                                    a class="link mono" href=(format!("/block/{}", row.creation_height)) { (row.creation_height) }
-                                }
-                                td class="mono" {
-                                    a class="link ellipsis" href=(format!("/tx/{}", row.creation_txid)) { (&row.creation_txid) }
-                                }
-                                td {
-                                    span class="mono" { (row.holders) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        html! { div class="alkanes-card" { (alkanes_table(&rows, true, show_creation_block, true)) } }
     };
 
     layout(

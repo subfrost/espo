@@ -1,7 +1,9 @@
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
-use crate::modules::essentials::consts::essentials_genesis_block;
+use crate::modules::essentials::consts::{
+    ESSENTIALS_GENESIS_INSPECTIONS, essentials_genesis_block,
+};
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
     alkane_creation_by_id_key, alkane_creation_count_key, alkane_creation_ordered_key,
@@ -225,31 +227,41 @@ impl EspoModule for Essentials {
         }
 
         let mut created_records = created_alkane_records_from_block(&block);
-        // Special case: ensure genesis alkane (2:0) is inspected on the genesis block even if no trace emits a create.
+        // Special case: ensure genesis alkanes are inspected on the genesis block even if no trace emits a create.
         let genesis_height = essentials_genesis_block(get_network());
         if block.height == genesis_height {
-            let genesis = SchemaAlkaneId { block: 2, tx: 0 };
-            let has_genesis = created_records.iter().any(|r| r.alkane == genesis);
-            if !has_genesis {
-                // Use the coinbase txid when available; fall back to zeroed bytes.
-                let txid_bytes = block
-                    .transactions
-                    .first()
-                    .map(|t| {
-                        let mut b = t.transaction.compute_txid().to_byte_array();
-                        b.reverse();
-                        b
-                    })
-                    .unwrap_or([0u8; 32]);
+            let genesis_targets: Vec<(SchemaAlkaneId, Option<(&str, &str)>)> =
+                ESSENTIALS_GENESIS_INSPECTIONS
+                    .iter()
+                    .map(|(block, tx, meta)| (SchemaAlkaneId { block: *block, tx: *tx }, *meta))
+                    .collect();
+            // Use the coinbase txid when available; fall back to zeroed bytes.
+            let txid_bytes = block
+                .transactions
+                .first()
+                .map(|t| {
+                    let mut b = t.transaction.compute_txid().to_byte_array();
+                    b.reverse();
+                    b
+                })
+                .unwrap_or([0u8; 32]);
+            for (alkane, meta) in genesis_targets {
+                if created_records.iter().any(|r| r.alkane == alkane) {
+                    continue;
+                }
+                let (names, symbols) = match meta {
+                    Some((name, symbol)) => (vec![name.to_string()], vec![symbol.to_string()]),
+                    None => (Vec::new(), Vec::new()),
+                };
                 created_records.push(AlkaneCreationRecord {
-                    alkane: genesis,
+                    alkane,
                     txid: txid_bytes,
                     creation_height: block.height,
                     creation_timestamp: block.block_header.time,
                     tx_index_in_block: 0,
                     inspection: None,
-                    names: vec!["DIESEL".to_string()],
-                    symbols: vec!["diesel".to_string()],
+                    names,
+                    symbols,
                 });
             }
         }

@@ -128,6 +128,10 @@ pub struct CliArgs {
     #[arg(long, short, default_value = None)]
     pub metashrew_db_label: Option<String>,
 
+    /// Enable debug mode checks (panic on configured invariants).
+    #[arg(long, default_value_t = false)]
+    pub debug: bool,
+
     /// Choose where block bodies come from: blk files + RPC fallback ("auto", default),
     /// RPC only ("rpc-only"), or blk files only ("blk-only").
     #[arg(long, value_parser = parse_block_fetch_mode, default_value = "rpc")]
@@ -347,6 +351,10 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
 /// NEW: Global accessor for bitcoin::Network
 pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
+}
+
+pub fn is_debug_mode() -> bool {
+    get_config().debug
 }
 
 pub fn get_metashrew() -> MetashrewAdapter {

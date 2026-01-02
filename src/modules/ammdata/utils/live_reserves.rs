@@ -20,10 +20,10 @@ pub fn fetch_latest_reserves_for_pools(
 
     for (pool_id, defs) in pools {
         let base_bal = metashrew
-            .get_latest_reserves_for_alkane(pool_id, &defs.base_alkane_id)?
+            .get_reserves_for_alkane(pool_id, &defs.base_alkane_id, None)?
             .unwrap_or(0);
         let quote_bal = metashrew
-            .get_latest_reserves_for_alkane(pool_id, &defs.quote_alkane_id)?
+            .get_reserves_for_alkane(pool_id, &defs.quote_alkane_id, None)?
             .unwrap_or(0);
 
         eprintln!(

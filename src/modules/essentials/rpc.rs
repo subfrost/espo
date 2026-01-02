@@ -822,15 +822,33 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                         }
                     };
 
-                    log_rpc(
-                        "get_alkane_balance_metashrew",
-                        &format!(
+                    let height = match payload.get("height") {
+                        None => None,
+                        Some(v) => match v.as_u64() {
+                            Some(h) => Some(h),
+                            None => {
+                                log_rpc(
+                                    "get_alkane_balance_metashrew",
+                                    "missing_or_invalid_height",
+                                );
+                                return json!({"ok": false, "error": "missing_or_invalid_height"});
+                            }
+                        },
+                    };
+
+                    let log_msg = match height {
+                        Some(h) => format!(
+                            "owner={}:{} target={}:{} height={}",
+                            owner.block, owner.tx, target.block, target.tx, h
+                        ),
+                        None => format!(
                             "owner={}:{} target={}:{}",
                             owner.block, owner.tx, target.block, target.tx
                         ),
-                    );
+                    };
+                    log_rpc("get_alkane_balance_metashrew", &log_msg);
 
-                    match get_metashrew().get_latest_reserves_for_alkane(&owner, &target) {
+                    match get_metashrew().get_reserves_for_alkane(&owner, &target, height) {
                         Ok(Some(bal)) => json!({
                             "ok": true,
                             "owner": format!("{}:{}", owner.block, owner.tx),

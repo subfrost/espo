@@ -7,7 +7,8 @@ use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
-use crate::config::{get_metashrew, get_network};
+use crate::config::{get_metashrew, get_network, is_debug_mode};
+use crate::modules::essentials::consts::ESSENTIALS_DEBUG_BALANCE_WATCH;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, BalanceEntry, HolderEntry, HolderId, addr_spk_key,
@@ -19,6 +20,8 @@ use crate::modules::essentials::storage::{
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Result, anyhow};
+use bitcoin::block::Header;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::{ScriptBuf, Transaction, Txid, hashes::Hash};
 use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
@@ -45,11 +48,9 @@ fn clean_espo_sandshrew_like_trace(
         return None;
     }
 
-    let mut mismatch = returns.saturating_sub(invokes);
-
     let (header, coinbase, diesel, fee) = host_function_values;
     let host_values: [&[u8]; 4] = [header, coinbase, diesel, fee];
-    let mut candidates: Vec<Vec<usize>> = vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mismatch = returns.saturating_sub(invokes);
 
     let decode_data = |data: &str| -> Option<Vec<u8>> {
         let trimmed = data.strip_prefix("0x").unwrap_or(data);
@@ -59,82 +60,109 @@ fn clean_espo_sandshrew_like_trace(
         hex::decode(trimmed).ok()
     };
 
-    for (idx, ev) in trace.events.iter().enumerate() {
-        let EspoSandshrewLikeTraceEvent::Return(ret) = ev else { continue };
-        if ret.status != EspoSandshrewLikeTraceStatus::Success {
-            continue;
-        }
-        if !ret.response.alkanes.is_empty() || !ret.response.storage.is_empty() {
-            continue;
-        }
-        let Some(data_bytes) = decode_data(&ret.response.data) else { continue };
-        for (slot, host_bytes) in host_values.iter().enumerate() {
-            if data_bytes.as_slice() == *host_bytes {
-                candidates[slot].push(idx);
-                break;
+    let host_match = |data_bytes: &[u8]| -> bool {
+        for host_bytes in host_values.iter() {
+            if data_bytes == *host_bytes {
+                return true;
             }
         }
-    }
+        false
+    };
 
-    let total_candidates: usize = candidates.iter().map(|v| v.len()).sum();
-    if total_candidates < mismatch {
-        return None;
-    }
-
-    let mut remove_indices: HashSet<usize> = HashSet::new();
-
-    for slot in 0..candidates.len() {
-        if mismatch == 0 {
-            break;
+    let fuzzy_host_match = |data_bytes: &[u8]| -> bool {
+        if data_bytes.len() == 80 && deserialize::<Header>(data_bytes).is_ok() {
+            return true;
         }
-        if candidates[slot].len() == 1 {
-            if let Some(idx) = candidates[slot].pop() {
-                remove_indices.insert(idx);
-                mismatch = mismatch.saturating_sub(1);
+        if let Ok(tx) = deserialize::<Transaction>(data_bytes) {
+            if tx.is_coinbase() {
+                return true;
             }
         }
-    }
+        false
+    };
 
-    let mut slot = 0usize;
-    while mismatch > 0 {
-        let mut removed = false;
-        for _ in 0..candidates.len() {
-            let cur = slot % candidates.len();
-            slot = slot.saturating_add(1);
-            if let Some(idx) = candidates[cur].pop() {
-                remove_indices.insert(idx);
-                mismatch = mismatch.saturating_sub(1);
-                removed = true;
-                break;
+    let attempt_clean = |allow_fuzzy: bool| -> Option<EspoSandshrewLikeTrace> {
+        let mut remove_indices: HashSet<usize> = HashSet::new();
+        let mut candidate_stack: Vec<usize> = Vec::new();
+        let mut total_candidates = 0usize;
+        let mut depth: isize = 0;
+
+        for (idx, ev) in trace.events.iter().enumerate() {
+            match ev {
+                EspoSandshrewLikeTraceEvent::Invoke(_) => {
+                    depth += 1;
+                }
+                EspoSandshrewLikeTraceEvent::Return(ret) => {
+                    let mut is_candidate = false;
+                    if ret.status == EspoSandshrewLikeTraceStatus::Success
+                        && ret.response.alkanes.is_empty()
+                        && ret.response.storage.is_empty()
+                    {
+                        if let Some(data_bytes) = decode_data(&ret.response.data) {
+                            if host_match(&data_bytes) {
+                                is_candidate = true;
+                            } else if allow_fuzzy && fuzzy_host_match(&data_bytes) {
+                                is_candidate = true;
+                            }
+                        }
+                    }
+                    if is_candidate {
+                        total_candidates += 1;
+                        candidate_stack.push(idx);
+                    }
+
+                    depth -= 1;
+                    if depth < 0 {
+                        let Some(remove_idx) = candidate_stack.pop() else {
+                            return None;
+                        };
+                        remove_indices.insert(remove_idx);
+                        depth += 1;
+                    }
+                }
+                EspoSandshrewLikeTraceEvent::Create(_) => {}
             }
         }
-        if !removed {
-            break;
-        }
-    }
 
-    let mut cleaned_events =
-        Vec::with_capacity(trace.events.len().saturating_sub(remove_indices.len()));
-    for (idx, ev) in trace.events.iter().enumerate() {
-        if !remove_indices.contains(&idx) {
-            cleaned_events.push(ev.clone());
+        if total_candidates < mismatch || remove_indices.len() != mismatch {
+            return None;
         }
-    }
 
-    let mut cleaned_invokes = 0usize;
-    let mut cleaned_returns = 0usize;
-    for ev in &cleaned_events {
-        match ev {
-            EspoSandshrewLikeTraceEvent::Invoke(_) => cleaned_invokes += 1,
-            EspoSandshrewLikeTraceEvent::Return(_) => cleaned_returns += 1,
-            EspoSandshrewLikeTraceEvent::Create(_) => {}
+        let mut cleaned_events =
+            Vec::with_capacity(trace.events.len().saturating_sub(remove_indices.len()));
+        for (idx, ev) in trace.events.iter().enumerate() {
+            if !remove_indices.contains(&idx) {
+                cleaned_events.push(ev.clone());
+            }
         }
-    }
-    if cleaned_invokes != cleaned_returns {
-        return None;
-    }
 
-    Some(EspoSandshrewLikeTrace { outpoint: trace.outpoint.clone(), events: cleaned_events })
+        let mut cleaned_invokes = 0usize;
+        let mut cleaned_returns = 0usize;
+        let mut cleaned_depth: isize = 0;
+        for ev in &cleaned_events {
+            match ev {
+                EspoSandshrewLikeTraceEvent::Invoke(_) => {
+                    cleaned_invokes += 1;
+                    cleaned_depth += 1;
+                }
+                EspoSandshrewLikeTraceEvent::Return(_) => {
+                    cleaned_returns += 1;
+                    cleaned_depth -= 1;
+                    if cleaned_depth < 0 {
+                        return None;
+                    }
+                }
+                EspoSandshrewLikeTraceEvent::Create(_) => {}
+            }
+        }
+        if cleaned_invokes != cleaned_returns || cleaned_depth != 0 {
+            return None;
+        }
+
+        Some(EspoSandshrewLikeTrace { outpoint: trace.outpoint.clone(), events: cleaned_events })
+    };
+
+    attempt_clean(false).or_else(|| attempt_clean(true))
 }
 
 pub(crate) fn accumulate_alkane_balance_deltas(
@@ -143,6 +171,12 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     host_function_values: &EspoHostFunctionValues,
 ) -> (bool, HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>) {
     let Some(trace) = clean_espo_sandshrew_like_trace(trace, host_function_values) else {
+        if is_debug_mode() {
+            eprintln!(
+                "[balances][debug] dropped trace: failed to clean sandshrew-like events (txid={})",
+                _txid
+            );
+        }
         return (false, HashMap::new());
     };
     if std::env::var_os("ESPO_LOG_HOST_FUNCTION_VALUES").is_some() {
@@ -729,6 +763,28 @@ fn holder_order_key(id: &HolderId) -> String {
         HolderId::Address(a) => format!("addr:{a}"),
         HolderId::Alkane(id) => format!("alkane:{:010}:{:020}", id.block, id.tx),
     }
+}
+
+fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let parse_u32 = |t: &str| {
+        if let Some(x) = t.strip_prefix("0x") {
+            u32::from_str_radix(x, 16).ok()
+        } else {
+            t.parse::<u32>().ok()
+        }
+    };
+    let parse_u64 = |t: &str| {
+        if let Some(x) = t.strip_prefix("0x") {
+            u64::from_str_radix(x, 16).ok()
+        } else {
+            t.parse::<u64>().ok()
+        }
+    };
+    Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
 }
 
 fn apply_holders_delta(
@@ -1516,6 +1572,102 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         }
     });
 
+    if is_debug_mode() && !ESSENTIALS_DEBUG_BALANCE_WATCH.is_empty() {
+        let metashrew = get_metashrew();
+        let height_u64 = block.height as u64;
+        let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
+            HashMap::new();
+        let mut mismatches: Vec<(SchemaAlkaneId, SchemaAlkaneId, u128, u128)> = Vec::new();
+
+        for (owner_str, token_str) in ESSENTIALS_DEBUG_BALANCE_WATCH.iter() {
+            let owner = parse_alkane_id_str(owner_str).unwrap_or_else(|| {
+                panic!("[balances][debug] invalid owner alkane id '{}'", owner_str)
+            });
+            let token = parse_alkane_id_str(token_str).unwrap_or_else(|| {
+                panic!("[balances][debug] invalid token alkane id '{}'", token_str)
+            });
+            if !local_cache.contains_key(&owner) {
+                let balances = match get_alkane_balances(mdb, &owner) {
+                    Ok(bal) => bal,
+                    Err(e) => {
+                        panic!(
+                            "[balances][debug] local balance lookup failed (owner={}:{}): {e:?}",
+                            owner.block, owner.tx
+                        );
+                    }
+                };
+                local_cache.insert(owner, balances);
+            }
+            let local_balance = local_cache
+                .get(&owner)
+                .and_then(|m| m.get(&token).copied())
+                .unwrap_or(0);
+
+            let metashrew_balance = match metashrew.get_reserves_for_alkane(
+                &owner,
+                &token,
+                Some(height_u64),
+            ) {
+                Ok(Some(bal)) => bal,
+                Ok(None) => 0,
+                Err(e) => {
+                    panic!(
+                        "[balances][debug] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
+                        owner.block, owner.tx, token.block, token.tx, height_u64
+                    );
+                }
+            };
+
+            if local_balance != metashrew_balance {
+                mismatches.push((owner, token, local_balance, metashrew_balance));
+            }
+        }
+
+        if !mismatches.is_empty() {
+            for (owner, token, local_balance, metashrew_balance) in &mismatches {
+                eprintln!(
+                    "[balances][debug] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
+                    height_u64,
+                    owner.block,
+                    owner.tx,
+                    token.block,
+                    token.tx,
+                    local_balance,
+                    metashrew_balance
+                );
+
+                let mut txids: Vec<String> = alkane_balance_tx_entries_by_token
+                    .get(&(*owner, *token))
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| Txid::from_byte_array(entry.txid).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                txids.sort();
+                txids.dedup();
+
+                if txids.is_empty() {
+                    eprintln!(
+                        "[balances][debug] balance-change txids: none (owner={}:{}, token={}:{})",
+                        owner.block, owner.tx, token.block, token.tx
+                    );
+                } else {
+                    eprintln!(
+                        "[balances][debug] balance-change txids: {}",
+                        txids.join(",")
+                    );
+                }
+            }
+            panic!(
+                "[balances][debug] metashrew balance mismatch at height {} ({} pair(s))",
+                height_u64,
+                mismatches.len()
+            );
+        }
+    }
+
     let minus_total: u128 = stat_minus_by_alk.values().copied().sum();
     let plus_total: u128 = stat_plus_by_alk.values().copied().sum();
 
@@ -1536,7 +1688,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 }
 
 fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
-    match get_metashrew().get_latest_reserves_for_alkane(alk, alk) {
+    match get_metashrew().get_reserves_for_alkane(alk, alk, None) {
         Ok(val) => val,
         Err(e) => {
             eprintln!(

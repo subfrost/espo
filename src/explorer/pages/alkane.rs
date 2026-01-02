@@ -12,7 +12,7 @@ use crate::explorer::components::svg_assets::{
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
-    AlkaneMetaCache, alkane_icon_fallback_url, alkane_meta, icon_onerror,
+    AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
@@ -64,7 +64,7 @@ pub async fn alkane_page(
     let meta = alkane_meta(&alk, &mut kv_cache, &state.essentials_mdb);
     let display_name = meta.name.value.clone();
     let fallback_letter = meta.name.fallback_letter();
-    let fallback_icon_url = alkane_icon_fallback_url(&alk);
+    let hero_icon_url = alkane_icon_url_unfiltered(&alk, &state.essentials_mdb);
     let page_title = if meta.name.known && display_name != alk_str {
         format!("Alkane {display_name} ({alk_str})")
     } else {
@@ -127,12 +127,11 @@ pub async fn alkane_page(
                     let id_str = format!("{}:{}", id.block, id.tx);
                     let h_meta = alkane_meta(&id, &mut kv_cache, &state.essentials_mdb);
                     let h_fallback_letter = h_meta.name.fallback_letter();
-                    let h_fallback_icon_url = alkane_icon_fallback_url(&id);
                     html! {
                         a class="link mono addr-inline" href=(format!("/alkane/{id_str}")) {
                             span class="addr-rank" { (format!("{rank}.")) }
                             div class="alk-icon-wrap" aria-hidden="true" {
-                                img class="alk-icon-img" src=(h_meta.icon_url.clone()) alt=(h_meta.symbol.clone()) loading="lazy" onerror=(icon_onerror(&h_fallback_icon_url)) {}
+                                span class="alk-icon-img" style=(icon_bg_style(&h_meta.icon_url)) {}
                                 span class="alk-icon-letter" { (h_fallback_letter) }
                             }
                             span class="addr-prefix" { (h_meta.name.value.clone()) }
@@ -146,7 +145,7 @@ pub async fn alkane_page(
                 html! {
                     div class="alk-line" {
                         div class="alk-icon-wrap" aria-hidden="true" {
-                            img class="alk-icon-img" src=(icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror=(icon_onerror(&fallback_icon_url)) {}
+                            span class="alk-icon-img" style=(icon_bg_style(&icon_url)) {}
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(h.amount)) }
@@ -179,7 +178,7 @@ pub async fn alkane_page(
             div class="alkane-page" {
                 div class="alkane-hero-card" {
                     div class="alk-icon-wrap alk-icon-lg" aria-hidden="true" {
-                        img class="alk-icon-img" src=(meta.icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror=(icon_onerror(&fallback_icon_url)) {}
+                        span class="alk-icon-img" style=(icon_bg_style(&hero_icon_url)) {}
                         span class="alk-icon-letter" { (fallback_letter) }
                     }
                     div class="alkane-hero-text" {

@@ -24,6 +24,10 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
         return Redirect::to(&format!("/block/{h}")).into_response();
     }
 
+    if let Some(alk) = parse_alkane_id(&query) {
+        return Redirect::to(&format!("/alkane/{}:{}", alk.block, alk.tx)).into_response();
+    }
+
     if query.len() == 64 && query.chars().all(|c| c.is_ascii_hexdigit()) {
         match bitcoincore_rpc::bitcoin::BlockHash::from_str(&query) {
             Ok(hash) => match get_bitcoind_rpc_client().get_block_header_info(&hash) {
@@ -34,7 +38,34 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
             },
             Err(_) => {}
         }
+
+        return Redirect::to(&format!("/tx/{query}")).into_response();
     }
 
     Redirect::to("/").into_response()
+}
+
+fn parse_alkane_id(s: &str) -> Option<crate::schemas::SchemaAlkaneId> {
+    let (a, b) = s.split_once(':')?;
+    let block = parse_u32_any(a)?;
+    let tx = parse_u64_any(b)?;
+    Some(crate::schemas::SchemaAlkaneId { block, tx })
+}
+
+fn parse_u32_any(s: &str) -> Option<u32> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x") {
+        u32::from_str_radix(h, 16).ok()
+    } else {
+        t.parse().ok()
+    }
+}
+
+fn parse_u64_any(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix("0x") {
+        u64::from_str_radix(h, 16).ok()
+    } else {
+        t.parse().ok()
+    }
 }

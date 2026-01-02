@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use maud::{Markup, html};
 
 use crate::explorer::components::tx_view::{
-    AlkaneMetaCache, alkane_icon_fallback_url, alkane_meta, icon_onerror,
+    AlkaneMetaCache, alkane_meta, icon_bg_style,
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::modules::essentials::storage::BalanceEntry;
@@ -22,11 +22,10 @@ pub fn render_alkane_balance_cards(entries: &[BalanceEntry], essentials_mdb: &Md
                 @let meta = alkane_meta(&be.alkane, &mut cache, essentials_mdb);
                 @let alk = format!("{}:{}", be.alkane.block, be.alkane.tx);
                 @let fallback_letter = meta.name.fallback_letter();
-                @let fallback_icon_url = alkane_icon_fallback_url(&be.alkane);
                 div class="alk-card" {
                     div class="alk-line" {
                         div class="alk-icon-wrap" aria-hidden="true" {
-                            img class="alk-icon-img" src=(meta.icon_url.clone()) alt=(meta.symbol.clone()) loading="lazy" onerror=(icon_onerror(&fallback_icon_url)) {}
+                            span class="alk-icon-img" style=(icon_bg_style(&meta.icon_url)) {}
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
