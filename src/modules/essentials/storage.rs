@@ -31,6 +31,7 @@ pub struct BalanceEntry {
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct AlkaneBalanceTxEntry {
     pub txid: [u8; 32],
+    pub height: u32,
     pub outflow: BTreeMap<SchemaAlkaneId, SignedU128>,
 }
 
@@ -82,6 +83,13 @@ pub fn alkane_balance_txs_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
     let mut key = b"/alkane_balance_txs/".to_vec();
     key.extend_from_slice(&alkane.block.to_be_bytes());
     key.extend_from_slice(&alkane.tx.to_be_bytes());
+    key
+}
+
+// /alkane_balance_txs_by_height/{height_be}
+pub fn alkane_balance_txs_by_height_key(height: u32) -> Vec<u8> {
+    let mut key = b"/alkane_balance_txs_by_height/".to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
     key
 }
 
@@ -204,10 +212,31 @@ pub fn decode_alkane_balance_tx_entries(bytes: &[u8]) -> Result<Vec<AlkaneBalanc
         return Ok(parsed);
     }
 
+    #[derive(BorshDeserialize)]
+    struct LegacyAlkaneBalanceTxEntry {
+        txid: [u8; 32],
+        outflow: BTreeMap<SchemaAlkaneId, SignedU128>,
+    }
+
+    if let Ok(legacy) = Vec::<LegacyAlkaneBalanceTxEntry>::try_from_slice(bytes) {
+        return Ok(legacy
+            .into_iter()
+            .map(|entry| AlkaneBalanceTxEntry {
+                txid: entry.txid,
+                height: 0,
+                outflow: entry.outflow,
+            })
+            .collect());
+    }
+
     let legacy: Vec<[u8; 32]> = Vec::<[u8; 32]>::try_from_slice(bytes)?;
     Ok(legacy
         .into_iter()
-        .map(|txid| AlkaneBalanceTxEntry { txid, outflow: BTreeMap::new() })
+        .map(|txid| AlkaneBalanceTxEntry {
+            txid,
+            height: 0,
+            outflow: BTreeMap::new(),
+        })
         .collect())
 }
 

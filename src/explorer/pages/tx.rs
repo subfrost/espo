@@ -65,6 +65,30 @@ fn mempool_tx_url(network: Network, txid: &Txid) -> Option<String> {
     Some(format!("{base}/tx/{txid}"))
 }
 
+fn match_trace_outpoint(outpoint: &[u8], txid: &Txid) -> Option<(Vec<u8>, u32)> {
+    if outpoint.len() < 36 {
+        return None;
+    }
+    let (tx_bytes, vout_le) = outpoint.split_at(32);
+    let vout = u32::from_le_bytes(vout_le[..4].try_into().ok()?);
+
+    if let Ok(trace_txid) = Txid::from_slice(tx_bytes) {
+        if trace_txid == *txid {
+            return Some((tx_bytes.to_vec(), vout));
+        }
+    }
+
+    let mut txid_be = tx_bytes.to_vec();
+    txid_be.reverse();
+    if let Ok(trace_txid) = Txid::from_slice(&txid_be) {
+        if trace_txid == *txid {
+            return Some((txid_be, vout));
+        }
+    }
+
+    None
+}
+
 fn fee_and_rate(
     tx: &Transaction,
     prev_map: &HashMap<Txid, Transaction>,
@@ -324,16 +348,9 @@ fn fetch_traces_for_tx(
     let tx_hex = txid.to_string();
 
     for partial in partials {
-        let (txid_le, vout_le) = partial.outpoint.split_at(32);
-        let mut txid_be = txid_le.to_vec();
-        txid_be.reverse();
-
-        let trace_txid = Txid::from_slice(&txid_be)?;
-        if trace_txid != *txid {
+        let Some((txid_be, vout)) = match_trace_outpoint(&partial.outpoint, txid) else {
             continue;
-        }
-
-        let vout = u32::from_le_bytes(vout_le.try_into()?);
+        };
         let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
         let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)?;
 
@@ -358,16 +375,9 @@ fn fetch_traces_for_tx_noheight(txid: &Txid, tx: &Transaction) -> anyhow::Result
     let tx_hex = txid.to_string();
 
     for partial in partials {
-        let (txid_le, vout_le) = partial.outpoint.split_at(32);
-        let mut txid_be = txid_le.to_vec();
-        txid_be.reverse();
-
-        let trace_txid = Txid::from_slice(&txid_be)?;
-        if trace_txid != *txid {
+        let Some((txid_be, vout)) = match_trace_outpoint(&partial.outpoint, txid) else {
             continue;
-        }
-
-        let vout = u32::from_le_bytes(vout_le.try_into()?);
+        };
         let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
         let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)?;
 

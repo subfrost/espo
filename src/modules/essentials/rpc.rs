@@ -934,6 +934,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                 }
                                 json!({
                                     "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                    "height": entry.height,
                                     "outflow": Value::Object(outflow),
                                 })
                             })
@@ -1032,6 +1033,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                 }
                                 json!({
                                     "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                    "height": entry.height,
                                     "outflow": Value::Object(outflow),
                                 })
                             })

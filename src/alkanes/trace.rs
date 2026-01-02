@@ -412,16 +412,29 @@ fn traces_for_block_indexed(
 
     let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     for p in partials {
-        let (txid_le, vout_le) = p.outpoint.split_at(32);
-        let mut txid_be = txid_le.to_vec();
-        txid_be.reverse();
-        let txid_hex = hex::encode(&txid_be);
-        if let Some(allow) = allow_txids {
-            if !allow.contains(&txid_hex) {
+        if p.outpoint.len() < 36 {
+            continue;
+        }
+        let (tx_bytes, vout_le) = p.outpoint.split_at(32);
+        let vout = u32::from_le_bytes(vout_le[..4].try_into().expect("vout 4 bytes"));
+
+        let txid_hex_be = hex::encode(tx_bytes);
+        let mut tx_bytes_rev = tx_bytes.to_vec();
+        tx_bytes_rev.reverse();
+        let txid_hex_le = hex::encode(&tx_bytes_rev);
+
+        let txid_hex = if let Some(allow) = allow_txids {
+            if allow.contains(&txid_hex_be) {
+                txid_hex_be
+            } else if allow.contains(&txid_hex_le) {
+                txid_hex_le
+            } else {
                 continue;
             }
-        }
-        let vout = u32::from_le_bytes(vout_le.try_into().expect("vout 4 bytes"));
+        } else {
+            txid_hex_le
+        };
+
         map.entry(txid_hex).or_default().push((vout, p));
     }
 

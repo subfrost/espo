@@ -12,10 +12,10 @@ use crate::modules::essentials::consts::ESSENTIALS_DEBUG_BALANCE_WATCH;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, BalanceEntry, HolderEntry, HolderId, addr_spk_key,
-    alkane_balance_txs_by_token_key, alkane_balance_txs_key, alkane_balances_key, balances_key,
-    decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, encode_vec,
-    holders_count_key, holders_key, mk_outpoint, outpoint_addr_key, outpoint_balances_key,
-    outpoint_balances_prefix, spk_to_address_str, utxo_spk_key,
+    alkane_balance_txs_by_height_key, alkane_balance_txs_by_token_key, alkane_balance_txs_key,
+    alkane_balances_key, balances_key, decode_alkane_balance_tx_entries, decode_balances_vec,
+    decode_holders_vec, encode_vec, holders_count_key, holders_key, mk_outpoint, outpoint_addr_key,
+    outpoint_balances_key, outpoint_balances_prefix, spk_to_address_str, utxo_spk_key,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -849,6 +849,9 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             if existing.outflow.is_empty() && !entry.outflow.is_empty() {
                 existing.outflow = entry.outflow;
             }
+            if existing.height == 0 && entry.height != 0 {
+                existing.height = entry.height;
+            }
             return;
         }
         entries.push(entry);
@@ -862,6 +865,9 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             if let Some(existing) = entries.iter_mut().find(|e| e.txid == entry.txid) {
                 if existing.outflow.is_empty() && !entry.outflow.is_empty() {
                     existing.outflow = entry.outflow;
+                }
+                if existing.height == 0 && entry.height != 0 {
+                    existing.height = entry.height;
                 }
                 return;
             }
@@ -1186,8 +1192,11 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             }
         }
         for (holder_alk, per_token) in &local_alkane_delta {
-            let entry_outflow =
-                AlkaneBalanceTxEntry { txid: txid_bytes, outflow: per_token.clone() };
+            let entry_outflow = AlkaneBalanceTxEntry {
+                txid: txid_bytes,
+                height: block.height,
+                outflow: per_token.clone(),
+            };
             let entry = alkane_balance_delta.entry(*holder_alk).or_default();
             for (token, delta) in per_token {
                 if delta.is_zero() {
@@ -1224,7 +1233,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
         for owner in &holder_alkanes_changed {
             let outflow = local_alkane_delta.get(owner).cloned().unwrap_or_else(BTreeMap::new);
-            let entry = AlkaneBalanceTxEntry { txid: txid_bytes, outflow };
+            let entry = AlkaneBalanceTxEntry { txid: txid_bytes, height: block.height, outflow };
             push_balance_tx_entry(&mut alkane_balance_tx_entries, *owner, entry);
         }
     }
@@ -1327,6 +1336,9 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 if existing[idx].outflow.is_empty() && !entry.outflow.is_empty() {
                     existing[idx].outflow = entry.outflow.clone();
                 }
+                if existing[idx].height == 0 && entry.height != 0 {
+                    existing[idx].height = entry.height;
+                }
                 continue;
             }
             seen.insert(entry.txid, existing.len());
@@ -1385,6 +1397,19 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             if !merged.is_empty() {
                 alkane_balance_txs_by_token_rows.insert(*pair, merged);
             }
+        }
+    }
+
+    let mut alkane_balance_txs_by_height_row: BTreeMap<
+        SchemaAlkaneId,
+        Vec<AlkaneBalanceTxEntry>,
+    > = BTreeMap::new();
+    if !alkane_balance_tx_entries.is_empty() {
+        for (alkane, entries) in &alkane_balance_tx_entries {
+            if entries.is_empty() {
+                continue;
+            }
+            alkane_balance_txs_by_height_row.insert(*alkane, entries.clone());
         }
     }
 
@@ -1546,6 +1571,14 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             if let Ok(buf) = encode_vec(txids) {
                 wb.put(&key, &buf);
             }
+        }
+
+        // C3c) Persist alkane balance change txids by height
+        let height_key = alkane_balance_txs_by_height_key(block.height);
+        if alkane_balance_txs_by_height_row.is_empty() {
+            wb.delete(&height_key);
+        } else if let Ok(buf) = borsh::to_vec(&alkane_balance_txs_by_height_row) {
+            wb.put(&height_key, &buf);
         }
 
         // D) Holders deltas

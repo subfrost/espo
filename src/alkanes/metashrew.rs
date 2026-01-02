@@ -14,7 +14,7 @@ use prost::Message;
 use protorune_support::protostone::Protostone;
 use metashrew_support::utils::consensus_encode;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn try_decode_trace_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
@@ -57,6 +57,37 @@ pub fn decode_trace_event_blob(bytes: &[u8]) -> Option<AlkanesTraceEvent> {
     }
 
     try_decode_trace_event_prost(bytes)
+}
+
+fn parse_ascii_or_le_u64(bytes: &[u8]) -> Option<u64> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if let Ok(v) = s.parse::<u64>() {
+            return Some(v);
+        }
+    }
+
+    match bytes.len() {
+        4 => {
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(bytes);
+            Some(u32::from_le_bytes(arr) as u64)
+        }
+        8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(bytes);
+            Some(u64::from_le_bytes(arr))
+        }
+        _ => None,
+    }
+}
+
+fn parse_ascii_or_le_usize(bytes: &[u8]) -> Option<usize> {
+    let v = parse_ascii_or_le_u64(bytes)?;
+    if v > usize::MAX as u64 {
+        None
+    } else {
+        Some(v as usize)
+    }
 }
 
 pub struct MetashrewAdapter {
@@ -264,64 +295,160 @@ impl MetashrewAdapter {
         let db = get_metashrew_sdb();
         db.catch_up_now().context("metashrew catch_up before scanning traces_for_tx")?;
 
-        let tx_le = txid.to_byte_array().to_vec();
+        let tx_be = txid.to_byte_array().to_vec();
+        let mut tx_le = tx_be.clone();
+        tx_le.reverse();
 
-        let parse_ascii_len = |bytes: &[u8]| -> Option<usize> {
-            std::str::from_utf8(bytes).ok()?.parse::<usize>().ok()
+        let mut traces_by_outpoint: HashMap<Vec<u8>, HashMap<u64, AlkanesTrace>> = HashMap::new();
+        let mut events_by_outpoint: HashMap<Vec<u8>, HashMap<u64, BTreeMap<u64, AlkanesTraceEvent>>> =
+            HashMap::new();
+        let mut lengths_by_outpoint: HashMap<Vec<u8>, u64> = HashMap::new();
+
+        let mut scan_prefix = |tx_bytes: &[u8], tx_bytes_are_be: bool| -> Result<()> {
+            let mut prefix = b"/trace/".to_vec();
+            prefix.extend_from_slice(tx_bytes);
+            let prefix = self.apply_label(prefix);
+
+            let mut ro = ReadOptions::default();
+            if let Some(ub) = self.next_prefix(prefix.clone()) {
+                ro.set_iterate_upper_bound(ub);
+            }
+            ro.set_total_order_seek(true);
+
+            let mut tx_outpoint = tx_bytes.to_vec();
+            if tx_bytes_are_be {
+                tx_outpoint.reverse();
+            }
+
+            let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
+            while let Some(Ok((k, v))) = it.next() {
+                if !k.starts_with(&prefix) {
+                    break;
+                }
+
+                let suffix = &k[prefix.len()..];
+                if suffix.len() < 4 {
+                    continue;
+                }
+                let vout_le = &suffix[..4];
+                let rest = &suffix[4..];
+
+                let mut outpoint = Vec::with_capacity(tx_outpoint.len() + 4);
+                outpoint.extend_from_slice(&tx_outpoint);
+                outpoint.extend_from_slice(vout_le);
+
+                if rest.is_empty() {
+                    if let Some(trace) = decode_trace_blob(&v) {
+                        traces_by_outpoint.entry(outpoint).or_default().insert(0, trace);
+                    }
+                    continue;
+                }
+
+                if rest[0] != b'/' {
+                    continue;
+                }
+                let remainder = &rest[1..];
+                if remainder.is_empty() {
+                    continue;
+                }
+                if remainder == b"length" {
+                    if let Some(len) = parse_ascii_or_le_u64(&v) {
+                        lengths_by_outpoint
+                            .entry(outpoint)
+                            .and_modify(|cur| {
+                                if *cur < len {
+                                    *cur = len;
+                                }
+                            })
+                            .or_insert(len);
+                    }
+                    continue;
+                }
+
+                let segments: Vec<&[u8]> = remainder.split(|b| *b == b'/').collect();
+                if segments.is_empty() || segments.iter().any(|s| *s == b"length") {
+                    continue;
+                }
+
+                if segments.len() == 1 {
+                    let idx = parse_ascii_or_le_u64(segments[0]).unwrap_or(0);
+                    if let Some(event) = decode_trace_event_blob(&v) {
+                        let events = events_by_outpoint
+                            .entry(outpoint)
+                            .or_default()
+                            .entry(0)
+                            .or_insert_with(BTreeMap::new);
+                        events.entry(idx).or_insert(event);
+                        continue;
+                    }
+                    if let Some(trace) = decode_trace_blob(&v) {
+                        traces_by_outpoint.entry(outpoint).or_default().insert(idx, trace);
+                    }
+                    continue;
+                }
+
+                let trace_idx = parse_ascii_or_le_u64(segments[0]).unwrap_or(0);
+                let Some(event_idx) = parse_ascii_or_le_u64(segments[1]) else {
+                    continue;
+                };
+
+                if let Some(event) = decode_trace_event_blob(&v) {
+                    let events = events_by_outpoint
+                        .entry(outpoint)
+                        .or_default()
+                        .entry(trace_idx)
+                        .or_insert_with(BTreeMap::new);
+                    events.entry(event_idx).or_insert(event);
+                    continue;
+                }
+
+                if let Some(trace) = decode_trace_blob(&v) {
+                    traces_by_outpoint
+                        .entry(outpoint)
+                        .or_default()
+                        .insert(trace_idx, trace);
+                }
+            }
+
+            Ok(())
         };
 
-        let mut prefix = b"/trace/".to_vec();
-        prefix.extend_from_slice(&tx_le);
-        let prefix = self.apply_label(prefix);
-
-        let mut ro = ReadOptions::default();
-        if let Some(ub) = self.next_prefix(prefix.clone()) {
-            ro.set_iterate_upper_bound(ub);
+        scan_prefix(&tx_be, true)?;
+        if tx_le != tx_be {
+            scan_prefix(&tx_le, false)?;
         }
-        ro.set_total_order_seek(true);
 
-        let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-        let mut outpoint_lengths: HashMap<Vec<u8>, usize> = HashMap::new();
-
-        while let Some(Ok((k, v))) = it.next() {
-            if !k.starts_with(&prefix) {
-                break;
-            }
-
-            let suffix = &k[prefix.len()..];
-            if suffix.len() < 5 || suffix[4] != b'/' {
-                continue;
-            }
-            let tail = &suffix[5..];
-            if tail != b"length" {
-                continue;
-            }
-
-            let mut outpoint = Vec::with_capacity(36);
-            outpoint.extend_from_slice(&tx_le);
-            outpoint.extend_from_slice(&suffix[..4]);
-
-            if let Some(len) = parse_ascii_len(&v) {
-                outpoint_lengths.insert(outpoint, len);
+        for (outpoint, trace_map) in events_by_outpoint {
+            let traces_entry = traces_by_outpoint.entry(outpoint).or_default();
+            for (trace_idx, events) in trace_map {
+                if events.is_empty() {
+                    continue;
+                }
+                traces_entry.entry(trace_idx).or_insert_with(|| {
+                    let evs = events.into_iter().map(|(_, ev)| ev).collect();
+                    AlkanesTrace { events: evs }
+                });
             }
         }
 
-        let mut out: Vec<PartialEspoTrace> = Vec::with_capacity(outpoint_lengths.len());
-        for (outpoint, len) in outpoint_lengths {
-            if len == 0 {
+        let mut out: Vec<PartialEspoTrace> = Vec::new();
+        for (outpoint, traces) in traces_by_outpoint {
+            if outpoint.len() < 36 {
                 continue;
             }
-            let idx = len.saturating_sub(1);
-            let mut key = Vec::with_capacity(7 + outpoint.len() + 1 + 20);
-            key.extend_from_slice(b"/trace/");
-            key.extend_from_slice(&outpoint);
-            key.push(b'/');
-            key.extend_from_slice(idx.to_string().as_bytes());
-            let key = self.apply_label(key);
-
-            let Some(bytes) = db.get(&key)? else { continue };
-            let Some(trace) = decode_trace_blob(&bytes) else { continue };
-            out.push(PartialEspoTrace { protobuf_trace: trace, outpoint });
+            let preferred = lengths_by_outpoint
+                .get(&outpoint)
+                .copied()
+                .and_then(|len| len.checked_sub(1));
+            let selected_idx = preferred
+                .filter(|idx| traces.contains_key(idx))
+                .or_else(|| traces.keys().max().copied());
+            let trace = selected_idx
+                .and_then(|idx| traces.get(&idx))
+                .or_else(|| traces.values().next());
+            if let Some(trace) = trace {
+                out.push(PartialEspoTrace { protobuf_trace: trace.clone(), outpoint });
+            }
         }
 
         Ok(out)
@@ -473,10 +600,6 @@ impl MetashrewAdapter {
             None
         };
 
-        let parse_ascii_len = |bytes: &[u8]| -> Option<usize> {
-            std::str::from_utf8(bytes).ok()?.parse::<usize>().ok()
-        };
-
         let db = get_metashrew_sdb();
         // Ensure the secondary view is fresh before scanning traces.
         db.catch_up_now().context("metashrew catch_up before scanning traces")?;
@@ -519,7 +642,7 @@ impl MetashrewAdapter {
                 continue;
             }
             if parts.len() == 2 && parts[1] == b"length" {
-                match parse_ascii_len(&v) {
+                match parse_ascii_or_le_usize(&v) {
                     Some(len) => {
                         pointer_lengths.insert(idx.to_vec(), len);
                     }
@@ -592,7 +715,7 @@ impl MetashrewAdapter {
             let trace_len_key = self.apply_label(trace_len_key);
             let trace_len = db
                 .get(&trace_len_key)?
-                .and_then(|v| parse_ascii_len(&v))
+                .and_then(|v| parse_ascii_or_le_usize(&v))
                 .unwrap_or(0);
             if trace_len == 0 {
                 missing_trace_blobs = missing_trace_blobs.saturating_add(1);
@@ -659,7 +782,7 @@ impl MetashrewAdapter {
             let trace_len_key = self.apply_label(trace_len_key);
             let trace_len = db
                 .get(&trace_len_key)?
-                .and_then(|v| parse_ascii_len(&v))
+                .and_then(|v| parse_ascii_or_le_usize(&v))
                 .unwrap_or(0);
             if trace_len == 0 {
                 missing_trace_blobs = missing_trace_blobs.saturating_add(1);
@@ -796,7 +919,7 @@ impl MetashrewAdapter {
                     length_key.extend_from_slice(b"/length");
                     let latest_idx = db
                         .get(&length_key)?
-                        .and_then(|v| parse_ascii_len(&v))
+                        .and_then(|v| parse_ascii_or_le_usize(&v))
                         .and_then(|len| len.checked_sub(1));
                     if let Some(idx) = latest_idx {
                         let mut key = key_base.clone();
