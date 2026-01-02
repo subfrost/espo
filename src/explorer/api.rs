@@ -3,10 +3,11 @@ use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, get_metashrew_rpc_url};
+use crate::config::{get_espo_next_height, get_metashrew_rpc_url};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::modules::essentials::storage::{
-    alkane_name_index_prefix, parse_alkane_name_index_key, trace_count_key,
+    block_summary_key, alkane_name_index_prefix, get_cached_block_summary,
+    parse_alkane_name_index_key, BlockSummary,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -16,11 +17,13 @@ use alkanes_support::id::AlkaneId;
 use alkanes_support::proto::alkanes::MessageContextParcel;
 use alkanes_support::proto::alkanes::SimulateResponse as SimulateProto;
 use anyhow::Context;
+use bitcoin::blockdata::block::Header;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
-use bitcoincore_rpc::RpcApi;
+use borsh::BorshDeserialize;
 use ordinals::Runestone;
 use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
@@ -84,33 +87,26 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let start = center.saturating_sub(radius);
     let end = (center + radius).min(espo_tip);
 
-    let rpc = get_bitcoind_rpc_client();
     let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
     for h in start..=end {
-        let block_hash = match rpc.get_block_hash(h) {
-            Ok(bh) => bh,
-            Err(_) => continue,
+        let summary = get_cached_block_summary(h as u32).or_else(|| {
+            essentials_mdb
+                .get(&block_summary_key(h as u32))
+                .ok()
+                .flatten()
+                .and_then(|b| BlockSummary::try_from_slice(&b).ok())
+        });
+
+        let (traces, time) = if let Some(summary) = summary {
+            let time = deserialize::<Header>(&summary.header)
+                .ok()
+                .map(|hdr| hdr.time as u32);
+            (summary.trace_count as usize, time)
+        } else {
+            (0, None)
         };
-
-        let header_info = rpc.get_block_header_info(&block_hash).ok();
-        let time = header_info.as_ref().map(|hi| hi.time as u32);
-
-        let traces = essentials_mdb
-            .get(&trace_count_key(h as u32))
-            .ok()
-            .flatten()
-            .and_then(|b| {
-                if b.len() == 4 {
-                    let mut arr = [0u8; 4];
-                    arr.copy_from_slice(&b);
-                    Some(u32::from_le_bytes(arr) as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
 
         blocks.push(CarouselBlock { height: h, traces, time });
     }

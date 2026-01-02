@@ -1,11 +1,13 @@
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 use crate::modules::essentials::utils::balances::SignedU128;
+use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use bitcoin::{Address, Network, ScriptBuf};
 use borsh::{BorshDeserialize, BorshSerialize};
 
 use anyhow::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Identifier for a holder: either a Bitcoin address or another Alkane.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, BorshSerialize, BorshDeserialize)]
@@ -38,6 +40,92 @@ pub struct AlkaneBalanceTxEntry {
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct HoldersCountEntry {
     pub count: u64,
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct BlockSummary {
+    pub trace_count: u32,
+    pub header: Vec<u8>,
+}
+
+const BLOCK_SUMMARY_CACHE_CAP: usize = 100;
+
+struct BlockSummaryCache {
+    order: VecDeque<u32>,
+    map: HashMap<u32, BlockSummary>,
+}
+
+impl BlockSummaryCache {
+    fn insert(&mut self, height: u32, summary: BlockSummary) {
+        if self.map.contains_key(&height) {
+            self.order.retain(|h| *h != height);
+        }
+        self.map.insert(height, summary);
+        self.order.push_back(height);
+        while self.order.len() > BLOCK_SUMMARY_CACHE_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+            }
+        }
+    }
+
+    fn get(&self, height: u32) -> Option<BlockSummary> {
+        self.map.get(&height).cloned()
+    }
+}
+
+static BLOCK_SUMMARY_CACHE: OnceLock<Arc<RwLock<BlockSummaryCache>>> = OnceLock::new();
+
+fn block_summary_cache() -> &'static Arc<RwLock<BlockSummaryCache>> {
+    BLOCK_SUMMARY_CACHE.get_or_init(|| {
+        Arc::new(RwLock::new(BlockSummaryCache {
+            order: VecDeque::new(),
+            map: HashMap::new(),
+        }))
+    })
+}
+
+pub fn cache_block_summary(height: u32, summary: BlockSummary) {
+    if let Ok(mut cache) = block_summary_cache().write() {
+        cache.insert(height, summary);
+    }
+}
+
+pub fn get_cached_block_summary(height: u32) -> Option<BlockSummary> {
+    block_summary_cache()
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(height))
+}
+
+pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
+    let prefix = block_summary_prefix();
+    let prefix_full = mdb.prefixed(prefix);
+    let mut loaded = 0usize;
+
+    for res in mdb.iter_prefix_rev(&prefix_full) {
+        if loaded >= BLOCK_SUMMARY_CACHE_CAP {
+            break;
+        }
+        let Ok((k, v)) = res else { continue };
+        let rel = &k[mdb.prefix().len()..];
+        if !rel.starts_with(prefix) {
+            break;
+        }
+        let height_bytes = &rel[prefix.len()..];
+        if height_bytes.len() != 4 {
+            continue;
+        }
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(height_bytes);
+        let height = u32::from_be_bytes(arr);
+        if let Ok(summary) = BlockSummary::try_from_slice(&v) {
+            cache_block_summary(height, summary);
+            loaded += 1;
+        }
+    }
+
+    loaded
 }
 
 /// Creation metadata for an alkane.
@@ -209,11 +297,15 @@ pub fn outpoint_balances_key(outp: &EspoOutpoint) -> Result<Vec<u8>> {
     Ok(k)
 }
 
-// /trace_count/{height_be}
-pub fn trace_count_key(height: u32) -> Vec<u8> {
-    let mut k = b"/trace_count/".to_vec();
+// /block_summary/{height_be}
+pub fn block_summary_key(height: u32) -> Vec<u8> {
+    let mut k = b"/block_summary/".to_vec();
     k.extend_from_slice(&height.to_be_bytes());
     k
+}
+
+pub fn block_summary_prefix() -> &'static [u8] {
+    b"/block_summary/"
 }
 
 #[derive(BorshSerialize)]

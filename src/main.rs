@@ -19,6 +19,7 @@ use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
+use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
@@ -32,6 +33,7 @@ use crate::{
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
     runtime::aof::AOF_REORG_DEPTH,
+    runtime::mdb::Mdb,
     runtime::mempool::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
@@ -102,111 +104,14 @@ fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
     Some(next_height.saturating_sub(revert_count as u32))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_config()?;
-    let cfg = get_config();
-    let network = get_network();
-    let view_only = cfg.view_only;
-    init_block_source()?;
-
-    if view_only {
-        eprintln!(
-            "[mode] view-only enabled: indexer and mempool are disabled; serving existing data only"
-        );
-    }
-    let metashrew_sdb = get_metashrew_sdb();
-
-    if cfg.simulate_reorg {
-        if view_only {
-            eprintln!("[aof] simulate-reorg ignored in view-only mode");
-        } else {
-            match get_aof_manager() {
-                Some(aof) => match aof.revert_all_blocks() {
-                    Ok(Some(h)) => {
-                        eprintln!(
-                            "[aof] simulate-reorg: reverted through height {}, will reindex",
-                            h
-                        );
-                        if let Err(e) = reset_mempool_store() {
-                            eprintln!(
-                                "[mempool] failed to reset store after simulated reorg: {e:?}"
-                            );
-                        }
-                    }
-                    Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
-                    Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
-                },
-                None => {
-                    eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert")
-                }
-            }
-        }
-    }
-
-    // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
-    // Essentials must run before any optional modules.
-    mods.register_module(Essentials::new());
-    mods.register_module(AmmData::new());
-    // mods.register_module(TracesData::new());
-
-    // Start RPC server
-    let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
-    let rpc_router = mods.router.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_rpc(rpc_router, addr).await {
-            eprintln!("[rpc] server error: {e:?}");
-        }
-    });
-    eprintln!("[rpc] listening on {}", addr);
-
-    // Optional SSR explorer server
-    if let Some(explorer_addr) = cfg.explorer_host {
-        tokio::spawn(async move {
-            if let Err(e) = run_explorer(explorer_addr).await {
-                eprintln!("[explorer] server error: {e:?}");
-            }
-        });
-        eprintln!("[explorer] listening on {}", explorer_addr);
-    }
-
-    let global_genesis = alkanes_genesis_block(network);
-
-    // Decide initial start height (resume at last+1 per module)
-    let start_height = mods
-        .modules()
-        .iter()
-        .map(|m| {
-            let g = m.get_genesis_block(network);
-            match m.get_index_height() {
-                Some(h) => h.saturating_add(1).max(g),
-                None => g,
-            }
-        })
-        .min()
-        .unwrap_or(global_genesis)
-        .max(global_genesis);
-
-    let height_cell = Arc::new(AtomicU32::new(start_height));
-
-    ESPO_HEIGHT
-        .set(height_cell.clone())
-        .map_err(|_| anyhow::anyhow!("espo height client already initialized"))?;
-    let mut next_height: u32 = start_height;
-
-    if view_only {
-        let indexed_height = start_height.saturating_sub(1);
-        update_safe_tip(indexed_height);
-        eprintln!(
-            "[mode] view-only: explorer/RPC running; indexed height {}, next height {}",
-            indexed_height, start_height
-        );
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    }
-
+async fn run_indexer_loop(
+    mods: ModuleRegistry,
+    start_height: u32,
+    mut next_height: u32,
+    network: bitcoin::Network,
+    metashrew_sdb: std::sync::Arc<crate::runtime::sdb::SDB>,
+    cfg: crate::config::CliArgs,
+) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
@@ -336,6 +241,9 @@ async fn main() -> Result<()> {
                     if let Some(h) = ESPO_HEIGHT.get() {
                         h.store(next_height, std::sync::atomic::Ordering::Relaxed);
                     }
+                    if cfg.indexer_block_delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(cfg.indexer_block_delay_ms)).await;
+                    }
                 }
                 Err(e) => {
                     eprintln!("[indexer] error at height {}: {e:?}", next_height);
@@ -374,5 +282,137 @@ async fn main() -> Result<()> {
                 next_height, tip
             );
         }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_config()?;
+    let cfg = get_config().clone();
+    let network = get_network();
+    let view_only = cfg.view_only;
+    init_block_source()?;
+
+    if view_only {
+        eprintln!(
+            "[mode] view-only enabled: indexer and mempool are disabled; serving existing data only"
+        );
+    }
+    let metashrew_sdb = get_metashrew_sdb();
+
+    if cfg.simulate_reorg {
+        if view_only {
+            eprintln!("[aof] simulate-reorg ignored in view-only mode");
+        } else {
+            match get_aof_manager() {
+                Some(aof) => match aof.revert_all_blocks() {
+                    Ok(Some(h)) => {
+                        eprintln!(
+                            "[aof] simulate-reorg: reverted through height {}, will reindex",
+                            h
+                        );
+                        if let Err(e) = reset_mempool_store() {
+                            eprintln!(
+                                "[mempool] failed to reset store after simulated reorg: {e:?}"
+                            );
+                        }
+                    }
+                    Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
+                    Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
+                },
+                None => {
+                    eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert")
+                }
+            }
+        }
+    }
+
+    // Build module registry with the global ESPO DB
+    let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
+    // Essentials must run before any optional modules.
+    mods.register_module(Essentials::new());
+    mods.register_module(AmmData::new());
+    // mods.register_module(TracesData::new());
+
+    let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+    let loaded = preload_block_summary_cache(&essentials_mdb);
+    if loaded > 0 {
+        eprintln!("[cache] preloaded {} block summaries", loaded);
+    }
+
+    // Start RPC server
+    let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let rpc_router = mods.router.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_rpc(rpc_router, addr).await {
+            eprintln!("[rpc] server error: {e:?}");
+        }
+    });
+    eprintln!("[rpc] listening on {}", addr);
+
+    // Optional SSR explorer server
+    if let Some(explorer_addr) = cfg.explorer_host {
+        tokio::spawn(async move {
+            if let Err(e) = run_explorer(explorer_addr).await {
+                eprintln!("[explorer] server error: {e:?}");
+            }
+        });
+        eprintln!("[explorer] listening on {}", explorer_addr);
+    }
+
+    let global_genesis = alkanes_genesis_block(network);
+
+    // Decide initial start height (resume at last+1 per module)
+    let start_height = mods
+        .modules()
+        .iter()
+        .map(|m| {
+            let g = m.get_genesis_block(network);
+            match m.get_index_height() {
+                Some(h) => h.saturating_add(1).max(g),
+                None => g,
+            }
+        })
+        .min()
+        .unwrap_or(global_genesis)
+        .max(global_genesis);
+
+    let height_cell = Arc::new(AtomicU32::new(start_height));
+
+    ESPO_HEIGHT
+        .set(height_cell.clone())
+        .map_err(|_| anyhow::anyhow!("espo height client already initialized"))?;
+    let next_height: u32 = start_height;
+
+    if view_only {
+        let indexed_height = start_height.saturating_sub(1);
+        update_safe_tip(indexed_height);
+        eprintln!(
+            "[mode] view-only: explorer/RPC running; indexed height {}, next height {}",
+            indexed_height, start_height
+        );
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    std::thread::spawn(move || {
+        let rt = TokioBuilder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build indexer runtime");
+        rt.block_on(run_indexer_loop(
+            mods,
+            start_height,
+            next_height,
+            network,
+            metashrew_sdb,
+            cfg,
+        ));
+    });
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }

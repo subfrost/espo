@@ -6,6 +6,7 @@ cargo run --release -- \
   --bitcoind-rpc-user admin \
   --bitcoind-rpc-pass admin \
   --network mainnet \
+  --indexer-block-delay-ms 50 \
   --block-source-mode rpc \
   --metashrew-rpc-url http://127.0.0.1:7045 \
   --explorer-host 0.0.0.0:5779 \

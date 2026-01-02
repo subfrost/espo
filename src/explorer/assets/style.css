@@ -649,6 +649,12 @@ a:hover {
   .home-table-grid {
     gap: 50px;
   }
+  .home-table-grid .home-table-block {
+    order: 1;
+  }
+  .home-table-grid .home-table-block:nth-child(2) {
+    order: 0;
+  }
 }
 .table {
   width: 100%;

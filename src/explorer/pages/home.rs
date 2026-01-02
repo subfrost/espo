@@ -25,6 +25,8 @@ struct AlkaneTxRow {
     trace: EspoTrace,
 }
 
+const LATEST_TRACES_MAX_SEARCH_DEPTH_BLOCKS: u64 = 1;
+
 fn load_newest_alkanes(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<AlkaneTableRow> {
     let mut rows: Vec<AlkaneTableRow> = Vec::new();
     if limit == 0 {
@@ -113,8 +115,9 @@ fn load_latest_alkane_txs(espo_tip: u64, network: Network, limit: usize) -> Vec<
 
     let genesis = alkanes_genesis_block(network) as u64;
     let mut height = espo_tip;
+    let mut depth = 0u64;
     loop {
-        if out.len() >= limit || height < genesis {
+        if out.len() >= limit || height < genesis || depth >= LATEST_TRACES_MAX_SEARCH_DEPTH_BLOCKS {
             break;
         }
         if let Ok(block) = get_espo_block(height, espo_tip) {
@@ -136,6 +139,7 @@ fn load_latest_alkane_txs(espo_tip: u64, network: Network, limit: usize) -> Vec<
             break;
         }
         height = height.saturating_sub(1);
+        depth = depth.saturating_add(1);
     }
 
     out

@@ -7,7 +7,8 @@ use crate::modules::essentials::consts::{
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
     alkane_creation_by_id_key, alkane_creation_count_key, alkane_creation_ordered_key,
-    alkane_name_index_key, encode_creation_record, load_creation_record, trace_count_key,
+    alkane_name_index_key, block_summary_key, encode_creation_record, load_creation_record,
+    BlockSummary, cache_block_summary,
 };
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, created_alkane_records_from_block, inspect_wasm_metadata,
@@ -19,6 +20,7 @@ use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use std::sync::Arc;
 
@@ -167,12 +169,16 @@ impl EspoModule for Essentials {
                 rows.insert(alkane_name_index_key(&norm, alk), Vec::new());
             }
         };
-        // trace count row
+        // block summary row (trace count + header)
         let trace_count = block
             .transactions
             .iter()
             .map(|tx| tx.traces.as_ref().map(|t| t.len()).unwrap_or(0))
             .sum::<usize>() as u32;
+        let mut header_bytes = Vec::new();
+        block.block_header.consensus_encode(&mut header_bytes)?;
+        let block_summary = BlockSummary { trace_count, header: header_bytes };
+        let block_summary_bytes = borsh::to_vec(&block_summary)?;
 
         let mut total_pairs_dedup = 0usize;
 
@@ -491,82 +497,73 @@ impl EspoModule for Essentials {
             creation_rows_ordered.insert(key_ord, encoded);
         }
 
-        // If there’s nothing to write (typical empty block), skip the write-batch
-        if !kv_rows.is_empty()
-            || !dir_rows.is_empty()
-            || !creation_rows_by_id.is_empty()
-            || !creation_rows_ordered.is_empty()
-            || !name_index_rows.is_empty()
-            || trace_count > 0
-        {
-            // -------- Phase B: write in sorted key order (better LSM locality) --------
-            let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();
-            kv_keys.sort_unstable();
-            let mut dir_keys: Vec<Vec<u8>> = dir_rows.into_iter().collect();
-            dir_keys.sort_unstable();
-            let mut creation_keys_by_id: Vec<Vec<u8>> =
-                creation_rows_by_id.keys().cloned().collect();
-            creation_keys_by_id.sort_unstable();
-            let mut creation_keys_ordered: Vec<Vec<u8>> =
-                creation_rows_ordered.keys().cloned().collect();
-            creation_keys_ordered.sort_unstable();
-            let mut name_index_keys: Vec<Vec<u8>> = name_index_rows.keys().cloned().collect();
-            name_index_keys.sort_unstable();
-            let mut creation_count_row: Option<[u8; 8]> = None;
-            if new_creations_added > 0 {
-                let current = mdb
-                    .get(alkane_creation_count_key())
-                    .ok()
-                    .flatten()
-                    .and_then(|b| {
-                        if b.len() == 8 {
-                            let mut arr = [0u8; 8];
-                            arr.copy_from_slice(&b);
-                            Some(u64::from_le_bytes(arr))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                let updated = current.saturating_add(new_creations_added);
-                creation_count_row = Some(updated.to_le_bytes());
-            }
-
-            if let Err(e) = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
-                // Values first
-                for k in &kv_keys {
-                    if let Some(v) = kv_rows.get(k) {
-                        wb.put(k, v);
+        // -------- Phase B: write in sorted key order (better LSM locality) --------
+        let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();
+        kv_keys.sort_unstable();
+        let mut dir_keys: Vec<Vec<u8>> = dir_rows.into_iter().collect();
+        dir_keys.sort_unstable();
+        let mut creation_keys_by_id: Vec<Vec<u8>> = creation_rows_by_id.keys().cloned().collect();
+        creation_keys_by_id.sort_unstable();
+        let mut creation_keys_ordered: Vec<Vec<u8>> =
+            creation_rows_ordered.keys().cloned().collect();
+        creation_keys_ordered.sort_unstable();
+        let mut name_index_keys: Vec<Vec<u8>> = name_index_rows.keys().cloned().collect();
+        name_index_keys.sort_unstable();
+        let mut creation_count_row: Option<[u8; 8]> = None;
+        if new_creations_added > 0 {
+            let current = mdb
+                .get(alkane_creation_count_key())
+                .ok()
+                .flatten()
+                .and_then(|b| {
+                    if b.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&b);
+                        Some(u64::from_le_bytes(arr))
+                    } else {
+                        None
                     }
-                }
-                // Then directory markers
-                for k in &dir_keys {
-                    wb.put(k, &[]);
-                }
-                for k in &creation_keys_by_id {
-                    if let Some(v) = creation_rows_by_id.get(k) {
-                        wb.put(k, v);
-                    }
-                }
-                for k in &creation_keys_ordered {
-                    if let Some(v) = creation_rows_ordered.get(k) {
-                        wb.put(k, v);
-                    }
-                }
-                for k in &name_index_keys {
-                    if let Some(v) = name_index_rows.get(k) {
-                        wb.put(k, v);
-                    }
-                }
-                wb.put(&trace_count_key(block.height), &trace_count.to_le_bytes());
-                if let Some(count_bytes) = creation_count_row {
-                    wb.put(alkane_creation_count_key(), &count_bytes);
-                }
-            }) {
-                eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
-                return Err(e.into());
-            }
+                })
+                .unwrap_or(0);
+            let updated = current.saturating_add(new_creations_added);
+            creation_count_row = Some(updated.to_le_bytes());
         }
+
+        if let Err(e) = mdb.bulk_write(|wb: &mut MdbBatch<'_>| {
+            // Values first
+            for k in &kv_keys {
+                if let Some(v) = kv_rows.get(k) {
+                    wb.put(k, v);
+                }
+            }
+            // Then directory markers
+            for k in &dir_keys {
+                wb.put(k, &[]);
+            }
+            for k in &creation_keys_by_id {
+                if let Some(v) = creation_rows_by_id.get(k) {
+                    wb.put(k, v);
+                }
+            }
+            for k in &creation_keys_ordered {
+                if let Some(v) = creation_rows_ordered.get(k) {
+                    wb.put(k, v);
+                }
+            }
+            for k in &name_index_keys {
+                if let Some(v) = name_index_rows.get(k) {
+                    wb.put(k, v);
+                }
+            }
+            wb.put(&block_summary_key(block.height), &block_summary_bytes);
+            if let Some(count_bytes) = creation_count_row {
+                wb.put(alkane_creation_count_key(), &count_bytes);
+            }
+        }) {
+            eprintln!("[ESSENTIALS] bulk_write failed at block #{}: {e}", block.height);
+            return Err(e.into());
+        }
+        cache_block_summary(block.height, block_summary);
 
         // ✅ also update alkane balances/holders for this block
         if let Err(e) = bulk_update_balances_for_block(mdb, &block) {

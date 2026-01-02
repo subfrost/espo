@@ -114,6 +114,10 @@ pub struct CliArgs {
     #[arg(short, long, default_value_t = 5000)]
     pub sdb_poll_ms: u16,
 
+    /// Optional delay between indexing blocks (ms). Use to throttle catch-up pressure.
+    #[arg(long, default_value_t = 0)]
+    pub indexer_block_delay_ms: u64,
+
     #[arg(short = 'p', long, default_value_t = 8080)]
     pub port: u16,
 

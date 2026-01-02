@@ -4,9 +4,9 @@ use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, HolderId, HoldersCountEntry, alkane_balance_txs_by_token_key,
-    alkane_balance_txs_key, alkane_creation_ordered_prefix, decode_alkane_balance_tx_entries,
-    decode_creation_record, holders_count_key, load_creation_record, outpoint_addr_key,
-    outpoint_balances_prefix, trace_count_key,
+    alkane_balance_txs_key, alkane_creation_ordered_prefix, block_summary_key,
+    decode_alkane_balance_tx_entries, decode_creation_record, holders_count_key,
+    load_creation_record, outpoint_addr_key, outpoint_balances_prefix, BlockSummary,
 };
 use crate::runtime::mempool::{
     MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
@@ -509,40 +509,43 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
-    /* -------- trace count lookup -------- */
+    /* -------- block summary lookup -------- */
     {
-        let reg_trace = reg.clone();
-        let mdb_trace = Arc::clone(&mdb);
+        let reg_summary = reg.clone();
+        let mdb_summary = Arc::clone(&mdb);
         tokio::spawn(async move {
-            reg_trace
-                .register("get_trace_count", move |_cx, payload| {
-                    let mdb = Arc::clone(&mdb_trace);
+            reg_summary
+                .register("get_block_summary", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_summary);
                     async move {
                         let height = match payload.get("height").and_then(|v| v.as_u64()) {
                             Some(h) => h as u32,
                             None => {
-                                log_rpc("get_trace_count", "missing_or_invalid_height");
+                                log_rpc("get_block_summary", "missing_or_invalid_height");
                                 return json!({"ok": false, "error": "missing_or_invalid_height"});
                             }
                         };
 
-                        let key = trace_count_key(height);
-                        let count = mdb
+                        let key = block_summary_key(height);
+                        let summary = mdb
                             .get(&key)
                             .ok()
                             .flatten()
-                            .and_then(|b| {
-                                if b.len() == 4 {
-                                    let mut arr = [0u8; 4];
-                                    arr.copy_from_slice(&b);
-                                    Some(u32::from_le_bytes(arr))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(0);
+                            .and_then(|b| BlockSummary::try_from_slice(&b).ok());
 
-                        json!({"ok": true, "height": height, "trace_count": count})
+                        let (trace_count, header_hex, found) = if let Some(summary) = summary {
+                            (summary.trace_count, Some(hex::encode(summary.header)), true)
+                        } else {
+                            (0, None, false)
+                        };
+
+                        json!({
+                            "ok": true,
+                            "height": height,
+                            "found": found,
+                            "trace_count": trace_count,
+                            "header_hex": header_hex,
+                        })
                     }
                 })
                 .await;
