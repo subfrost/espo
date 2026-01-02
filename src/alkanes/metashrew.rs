@@ -144,39 +144,47 @@ impl MetashrewAdapter {
     }
 
     pub fn get_alkanes_tip_height(&self) -> Result<u32> {
-        let tip_height_key: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
-
-        eprintln!("[metashrew] looking for key: {:?}", String::from_utf8_lossy(&tip_height_key));
-
         // Force catch up with primary before reading
         let metashrew_sdb = get_metashrew_sdb();
         if let Err(e) = metashrew_sdb.catch_up_now() {
             eprintln!("[metashrew] catch_up error: {:?}", e);
         }
 
-        // First try direct read (non-SMT mode)
-        match metashrew_sdb.get(&tip_height_key) {
-            Ok(Some(bytes)) => {
-                eprintln!("[metashrew] found key, value bytes: {:?} (len={})", hex::encode(&bytes), bytes.len());
-                if bytes.len() >= 4 {
-                    let arr: [u8; 4] = bytes[..4].try_into().unwrap();
-                    let height = u32::from_le_bytes(arr);
-                    eprintln!("[metashrew] tip height (direct): {}", height);
-                    return Ok(height);
+        // Try both possible height keys:
+        // 1. __INTERNAL/height (used by RocksDBStorageAdapter in metashrew-sync)
+        // 2. /__INTERNAL/tip-height (used by rockshrew-runtime TIP_HEIGHT_KEY)
+        let height_keys = [
+            self.apply_label(b"__INTERNAL/height".to_vec()),
+            self.apply_label(b"/__INTERNAL/tip-height".to_vec()),
+        ];
+
+        for height_key in &height_keys {
+            let key_str = String::from_utf8_lossy(height_key);
+            match metashrew_sdb.get(height_key) {
+                Ok(Some(bytes)) => {
+                    if bytes.len() >= 4 {
+                        let arr: [u8; 4] = bytes[..4].try_into().unwrap();
+                        let height = u32::from_le_bytes(arr);
+                        eprintln!("[metashrew] tip height from key '{}': {}", key_str, height);
+                        return Ok(height);
+                    }
                 }
-            }
-            Ok(None) => {
-                eprintln!("[metashrew] key not found via direct read");
-            }
-            Err(e) => {
-                eprintln!("[metashrew] error reading key: {:?}", e);
+                Ok(None) => {
+                    eprintln!("[metashrew] key '{}' not found", key_str);
+                }
+                Err(e) => {
+                    eprintln!("[metashrew] error reading key '{}': {:?}", key_str, e);
+                }
             }
         }
 
-        // Then try versioned format (SMT mode)
-        if let Some(height) = self.read_versioned_uint_key::<4, u32>(tip_height_key.clone())? {
-            eprintln!("[metashrew] tip height (versioned): {}", height);
-            return Ok(height);
+        // Then try versioned format (SMT mode) for both keys
+        for height_key in &height_keys {
+            if let Some(height) = self.read_versioned_uint_key::<4, u32>(height_key.clone())? {
+                let key_str = String::from_utf8_lossy(height_key);
+                eprintln!("[metashrew] tip height (versioned) from key '{}': {}", key_str, height);
+                return Ok(height);
+            }
         }
 
         // Debug: scan for any keys starting with /__INTERNAL
