@@ -82,7 +82,7 @@ impl MetashrewAdapter {
         let metashrew_sdb = get_metashrew_sdb();
 
         let bytes = metashrew_sdb
-            .get(key)?
+            .get(&key)?
             .ok_or_else(|| anyhow!("ESPO ERROR: failed to find metashrew key"))?;
 
         let arr: [u8; N] = bytes
@@ -92,10 +92,117 @@ impl MetashrewAdapter {
 
         Ok(T::from_le_bytes(arr))
     }
-    pub fn get_alkanes_tip_height(&self) -> Result<u32> {
-        let tip_height_prefix: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
 
-        self.read_uint_key::<4, u32>(tip_height_prefix)
+    /// Read a versioned key in rockshrew-mono format
+    /// Data is stored as: key/length -> count, key/0, key/1, ... -> "height:HEX_VALUE"
+    fn read_versioned_uint_key<const N: usize, T>(&self, base_key: Vec<u8>) -> Result<Option<T>>
+    where
+        T: FromLeBytes<N>,
+    {
+        let metashrew_sdb = get_metashrew_sdb();
+
+        // Try versioned format first: key/length
+        let mut length_key = base_key.clone();
+        length_key.extend_from_slice(b"/length");
+
+        if let Some(length_bytes) = metashrew_sdb.get(&length_key)? {
+            let length_str = std::str::from_utf8(&length_bytes)
+                .map_err(|e| anyhow!("utf8 decode length: {e}"))?;
+            let length: u64 = length_str.parse()
+                .map_err(|e| anyhow!("parse length '{length_str}': {e}"))?;
+
+            if length == 0 {
+                return Ok(None);
+            }
+
+            // Read the latest entry: key/{length-1}
+            let latest_idx = length.saturating_sub(1);
+            let mut entry_key = base_key.clone();
+            entry_key.push(b'/');
+            entry_key.extend_from_slice(latest_idx.to_string().as_bytes());
+
+            if let Some(entry_bytes) = metashrew_sdb.get(&entry_key)? {
+                let entry_str = std::str::from_utf8(&entry_bytes)
+                    .map_err(|e| anyhow!("utf8 decode entry: {e}"))?;
+
+                // Format is "height:HEX_VALUE"
+                let (_height_str, hex_part) = entry_str.split_once(':')
+                    .ok_or_else(|| anyhow!("entry missing ':'"))?;
+
+                let raw_bytes = hex::decode(hex_part)
+                    .map_err(|e| anyhow!("hex decode entry '{hex_part}': {e}"))?;
+
+                let arr: [u8; N] = raw_bytes.as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Expected {} bytes, got {}", N, raw_bytes.len()))?;
+
+                return Ok(Some(T::from_le_bytes(arr)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_alkanes_tip_height(&self) -> Result<u32> {
+        let tip_height_key: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
+
+        // First try direct read (non-SMT mode)
+        if let Ok(height) = self.read_uint_key::<4, u32>(tip_height_key.clone()) {
+            eprintln!("[metashrew] tip height (direct): {}", height);
+            return Ok(height);
+        }
+
+        // Then try versioned format (SMT mode)
+        if let Some(height) = self.read_versioned_uint_key::<4, u32>(tip_height_key.clone())? {
+            eprintln!("[metashrew] tip height (versioned): {}", height);
+            return Ok(height);
+        }
+
+        // Debug: scan for any keys starting with /__INTERNAL
+        let metashrew_sdb = get_metashrew_sdb();
+        let internal_prefix = self.apply_label(b"/__INTERNAL".to_vec());
+        eprintln!("[metashrew] scanning for keys starting with /__INTERNAL...");
+
+        let mut ro = ReadOptions::default();
+        ro.set_total_order_seek(true);
+        let mut count = 0;
+        let mut it = metashrew_sdb.iterator_opt(
+            IteratorMode::From(&internal_prefix, Direction::Forward),
+            ro,
+        );
+        while let Some(Ok((k, v))) = it.next() {
+            if !k.starts_with(&internal_prefix) {
+                break;
+            }
+            if count < 5 {
+                let key_str = String::from_utf8_lossy(&k);
+                let val_preview = if v.len() <= 32 {
+                    hex::encode(&v)
+                } else {
+                    format!("{}... ({} bytes)", hex::encode(&v[..16]), v.len())
+                };
+                eprintln!("[metashrew] found key: {} = {}", key_str, val_preview);
+            }
+            count += 1;
+        }
+        eprintln!("[metashrew] total /__INTERNAL keys found: {}", count);
+
+        // Also try to scan all keys to see what's in the database
+        eprintln!("[metashrew] scanning first 10 keys in database...");
+        let mut it2 = metashrew_sdb.iterator(IteratorMode::Start);
+        for i in 0..10 {
+            if let Some(Ok((k, v))) = it2.next() {
+                let key_str = String::from_utf8_lossy(&k);
+                let val_preview = if v.len() <= 16 {
+                    hex::encode(&v)
+                } else {
+                    format!("{}... ({} bytes)", hex::encode(&v[..8]), v.len())
+                };
+                eprintln!("[metashrew] key[{}]: {} = {}", i, key_str, val_preview);
+            }
+        }
+
+        Err(anyhow!("ESPO ERROR: failed to find tip height in metashrew database"))
     }
 
     pub fn get_latest_reserves_for_alkane(
