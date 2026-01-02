@@ -7,10 +7,13 @@ use crate::modules::essentials::consts::{
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
     alkane_creation_by_id_key, alkane_creation_count_key, alkane_creation_ordered_key,
-    encode_creation_record, load_creation_record, trace_count_key,
+    alkane_name_index_key, encode_creation_record, load_creation_record, trace_count_key,
 };
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, created_alkane_records_from_block, inspect_wasm_metadata,
+};
+use crate::modules::essentials::utils::names::{
+    get_name as get_alkane_name, normalize_alkane_name,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
@@ -157,6 +160,13 @@ impl EspoModule for Essentials {
         let mut creation_rows_ordered: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
+        let mut name_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let add_name_index =
+            |rows: &mut HashMap<Vec<u8>, Vec<u8>>, alk: &SchemaAlkaneId, name: &str| {
+            if let Some(norm) = normalize_alkane_name(name) {
+                rows.insert(alkane_name_index_key(&norm, alk), Vec::new());
+            }
+        };
         // trace count row
         let trace_count = block
             .transactions
@@ -313,6 +323,20 @@ impl EspoModule for Essentials {
             }
         }
 
+        for rec in created_records.iter_mut() {
+            if rec.names.is_empty() {
+                if let Some(name) = get_alkane_name(&block, &rec.alkane, rec.inspection.as_ref()) {
+                    rec.names.push(name);
+                }
+            }
+        }
+
+        for rec in created_records.iter() {
+            for name in rec.names.iter() {
+                add_name_index(&mut name_index_rows, &rec.alkane, name);
+            }
+        }
+
         // Dedup against existing records to avoid double-counting if re-run.
         let mut new_creations_added: u64 = 0;
         if !created_records.is_empty() {
@@ -421,7 +445,8 @@ impl EspoModule for Essentials {
             let Some(mut rec) = load_creation_record(mdb, alk).ok().flatten() else {
                 continue;
             };
-            let mut dirty = false;
+            let mut name_dirty = false;
+            let mut symbol_dirty = false;
             let maybe_push = |vec: &mut Vec<String>, vals: &[String]| {
                 let mut changed = false;
                 for v in vals {
@@ -433,13 +458,18 @@ impl EspoModule for Essentials {
                 changed
             };
             if maybe_push(&mut rec.names, names) {
-                dirty = true;
+                name_dirty = true;
             }
             if maybe_push(&mut rec.symbols, symbols) {
-                dirty = true;
+                symbol_dirty = true;
             }
-            if !dirty {
+            if !name_dirty && !symbol_dirty {
                 continue;
+            }
+            if name_dirty {
+                for name in rec.names.iter() {
+                    add_name_index(&mut name_index_rows, &rec.alkane, name);
+                }
             }
             let encoded = match encode_creation_record(&rec) {
                 Ok(v) => v,
@@ -466,6 +496,7 @@ impl EspoModule for Essentials {
             || !dir_rows.is_empty()
             || !creation_rows_by_id.is_empty()
             || !creation_rows_ordered.is_empty()
+            || !name_index_rows.is_empty()
             || trace_count > 0
         {
             // -------- Phase B: write in sorted key order (better LSM locality) --------
@@ -479,6 +510,8 @@ impl EspoModule for Essentials {
             let mut creation_keys_ordered: Vec<Vec<u8>> =
                 creation_rows_ordered.keys().cloned().collect();
             creation_keys_ordered.sort_unstable();
+            let mut name_index_keys: Vec<Vec<u8>> = name_index_rows.keys().cloned().collect();
+            name_index_keys.sort_unstable();
             let mut creation_count_row: Option<[u8; 8]> = None;
             if new_creations_added > 0 {
                 let current = mdb
@@ -517,6 +550,11 @@ impl EspoModule for Essentials {
                 }
                 for k in &creation_keys_ordered {
                     if let Some(v) = creation_rows_ordered.get(k) {
+                        wb.put(k, v);
+                    }
+                }
+                for k in &name_index_keys {
+                    if let Some(v) = name_index_rows.get(k) {
                         wb.put(k, v);
                     }
                 }

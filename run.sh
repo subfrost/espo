@@ -10,6 +10,5 @@ cargo run --release -- \
   --metashrew-rpc-url http://127.0.0.1:7045 \
   --explorer-host 0.0.0.0:5779 \
   --enable-aof \
-  --debug \
-  --view-only
+  --debug
 # Add --view-only to disable indexing/mempool and serve existing data only.

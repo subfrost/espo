@@ -24,26 +24,29 @@ pub struct SchemaMarketDefs {
     pub pool_alkane_id: SchemaAlkaneId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub enum TradeSide {
-    Sell,
-    Buy,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ActivityKind {
+    TradeBuy,
+    TradeSell,
+    LiquidityAdd,
+    LiquidityRemove,
+    PoolCreate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub enum ActivityDirection {
+    BaseIn,
+    QuoteIn,
 }
 
 #[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
-pub struct SchemaTradeV1 {
+pub struct SchemaActivityV1 {
     pub timestamp: u64,
     pub txid: [u8; 32],
-    pub address: String,
-    pub xpubkey: [u8; 32],
-    pub base_inflow: i128,
-    pub quote_inflow: i128,
-}
-
-#[derive(Clone, BorshSerialize, BorshDeserialize, Debug)]
-pub struct SchemaFullTradeV1 {
-    pub base_trade: SchemaTradeV1,
-    pub quote_trade: SchemaTradeV1,
+    pub kind: ActivityKind,
+    pub direction: Option<ActivityDirection>,
+    pub base_delta: i128,
+    pub quote_delta: i128,
 }
 
 impl SchemaCandleV1 {

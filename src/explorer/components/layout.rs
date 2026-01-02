@@ -290,9 +290,22 @@ fn search_scripts() -> Markup {
       }}
     }});
     form.addEventListener('submit', (event) => {{
-      if (!input.value.trim()) {{
+      const value = input.value.trim();
+      if (!value) {{
         event.preventDefault();
         clearResults();
+        return;
+      }}
+      const firstAlkane = resultsBody.querySelector(
+        '.search-results-section[data-kind="alkanes"] .search-result[href]'
+      );
+      if (firstAlkane) {{
+        const href = firstAlkane.getAttribute('href');
+        if (href) {{
+          event.preventDefault();
+          window.location.assign(href);
+          return;
+        }}
       }}
     }});
     document.addEventListener('click', (event) => {{

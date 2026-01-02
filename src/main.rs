@@ -146,8 +146,9 @@ async fn main() -> Result<()> {
 
     // Build module registry with the global ESPO DB
     let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
-    mods.register_module(AmmData::new());
+    // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
+    mods.register_module(AmmData::new());
     // mods.register_module(TracesData::new());
 
     // Start RPC server

@@ -27,9 +27,16 @@ pub struct ReserveExtraction {
     pub k_ratio_approx: Option<f64>, // best-effort diagnostic
 }
 
+#[derive(Debug, Clone)]
+pub struct NewPoolInfo {
+    pub pool_id: SchemaAlkaneId,
+    pub defs: SchemaMarketDefs,
+    pub factory_id: Option<SchemaAlkaneId>,
+}
+
 pub fn extract_new_pools_from_espo_transaction(
     transaction: &EspoAlkanesTransaction,
-) -> Result<Vec<(SchemaAlkaneId, SchemaMarketDefs)>> {
+) -> Result<Vec<NewPoolInfo>> {
     /* ---------- helpers ---------- */
     let traces: &Vec<EspoTrace> = match &transaction.traces {
         Some(t) => t,
@@ -103,7 +110,7 @@ pub fn extract_new_pools_from_espo_transaction(
 
     /* ---------- walk the call stack; detect pool init writes ---------- */
     let mut stack: VecDeque<EspoSandshrewLikeTraceShortId> = VecDeque::new();
-    let mut results: Vec<(SchemaAlkaneId, SchemaMarketDefs)> = Vec::new();
+    let mut results: Vec<NewPoolInfo> = Vec::new();
     let mut seen_pools: HashSet<(u32, u64)> = HashSet::new(); // dedupe if multiple returns
 
     for trace in traces {
@@ -130,10 +137,12 @@ pub fn extract_new_pools_from_espo_transaction(
 
                     let mut alk0: Option<&str> = None;
                     let mut alk1: Option<&str> = None;
+                    let mut factory_id: Option<&str> = None;
                     for kv in &ret.response.storage {
                         match kv.key.as_str() {
                             "/alkane/0" => alk0 = Some(kv.value.as_str()),
                             "/alkane/1" => alk1 = Some(kv.value.as_str()),
+                            "/factory_id" => factory_id = Some(kv.value.as_str()),
                             _ => {}
                         }
                     }
@@ -154,14 +163,18 @@ pub fn extract_new_pools_from_espo_transaction(
                         continue;
                     }
 
-                    results.push((
+                    let factory_id = factory_id
+                        .and_then(|val| schema_id_from_storage_val_32b(val).ok());
+
+                    results.push(NewPoolInfo {
                         pool_id,
-                        SchemaMarketDefs {
+                        defs: SchemaMarketDefs {
                             base_alkane_id: base_id,
                             quote_alkane_id: quote_id,
                             pool_alkane_id: pool_id,
                         },
-                    ));
+                        factory_id,
+                    });
                 }
                 EspoSandshrewLikeTraceEvent::Create(_c) => {
                     // already captured above; nothing to do during streaming walk

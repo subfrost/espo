@@ -195,7 +195,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
             div class="grid2 home-table-grid" {
                 div class="home-table-block" {
                     div class="home-table-header" {
-                            h2 class="h2" { "Latest Alkanes Txs" }
+                            h2 class="h2" { "Latest Traces" }
                         a class="home-table-link" href=(latest_block_link) {
                             "View more alkane txs"
                             (icon_right())

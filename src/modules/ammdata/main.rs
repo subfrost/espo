@@ -1,45 +1,162 @@
-use super::schemas::SchemaPoolSnapshot;
-use super::storage::reserves_snapshot_key;
+use super::schemas::{
+    ActivityDirection, ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolSnapshot,
+    active_timeframes,
+};
+use super::storage::{decode_reserves_snapshot, encode_reserves_snapshot, reserves_snapshot_key};
+use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use super::utils::candles::CandleCache;
-use super::utils::trades::{TradeIndexAcc, TradeWriteAcc};
 use crate::alkanes::trace::EspoBlock;
-use crate::config::get_electrum_like;
-use crate::modules::ammdata::consts::ammdata_genesis_block;
-use crate::modules::ammdata::schemas::{SchemaMarketDefs, active_timeframes};
-use crate::modules::ammdata::storage::decode_reserves_snapshot;
-use crate::modules::ammdata::storage::encode_reserves_snapshot;
+use crate::config::{get_espo_db, get_network};
+use crate::modules::ammdata::consts::{ammdata_genesis_block, get_amm_contract};
 use crate::modules::ammdata::utils::candles::{price_base_per_quote, price_quote_per_base};
 use crate::modules::ammdata::utils::reserves::{
-    extract_new_pools_from_espo_transaction, extract_reserves_from_espo_transaction,
+    NewPoolInfo, extract_new_pools_from_espo_transaction,
 };
-
-use crate::modules::ammdata::utils::trades::create_trade_v1;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use crate::modules::essentials::storage::{
+    AlkaneBalanceTxEntry, alkane_balance_txs_by_height_key, load_creation_record,
+};
+use crate::modules::essentials::utils::balances::SignedU128;
+use crate::modules::essentials::utils::inspections::StoredInspectionResult;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
+use bitcoin::hashes::Hash;
+use borsh::BorshDeserialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::rpc::register_rpc;
-// NEW: live reserves util
-use crate::modules::ammdata::utils::live_reserves::fetch_latest_reserves_for_pools;
 
 /* ---------- module ---------- */
 
+const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
+const UPGRADEABLE_METHODS: [(&str, u128); 3] =
+    [("initialize", 32767), ("upgrade", 32766), ("forward", 36863)];
+const UPGRADEABLE_NAME: &str = "Upgradeable";
+const UPGRADEABLE_NAME_ALT: &str = "Upgradable";
+
+fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
+    let Some(meta) = inspection.metadata.as_ref() else { return false };
+    let name_matches = meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME)
+        || meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME_ALT);
+    if !name_matches {
+        return false;
+    }
+    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
+        meta.methods.iter().any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
+    })
+}
+
+fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
+    v.push(0x01);
+    v.extend_from_slice(&alk.block.to_be_bytes());
+    v.extend_from_slice(&alk.tx.to_be_bytes());
+    let len = u16::try_from(skey.len()).unwrap_or(u16::MAX);
+    v.extend_from_slice(&len.to_be_bytes());
+    if len as usize != skey.len() {
+        v.extend_from_slice(&skey[..(len as usize)]);
+    } else {
+        v.extend_from_slice(skey);
+    }
+    v
+}
+
+fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
+    if raw.len() < 32 {
+        return None;
+    }
+    let block_bytes: [u8; 16] = raw[0..16].try_into().ok()?;
+    let tx_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+    let block = u128::from_le_bytes(block_bytes);
+    let tx = u128::from_le_bytes(tx_bytes);
+    if block > u32::MAX as u128 || tx > u64::MAX as u128 {
+        return None;
+    }
+    Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
+}
+
+fn resolve_factory_target(
+    network: Network,
+    essentials_mdb: &Mdb,
+) -> Result<Option<SchemaAlkaneId>> {
+    let base = match get_amm_contract(network) {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+
+    if network != Network::Bitcoin {
+        return Ok(Some(base));
+    }
+
+    let key = kv_row_key(&base, KV_KEY_IMPLEMENTATION);
+    if let Some(raw) = essentials_mdb.get(&key)? {
+        let slice = if raw.len() >= 32 { &raw[32..] } else { raw.as_slice() };
+        if let Some(decoded) = decode_kv_implementation(slice) {
+            return Ok(Some(decoded));
+        }
+    }
+
+    let inspection = load_creation_record(essentials_mdb, &base)?.and_then(|rec| rec.inspection);
+    if let Some(inspection) = inspection.as_ref() {
+        if is_upgradeable_proxy(inspection) {
+            return Ok(Some(base));
+        }
+    }
+
+    Ok(Some(base))
+}
+
+fn signed_from_delta(delta: Option<&SignedU128>) -> i128 {
+    let Some(d) = delta else { return 0 };
+    let (neg, amt) = d.as_parts();
+    if neg { -(amt as i128) } else { amt as i128 }
+}
+
+fn apply_delta_u128(current: u128, delta: i128) -> u128 {
+    if delta >= 0 {
+        current.saturating_add(delta as u128)
+    } else {
+        current.saturating_sub((-delta) as u128)
+    }
+}
+
+fn load_balance_txs_by_height(
+    essentials_mdb: &Mdb,
+    height: u32,
+) -> Result<BTreeMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>> {
+    let key = alkane_balance_txs_by_height_key(height);
+    let Some(bytes) = essentials_mdb.get(&key)? else { return Ok(BTreeMap::new()) };
+    let parsed = BTreeMap::<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>::try_from_slice(&bytes)
+        .map_err(|e| anyhow!("failed to decode balance txs by height: {e}"))?;
+    Ok(parsed)
+}
+
 pub struct AmmData {
     mdb: Option<Arc<Mdb>>,
+    essentials_mdb: Option<Arc<Mdb>>,
     index_height: Arc<std::sync::RwLock<Option<u32>>>,
 }
 
 impl AmmData {
     pub fn new() -> Self {
-        Self { mdb: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
+        Self {
+            mdb: None,
+            essentials_mdb: None,
+            index_height: Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     #[inline]
     fn mdb(&self) -> &Mdb {
         self.mdb.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
+    }
+
+    #[inline]
+    fn essentials_mdb(&self) -> &Mdb {
+        self.essentials_mdb.as_ref().expect("Essentials DB must be initialized").as_ref()
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
@@ -86,6 +203,8 @@ impl EspoModule for AmmData {
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
         self.mdb = Some(mdb.clone());
+        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+        self.essentials_mdb = Some(Arc::new(essentials_mdb));
         match self.load_index_height() {
             Ok(h) => {
                 *self.index_height.write().unwrap() = h;
@@ -100,13 +219,11 @@ impl EspoModule for AmmData {
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
-        use bitcoin::consensus::deserialize;
-        use bitcoin::{Transaction, Txid};
-        use std::collections::{HashMap, HashSet};
-
         let block_ts = block.block_header.time as u64;
         let height = block.height;
-        println!("[AMMDATA] Indexing block #{height} for candles and trades...");
+        println!("[AMMDATA] Indexing block #{height} for candles and activity...");
+
+        let essentials_mdb = self.essentials_mdb();
 
         // ---- Load existing snapshot (single read) ----
         let mut reserves_snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
@@ -135,273 +252,183 @@ impl EspoModule for AmmData {
             );
         }
 
-        // Accumulators used in PASS 2
+        let network = get_network();
+        let base_factory = get_amm_contract(network).ok();
+        let factory_target = match resolve_factory_target(network, essentials_mdb) {
+            Ok(target) => target,
+            Err(e) => {
+                eprintln!("[AMMDATA] failed to resolve factory target: {e:?}");
+                None
+            }
+        };
+
         let mut candle_cache = CandleCache::new();
-        let mut trade_acc = TradeWriteAcc::new();
-        let mut index_acc = TradeIndexAcc::new();
-        let mut reserves_map_delta: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
+        let mut activity_acc = ActivityWriteAcc::new();
+        let mut index_acc = ActivityIndexAcc::new();
 
-        // -----------------------------------------------------------------------------------------
-        // PASS 1: discover new pools and collect prevout txids ONLY for txs with reserve changes
-        // -----------------------------------------------------------------------------------------
-        let mut need_prevouts_for_txids: HashSet<Txid> = HashSet::new();
-
+        // Discover new pools (per-tx) and record pool creation activity.
+        let mut seen_new_pools: HashSet<(u32, u64)> = HashSet::new();
         for transaction in block.transactions.iter() {
-            // skip tx without traces
             if transaction.traces.is_none() {
                 continue;
             }
 
-            // Discover newly created pools in this tx
             if let Ok(new_pools) = extract_new_pools_from_espo_transaction(transaction) {
-                for (_pid, defs) in new_pools {
-                    let pool = defs.pool_alkane_id;
-                    let base = defs.base_alkane_id;
-                    let quote = defs.quote_alkane_id;
+                for NewPoolInfo { pool_id, defs, factory_id } in new_pools {
+                    if !seen_new_pools.insert((pool_id.block, pool_id.tx)) {
+                        continue;
+                    }
 
-                    // extend maps/snapshot so later reserve events can resolve ids
-                    pools_map.insert(pool, defs);
-                    reserves_snapshot.entry(pool).or_insert(SchemaPoolSnapshot {
+                    let should_track = match factory_target {
+                        Some(factory) => match factory_id {
+                            Some(fid) => {
+                                let matches_base = base_factory.map(|b| b == fid).unwrap_or(false);
+                                fid == factory || matches_base
+                            }
+                            None => match load_creation_record(essentials_mdb, &pool_id)? {
+                                Some(rec) => rec
+                                    .inspection
+                                    .and_then(|i| i.factory_alkane)
+                                    .map(|id| id == factory)
+                                    .unwrap_or(true),
+                                None => true,
+                            },
+                        },
+                        None => {
+                            if let Some(fid) = factory_id {
+                                base_factory.map(|b| b == fid).unwrap_or(true)
+                            } else {
+                                true
+                            }
+                        }
+                    };
+
+                    if !should_track {
+                        continue;
+                    }
+
+                    pools_map.insert(pool_id, defs);
+                    reserves_snapshot.entry(pool_id).or_insert(SchemaPoolSnapshot {
                         base_reserve: 0,
                         quote_reserve: 0,
-                        base_id: base,
-                        quote_id: quote,
+                        base_id: defs.base_alkane_id,
+                        quote_id: defs.quote_alkane_id,
                     });
+
+                    let txid_bytes = transaction.transaction.compute_txid().to_byte_array();
+
+                    let activity = SchemaActivityV1 {
+                        timestamp: block_ts,
+                        txid: txid_bytes,
+                        kind: ActivityKind::PoolCreate,
+                        direction: None,
+                        base_delta: 0,
+                        quote_delta: 0,
+                    };
+
+                    if let Ok(seq) = activity_acc.push(pool_id, block_ts, activity.clone()) {
+                        index_acc.add(&pool_id, block_ts, seq, &activity);
+                    }
 
                     println!(
                         "[AMMDATA] New pool created @ block #{blk}, ts={ts}\n\
-                     [AMMDATA]   Pool:  {pb}:{pt}\n\
-                     [AMMDATA]   Base:  {bb}:{bt}\n\
-                     [AMMDATA]   Quote: {qb}:{qt}",
+                         [AMMDATA]   Pool:  {pb}:{pt}\n\
+                         [AMMDATA]   Base:  {bb}:{bt}\n\
+                         [AMMDATA]   Quote: {qb}:{qt}",
                         blk = block.height,
                         ts = block_ts,
-                        pb = pool.block,
-                        pt = pool.tx,
-                        bb = base.block,
-                        bt = base.tx,
-                        qb = quote.block,
-                        qt = quote.tx
-                    );
-                }
-            }
-
-            // Mark this tx's prevout txids only if it actually has reserve changes
-            match extract_reserves_from_espo_transaction(transaction, &pools_map) {
-                Ok(reserve_data_vec) if !reserve_data_vec.is_empty() => {
-                    let tx = &transaction.transaction;
-                    for inp in &tx.input {
-                        if inp.previous_output.is_null() {
-                            continue;
-                        } // coinbase
-                        need_prevouts_for_txids.insert(inp.previous_output.txid);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // -----------------------------------------------------------------------------------------
-        // One Electrum-like batch for the subset of prevout txids we actually need
-        // -----------------------------------------------------------------------------------------
-        let mut prevouts_subset: HashMap<Txid, Transaction> = HashMap::new();
-        if !need_prevouts_for_txids.is_empty() {
-            eprintln!(
-                "[AMMDATA] fetching prevouts subset via electrum/esplora: {} txids",
-                need_prevouts_for_txids.len()
-            );
-
-            let electrum = get_electrum_like();
-            let ids: Vec<Txid> = need_prevouts_for_txids.iter().copied().collect();
-
-            // Try batch first (raw, faster), then granular fallbacks for empties or errors.
-            match electrum.batch_transaction_get_raw(&ids) {
-                Ok(raws) => {
-                    for (i, raw) in raws.into_iter().enumerate() {
-                        let txid = ids[i];
-                        if raw.is_empty() {
-                            // fallback to single
-                            match electrum.transaction_get_raw(&txid) {
-                                Ok(raw2) if !raw2.is_empty() => {
-                                    if let Ok(tx) = deserialize::<Transaction>(&raw2) {
-                                        prevouts_subset.insert(txid, tx);
-                                    } else {
-                                        eprintln!(
-                                            "[AMMDATA] WARN: failed to deserialize prevout {txid} (single fallback)"
-                                        );
-                                    }
-                                }
-                                _ => eprintln!("[AMMDATA] WARN: missing prevout {txid}"),
-                            }
-                        } else if let Ok(tx) = deserialize::<Transaction>(&raw) {
-                            prevouts_subset.insert(txid, tx);
-                        } else {
-                            eprintln!(
-                                "[AMMDATA] WARN: failed to deserialize prevout {txid} (batch)"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[AMMDATA] WARN: electrum-like batch_transaction_get_raw failed: {e:?}; falling back per-tx"
-                    );
-                    for txid in ids {
-                        match electrum.transaction_get_raw(&txid) {
-                            Ok(raw) if !raw.is_empty() => {
-                                if let Ok(tx) = deserialize::<Transaction>(&raw) {
-                                    prevouts_subset.insert(txid, tx);
-                                } else {
-                                    eprintln!(
-                                        "[AMMDATA] WARN: failed to deserialize prevout {txid} (per-tx fallback)"
-                                    );
-                                }
-                            }
-                            _ => eprintln!("[AMMDATA] WARN: missing prevout {txid}"),
-                        }
-                    }
-                }
-            }
-        } else {
-            eprintln!("[AMMDATA] no reserve-change txs; skipping prevouts fetch");
-        }
-
-        // -----------------------------------------------------------------------------------------
-        // PASS 2: candles + trades + reserves deltas (use prevouts_subset)
-        // -----------------------------------------------------------------------------------------
-        for transaction in block.transactions.iter() {
-            if transaction.traces.is_none() {
-                continue;
-            }
-
-            match extract_reserves_from_espo_transaction(transaction, &pools_map) {
-                Ok(reserve_data_vec) if !reserve_data_vec.is_empty() => {
-                    for rd in reserve_data_vec {
-                        let pool_block_dec =
-                            u32::from_str_radix(rd.pool.block.trim_start_matches("0x"), 16)
-                                .unwrap_or_default();
-                        let pool_tx_dec =
-                            u64::from_str_radix(rd.pool.tx.trim_start_matches("0x"), 16)
-                                .unwrap_or_default();
-
-                        let pool_schema = SchemaAlkaneId { block: pool_block_dec, tx: pool_tx_dec };
-
-                        // Update snapshot delta (event-derived)
-                        if let Some(defs) = pools_map.get(&pool_schema) {
-                            reserves_map_delta.insert(
-                                pool_schema,
-                                SchemaPoolSnapshot {
-                                    base_reserve: rd.new_reserves.0,
-                                    quote_reserve: rd.new_reserves.1,
-                                    base_id: defs.base_alkane_id,
-                                    quote_id: defs.quote_alkane_id,
-                                },
-                            );
-                        }
-
-                        // Candles
-                        let (prev_base, prev_quote) = rd.prev_reserves;
-                        let (new_base, new_quote) = rd.new_reserves;
-                        let p_q_per_b = price_quote_per_base(new_base, new_quote);
-                        let p_b_per_q = price_base_per_quote(new_base, new_quote);
-                        let (vol_base_in, vol_quote_out) = rd.volume;
-
-                        candle_cache.apply_trade_for_frames(
-                            block_ts,
-                            pool_schema,
-                            &active_timeframes(),
-                            p_b_per_q,
-                            p_q_per_b,
-                            vol_base_in,
-                            vol_quote_out,
-                        );
-
-                        // Trades using the prevouts subset we fetched in Pass 1
-                        if let Some(full_trade) =
-                            create_trade_v1(block_ts, &prevouts_subset, transaction, &rd)
-                        {
-                            if let Ok(seq) =
-                                trade_acc.push(pool_schema, block_ts, full_trade.clone())
-                            {
-                                index_acc.add(&pool_schema, block_ts, seq, &full_trade);
-                            }
-                        }
-
-                        // Pretty logs
-                        let d_base = (new_base as i128) - (prev_base as i128);
-                        let d_quote = (new_quote as i128) - (prev_quote as i128);
-                        let k_ratio_str = rd
-                            .k_ratio_approx
-                            .map(|r| format!("{:.6}", r))
-                            .unwrap_or_else(|| "n/a".into());
-                        let p_bq_str = if new_quote != 0 {
-                            format!("{:.12}", (new_base as f64) / (new_quote as f64))
-                        } else {
-                            "n/a".into()
-                        };
-                        let p_qb_str = if new_base != 0 {
-                            format!("{:.12}", (new_quote as f64) / (new_base as f64))
-                        } else {
-                            "n/a".into()
-                        };
-
-                        println!(
-                            "[AMMDATA] Trade detected in pool {pool}:{tx} @ block #{blk}, ts={ts}\n\
-                         [AMMDATA]   Δ: [base={d_base}, quote={d_quote}]  prev[{p0},{p1}] -> new[{n0},{n1}] | K≈{k}\n\
-                         [AMMDATA]   Prices: base→quote={pbq} | quote→base={pqb}  Volume: base_in={vbin}, quote_out={vqout}",
-                            pool = pool_block_dec,
-                            tx = pool_tx_dec,
-                            blk = block.height,
-                            ts = block_ts,
-                            d_base = d_base,
-                            d_quote = d_quote,
-                            p0 = prev_base,
-                            p1 = prev_quote,
-                            n0 = new_base,
-                            n1 = new_quote,
-                            k = k_ratio_str,
-                            pbq = p_bq_str,
-                            pqb = p_qb_str,
-                            vbin = vol_base_in,
-                            vqout = vol_quote_out
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Tip override: pull live reserves and merge
-        if block.is_latest {
-            eprintln!("[AMMDATA] is_latest=true -> fetching live reserves from Metashrew…");
-            match fetch_latest_reserves_for_pools(&pools_map) {
-                Ok(live) => {
-                    for (pool, snap) in live {
-                        reserves_snapshot.insert(pool, snap.clone());
-                        reserves_map_delta.insert(pool, snap);
-                    }
-                    eprintln!("[AMMDATA] live reserves applied for {} pools", pools_map.len());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[AMMDATA] live reserves fetch failed: {e:?} (keeping event-derived state)"
+                        pb = pool_id.block,
+                        pt = pool_id.tx,
+                        bb = defs.base_alkane_id.block,
+                        bt = defs.base_alkane_id.tx,
+                        qb = defs.quote_alkane_id.block,
+                        qt = defs.quote_alkane_id.tx
                     );
                 }
             }
         }
 
-        // ---------- one atomic DB write (candles + trades + indexes + reserves snapshot) ----------
+        let balance_txs = match load_balance_txs_by_height(essentials_mdb, height) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[AMMDATA] failed to load balance txs for height {height}: {e:?}");
+                BTreeMap::new()
+            }
+        };
+
+        // Apply balance deltas per pool and emit activity + candles.
+        for (owner, entries) in balance_txs {
+            let Some(defs) = pools_map.get(&owner) else { continue };
+            let Some(snapshot) = reserves_snapshot.get_mut(&owner) else { continue };
+
+            for entry in entries {
+                let base_delta = signed_from_delta(entry.outflow.get(&defs.base_alkane_id));
+                let quote_delta = signed_from_delta(entry.outflow.get(&defs.quote_alkane_id));
+                if base_delta == 0 && quote_delta == 0 {
+                    continue;
+                }
+
+                let prev_base = snapshot.base_reserve;
+                let prev_quote = snapshot.quote_reserve;
+                let new_base = apply_delta_u128(prev_base, base_delta);
+                let new_quote = apply_delta_u128(prev_quote, quote_delta);
+                snapshot.base_reserve = new_base;
+                snapshot.quote_reserve = new_quote;
+
+                let (kind, direction) = match (base_delta.signum(), quote_delta.signum()) {
+                    (1, -1) => (ActivityKind::TradeSell, Some(ActivityDirection::BaseIn)),
+                    (-1, 1) => (ActivityKind::TradeBuy, Some(ActivityDirection::QuoteIn)),
+                    (1, 1) => (ActivityKind::LiquidityAdd, None),
+                    (-1, -1) => (ActivityKind::LiquidityRemove, None),
+                    _ => continue,
+                };
+
+                let activity = SchemaActivityV1 {
+                    timestamp: block_ts,
+                    txid: entry.txid,
+                    kind,
+                    direction,
+                    base_delta,
+                    quote_delta,
+                };
+
+                if let Ok(seq) = activity_acc.push(owner, block_ts, activity.clone()) {
+                    index_acc.add(&owner, block_ts, seq, &activity);
+                }
+
+                if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
+                    let p_q_per_b = price_quote_per_base(new_base, new_quote);
+                    let p_b_per_q = price_base_per_quote(new_base, new_quote);
+                    let base_in = if base_delta > 0 { base_delta as u128 } else { 0 };
+                    let quote_out = if quote_delta < 0 { (-quote_delta) as u128 } else { 0 };
+
+                    candle_cache.apply_trade_for_frames(
+                        block_ts,
+                        owner,
+                        &active_timeframes(),
+                        p_b_per_q,
+                        p_q_per_b,
+                        base_in,
+                        quote_out,
+                    );
+                }
+            }
+        }
+
+        // ---------- one atomic DB write (candles + activity + indexes + reserves snapshot) ----------
         let candle_writes = candle_cache.into_writes(self.mdb())?;
-        let trade_writes = trade_acc.into_writes();
+        let activity_writes = activity_acc.into_writes();
         let idx_delta = index_acc.clone().per_pool_delta();
+        let idx_group_delta = index_acc.clone().per_pool_group_delta();
         let mut index_writes = index_acc.into_writes();
 
         // Update per-pool index counts
         for ((blk_id, tx_id), delta) in idx_delta {
             let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
-            let count_k_rel = crate::modules::ammdata::utils::trades::idx_count_key(&pool);
+            let count_k_rel = crate::modules::ammdata::utils::activity::idx_count_key(&pool);
 
             let current = if let Some(v) = self.mdb().get(&count_k_rel)? {
-                crate::modules::ammdata::utils::trades::decode_u64_be(&v).unwrap_or(0)
+                crate::modules::ammdata::utils::activity::decode_u64_be(&v).unwrap_or(0)
             } else {
                 0u64
             };
@@ -409,31 +436,44 @@ impl EspoModule for AmmData {
 
             index_writes.push((
                 count_k_rel,
-                crate::modules::ammdata::utils::trades::encode_u64_be(newv).to_vec(),
+                crate::modules::ammdata::utils::activity::encode_u64_be(newv).to_vec(),
+            ));
+        }
+        for ((blk_id, tx_id, group), delta) in idx_group_delta {
+            let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
+            let count_k_rel =
+                crate::modules::ammdata::utils::activity::idx_count_key_group(&pool, group);
+
+            let current = if let Some(v) = self.mdb().get(&count_k_rel)? {
+                crate::modules::ammdata::utils::activity::decode_u64_be(&v).unwrap_or(0)
+            } else {
+                0u64
+            };
+            let newv = current.saturating_add(delta);
+
+            index_writes.push((
+                count_k_rel,
+                crate::modules::ammdata::utils::activity::encode_u64_be(newv).to_vec(),
             ));
         }
 
-        // Merge deltas into snapshot & serialize
-        for (pool, latest) in reserves_map_delta.into_iter() {
-            reserves_snapshot.insert(pool, latest);
-        }
         let reserves_blob = encode_reserves_snapshot(&reserves_snapshot)?;
         let reserves_key_rel = reserves_snapshot_key();
 
         let c_cnt = candle_writes.len();
-        let t_cnt = trade_writes.len();
+        let a_cnt = activity_writes.len();
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, trades={t_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
-            t_cnt = t_cnt,
+            a_cnt = a_cnt,
             i_cnt = i_cnt,
         );
 
         if !candle_writes.is_empty()
-            || !trade_writes.is_empty()
+            || !activity_writes.is_empty()
             || !index_writes.is_empty()
             || !reserves_blob.is_empty()
         {
@@ -447,7 +487,7 @@ impl EspoModule for AmmData {
                     };
                     wb.put(k_rel, v);
                 }
-                for (k_rel, v) in trade_writes.iter() {
+                for (k_rel, v) in activity_writes.iter() {
                     wb.put(k_rel, v);
                 }
                 for (k_rel, v) in index_writes.iter() {

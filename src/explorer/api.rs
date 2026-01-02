@@ -5,7 +5,10 @@ use serde::Serialize;
 
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height, get_metashrew_rpc_url};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
-use crate::modules::essentials::storage::trace_count_key;
+use crate::modules::essentials::storage::{
+    alkane_name_index_prefix, parse_alkane_name_index_key, trace_count_key,
+};
+use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
@@ -23,7 +26,7 @@ use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -123,11 +126,15 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
     let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
+    let mut seen_alkanes: HashSet<SchemaAlkaneId> = HashSet::new();
     let mut blocks: Vec<SearchGuessItem> = Vec::new();
     let mut alkanes: Vec<SearchGuessItem> = Vec::new();
     let mut txid: Vec<SearchGuessItem> = Vec::new();
 
-    let mut push_alkane_item = |alk: &SchemaAlkaneId| {
+    let mut push_alkane_item = |alk: &SchemaAlkaneId| -> bool {
+        if !seen_alkanes.insert(*alk) {
+            return false;
+        }
         let meta = alkane_meta(alk, &mut meta_cache, &essentials_mdb);
         let id = format!("{}:{}", alk.block, alk.tx);
         let known = meta.name.known;
@@ -141,7 +148,27 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             icon_url,
             fallback_letter: Some(meta.name.fallback_letter().to_string()),
         });
+        true
     };
+
+    if let Some(query_norm) = normalize_alkane_name(&query) {
+        let prefix = alkane_name_index_prefix(&query_norm);
+        let mut matches = 0usize;
+        for res in essentials_mdb.iter_from(&prefix) {
+            let Ok((k, _)) = res else { continue };
+            let rel = &k[essentials_mdb.prefix().len()..];
+            if !rel.starts_with(&prefix) {
+                break;
+            }
+            let Some((_name, alk)) = parse_alkane_name_index_key(rel) else { continue };
+            if push_alkane_item(&alk) {
+                matches += 1;
+                if matches >= 5 {
+                    break;
+                }
+            }
+        }
+    }
 
     if let Ok(height) = query.parse::<u64>() {
         let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
@@ -156,12 +183,12 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
         if height <= u32::MAX as u64 {
             let alk = SchemaAlkaneId { block: height as u32, tx: 0 };
-            push_alkane_item(&alk);
+            let _ = push_alkane_item(&alk);
         }
     }
 
     if let Some(alk) = parse_alkane_id(&query) {
-        push_alkane_item(&alk);
+        let _ = push_alkane_item(&alk);
     }
 
     if query.chars().all(|c| c.is_ascii_hexdigit()) {

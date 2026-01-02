@@ -118,6 +118,45 @@ pub fn alkane_info_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
     key.extend_from_slice(&alkane.tx.to_be_bytes());
     key
 }
+
+// /alkanes/name/{name}/{alkane block:u32be}{tx:u64be}
+pub fn alkane_name_index_key(name: &str, alkane: &SchemaAlkaneId) -> Vec<u8> {
+    let mut key = b"/alkanes/name/".to_vec();
+    key.extend_from_slice(name.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(&alkane.block.to_be_bytes());
+    key.extend_from_slice(&alkane.tx.to_be_bytes());
+    key
+}
+
+pub fn alkane_name_index_prefix(name_prefix: &str) -> Vec<u8> {
+    let mut key = b"/alkanes/name/".to_vec();
+    key.extend_from_slice(name_prefix.as_bytes());
+    key
+}
+
+pub fn parse_alkane_name_index_key(key: &[u8]) -> Option<(String, SchemaAlkaneId)> {
+    let prefix = b"/alkanes/name/";
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    let rest = &key[prefix.len()..];
+    let split = rest.iter().rposition(|b| *b == b'/')?;
+    let name_bytes = &rest[..split];
+    let id_bytes = &rest[split + 1..];
+    if id_bytes.len() != 12 {
+        return None;
+    }
+    let mut block_arr = [0u8; 4];
+    block_arr.copy_from_slice(&id_bytes[..4]);
+    let mut tx_arr = [0u8; 8];
+    tx_arr.copy_from_slice(&id_bytes[4..12]);
+    let name = String::from_utf8(name_bytes.to_vec()).ok()?;
+    Some((
+        name,
+        SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) },
+    ))
+}
 // /alkanes/creation/id/{alkane block:u32be}{tx:u64be}
 pub fn alkane_creation_by_id_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
     let mut key = b"/alkanes/creation/id/".to_vec();

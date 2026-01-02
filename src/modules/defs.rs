@@ -154,21 +154,37 @@ impl ModuleRegistry {
     where
         M: EspoModule + 'static,
     {
+        let name = module.get_name();
+        if self.modules.is_empty() {
+            if name != "essentials" {
+                panic!("ModuleRegistry requires essentials to be registered first (got {name})");
+            }
+        } else if name == "essentials" {
+            panic!("ModuleRegistry requires essentials to be registered before any other modules");
+        } else if self
+            .modules
+            .first()
+            .map(|m| m.get_name() != "essentials")
+            .unwrap_or(true)
+        {
+            panic!("ModuleRegistry requires essentials to be registered first");
+        }
+
         // --- Mdb prefix like "ammdata:" ---
-        let mut prefix_kv = Vec::with_capacity(module.get_name().len() + 1);
-        prefix_kv.extend_from_slice(module.get_name().as_bytes());
+        let mut prefix_kv = Vec::with_capacity(name.len() + 1);
+        prefix_kv.extend_from_slice(name.as_bytes());
         prefix_kv.push(b':');
 
         let mdb = Arc::new(Mdb::from_db_with_aof(
             self.module_db.clone(),
             prefix_kv,
             self.aof.clone(),
-            Some(module.get_name().to_string()),
+            Some(name.to_string()),
         ));
         module.set_mdb(mdb);
 
         // --- RPC prefix like "ammdata." ---
-        let ns = RpcNsRegistrar::new(self.router.clone(), module.get_name());
+        let ns = RpcNsRegistrar::new(self.router.clone(), name);
 
         let m = Arc::new(module);
         m.register_rpc(&ns);
