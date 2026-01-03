@@ -46,7 +46,8 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         inner
     } else {
         // Nest all routes under base path and add redirect from / to base path
-        let redirect_path = format!("{}/", base_path);
+        // Note: redirect to base_path without trailing slash (Axum nested routes match without trailing slash)
+        let redirect_path = base_path.clone();
         Router::new()
             .route("/", get(move || async move { Redirect::permanent(&redirect_path) }))
             .nest(&base_path, inner)
