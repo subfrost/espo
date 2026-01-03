@@ -1,14 +1,16 @@
 use axum::extract::State;
 use axum::response::Html;
-use bitcoin::{Network, Txid};
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use bitcoin::hashes::Hash;
+use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 use borsh::BorshDeserialize;
 use maud::{Markup, html};
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::str::FromStr;
 
-use crate::alkanes::trace::{EspoTrace, get_espo_block};
+use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_espo_next_height};
-use crate::consts::alkanes_genesis_block;
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::icon_right;
@@ -16,16 +18,15 @@ use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::storage::{
-    HoldersCountEntry, alkane_creation_ordered_prefix, decode_creation_record, holders_count_key,
+    AlkaneTxSummary, HoldersCountEntry, alkane_creation_ordered_prefix, alkane_latest_traces_key,
+    alkane_tx_summary_key, decode_creation_record, holders_count_key,
 };
-use crate::runtime::mempool::{decode_seen_key, get_mempool_mdb, get_tx_from_mempool};
+use crate::schemas::EspoOutpoint;
 
 struct AlkaneTxRow {
     txid: Txid,
     trace: EspoTrace,
 }
-
-const LATEST_TRACES_MAX_SEARCH_DEPTH_BLOCKS: u64 = 1;
 
 fn load_newest_alkanes(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<AlkaneTableRow> {
     let mut rows: Vec<AlkaneTableRow> = Vec::new();
@@ -81,65 +82,63 @@ fn load_newest_alkanes(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<Alka
     rows
 }
 
-fn load_latest_alkane_txs(espo_tip: u64, network: Network, limit: usize) -> Vec<AlkaneTxRow> {
+fn traces_from_summary(txid: &Txid, summary: &AlkaneTxSummary) -> Vec<EspoTrace> {
+    summary
+        .traces
+        .iter()
+        .filter_map(|trace| sandshrew_to_espo_trace(txid, trace))
+        .collect()
+}
+
+fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Option<EspoTrace> {
+    let (txid_hex, vout_s) = trace.outpoint.split_once(':')?;
+    let vout = vout_s.parse::<u32>().ok()?;
+    let trace_txid = Txid::from_str(txid_hex).unwrap_or(*txid);
+    Some(EspoTrace {
+        sandshrew_trace: trace.clone(),
+        protobuf_trace: AlkanesTrace::default(),
+        storage_changes: HashMap::new(),
+        outpoint: EspoOutpoint {
+            txid: trace_txid.to_byte_array().to_vec(),
+            vout,
+            tx_spent: None,
+        },
+    })
+}
+
+fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<AlkaneTxRow> {
     let mut out: Vec<AlkaneTxRow> = Vec::new();
     if limit == 0 {
         return out;
     }
 
-    let mut seen: HashSet<Txid> = HashSet::new();
-    let mdb = get_mempool_mdb();
-    let pref = mdb.prefixed(b"seen/");
-    for res in mdb.iter_prefix_rev(&pref) {
-        if out.len() >= limit {
-            break;
-        }
-        let Ok((k_full, _)) = res else { continue };
-        let rel = &k_full[mdb.prefix().len()..];
-        let Some((_, txid)) = decode_seen_key(rel) else { continue };
-        if !seen.insert(txid) {
-            continue;
-        }
-        if let Some(entry) = get_tx_from_mempool(&txid) {
-            if let Some(traces) = entry.traces.as_ref().filter(|t| !t.is_empty()) {
-                if let Some(first) = traces.first().cloned() {
-                    out.push(AlkaneTxRow { txid, trace: first });
-                }
-            }
-        }
-    }
-
-    if out.len() >= limit || espo_tip == 0 {
+    let list: Vec<[u8; 32]> = mdb
+        .get(alkane_latest_traces_key())
+        .ok()
+        .flatten()
+        .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
+        .unwrap_or_default();
+    if list.is_empty() {
         return out;
     }
 
-    let genesis = alkanes_genesis_block(network) as u64;
-    let mut height = espo_tip;
-    let mut depth = 0u64;
-    loop {
-        if out.len() >= limit || height < genesis || depth >= LATEST_TRACES_MAX_SEARCH_DEPTH_BLOCKS {
+    for txid_bytes in list {
+        if out.len() >= limit {
             break;
         }
-        if let Ok(block) = get_espo_block(height, espo_tip) {
-            for tx in block.transactions {
-                if out.len() >= limit {
-                    break;
-                }
-                let Some(traces) = tx.traces.as_ref().filter(|t| !t.is_empty()) else { continue };
-                let txid = tx.transaction.compute_txid();
-                if !seen.insert(txid) {
-                    continue;
-                }
-                if let Some(first) = traces.first().cloned() {
-                    out.push(AlkaneTxRow { txid, trace: first });
-                }
-            }
+        let Ok(txid) = Txid::from_slice(&txid_bytes) else { continue };
+        let summary = mdb
+            .get(&alkane_tx_summary_key(&txid.to_byte_array()))
+            .ok()
+            .flatten()
+            .and_then(|b| AlkaneTxSummary::try_from_slice(&b).ok());
+        let Some(summary) = summary else { continue };
+        let mut traces = traces_from_summary(&txid, &summary);
+        if traces.is_empty() {
+            continue;
         }
-        if height == genesis {
-            break;
-        }
-        height = height.saturating_sub(1);
-        depth = depth.saturating_add(1);
+        let trace = traces.remove(0);
+        out.push(AlkaneTxRow { txid, trace });
     }
 
     out
@@ -151,7 +150,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let latest_height = espo_tip.min(tip);
     let newest_alkanes = load_newest_alkanes(&state.essentials_mdb, 10);
-    let latest_alkane_txs = load_latest_alkane_txs(espo_tip, state.network, 4);
+    let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
     let latest_block_link = format!("/block/{espo_tip}?traces=1");
     let alkanes_link = "/alkanes";
 

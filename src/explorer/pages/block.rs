@@ -1,15 +1,20 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
+use borsh::BorshDeserialize;
 use maud::html;
 use serde::Deserialize;
 
 use crate::alkanes::trace::{
-    EspoTrace, GetEspoBlockOpts, get_espo_block_with_opts, traces_for_block_as_prost,
+    EspoSandshrewLikeTrace, EspoTrace, GetEspoBlockOpts, get_espo_block_with_opts,
+    traces_for_block_as_prost,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
@@ -26,8 +31,12 @@ use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent,
+    OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
+use crate::modules::essentials::storage::{
+    AlkaneTxSummary, alkane_block_len_key, alkane_block_txid_key, alkane_tx_summary_key,
+};
+use crate::schemas::EspoOutpoint;
 
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
@@ -60,6 +69,36 @@ pub struct BlockPageQuery {
     pub page: Option<usize>,
     pub limit: Option<usize>,
     pub traces: Option<String>,
+}
+
+struct BlockTxItem {
+    txid: Txid,
+    tx: Transaction,
+    traces: Option<Vec<EspoTrace>>,
+}
+
+fn traces_from_summary(txid: &Txid, summary: &AlkaneTxSummary) -> Vec<EspoTrace> {
+    summary
+        .traces
+        .iter()
+        .filter_map(|trace| sandshrew_to_espo_trace(txid, trace))
+        .collect()
+}
+
+fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Option<EspoTrace> {
+    let (txid_hex, vout_s) = trace.outpoint.split_once(':')?;
+    let vout = vout_s.parse::<u32>().ok()?;
+    let trace_txid = Txid::from_str(txid_hex).unwrap_or(*txid);
+    Some(EspoTrace {
+        sandshrew_trace: trace.clone(),
+        protobuf_trace: AlkanesTrace::default(),
+        storage_changes: HashMap::new(),
+        outpoint: EspoOutpoint {
+            txid: trace_txid.to_byte_array().to_vec(),
+            vout,
+            tx_spent: None,
+        },
+    })
 }
 
 pub async fn block_page(
@@ -97,9 +136,8 @@ pub async fn block_page(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
 
-    let espo_block = if espo_indexed {
-        let opts = if traces_only { None } else { Some(GetEspoBlockOpts { page, limit }) };
-        match get_espo_block_with_opts(height, nav_tip, opts) {
+    let espo_block = if espo_indexed && !traces_only {
+        match get_espo_block_with_opts(height, nav_tip, Some(GetEspoBlockOpts { page, limit })) {
             Ok(b) => Some(b),
             Err(e) => {
                 return layout(
@@ -115,35 +153,104 @@ pub async fn block_page(
     let mempool_url = mempool_block_url(network, &block_hash);
 
     let mut tx_total = 0usize;
-    let mut tx_items = Vec::new();
+    let mut tx_items: Vec<BlockTxItem> = Vec::new();
     let mut tx_has_prev = false;
     let mut tx_has_next = false;
     let mut display_start = 0usize;
     let mut display_end = 0usize;
     let mut last_page = 1usize;
     let traces_param = if traces_only { "1" } else { "0" };
-    if let Some(espo_block) = espo_block.clone() {
+
+    if espo_indexed {
         if traces_only {
-            let mut txs = espo_block.transactions;
-            txs.retain(|t| t.traces.as_ref().map_or(false, |v| !v.is_empty()));
-            tx_total = txs.len();
+            let total = state
+                .essentials_mdb
+                .get(&alkane_block_len_key(height))
+                .ok()
+                .flatten()
+                .and_then(|b| {
+                    if b.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&b);
+                        Some(u64::from_le_bytes(arr) as usize)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            tx_total = total;
             let off = limit.saturating_mul(page.saturating_sub(1));
             let end = (off + limit).min(tx_total);
             tx_has_prev = page > 1;
             tx_has_next = end < tx_total;
-            tx_items = txs.into_iter().skip(off).take(limit).collect();
             if tx_total > 0 && off < tx_total {
                 display_start = off + 1;
-                display_end = (off + tx_items.len()).min(tx_total);
+                display_end = (off + end.saturating_sub(off)).min(tx_total);
                 last_page = (tx_total + limit - 1) / limit;
             }
-        } else {
+
+            if end > off {
+                let mut txid_keys: Vec<Vec<u8>> = Vec::new();
+                for idx in off..end {
+                    txid_keys.push(alkane_block_txid_key(height, idx as u64));
+                }
+                let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
+                let mut txids: Vec<Txid> = Vec::new();
+                for v in txid_vals {
+                    let Some(bytes) = v else { continue };
+                    if bytes.len() != 32 {
+                        continue;
+                    }
+                    if let Ok(txid) = Txid::from_slice(&bytes) {
+                        txids.push(txid);
+                    }
+                }
+
+                let summary_keys: Vec<Vec<u8>> = txids
+                    .iter()
+                    .map(|t| alkane_tx_summary_key(&t.to_byte_array()))
+                    .collect();
+                let summary_vals =
+                    state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
+
+                let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+                for (idx, txid) in txids.iter().enumerate() {
+                    let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let Ok(tx) = deserialize::<Transaction>(&raw) else {
+                        continue;
+                    };
+                    let summary = summary_vals
+                        .get(idx)
+                        .and_then(|v| v.as_ref())
+                        .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                    let traces = summary
+                        .as_ref()
+                        .map(|s| traces_from_summary(txid, s))
+                        .filter(|t| !t.is_empty());
+                    tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                }
+                if tx_total > 0 && off < tx_total {
+                    display_end = (off + tx_items.len()).min(tx_total);
+                }
+            }
+        } else if let Some(espo_block) = espo_block.clone() {
             tx_total = espo_block.tx_count;
             let off = limit.saturating_mul(page.saturating_sub(1));
             let end = (off + limit).min(tx_total);
             tx_has_prev = page > 1;
             tx_has_next = end < tx_total;
-            tx_items = espo_block.transactions;
+            tx_items = espo_block
+                .transactions
+                .into_iter()
+                .map(|atx| BlockTxItem {
+                    txid: atx.transaction.compute_txid(),
+                    tx: atx.transaction,
+                    traces: atx.traces,
+                })
+                .collect();
             if tx_total > 0 {
                 display_start = off + 1;
                 display_end = (off + tx_items.len()).min(tx_total);
@@ -152,11 +259,20 @@ pub async fn block_page(
         }
     }
 
-    let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
-        get_outpoint_balances_with_spent(&state.essentials_mdb, txid, vout).unwrap_or_default()
+    let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+    for item in &tx_items {
+        for (vout, _) in item.tx.output.iter().enumerate() {
+            all_outpoints.push((item.txid, vout as u32));
+        }
+    }
+    let outpoint_map =
+        get_outpoint_balances_with_spent_batch(&state.essentials_mdb, &all_outpoints)
+            .unwrap_or_default();
+    let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
+        outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };
     let outspends_map: std::collections::HashMap<Txid, Vec<Option<Txid>>> = {
-        let mut dedup: Vec<Txid> = tx_items.iter().map(|t| t.transaction.compute_txid()).collect();
+        let mut dedup: Vec<Txid> = tx_items.iter().map(|t| t.txid).collect();
         dedup.sort();
         dedup.dedup();
         let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();
@@ -169,8 +285,8 @@ pub async fn block_page(
     let mut prev_map: HashMap<Txid, Transaction> = HashMap::new();
     if !tx_items.is_empty() {
         let mut prev_txids: Vec<Txid> = Vec::new();
-        for atx in &tx_items {
-            for vin in &atx.transaction.input {
+        for item in &tx_items {
+            for vin in &item.tx.input {
                 if !vin.previous_output.is_null() {
                     prev_txids.push(vin.previous_output.txid);
                 }
@@ -319,10 +435,9 @@ pub async fn block_page(
                         tone: TxPillTone::Success,
                     };
                     div class="list" {
-                        @for atx in tx_items {
-                            @let txid = atx.transaction.compute_txid();
-                            @let traces: Option<&[EspoTrace]> = atx.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&txid, &atx.transaction, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true))
+                        @for item in tx_items {
+                            @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true))
                         }
                     }
                 }

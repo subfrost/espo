@@ -96,20 +96,13 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub view_only: bool,
 
-    #[arg(short, long, default_value = "./db/tmp")]
-    pub tmp_dbs_dir: String,
-
-    /// Path for ESPO module DB (RocksDB dir). Will be created if missing.
-    #[arg(long, default_value = "./db/espo")]
-    pub espo_db_path: String,
+    /// Base directory for ESPO databases (espo/tmp/aof subdirs).
+    #[arg(long, default_value = "./db")]
+    pub db_path: String,
 
     /// Enable append-only file logging for module namespaces (reorg protection).
     #[arg(long, default_value_t = false)]
     pub enable_aof: bool,
-
-    /// Directory for the AOF journal (separate from RocksDB).
-    #[arg(long, default_value = "./db/aof")]
-    pub aof_db_path: String,
 
     #[arg(short, long, default_value_t = 5000)]
     pub sdb_poll_ms: u16,
@@ -160,32 +153,41 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
         anyhow::bail!("metashrew_rpc_url must be provided");
     }
 
-    let tmp = Path::new(&args.tmp_dbs_dir);
-    if !tmp.exists() {
-        fs::create_dir_all(tmp).map_err(|e| {
-            anyhow::anyhow!("Failed to create tmp_dbs_dir {}: {e}", args.tmp_dbs_dir)
+    let db_root = Path::new(&args.db_path);
+    if !db_root.exists() {
+        fs::create_dir_all(db_root).map_err(|e| {
+            anyhow::anyhow!("Failed to create db_path {}: {e}", args.db_path)
         })?;
-    } else if !tmp.is_dir() {
-        anyhow::bail!("Temporary dbs dir is not a directory: {}", args.tmp_dbs_dir);
+    } else if !db_root.is_dir() {
+        anyhow::bail!("db_path is not a directory: {}", args.db_path);
     }
 
-    let espo_dir = Path::new(&args.espo_db_path);
+    let tmp = db_root.join("tmp");
+    if !tmp.exists() {
+        fs::create_dir_all(&tmp).map_err(|e| {
+            anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display())
+        })?;
+    } else if !tmp.is_dir() {
+        anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
+    }
+
+    let espo_dir = db_root.join("espo");
     if !espo_dir.exists() {
-        fs::create_dir_all(espo_dir).map_err(|e| {
-            anyhow::anyhow!("Failed to create espo_db_path {}: {e}", args.espo_db_path)
+        fs::create_dir_all(&espo_dir).map_err(|e| {
+            anyhow::anyhow!("Failed to create espo db dir {}: {e}", espo_dir.display())
         })?;
     } else if !espo_dir.is_dir() {
-        anyhow::bail!("espo_db_path is not a directory: {}", args.espo_db_path);
+        anyhow::bail!("espo db dir is not a directory: {}", espo_dir.display());
     }
 
     if args.enable_aof {
-        let aof_dir = Path::new(&args.aof_db_path);
+        let aof_dir = db_root.join("aof");
         if !aof_dir.exists() {
-            fs::create_dir_all(aof_dir).map_err(|e| {
-                anyhow::anyhow!("Failed to create aof_db_path {}: {e}", args.aof_db_path)
+            fs::create_dir_all(&aof_dir).map_err(|e| {
+                anyhow::anyhow!("Failed to create aof db dir {}: {e}", aof_dir.display())
             })?;
         } else if !aof_dir.is_dir() {
-            anyhow::bail!("aof_db_path is not a directory: {}", args.aof_db_path);
+            anyhow::bail!("aof db dir is not a directory: {}", aof_dir.display());
         }
     }
 
@@ -264,13 +266,15 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
     espo_opts.create_if_missing(true);
-    let espo_db = std::sync::Arc::new(DB::open(&espo_opts, &args.espo_db_path)?);
+    let espo_path = Path::new(&args.db_path).join("espo");
+    let espo_db = std::sync::Arc::new(DB::open(&espo_opts, espo_path)?);
     ESPO_DB
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
 
     if args.enable_aof {
-        let mgr = AofManager::new(espo_db.clone(), &args.aof_db_path, AOF_REORG_DEPTH)?;
+        let aof_path = Path::new(&args.db_path).join("aof");
+        let mgr = AofManager::new(espo_db.clone(), aof_path, AOF_REORG_DEPTH)?;
         AOF_MANAGER
             .set(std::sync::Arc::new(mgr))
             .map_err(|_| anyhow::anyhow!("AOF manager already initialized"))?;
@@ -331,8 +335,11 @@ pub fn get_metashrew_sdb() -> std::sync::Arc<SDB> {
 }
 
 /// Getter for the ESPO module DB path (directory for RocksDB)
-pub fn get_espo_db_path() -> &'static str {
-    &get_config().espo_db_path
+pub fn get_espo_db_path() -> String {
+    Path::new(&get_config().db_path)
+        .join("espo")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Cloneable handle to the global ESPO RocksDB

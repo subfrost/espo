@@ -1,3 +1,4 @@
+use crate::alkanes::trace::EspoSandshrewLikeTrace;
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 use crate::modules::essentials::utils::balances::SignedU128;
 use crate::runtime::mdb::Mdb;
@@ -35,6 +36,14 @@ pub struct AlkaneBalanceTxEntry {
     pub txid: [u8; 32],
     pub height: u32,
     pub outflow: BTreeMap<SchemaAlkaneId, SignedU128>,
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct AlkaneTxSummary {
+    pub txid: [u8; 32],
+    pub traces: Vec<EspoSandshrewLikeTrace>,
+    pub outflows: Vec<AlkaneBalanceTxEntry>,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -275,6 +284,46 @@ pub fn alkane_creation_ordered_prefix() -> &'static [u8] {
 
 pub fn alkane_creation_count_key() -> &'static [u8] {
     b"/alkanes/creation/count"
+}
+
+pub fn alkane_tx_summary_key(txid: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"/alkane_tx_summary/".to_vec();
+    k.extend_from_slice(txid);
+    k
+}
+
+pub fn alkane_block_txid_key(height: u64, idx: u64) -> Vec<u8> {
+    let mut k = b"/alkane_block/".to_vec();
+    k.extend_from_slice(&height.to_be_bytes());
+    k.push(b'/');
+    k.extend_from_slice(&idx.to_be_bytes());
+    k
+}
+
+pub fn alkane_block_len_key(height: u64) -> Vec<u8> {
+    let mut k = b"/alkane_block/".to_vec();
+    k.extend_from_slice(&height.to_be_bytes());
+    k.extend_from_slice(b"/length");
+    k
+}
+
+pub fn alkane_address_txid_key(addr: &str, idx: u64) -> Vec<u8> {
+    let mut k = b"/alkane_addr/".to_vec();
+    k.extend_from_slice(addr.as_bytes());
+    k.push(b'/');
+    k.extend_from_slice(&idx.to_be_bytes());
+    k
+}
+
+pub fn alkane_address_len_key(addr: &str) -> Vec<u8> {
+    let mut k = b"/alkane_addr/".to_vec();
+    k.extend_from_slice(addr.as_bytes());
+    k.extend_from_slice(b"/length");
+    k
+}
+
+pub fn alkane_latest_traces_key() -> &'static [u8] {
+    b"/alkane_latest_traces"
 }
 // /outpoint_addr/{borsh(EspoOutpoint)} -> address (utf8)
 pub fn outpoint_addr_key(outp: &EspoOutpoint) -> Result<Vec<u8>> {

@@ -186,18 +186,18 @@ fn protostone_json(tx: &Transaction) -> Option<Value> {
                 .into_iter()
                 .map(|e| {
                     json!({
-                        "id": { "block": e.id.block, "tx": e.id.tx },
-                        "amount": e.amount,
-                        "output": e.output,
+                        "id": { "block": e.id.block.to_string(), "tx": e.id.tx.to_string() },
+                        "amount": e.amount.to_string(),
+                        "output": e.output.to_string(),
                     })
                 })
                 .collect();
             json!({
-                "protocol_tag": p.protocol_tag,
-                "burn": p.burn,
-                "pointer": p.pointer,
-                "refund": p.refund,
-                "from": p.from,
+                "protocol_tag": p.protocol_tag.to_string(),
+                "burn": p.burn.map(|v| v.to_string()),
+                "pointer": p.pointer.map(|v| v.to_string()),
+                "refund": p.refund.map(|v| v.to_string()),
+                "from": p.from.map(|v| v.to_string()),
                 "message_hex": hex::encode(&p.message),
                 "message_utf8": utf8,
                 "edicts": edicts,
@@ -941,8 +941,13 @@ fn render_op_return(
     let trace_views: Vec<(String, Option<Value>)> = traces
         .iter()
         .map(|t| {
-            let raw = prettyify_protobuf_trace_json(&t.protobuf_trace)
-                .unwrap_or_else(|_| "[]".to_string());
+            let raw = if t.protobuf_trace.events.is_empty() {
+                serde_json::to_string_pretty(&t.sandshrew_trace.events)
+                    .unwrap_or_else(|_| "[]".to_string())
+            } else {
+                prettyify_protobuf_trace_json(&t.protobuf_trace)
+                    .unwrap_or_else(|_| "[]".to_string())
+            };
             let parsed = serde_json::from_str::<Value>(&raw).ok();
             (raw, parsed)
         })

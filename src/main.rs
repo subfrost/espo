@@ -352,9 +352,15 @@ async fn main() -> Result<()> {
 
     // Optional SSR explorer server
     if let Some(explorer_addr) = cfg.explorer_host {
-        tokio::spawn(async move {
+        let explorer_handle = tokio::spawn(async move {
             if let Err(e) = run_explorer(explorer_addr).await {
                 eprintln!("[explorer] server error: {e:?}");
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(err) = explorer_handle.await {
+                eprintln!("[explorer] task panicked: {err:?}");
+                std::process::abort();
             }
         });
         eprintln!("[explorer] listening on {}", explorer_addr);
@@ -396,7 +402,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    std::thread::spawn(move || {
+    let indexer_handle = std::thread::spawn(move || {
         let rt = TokioBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -410,6 +416,12 @@ async fn main() -> Result<()> {
             metashrew_sdb,
             cfg,
         ));
+    });
+    std::thread::spawn(move || {
+        if let Err(err) = indexer_handle.join() {
+            eprintln!("[indexer] thread panicked: {err:?}");
+            std::process::abort();
+        }
     });
 
     loop {

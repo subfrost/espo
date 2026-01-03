@@ -18,19 +18,20 @@ use bitcoin::{Transaction, Txid};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use protorune_support::utils::decode_varint_list;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::Cursor;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTrace {
     pub outpoint: String,
     pub events: Vec<EspoSandshrewLikeTraceEvent>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(tag = "event", content = "data")]
 pub enum EspoSandshrewLikeTraceEvent {
     #[serde(rename = "invoke")]
@@ -43,7 +44,7 @@ pub enum EspoSandshrewLikeTraceEvent {
     Create(EspoSandshrewLikeTraceShortId),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceInvokeData {
     #[serde(rename = "type")]
     pub typ: String,
@@ -51,7 +52,7 @@ pub struct EspoSandshrewLikeTraceInvokeData {
     pub fuel: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceInvokeContext {
     pub myself: EspoSandshrewLikeTraceShortId,
     pub caller: EspoSandshrewLikeTraceShortId,
@@ -61,39 +62,39 @@ pub struct EspoSandshrewLikeTraceInvokeContext {
     pub vout: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceShortId {
     pub block: String,
     pub tx: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceTransfer {
     pub id: EspoSandshrewLikeTraceShortId,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceReturnData {
     pub status: EspoSandshrewLikeTraceStatus,
     pub response: EspoSandshrewLikeTraceReturnResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EspoSandshrewLikeTraceStatus {
     Success,
     Failure,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceReturnResponse {
     pub alkanes: Vec<EspoSandshrewLikeTraceTransfer>,
     pub data: String,
     pub storage: Vec<EspoSandshrewLikeTraceStorageKV>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct EspoSandshrewLikeTraceStorageKV {
     pub key: String,
     pub value: String,
