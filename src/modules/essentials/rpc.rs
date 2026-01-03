@@ -1,7 +1,16 @@
-use crate::config::get_network;
+use crate::alkanes::trace::prettyify_protobuf_trace_json;
+use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
-use crate::modules::essentials::storage::{HoldersCountEntry, holders_count_key};
+use crate::modules::essentials::storage::{
+    AlkaneBalanceTxEntry, HolderId, HoldersCountEntry, alkane_balance_txs_by_token_key,
+    alkane_balance_txs_key, alkane_creation_ordered_prefix, block_summary_key,
+    decode_alkane_balance_tx_entries, decode_creation_record, holders_count_key,
+    load_creation_record, outpoint_addr_key, outpoint_balances_prefix, BlockSummary,
+};
+use crate::runtime::mempool::{
+    MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
+};
 // for Essentials::k_kv
 use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -14,11 +23,15 @@ use borsh::BorshDeserialize;
 // <-- use the public helpers & types from balances.rs
 use super::storage::BalanceEntry;
 use super::utils::balances::{
-    get_balance_for_address, get_holders_for_alkane,
+    get_alkane_balances, get_balance_for_address, get_holders_for_alkane,
     get_outpoint_balances as get_outpoint_balances_index,
 };
+use super::utils::inspections::inspection_to_json;
+use crate::modules::essentials::storage::alkane_creation_count_key;
 
-use bitcoin::Address;
+use bitcoin::hashes::Hash;
+use bitcoin::{Address, Txid};
+use hex;
 use std::str::FromStr;
 
 /// Local decoder using the public BalanceEntry type
@@ -46,11 +59,133 @@ fn log_rpc(method: &str, msg: &str) {
     eprintln!("[RPC::ESSENTIALS] {method} — {msg}");
 }
 
+fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
+    let mut traces_json: Vec<Value> = Vec::new();
+    if let Some(traces) = entry.traces.as_ref() {
+        for t in traces {
+            let events_val = prettyify_protobuf_trace_json(&t.protobuf_trace)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or(Value::Null);
+            traces_json.push(json!({
+                "outpoint": format!("{}:{}", entry.txid, t.outpoint.vout),
+                "events": events_val,
+            }));
+        }
+    }
+
+    json!({
+        "txid": entry.txid.to_string(),
+        "first_seen": entry.first_seen,
+        "traces": traces_json,
+    })
+}
+
 pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
     // Wrap once; everything else shares this.
     let mdb = Arc::new(mdb);
 
     eprintln!("[RPC::ESSENTIALS] registering RPC handlers…");
+
+    /* -------- get_mempool_traces -------- */
+    {
+        let reg_mem = reg.clone();
+        tokio::spawn(async move {
+            reg_mem
+                .register("get_mempool_traces", move |_cx, payload| async move {
+                    let page =
+                        payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                    let limit = payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).max(1)
+                        as usize;
+                    let addr_raw = payload
+                        .get("address")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let address = addr_raw.and_then(normalize_address);
+
+                    log_rpc(
+                        "get_mempool_traces",
+                        &format!(
+                            "page={}, limit={}, address={}",
+                            page,
+                            limit,
+                            address.as_deref().unwrap_or("-")
+                        ),
+                    );
+
+                    let mut items: Vec<Value> = Vec::new();
+                    let mut has_more = false;
+                    let mut total_traces: usize = 0;
+
+                    if let Some(addr) = address {
+                        let pending = pending_for_address(&addr);
+                        let pending_len = pending.len();
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+                        for (idx, entry) in pending.into_iter().enumerate() {
+                            if idx < offset {
+                                continue;
+                            }
+                            if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                                continue;
+                            }
+                            if items.len() >= limit {
+                                break;
+                            }
+                            if let Some(t) = entry.traces.as_ref() {
+                                total_traces += t.len();
+                            }
+                            items.push(mem_entry_to_json(&entry));
+                        }
+                        has_more = pending_len > offset + items.len();
+                    } else {
+                        let mdb = get_mempool_mdb();
+                        let pref = mdb.prefixed(b"seen/");
+                        let it = mdb.iter_prefix_rev(&pref);
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+                        let mut idx: usize = 0;
+                        for res in it {
+                            let Ok((k_full, _)) = res else { continue };
+                            let rel = &k_full[mdb.prefix().len()..];
+                            if !rel.starts_with(b"seen/") {
+                                break;
+                            }
+                            if idx < offset {
+                                idx += 1;
+                                continue;
+                            }
+                            if items.len() >= limit {
+                                has_more = true;
+                                break;
+                            }
+                            if let Some((_, txid)) = decode_seen_key(rel) {
+                                if let Some(entry) = get_tx_from_mempool(&txid) {
+                                    if entry.traces.as_ref().map_or(true, |t| t.is_empty()) {
+                                        idx += 1;
+                                        continue;
+                                    }
+                                    if let Some(t) = entry.traces.as_ref() {
+                                        total_traces += t.len();
+                                    }
+                                    items.push(mem_entry_to_json(&entry));
+                                }
+                            }
+                            idx += 1;
+                        }
+                    }
+
+                    json!({
+                        "ok": true,
+                        "page": page,
+                        "limit": limit,
+                        "has_more": has_more,
+                        "total": total_traces,
+                        "items": items,
+                    })
+                })
+                .await;
+        });
+    }
 
     /* -------- existing: get_keys -------- */
     {
@@ -203,6 +338,220 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
+    /* -------- new: get_all_alkanes -------- */
+    {
+        let reg_all = reg.clone();
+        let mdb_all = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_all
+                .register("get_all_alkanes", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_all);
+                    async move {
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                            as usize;
+                        let limit = payload
+                            .get("limit")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(100)
+                            .clamp(1, 500) as usize;
+                        let offset = limit.saturating_mul(page.saturating_sub(1));
+
+                        let total = mdb
+                            .get(alkane_creation_count_key())
+                            .ok()
+                            .flatten()
+                            .and_then(|b| {
+                                if b.len() == 8 {
+                                    let mut arr = [0u8; 8];
+                                    arr.copy_from_slice(&b);
+                                    Some(u64::from_le_bytes(arr))
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        let mut items: Vec<Value> = Vec::new();
+                        let mut seen: usize = 0;
+                        let prefix_full = mdb.prefixed(alkane_creation_ordered_prefix());
+                        let it = mdb.iter_prefix_rev(&prefix_full);
+                        for res in it {
+                            let Ok((_k_full, v)) = res else { continue };
+                            if seen < offset {
+                                seen += 1;
+                                continue;
+                            }
+                            if items.len() >= limit {
+                                break;
+                            }
+                            match decode_creation_record(&v) {
+                                Ok(rec) => {
+                                    let holder_count = mdb
+                                        .get(&holders_count_key(&rec.alkane))
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                                        .map(|hc| hc.count)
+                                        .unwrap_or(0);
+                                    let inspection_json =
+                                        rec.inspection.as_ref().map(|r| inspection_to_json(r));
+                                    let name = rec.names.first().cloned();
+                                    let symbol = rec.symbols.first().cloned();
+                                    items.push(json!({
+                                        "alkane": format!("{}:{}", rec.alkane.block, rec.alkane.tx),
+                                        "creation_txid": hex::encode(rec.txid),
+                                        "creation_height": rec.creation_height,
+                                        "creation_timestamp": rec.creation_timestamp,
+                                        "name": name,
+                                        "symbol": symbol,
+                                        "names": rec.names,
+                                        "symbols": rec.symbols,
+                                        "holder_count": holder_count,
+                                        "inspection": inspection_json,
+                                    }));
+                                }
+                                Err(e) => {
+                                    log_rpc(
+                                        "get_all_alkanes",
+                                        &format!("decode creation record failed: {e}"),
+                                    );
+                                }
+                            }
+                            seen += 1;
+                        }
+
+                        json!({
+                            "ok": true,
+                            "page": page,
+                            "limit": limit,
+                            "total": total,
+                            "items": items,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- alkane info lookup -------- */
+    {
+        let reg_info = reg.clone();
+        let mdb_info = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_info
+                .register("get_alkane_info", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_info);
+                    async move {
+                        let alk = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_alkane_info", "missing_or_invalid_alkane");
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_or_invalid_alkane",
+                                    "hint": "provide alkane as \"<block>:<tx>\" (hex ok)"
+                                });
+                            }
+                        };
+
+                        let record = match load_creation_record(&mdb, &alk) {
+                            Ok(Some(r)) => r,
+                            Ok(None) => {
+                                return json!({"ok": false, "error": "not_found"});
+                            }
+                            Err(e) => {
+                                log_rpc(
+                                    "get_alkane_info",
+                                    &format!(
+                                        "load_creation_record failed for {}:{}: {e}",
+                                        alk.block, alk.tx
+                                    ),
+                                );
+                                return json!({"ok": false, "error": "lookup_failed"});
+                            }
+                        };
+
+                        let holder_count = get_holders_for_alkane(&mdb, alk, 1, 1)
+                            .map(|(total, _, _)| total as u64)
+                            .unwrap_or_else(|_| {
+                                mdb.get(&holders_count_key(&alk))
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                                    .map(|hc| hc.count)
+                                    .unwrap_or(0)
+                            });
+                        let inspection_json =
+                            record.inspection.as_ref().map(|r| inspection_to_json(r));
+                        let name = record.names.first().cloned();
+                        let symbol = record.symbols.first().cloned();
+
+                        json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", record.alkane.block, record.alkane.tx),
+                            "creation_txid": hex::encode(record.txid),
+                            "creation_height": record.creation_height,
+                            "creation_timestamp": record.creation_timestamp,
+                            "name": name,
+                            "symbol": symbol,
+                            "names": record.names,
+                            "symbols": record.symbols,
+                            "holder_count": holder_count,
+                            "inspection": inspection_json,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- block summary lookup -------- */
+    {
+        let reg_summary = reg.clone();
+        let mdb_summary = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_summary
+                .register("get_block_summary", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_summary);
+                    async move {
+                        let height = match payload.get("height").and_then(|v| v.as_u64()) {
+                            Some(h) => h as u32,
+                            None => {
+                                log_rpc("get_block_summary", "missing_or_invalid_height");
+                                return json!({"ok": false, "error": "missing_or_invalid_height"});
+                            }
+                        };
+
+                        let key = block_summary_key(height);
+                        let summary = mdb
+                            .get(&key)
+                            .ok()
+                            .flatten()
+                            .and_then(|b| BlockSummary::try_from_slice(&b).ok());
+
+                        let (trace_count, header_hex, found) = if let Some(summary) = summary {
+                            (summary.trace_count, Some(hex::encode(summary.header)), true)
+                        } else {
+                            (0, None, false)
+                        };
+
+                        json!({
+                            "ok": true,
+                            "height": height,
+                            "found": found,
+                            "trace_count": trace_count,
+                            "header_hex": header_hex,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
     /* -------- NEW: get_holders -------- */
     {
         let reg_holders = reg.clone();
@@ -237,19 +586,31 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             ),
                         );
 
-                        let (total, slice) = match get_holders_for_alkane(&mdb, alk, page, limit) {
-                            Ok(tup) => tup,
-                            Err(e) => {
-                                log_rpc("get_holders", &format!("failed: {e:?}"));
-                                return json!({"ok": false, "error": "internal_error"});
-                            }
-                        };
+                        let (total, _supply, slice) =
+                            match get_holders_for_alkane(&mdb, alk, page, limit) {
+                                Ok(tup) => tup,
+                                Err(e) => {
+                                    log_rpc("get_holders", &format!("failed: {e:?}"));
+                                    return json!({"ok": false, "error": "internal_error"});
+                                }
+                            };
 
                         let has_more = page.saturating_mul(limit) < total;
 
                         let items: Vec<Value> = slice
                             .into_iter()
-                            .map(|h| json!({"address": h.address, "amount": h.amount.to_string()}))
+                            .map(|h| match h.holder {
+                                HolderId::Address(addr) => json!({
+                                    "type": "address",
+                                    "address": addr,
+                                    "amount": h.amount.to_string()
+                                }),
+                                HolderId::Alkane(id) => json!({
+                                    "type": "alkane",
+                                    "alkane": format!("{}:{}", id.block, id.tx),
+                                    "amount": h.amount.to_string()
+                                }),
+                            })
                             .collect();
 
                         json!({
@@ -380,6 +741,323 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
         });
     }
 
+    /* -------- NEW: get_alkane_balances -------- */
+    {
+        let reg_alk_bal = reg.clone();
+        let mdb_alk_bal = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_alk_bal
+                .register("get_alkane_balances", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_alk_bal);
+                    async move {
+                        let alk = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_alkane_balances", "missing_or_invalid_alkane");
+                                return json!({"ok": false, "error": "missing_or_invalid_alkane"});
+                            }
+                        };
+
+                        log_rpc("get_alkane_balances", &format!("alkane={}:{}", alk.block, alk.tx));
+
+                        let agg = match get_alkane_balances(&mdb, &alk) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                log_rpc(
+                                    "get_alkane_balances",
+                                    &format!("get_alkane_balances failed: {e:?}"),
+                                );
+                                return json!({"ok": false, "error": "internal_error"});
+                            }
+                        };
+
+                        let mut balances: Map<String, Value> = Map::new();
+                        for (id, amt) in agg {
+                            balances.insert(
+                                format!("{}:{}", id.block, id.tx),
+                                Value::String(amt.to_string()),
+                            );
+                        }
+
+                        json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", alk.block, alk.tx),
+                            "balances": Value::Object(balances),
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- NEW: get_alkane_balance_metashrew -------- */
+    {
+        let reg_live_bal = reg.clone();
+        tokio::spawn(async move {
+            reg_live_bal
+                .register("get_alkane_balance_metashrew", move |_cx, payload| async move {
+                    let owner = match payload
+                        .get("owner")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_alkane_from_str)
+                    {
+                        Some(a) => a,
+                        None => {
+                            log_rpc("get_alkane_balance_metashrew", "missing_or_invalid_owner");
+                            return json!({"ok": false, "error": "missing_or_invalid_owner"});
+                        }
+                    };
+
+                    let target = match payload
+                        .get("alkane")
+                        .or_else(|| payload.get("target"))
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_alkane_from_str)
+                    {
+                        Some(a) => a,
+                        None => {
+                            log_rpc("get_alkane_balance_metashrew", "missing_or_invalid_target");
+                            return json!({"ok": false, "error": "missing_or_invalid_target"});
+                        }
+                    };
+
+                    let height = match payload.get("height") {
+                        None => None,
+                        Some(v) => match v.as_u64() {
+                            Some(h) => Some(h),
+                            None => {
+                                log_rpc(
+                                    "get_alkane_balance_metashrew",
+                                    "missing_or_invalid_height",
+                                );
+                                return json!({"ok": false, "error": "missing_or_invalid_height"});
+                            }
+                        },
+                    };
+
+                    let log_msg = match height {
+                        Some(h) => format!(
+                            "owner={}:{} target={}:{} height={}",
+                            owner.block, owner.tx, target.block, target.tx, h
+                        ),
+                        None => format!(
+                            "owner={}:{} target={}:{}",
+                            owner.block, owner.tx, target.block, target.tx
+                        ),
+                    };
+                    log_rpc("get_alkane_balance_metashrew", &log_msg);
+
+                    match get_metashrew().get_reserves_for_alkane(&owner, &target, height) {
+                        Ok(Some(bal)) => json!({
+                            "ok": true,
+                            "owner": format!("{}:{}", owner.block, owner.tx),
+                            "alkane": format!("{}:{}", target.block, target.tx),
+                            "balance": bal.to_string(),
+                        }),
+                        Ok(None) => json!({
+                            "ok": true,
+                            "owner": format!("{}:{}", owner.block, owner.tx),
+                            "alkane": format!("{}:{}", target.block, target.tx),
+                            "balance": "0",
+                        }),
+                        Err(e) => {
+                            log_rpc(
+                                "get_alkane_balance_metashrew",
+                                &format!("metashrew fetch failed: {e:?}"),
+                            );
+                            json!({"ok": false, "error": "metashrew_error"})
+                        }
+                    }
+                })
+                .await;
+        });
+    }
+
+    /* -------- NEW: get_alkane_balance_txs -------- */
+    {
+        let reg_bal_txs = reg.clone();
+        let mdb_bal_txs = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_bal_txs
+                .register("get_alkane_balance_txs", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_bal_txs);
+                    async move {
+                        let alk = match payload
+                            .get("alkane")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_alkane_balance_txs", "missing_or_invalid_alkane");
+                                return json!({"ok": false, "error": "missing_or_invalid_alkane"});
+                            }
+                        };
+
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                            as usize;
+
+                        log_rpc(
+                            "get_alkane_balance_txs",
+                            &format!(
+                                "alkane={}:{} page={} limit={}",
+                                alk.block, alk.tx, page, limit
+                            ),
+                        );
+
+                        let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
+                        if let Ok(Some(bytes)) = mdb.get(&alkane_balance_txs_key(&alk)) {
+                            if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                                txs = list;
+                            }
+                        }
+
+                        let total = txs.len();
+                        let p = page.max(1);
+                        let l = limit.max(1);
+                        let off = l.saturating_mul(p - 1);
+                        let end = (off + l).min(total);
+                        let slice = if off >= total { vec![] } else { txs[off..end].to_vec() };
+
+                        let items: Vec<Value> = slice
+                            .into_iter()
+                            .map(|entry| {
+                                let mut outflow: Map<String, Value> = Map::new();
+                                for (id, delta) in entry.outflow {
+                                    outflow.insert(
+                                        format!("{}:{}", id.block, id.tx),
+                                        Value::String(delta.to_string()),
+                                    );
+                                }
+                                json!({
+                                    "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                    "height": entry.height,
+                                    "outflow": Value::Object(outflow),
+                                })
+                            })
+                            .collect();
+
+                        json!({
+                            "ok": true,
+                            "alkane": format!("{}:{}", alk.block, alk.tx),
+                            "page": p,
+                            "limit": l,
+                            "total": total,
+                            "has_more": off + items.len() < total,
+                            "txids": items
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+    /* -------- NEW: get_alkane_balance_txs_by_token -------- */
+    {
+        let reg_bal_txs_tok = reg.clone();
+        let mdb_bal_txs_tok = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_bal_txs_tok
+                .register("get_alkane_balance_txs_by_token", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_bal_txs_tok);
+                    async move {
+                        let owner = match payload
+                            .get("owner")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc(
+                                    "get_alkane_balance_txs_by_token",
+                                    "missing_or_invalid_owner",
+                                );
+                                return json!({"ok": false, "error": "missing_or_invalid_owner"});
+                            }
+                        };
+                        let token = match payload
+                            .get("token")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_alkane_from_str)
+                        {
+                            Some(a) => a,
+                            None => {
+                                log_rpc(
+                                    "get_alkane_balance_txs_by_token",
+                                    "missing_or_invalid_token",
+                                );
+                                return json!({"ok": false, "error": "missing_or_invalid_token"});
+                            }
+                        };
+
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                        let page = payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                            as usize;
+
+                        log_rpc(
+                            "get_alkane_balance_txs_by_token",
+                            &format!(
+                                "owner={}:{} token={}:{} page={} limit={}",
+                                owner.block, owner.tx, token.block, token.tx, page, limit
+                            ),
+                        );
+
+                        let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
+                        if let Ok(Some(bytes)) =
+                            mdb.get(&alkane_balance_txs_by_token_key(&owner, &token))
+                        {
+                            if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                                txs = list;
+                            }
+                        }
+
+                        let total = txs.len();
+                        let p = page.max(1);
+                        let l = limit.max(1);
+                        let off = l.saturating_mul(p - 1);
+                        let end = (off + l).min(total);
+                        let slice = if off >= total { vec![] } else { txs[off..end].to_vec() };
+
+                        let items: Vec<Value> = slice
+                            .into_iter()
+                            .map(|entry| {
+                                let mut outflow: Map<String, Value> = Map::new();
+                                for (id, delta) in entry.outflow {
+                                    outflow.insert(
+                                        format!("{}:{}", id.block, id.tx),
+                                        Value::String(delta.to_string()),
+                                    );
+                                }
+                                json!({
+                                    "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                    "height": entry.height,
+                                    "outflow": Value::Object(outflow),
+                                })
+                            })
+                            .collect();
+
+                        json!({
+                            "ok": true,
+                            "owner": format!("{}:{}", owner.block, owner.tx),
+                            "token": format!("{}:{}", token.block, token.tx),
+                            "page": p,
+                            "limit": l,
+                            "total": total,
+                            "has_more": off + items.len() < total,
+                            "txids": items
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
     {
         let reg_op_bal = reg.clone();
         let mdb_op_bal = Arc::clone(&mdb);
@@ -431,15 +1109,29 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             }
                         };
 
-                        let addr = {
-                            let key = {
-                                let mut k = b"/outpoint_addr/".to_vec();
-                                k.extend_from_slice(outpoint.as_bytes());
-                                k
-                            };
-                            match mdb.get(&key) {
-                                Ok(Some(b)) => std::str::from_utf8(&b).ok().map(|s| s.to_string()),
-                                _ => None,
+                            let addr = {
+                                let pref =
+                                    outpoint_balances_prefix(txid.to_byte_array().as_slice(), vout_u32);
+                            if let Ok(pref) = pref {
+                                if let Ok(keys) = mdb.scan_prefix(&pref) {
+                                    if let Some(full_key) = keys.first() {
+                                        let raw = &full_key[b"/outpoint_balances/".len()..];
+                                        if let Ok(op) = EspoOutpoint::try_from_slice(raw) {
+                                            let key_new = outpoint_addr_key(&op).ok();
+                                            key_new.and_then(|k| mdb.get(&k).ok().flatten()).and_then(|b| {
+                                                std::str::from_utf8(&b).ok().map(|s| s.to_string())
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
                             }
                         };
 
@@ -464,6 +1156,68 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             "items": [item]
                         })
                     }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_traces = reg.clone();
+        tokio::spawn(async move {
+            reg_traces
+                .register("get_block_traces", move |_cx, payload| async move {
+                    let height = match payload.get("height").and_then(|v| v.as_u64()) {
+                        Some(h) => h,
+                        None => {
+                            log_rpc("get_block_traces", "missing_or_invalid_height");
+                            return json!({"ok": false, "error": "missing_or_invalid_height", "hint": "expected {\"height\": <u64>}"} );
+                        }
+                    };
+
+                    log_rpc("get_block_traces", &format!("height={height}"));
+
+                    let partials = match get_metashrew().traces_for_block_as_prost(height) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log_rpc("get_block_traces", &format!("metashrew fetch failed: {e:?}"));
+                            return json!({"ok": false, "error": "metashrew_fetch_failed"});
+                        }
+                    };
+
+                    let mut traces: Vec<Value> = Vec::with_capacity(partials.len());
+                    for p in partials {
+                        if p.outpoint.len() < 36 {
+                            continue;
+                        }
+                        let (txid_le, vout_le) = p.outpoint.split_at(32);
+                        let mut txid_be = txid_le.to_vec();
+                        txid_be.reverse();
+                        let txid_hex = hex::encode(&txid_be);
+                        let vout = u32::from_le_bytes(vout_le[..4].try_into().expect("vout 4 bytes"));
+
+                        let events_str = match prettyify_protobuf_trace_json(&p.protobuf_trace) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log_rpc(
+                                    "get_block_traces",
+                                    &format!("normalize failed for {txid_hex}:{vout}: {e:?}"),
+                                );
+                                continue;
+                            }
+                        };
+                        let events: Value = serde_json::from_str(&events_str).unwrap_or(Value::Null);
+
+                        traces.push(json!({
+                            "outpoint": format!("{txid_hex}:{vout}"),
+                            "events": events
+                        }));
+                    }
+
+                    json!({
+                        "ok": true,
+                        "height": height,
+                        "traces": traces
+                    })
                 })
                 .await;
         });
@@ -578,6 +1332,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                     continue;
                                 }
                             };
+
+                            if espo_out.tx_spent.is_some() {
+                                continue;
+                            }
 
                             let outpoint_str = espo_out.as_outpoint_string();
 

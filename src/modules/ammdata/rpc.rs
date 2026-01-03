@@ -1,10 +1,10 @@
 use crate::modules::ammdata::consts::PRICE_SCALE;
+use crate::modules::ammdata::utils::activity::{
+    ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir,
+    read_activity_for_pool, read_activity_for_pool_sorted,
+};
 use crate::modules::ammdata::utils::candles::{PriceSide, read_candles_v1};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
-use crate::modules::ammdata::utils::trades::{
-    SortDir, TradePage, TradeSideFilter, TradeSortKey, read_trades_for_pool,
-    read_trades_for_pool_sorted,
-};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -75,16 +75,28 @@ fn parse_price_side(s: &str) -> Option<PriceSide> {
     }
 }
 
-fn parse_side_filter(v: Option<&Value>) -> TradeSideFilter {
+fn parse_side_filter(v: Option<&Value>) -> ActivitySideFilter {
     if let Some(Value::String(s)) = v {
         return match s.to_ascii_lowercase().as_str() {
-            "buy" | "b" => TradeSideFilter::Buy,
-            "sell" | "s" => TradeSideFilter::Sell,
-            "all" | "a" | "" => TradeSideFilter::All,
-            _ => TradeSideFilter::All,
+            "buy" | "b" => ActivitySideFilter::Buy,
+            "sell" | "s" => ActivitySideFilter::Sell,
+            "all" | "a" | "" => ActivitySideFilter::All,
+            _ => ActivitySideFilter::All,
         };
     }
-    TradeSideFilter::All
+    ActivitySideFilter::All
+}
+
+fn parse_activity_type(v: Option<&Value>) -> ActivityFilter {
+    if let Some(Value::String(s)) = v {
+        return match s.to_ascii_lowercase().as_str() {
+            "trades" | "trade" => ActivityFilter::Trades,
+            "events" | "event" => ActivityFilter::Events,
+            "all" | "" => ActivityFilter::All,
+            _ => ActivityFilter::All,
+        };
+    }
+    ActivityFilter::All
 }
 
 #[inline]
@@ -121,25 +133,25 @@ fn norm_token(s: &str) -> Option<&'static str> {
 }
 
 /// Map a single `sort` token + requested PriceSide to a concrete index label + key.
-fn map_sort(side: PriceSide, token: Option<&str>) -> (TradeSortKey, &'static str) {
+fn map_sort(side: PriceSide, token: Option<&str>) -> (ActivitySortKey, &'static str) {
     if let Some(tok) = token.and_then(norm_token) {
         return match tok {
-            "ts" => (TradeSortKey::Timestamp, "ts"),
+            "ts" => (ActivitySortKey::Timestamp, "ts"),
             "amount" => match side {
-                PriceSide::Base => (TradeSortKey::AmountBaseAbs, "absb"),
-                PriceSide::Quote => (TradeSortKey::AmountQuoteAbs, "absq"),
+                PriceSide::Base => (ActivitySortKey::AmountBaseAbs, "absb"),
+                PriceSide::Quote => (ActivitySortKey::AmountQuoteAbs, "absq"),
             },
             "side" => match side {
                 // side ⇒ group by side then ts so paging is stable
-                PriceSide::Base => (TradeSortKey::SideBaseTs, "sb_ts"),
-                PriceSide::Quote => (TradeSortKey::SideQuoteTs, "sq_ts"),
+                PriceSide::Base => (ActivitySortKey::SideBaseTs, "sb_ts"),
+                PriceSide::Quote => (ActivitySortKey::SideQuoteTs, "sq_ts"),
             },
-            "absb" => (TradeSortKey::AmountBaseAbs, "absb"),
-            "absq" => (TradeSortKey::AmountQuoteAbs, "absq"),
-            _ => (TradeSortKey::Timestamp, "ts"),
+            "absb" => (ActivitySortKey::AmountBaseAbs, "absb"),
+            "absq" => (ActivitySortKey::AmountQuoteAbs, "absq"),
+            _ => (ActivitySortKey::Timestamp, "ts"),
         };
     }
-    (TradeSortKey::Timestamp, "ts")
+    (ActivitySortKey::Timestamp, "ts")
 }
 
 /* ---------- tiny helpers for this file ---------- */
@@ -287,14 +299,14 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
             .await;
     });
 
-    /* -------------------- get_trades -------------------- */
-    let reg_trades = reg.clone();
-    let mdb_ptr_trades: Arc<Mdb> = Arc::clone(&mdb_ptr);
+    /* -------------------- get_activity -------------------- */
+    let reg_activity = reg.clone();
+    let mdb_ptr_activity: Arc<Mdb> = Arc::clone(&mdb_ptr);
 
     tokio::spawn(async move {
-        reg_trades
-            .register("get_trades", move |_cx, payload| {
-                let mdb_for_handler = Arc::clone(&mdb_ptr_trades);
+        reg_activity
+            .register("get_activity", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_ptr_activity);
 
                 async move {
                     let limit = payload
@@ -315,6 +327,9 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         .unwrap_or(PriceSide::Base);
 
                     let filter_side = parse_side_filter(payload.get("filter_side"));
+                    let activity_type = parse_activity_type(
+                        payload.get("activity_type").or_else(|| payload.get("type")),
+                    );
 
                     // parse single sort token + dir
                     let sort_token: Option<String> =
@@ -327,7 +342,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         {
                             Some(p) => p,
                             None => {
-                                log_rpc("get_trades", &format!("invalid pool, payload={payload:?}"));
+                                log_rpc("get_activity", &format!("invalid pool, payload={payload:?}"));
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_pool",
@@ -337,12 +352,13 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         };
 
                     log_rpc(
-                        "get_trades",
+                        "get_activity",
                         &format!(
-                            "pool={}, side={:?}, filter_side={:?}, sort={}, dir={:?}, page={}, limit={}",
+                            "pool={}, side={:?}, filter_side={:?}, activity_type={:?}, sort={}, dir={:?}, page={}, limit={}",
                             id_str(&pool),
                             side,
                             filter_side,
+                            activity_type,
                             sort_code,
                             dir,
                             page,
@@ -350,19 +366,35 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                         ),
                     );
 
-                    if sort_token.is_some() || !matches!(filter_side, TradeSideFilter::All) {
-                        match read_trades_for_pool_sorted(
-                            &mdb_for_handler, pool, page, limit, side, sort_key, dir, filter_side,
+                    if sort_token.is_some()
+                        || !matches!(filter_side, ActivitySideFilter::All)
+                        || !matches!(activity_type, ActivityFilter::All)
+                    {
+                        match read_activity_for_pool_sorted(
+                            &mdb_for_handler,
+                            pool,
+                            page,
+                            limit,
+                            side,
+                            sort_key,
+                            dir,
+                            filter_side,
+                            activity_type,
                         ) {
-                            Ok(TradePage { trades, total }) => {
+                            Ok(ActivityPage { activity, total }) => {
                                 json!({
                                     "ok": true,
                                     "pool": id_str(&pool),
                                     "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
                                     "filter_side": match filter_side {
-                                        TradeSideFilter::All => "all",
-                                        TradeSideFilter::Buy => "buy",
-                                        TradeSideFilter::Sell => "sell"
+                                        ActivitySideFilter::All => "all",
+                                        ActivitySideFilter::Buy => "buy",
+                                        ActivitySideFilter::Sell => "sell"
+                                    },
+                                    "activity_type": match activity_type {
+                                        ActivityFilter::All => "all",
+                                        ActivityFilter::Trades => "trades",
+                                        ActivityFilter::Events => "events",
                                     },
                                     "sort": sort_code,
                                     "dir": match dir { SortDir::Asc => "asc", SortDir::Desc => "desc" },
@@ -370,33 +402,41 @@ pub fn register_rpc(reg: &RpcNsRegistrar, mdb: Mdb) {
                                     "limit": limit,
                                     "total": total,
                                     "has_more": page.saturating_mul(limit) < total,
-                                    "trades": trades
+                                    "activity": activity
                                 })
                             }
                             Err(e) => {
-                                log_rpc("get_trades", &format!("read_failed(sorted): {e}"));
+                                log_rpc("get_activity", &format!("read_failed(sorted): {e}"));
                                 json!({ "ok": false, "error": format!("read_failed: {e}") })
                             }
                         }
                     } else {
-                        match read_trades_for_pool(&mdb_for_handler, pool, page, limit, side) {
-                            Ok(TradePage { trades, total }) => {
+                        match read_activity_for_pool(
+                            &mdb_for_handler,
+                            pool,
+                            page,
+                            limit,
+                            side,
+                            activity_type,
+                        ) {
+                            Ok(ActivityPage { activity, total }) => {
                                 json!({
                                     "ok": true,
                                     "pool": id_str(&pool),
                                     "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
                                     "filter_side": "all",
+                                    "activity_type": "all",
                                     "sort": "ts",
                                     "dir": "desc",
                                     "page": page,
                                     "limit": limit,
                                     "total": total,
                                     "has_more": page.saturating_mul(limit) < total,
-                                    "trades": trades
+                                    "activity": activity
                                 })
                             }
                             Err(e) => {
-                                log_rpc("get_trades", &format!("read_failed: {e}"));
+                                log_rpc("get_activity", &format!("read_failed: {e}"));
                                 json!({ "ok": false, "error": format!("read_failed: {e}") })
                             }
                         }

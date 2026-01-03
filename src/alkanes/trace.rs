@@ -1,27 +1,28 @@
 use crate::config::{
     get_block_source, // NEW: use BlockSource for full blocks
-    get_metashrew_sdb,
+    get_metashrew,
 };
-use prost::Message;
-
-use crate::consts::TRACES_BY_BLOCK_PREFIX;
 use crate::core::blockfetcher::BlockSource;
-use crate::runtime::sdb::SDB;
 use crate::schemas::EspoOutpoint;
 use crate::schemas::SchemaAlkaneId;
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
+use alkanes_support::cellpack::Cellpack;
+use alkanes_support::id::AlkaneId;
 use alkanes_support::proto::alkanes;
-use alkanes_support::proto::alkanes::AlkanesTrace;
 use anyhow::{Context, Result};
 use bitcoin::block::Header;
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid};
-
 // use bitcoincore_rpc::RpcApi; // REMOVED: block fetch now via BlockSource
-use rocksdb::{Direction, IteratorMode, ReadOptions};
+use ordinals::{Artifact, Runestone};
+use protorune_support::protostone::Protostone;
+use protorune_support::utils::decode_varint_list;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::u64;
+use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
+use std::io::Cursor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EspoSandshrewLikeTrace {
@@ -39,7 +40,7 @@ pub enum EspoSandshrewLikeTraceEvent {
     Return(EspoSandshrewLikeTraceReturnData),
 
     #[serde(rename = "create")]
-    Create(EspoSandshrewLikeTraceCreateData),
+    Create(EspoSandshrewLikeTraceShortId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +79,7 @@ pub struct EspoSandshrewLikeTraceReturnData {
     pub response: EspoSandshrewLikeTraceReturnResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EspoSandshrewLikeTraceStatus {
     Success,
@@ -98,19 +99,13 @@ pub struct EspoSandshrewLikeTraceStorageKV {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EspoSandshrewLikeTraceCreateData {
-    #[serde(rename = "newAlkane")]
-    pub new_alkane: EspoSandshrewLikeTraceShortId,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PartialEspoTrace {
     pub protobuf_trace: AlkanesTrace,
     pub outpoint: Vec<u8>, // [32 txid_le | 4 vout_le]
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EspoTrace {
     pub sandshrew_trace: EspoSandshrewLikeTrace,
     pub protobuf_trace: AlkanesTrace,
@@ -118,18 +113,46 @@ pub struct EspoTrace {
     pub outpoint: EspoOutpoint,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EspoAlkanesTransaction {
     pub traces: Option<Vec<EspoTrace>>,
     pub transaction: Transaction,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EspoHostFunctionType {
+    BlockHeader = 0,
+    CoinbaseTxResponse = 1,
+    DieselMints = 2,
+    TotalMinerFee = 3,
+}
+
+pub type EspoHostFunctionValues = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[derive(Clone)]
 pub struct EspoBlock {
     pub is_latest: bool,
     pub height: u32,
     pub block_header: Header,
+    pub host_function_values: EspoHostFunctionValues,
+    pub tx_count: usize,
     pub transactions: Vec<EspoAlkanesTransaction>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GetEspoBlockOpts {
+    pub page: usize,
+    pub limit: usize,
+}
+
+impl GetEspoBlockOpts {
+    fn page_range(&self, total: usize) -> (usize, usize) {
+        let limit = self.limit.max(1);
+        let page = self.page.max(1);
+        let off = limit.saturating_mul(page.saturating_sub(1));
+        let end = (off + limit).min(total);
+        (off, end)
+    }
 }
 
 /// Map of AlkaneId -> (key -> value), last-write-wins per key within a single trace.
@@ -170,71 +193,13 @@ pub fn extract_alkane_storage(
                     }
                 }
                 Event::CreateAlkane(_create) => {}
+                Event::ReceiveIntent(_) => {}
+                Event::ValueTransfer(_) => {}
             }
         }
     }
 
     Ok(out)
-}
-
-fn trace_block_prefix(block: &u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(7 + 8 + 1);
-    v.extend_from_slice(TRACES_BY_BLOCK_PREFIX);
-    v.extend_from_slice(&block.to_le_bytes());
-    v.push(b'/');
-    v
-}
-
-fn next_prefix(mut p: Vec<u8>) -> Option<Vec<u8>> {
-    for i in (0..p.len()).rev() {
-        if p[i] != 0xff {
-            p[i] += 1;
-            p.truncate(i + 1);
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn is_length_bucket(key: &[u8], prefix: &[u8]) -> bool {
-    if key.len() < prefix.len() + 1 + 4 {
-        return false;
-    }
-    let bucket = &key[prefix.len()..key.len() - 4];
-    bucket == b"length"
-}
-
-pub fn collect_outpoints_for_block(db: &SDB, block: &u64) -> Result<Vec<Vec<u8>>> {
-    let prefix = trace_block_prefix(block);
-    let mut ro = ReadOptions::default();
-    if let Some(ub) = next_prefix(prefix.clone()) {
-        ro.set_iterate_upper_bound(ub);
-    }
-    ro.set_total_order_seek(true);
-
-    let mut it = db.iterator_opt(IteratorMode::From(&prefix, Direction::Forward), ro);
-    let mut out = Vec::new();
-
-    while let Some(Ok((k, v))) = it.next() {
-        if !k.starts_with(&prefix) {
-            break;
-        }
-        if is_length_bucket(&k, &prefix) {
-            continue;
-        }
-        if v.len() == 4 && v[..] == [0x01, 0x00, 0x00, 0x00] {
-            continue;
-        }
-        if v.len() < 36 {
-            continue;
-        }
-        out.push(v[..36].to_vec());
-    }
-    Ok(out)
-}
-
-pub fn outpoint_bytes_to_key(bytes: &Vec<u8>) -> Vec<u8> {
-    vec![TRACES_BY_BLOCK_PREFIX, &bytes.to_vec(), &vec![0x00, 0x00, 0x00, 0x00]].concat()
 }
 
 fn fmt_u128_hex(u: &alkanes::Uint128) -> String {
@@ -380,7 +345,7 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                 }
 
                 Event::CreateAlkane(create) => {
-                    let id = create.new_alkane.as_ref();
+                    let id: Option<&alkanes::AlkaneId> = create.new_alkane.as_ref();
                     let block_hex = id
                         .and_then(|x| x.block.as_ref())
                         .map(fmt_u128_hex)
@@ -391,11 +356,12 @@ pub fn prettyify_protobuf_trace_json(trace: &AlkanesTrace) -> Result<String> {
                         .unwrap_or_else(|| "0x0".to_string());
                     out.push(json!({
                         "event": "create",
-                        "data": {
-                            "newAlkane": { "block": block_hex, "tx": tx_hex }
-                        }
+                        "data": { "block": block_hex, "tx": tx_hex }
                     }));
                 }
+
+                Event::ReceiveIntent(_) => {}
+                Event::ValueTransfer(_) => {}
             }
         }
     }
@@ -412,41 +378,12 @@ fn outpoint_bytes_to_display(outpoint: &[u8]) -> String {
 }
 
 // parse possibly-tailed trace (strip trailing u32 if needed)
-fn parse_trace_maybe_with_trailer(mut bytes: Vec<u8>) -> Option<AlkanesTrace> {
-    AlkanesTrace::decode(bytes.as_slice()).ok().or_else(|| {
-        if bytes.len() >= 4 {
-            bytes.truncate(bytes.len() - 4);
-            AlkanesTrace::decode(bytes.as_slice()).ok()
-        } else {
-            None
-        }
-    })
+pub fn traces_for_block_as_prost(block: u64) -> Result<Vec<PartialEspoTrace>> {
+    get_metashrew().traces_for_block_as_prost(block)
 }
 
-pub fn traces_for_block_as_protobuf(db: &SDB, block: u64) -> Result<Vec<PartialEspoTrace>> {
-    let outpoints = collect_outpoints_for_block(db, &block)
-        .with_context(|| format!("collect_outpoints_for_block({block}) failed"))?;
-
-    let keys: Vec<Vec<u8>> = outpoints.iter().map(|op| outpoint_bytes_to_key(op)).collect();
-
-    let values = db.multi_get(keys.iter())?;
-
-    let traces: Vec<PartialEspoTrace> = values
-        .into_iter()
-        .flat_map(Option::into_iter)
-        .map(|bytes| parse_trace_maybe_with_trailer(bytes))
-        .flat_map(Option::into_iter)
-        .enumerate()
-        .map(|(index, protobuf_trace)| PartialEspoTrace {
-            protobuf_trace,
-            outpoint: outpoints[index].clone(),
-        })
-        .collect();
-    Ok(traces)
-}
-
-pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
-    let partial_traces = traces_for_block_as_protobuf(db, block)?;
+pub fn traces_for_block_as_json_str(block: u64) -> Result<String> {
+    let partial_traces = traces_for_block_as_prost(block)?;
     let mut entries: Vec<serde_json::Value> = Vec::new();
 
     for partial_trace in partial_traces {
@@ -467,19 +404,37 @@ pub fn traces_for_block_as_json_str(db: &SDB, block: u64) -> Result<String> {
 
 /// Build a map { txid_be_hex => Vec<(vout, PartialEspoTrace)> } for quick attach later.
 fn traces_for_block_indexed(
-    db: &SDB,
     block: u64,
+    allow_txids: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, Vec<(u32, PartialEspoTrace)>>> {
-    let partials = traces_for_block_as_protobuf(db, block)
-        .with_context(|| format!("failed traces_for_block_as_protobuf({block})"))?;
+    let partials = traces_for_block_as_prost(block)
+        .with_context(|| format!("failed traces_for_block_as_prost({block})"))?;
 
     let mut map: HashMap<String, Vec<(u32, PartialEspoTrace)>> = HashMap::new();
     for p in partials {
-        let (txid_le, vout_le) = p.outpoint.split_at(32);
-        let mut txid_be = txid_le.to_vec();
-        txid_be.reverse();
-        let txid_hex = hex::encode(&txid_be);
-        let vout = u32::from_le_bytes(vout_le.try_into().expect("vout 4 bytes"));
+        if p.outpoint.len() < 36 {
+            continue;
+        }
+        let (tx_bytes, vout_le) = p.outpoint.split_at(32);
+        let vout = u32::from_le_bytes(vout_le[..4].try_into().expect("vout 4 bytes"));
+
+        let txid_hex_be = hex::encode(tx_bytes);
+        let mut tx_bytes_rev = tx_bytes.to_vec();
+        tx_bytes_rev.reverse();
+        let txid_hex_le = hex::encode(&tx_bytes_rev);
+
+        let txid_hex = if let Some(allow) = allow_txids {
+            if allow.contains(&txid_hex_be) {
+                txid_hex_be
+            } else if allow.contains(&txid_hex_le) {
+                txid_hex_le
+            } else {
+                continue;
+            }
+        } else {
+            txid_hex_le
+        };
+
         map.entry(txid_hex).or_default().push((vout, p));
     }
 
@@ -492,9 +447,16 @@ fn traces_for_block_indexed(
 /// Use the BlockSource for the block (header + transactions), Electrum for prevouts.
 /// Traces are now **multiple per transaction** and are stitched in per outpoint (vout).
 pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
+    get_espo_block_with_opts(block, tip, None)
+}
+
+pub fn get_espo_block_with_opts(
+    block: u64,
+    tip: u64,
+    opts: Option<GetEspoBlockOpts>,
+) -> Result<EspoBlock> {
     eprintln!("[TRACE::get_espo_block] start block={block}, tip={tip}");
 
-    let metashrew_sdb = &get_metashrew_sdb();
     let block_source = get_block_source();
 
     // Block height conversions
@@ -509,17 +471,112 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
     let full_block = block_source
         .get_block_by_height(h32, tip32)
         .context("BlockSource: get_block_by_height")?;
-    eprintln!(
-        "[TRACE::get_espo_block] got block at height={}, txs={}",
-        h32,
-        full_block.txdata.len()
-    );
+    let total_txs = full_block.txdata.len();
+    eprintln!("[TRACE::get_espo_block] got block at height={}, txs={}", h32, total_txs);
 
     // Header from block source
     let block_header: Header = full_block.header.clone();
+    let host_function_values = {
+        let mut header_bytes = Vec::new();
+        full_block
+            .header
+            .consensus_encode(&mut header_bytes)
+            .context("consensus encode block header for host function values")?;
 
-    // Index traces
-    let traces_index = traces_for_block_indexed(metashrew_sdb, block)?;
+        let coinbase_tx = full_block
+            .txdata
+            .get(0)
+            .cloned()
+            .context("block has no coinbase transaction for host function values")?;
+        let mut coinbase_bytes = Vec::new();
+        coinbase_tx
+            .consensus_encode(&mut coinbase_bytes)
+            .context("consensus encode coinbase tx for host function values")?;
+
+        let total_fees: u128 = coinbase_tx
+            .output
+            .iter()
+            .map(|out| out.value.to_sat() as u128)
+            .sum();
+        let total_fees_bytes = total_fees.to_le_bytes().to_vec();
+
+        let mut diesel_mints: u128 = 0;
+        for (tx_idx, tx) in full_block.txdata.iter().enumerate() {
+            if let Some(Artifact::Runestone(ref runestone)) = Runestone::decipher(tx) {
+                let protostones = match Protostone::from_runestone(runestone) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        if std::env::var_os("ESPO_LOG_DIESEL_MINTS").is_some() {
+                            eprintln!(
+                                "[TRACE::get_espo_block] diesel mint protostone parse failed: tx_index={tx_idx} txid={} err={err:#}",
+                                tx.compute_txid()
+                            );
+                        }
+                        continue;
+                    }
+                };
+                for protostone in protostones {
+                    if protostone.protocol_tag != 1 {
+                        continue;
+                    }
+                    let calldata: Vec<u8> = protostone
+                        .message
+                        .iter()
+                        .flat_map(|v| v.to_be_bytes())
+                        .collect();
+                    if calldata.is_empty() {
+                        continue;
+                    }
+                    let varint_list = match decode_varint_list(&mut Cursor::new(calldata)) {
+                        Ok(list) => list,
+                        Err(err) => {
+                            if std::env::var_os("ESPO_LOG_DIESEL_MINTS").is_some() {
+                                eprintln!(
+                                    "[TRACE::get_espo_block] diesel mint decode failed: txid={} err={err:#}",
+                                    tx.compute_txid()
+                                );
+                            }
+                            continue;
+                        }
+                    };
+                    if varint_list.len() < 2 {
+                        continue;
+                    }
+                    if let Ok(cellpack) = TryInto::<Cellpack>::try_into(varint_list) {
+                        if cellpack.target == AlkaneId::new(2, 0)
+                            && !cellpack.inputs.is_empty()
+                            && cellpack.inputs[0] == 77
+                        {
+                            diesel_mints = diesel_mints.saturating_add(1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let diesel_mints_bytes = diesel_mints.to_le_bytes().to_vec();
+
+        (header_bytes, coinbase_bytes, diesel_mints_bytes, total_fees_bytes)
+    };
+
+    let (page_start, page_end) =
+        opts.as_ref().map(|o| o.page_range(total_txs)).unwrap_or((0, total_txs));
+
+    // Select only the requested page of transactions
+    let mut selected: Vec<(Txid, Transaction)> =
+        Vec::with_capacity(page_end.saturating_sub(page_start));
+    for (idx, tx) in full_block.txdata.into_iter().enumerate() {
+        if idx < page_start || idx >= page_end {
+            continue;
+        }
+        let txid = tx.compute_txid();
+        selected.push((txid, tx));
+    }
+
+    let allow_txids: HashSet<String> = selected.iter().map(|(txid, _)| txid.to_string()).collect();
+
+    // Index traces only for the selected txids
+    let traces_index = traces_for_block_indexed(block, Some(&allow_txids))?;
     eprintln!(
         "[TRACE::get_espo_block] built traces_index for block={} ({} txs with traces)",
         block,
@@ -527,47 +584,56 @@ pub fn get_espo_block(block: u64, tip: u64) -> Result<EspoBlock> {
     );
 
     // Build transactions
-    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(full_block.txdata.len());
-    for tx in full_block.txdata.into_iter() {
-        let txid = tx.compute_txid();
+    let mut txs: Vec<EspoAlkanesTransaction> = Vec::with_capacity(selected.len());
+    for (txid, tx) in selected.into_iter() {
         let txid_hex = txid.to_string();
 
-        let traces_opt: Option<Vec<EspoTrace>> = if let Some(vouts_partials) =
-            traces_index.get(&txid_hex)
-        {
-            let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
-            for (vout, partial) in vouts_partials.iter() {
-                let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
-                let events: Vec<EspoSandshrewLikeTraceEvent> =
-                    serde_json::from_str(&events_json_str)
-                        .context("deserialize sandshrew-like events")?;
+        let traces_opt: Option<Vec<EspoTrace>> =
+            if let Some(vouts_partials) = traces_index.get(&txid_hex) {
+                let mut traces_vec: Vec<EspoTrace> = Vec::with_capacity(vouts_partials.len());
+                for (vout, partial) in vouts_partials.iter() {
+                    let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)?;
+                    let events: Vec<EspoSandshrewLikeTraceEvent> =
+                        serde_json::from_str(&events_json_str)
+                            .context("deserialize sandshrew-like events")?;
 
-                let sandshrew_trace =
-                    EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
+                    let sandshrew_trace =
+                        EspoSandshrewLikeTrace { outpoint: format!("{txid_hex}:{vout}"), events };
 
-                let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
-                let outpoint = EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: *vout };
+                    let storage_changes = extract_alkane_storage(&partial.protobuf_trace, &tx)?;
+                    let outpoint = EspoOutpoint {
+                        txid: txid.as_byte_array().to_vec(),
+                        vout: *vout,
+                        tx_spent: None,
+                    };
 
-                traces_vec.push(EspoTrace {
-                    sandshrew_trace,
-                    protobuf_trace: partial.protobuf_trace.clone(),
-                    storage_changes,
-                    outpoint,
-                });
-            }
-            Some(traces_vec)
-        } else {
-            None
-        };
+                    traces_vec.push(EspoTrace {
+                        sandshrew_trace,
+                        protobuf_trace: partial.protobuf_trace.clone(),
+                        storage_changes,
+                        outpoint,
+                    });
+                }
+                Some(traces_vec)
+            } else {
+                None
+            };
 
         txs.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx });
     }
-    eprintln!("[TRACE::get_espo_block] built {} EspoAlkanesTransaction(s)", txs.len());
+    eprintln!(
+        "[TRACE::get_espo_block] built {} EspoAlkanesTransaction(s) (page {}..{})",
+        txs.len(),
+        page_start,
+        page_end
+    );
 
     eprintln!("[TRACE::get_espo_block] done block={block}");
     Ok(EspoBlock {
         block_header,
+        tx_count: total_txs,
         transactions: txs,
+        host_function_values,
         height: block
             .try_into()
             .context("block height does not fit into u32 for EspoBlock::height")?,

@@ -1,25 +1,39 @@
-use crate::ESPO_HEIGHT;
-use crate::runtime::{dbpaths::get_sdb_path_for_metashrew, sdb::SDB};
+use crate::alkanes::metashrew::MetashrewAdapter;
+use crate::runtime::{
+    aof::{AOF_REORG_DEPTH, AofManager},
+    dbpaths::get_sdb_path_for_metashrew,
+    sdb::SDB,
+};
+use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
+use crate::{ESPO_HEIGHT, SAFE_TIP};
 use anyhow::Result;
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
-use std::sync::atomic::Ordering;
-use std::{fs, path::Path, sync::OnceLock, time::Duration};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 // Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client as CoreClient};
 
 // Block fetcher (blk files + RPC fallback)
-use crate::core::blockfetcher::BlkOrRpcBlockSource;
+use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
 
 static CONFIG: OnceLock<CliArgs> = OnceLock::new();
-static ELECTRUM_CLIENT: OnceLock<Client> = OnceLock::new();
+static ELECTRUM_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+static ELECTRUM_LIKE: OnceLock<Arc<dyn ElectrumLike>> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
 static METASHREW_SDB: OnceLock<std::sync::Arc<SDB>> = OnceLock::new();
 static ESPO_DB: OnceLock<std::sync::Arc<DB>> = OnceLock::new();
 static BLOCK_SOURCE: OnceLock<BlkOrRpcBlockSource> = OnceLock::new();
+static AOF_MANAGER: OnceLock<std::sync::Arc<AofManager>> = OnceLock::new();
 
 // NEW: Global bitcoin::Network
 static NETWORK: OnceLock<Network> = OnceLock::new();
@@ -32,6 +46,15 @@ fn parse_network(s: &str) -> std::result::Result<Network, String> {
     }
 }
 
+fn parse_block_fetch_mode(s: &str) -> std::result::Result<BlockFetchMode, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(BlockFetchMode::Auto),
+        "rpc" | "rpc-only" | "rpc_only" => Ok(BlockFetchMode::RpcOnly),
+        "blk" | "blk-only" | "blk_only" | "files" => Ok(BlockFetchMode::BlkOnly),
+        _ => Err("invalid value for --block-source-mode: use auto | rpc-only | blk-only".into()),
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct CliArgs {
@@ -39,7 +62,15 @@ pub struct CliArgs {
     pub readonly_metashrew_db_dir: String,
 
     #[arg(short, long)]
-    pub electrum_rpc_url: String,
+    pub electrum_rpc_url: Option<String>,
+
+    /// Full HTTP URL to a metashrew JSON-RPC endpoint (required for pending trace previews)
+    #[arg(long)]
+    pub metashrew_rpc_url: String,
+
+    /// HTTP base URL to an electrs/esplora endpoint (e.g. https://myelectrs.example)
+    #[arg(long)]
+    pub electrs_esplora_url: Option<String>,
 
     /// Full HTTP URL to Bitcoin Core's JSON-RPC (e.g. http://127.0.0.1:8332)
     #[arg(long)]
@@ -57,6 +88,14 @@ pub struct CliArgs {
     #[arg(long, default_value = "~/.bitcoin/blocks")]
     pub bitcoind_blocks_dir: String,
 
+    /// If set, clears the persisted mempool namespace on startup.
+    #[arg(long, default_value_t = false)]
+    pub reset_mempool_on_startup: bool,
+
+    /// Serve existing data without running the indexer or mempool service.
+    #[arg(long, default_value_t = false)]
+    pub view_only: bool,
+
     #[arg(short, long, default_value = "./db/tmp")]
     pub tmp_dbs_dir: String,
 
@@ -64,20 +103,50 @@ pub struct CliArgs {
     #[arg(long, default_value = "./db/espo")]
     pub espo_db_path: String,
 
+    /// Enable append-only file logging for module namespaces (reorg protection).
+    #[arg(long, default_value_t = false)]
+    pub enable_aof: bool,
+
+    /// Directory for the AOF journal (separate from RocksDB).
+    #[arg(long, default_value = "./db/aof")]
+    pub aof_db_path: String,
+
     #[arg(short, long, default_value_t = 5000)]
     pub sdb_poll_ms: u16,
+
+    /// Optional delay between indexing blocks (ms). Use to throttle catch-up pressure.
+    #[arg(long, default_value_t = 0)]
+    pub indexer_block_delay_ms: u64,
 
     #[arg(short = 'p', long, default_value_t = 8080)]
     pub port: u16,
 
+    /// Optional bind address for the SSR explorer (e.g. 127.0.0.1:8081). If omitted, no explorer server is started.
+    #[arg(long)]
+    pub explorer_host: Option<SocketAddr>,
+
     /// Bitcoin network: 'mainnet' or 'regtest'
     #[arg(short, long, value_parser = parse_network, default_value = "mainnet")]
     pub network: Network,
+
+    #[arg(long, short, default_value = None)]
+    pub metashrew_db_label: Option<String>,
+
+    /// Enable debug mode checks (panic on configured invariants).
+    #[arg(long, default_value_t = false)]
+    pub debug: bool,
+
+    /// Choose where block bodies come from: blk files + RPC fallback ("auto", default),
+    /// RPC only ("rpc-only"), or blk files only ("blk-only").
+    #[arg(long, value_parser = parse_block_fetch_mode, default_value = "rpc")]
+    pub block_source_mode: BlockFetchMode,
+
+    /// Test-only: on startup, revert all AOF-covered blocks to simulate a deep reorg.
+    #[arg(long, default_value_t = false)]
+    pub simulate_reorg: bool,
 }
 
-pub fn init_config() -> Result<()> {
-    let args = CliArgs::parse();
-
+pub fn init_config_from(args: CliArgs) -> Result<()> {
     // --- validations ---
     let db = Path::new(&args.readonly_metashrew_db_dir);
     if !db.exists() {
@@ -85,6 +154,10 @@ pub fn init_config() -> Result<()> {
     }
     if !db.is_dir() {
         anyhow::bail!("Database path is not a directory: {}", args.readonly_metashrew_db_dir);
+    }
+
+    if args.metashrew_rpc_url.trim().is_empty() {
+        anyhow::bail!("metashrew_rpc_url must be provided");
     }
 
     let tmp = Path::new(&args.tmp_dbs_dir);
@@ -105,16 +178,40 @@ pub fn init_config() -> Result<()> {
         anyhow::bail!("espo_db_path is not a directory: {}", args.espo_db_path);
     }
 
-    let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
-    if !blocks_dir.exists() {
-        anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
+    if args.enable_aof {
+        let aof_dir = Path::new(&args.aof_db_path);
+        if !aof_dir.exists() {
+            fs::create_dir_all(aof_dir).map_err(|e| {
+                anyhow::anyhow!("Failed to create aof_db_path {}: {e}", args.aof_db_path)
+            })?;
+        } else if !aof_dir.is_dir() {
+            anyhow::bail!("aof_db_path is not a directory: {}", args.aof_db_path);
+        }
     }
-    if !blocks_dir.is_dir() {
-        anyhow::bail!("bitcoind blocks dir is not a directory: {}", args.bitcoind_blocks_dir);
+
+    if args.block_source_mode != BlockFetchMode::RpcOnly {
+        let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
+        if !blocks_dir.exists() {
+            anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
+        }
+        if !blocks_dir.is_dir() {
+            anyhow::bail!("bitcoind blocks dir is not a directory: {}", args.bitcoind_blocks_dir);
+        }
     }
 
     if args.sdb_poll_ms == 0 {
         anyhow::bail!("sdb_poll_ms must be greater than 0");
+    }
+
+    let electrum_url = args.electrum_rpc_url.clone().filter(|s| !s.is_empty());
+    let esplora_url = args.electrs_esplora_url.clone().filter(|s| !s.is_empty());
+    if electrum_url.is_none() && esplora_url.is_none() {
+        anyhow::bail!("provide either --electrum-rpc-url or --electrs-esplora-url");
+    }
+    if electrum_url.is_some() && esplora_url.is_some() {
+        eprintln!(
+            "[config] both electrum rpc and electrs esplora URLs provided; electrum rpc will be used"
+        );
     }
 
     // --- store config ---
@@ -127,12 +224,22 @@ pub fn init_config() -> Result<()> {
         .set(args.network)
         .map_err(|_| anyhow::anyhow!("network already initialized"))?;
 
-    // --- init Electrum client once ---
-    let electrum_url = format!("tcp://{}", args.electrum_rpc_url);
-    let client: Client = Client::new(&electrum_url)?;
-    ELECTRUM_CLIENT
-        .set(client)
-        .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+    // --- init Electrum-like client once ---
+    let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
+        let electrum_url = format!("tcp://{}", url);
+        let client: Arc<Client> = Arc::new(Client::new(&electrum_url)?);
+        ELECTRUM_CLIENT
+            .set(client.clone())
+            .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+        Arc::new(ElectrumRpcClient::new(client))
+    } else {
+        let base =
+            esplora_url.expect("validation ensures esplora url exists when electrum is None");
+        Arc::new(EsploraElectrumLike::new(base)?)
+    };
+    ELECTRUM_LIKE
+        .set(electrum_like)
+        .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
 
     // --- init Bitcoin Core RPC client once ---
     let core = CoreClient::new(
@@ -157,19 +264,40 @@ pub fn init_config() -> Result<()> {
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
     espo_opts.create_if_missing(true);
-    let espo_db = DB::open(&espo_opts, &args.espo_db_path)?;
+    let espo_db = std::sync::Arc::new(DB::open(&espo_opts, &args.espo_db_path)?);
     ESPO_DB
-        .set(std::sync::Arc::new(espo_db))
+        .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
+
+    if args.enable_aof {
+        let mgr = AofManager::new(espo_db.clone(), &args.aof_db_path, AOF_REORG_DEPTH)?;
+        AOF_MANAGER
+            .set(std::sync::Arc::new(mgr))
+            .map_err(|_| anyhow::anyhow!("AOF manager already initialized"))?;
+    }
+
+    init_block_source()?;
 
     Ok(())
 }
 
+pub fn init_config() -> Result<()> {
+    let args = CliArgs::parse();
+    init_config_from(args)
+}
+
 // UPDATED: no param; uses global NETWORK
 pub fn init_block_source() -> Result<()> {
+    if BLOCK_SOURCE.get().is_some() {
+        return Ok(());
+    }
     let args = get_config();
     let network = get_network();
-    let src = BlkOrRpcBlockSource::new_with_config(&args.bitcoind_blocks_dir, network)?;
+    let src = BlkOrRpcBlockSource::new_with_config(
+        &args.bitcoind_blocks_dir,
+        network,
+        args.block_source_mode,
+    )?;
     BLOCK_SOURCE
         .set(src)
         .map_err(|_| anyhow::anyhow!("block source already initialized"))?;
@@ -180,8 +308,15 @@ pub fn get_config() -> &'static CliArgs {
     CONFIG.get().expect("init_config() must be called once at startup")
 }
 
-pub fn get_electrum_client() -> &'static Client {
-    ELECTRUM_CLIENT.get().expect("init_config() must be called once at startup")
+pub fn get_electrum_client() -> Option<Arc<Client>> {
+    ELECTRUM_CLIENT.get().cloned()
+}
+
+pub fn get_electrum_like() -> Arc<dyn ElectrumLike> {
+    ELECTRUM_LIKE
+        .get()
+        .expect("init_config() must be called once at startup")
+        .clone()
 }
 
 pub fn get_bitcoind_rpc_client() -> &'static CoreClient {
@@ -205,6 +340,11 @@ pub fn get_espo_db() -> std::sync::Arc<DB> {
     std::sync::Arc::clone(ESPO_DB.get().expect("init_config() must be called once at startup"))
 }
 
+/// Optional handle to the global AOF manager (only present when --enable-aof is set).
+pub fn get_aof_manager() -> Option<std::sync::Arc<AofManager>> {
+    AOF_MANAGER.get().cloned()
+}
+
 /// Global accessor for the block source (blk files + RPC fallback)
 pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
     BLOCK_SOURCE
@@ -217,9 +357,36 @@ pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
 }
 
+pub fn is_debug_mode() -> bool {
+    get_config().debug
+}
+
+pub fn get_metashrew() -> MetashrewAdapter {
+    let label = get_config().metashrew_db_label.clone();
+
+    MetashrewAdapter::new(label)
+}
+
+pub fn get_metashrew_rpc_url() -> &'static str {
+    &get_config().metashrew_rpc_url
+}
+
 pub fn get_espo_next_height() -> u32 {
     ESPO_HEIGHT
         .get()
         .expect("indexer must be initialized before calling get_espo_next_height")
         .load(Ordering::Relaxed)
+}
+
+pub fn get_espo_indexed_height() -> Option<u32> {
+    ESPO_HEIGHT.get().map(|cell| cell.load(Ordering::Relaxed).saturating_sub(1))
+}
+
+pub fn update_safe_tip(height: u32) {
+    let cell = SAFE_TIP.get_or_init(|| Arc::new(AtomicU32::new(height)));
+    cell.store(height, Ordering::Relaxed);
+}
+
+pub fn get_last_safe_tip() -> Option<u32> {
+    SAFE_TIP.get().map(|cell| cell.load(Ordering::Relaxed))
 }
