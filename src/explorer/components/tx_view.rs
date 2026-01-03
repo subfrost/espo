@@ -5,6 +5,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid, opcodes};
 use maud::{Markup, PreEscaped, html};
 
+use crate::config::get_base_path;
 use crate::alkanes::trace::{
     EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
     EspoTrace, prettyify_protobuf_trace_json,
@@ -611,10 +612,10 @@ fn summarize_contract_call(
     })
 }
 
-fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
+fn render_trace_summary(summary: &ContractCallSummary, base_path: &str) -> Markup {
     let is_factory_clone = summary.factory_template.is_some();
     let link_id = summary.link_id;
-    let alkane_path = format!("/alkane/{}:{}", link_id.block, link_id.tx);
+    let alkane_path = format!("{}/alkane/{}:{}", base_path, link_id.block, link_id.tx);
     let status_class = if summary.success { "success" } else { "failure" };
     let status_text = match (summary.response_text.clone(), summary.success) {
         (Some(_), true) => "Call successful".to_string(),
@@ -666,7 +667,7 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
                 }
             }
             @if let Some(created) = summary.factory_created {
-                @let created_path = format!("/alkane/{}:{}", created.block, created.tx);
+                @let created_path = format!("{}/alkane/{}:{}", base_path, created.block, created.tx);
                 @let created_meta = summary.factory_created_meta.as_ref();
                 @let created_icon = created_meta.map(|m| m.icon_url.clone()).unwrap_or_default();
                 @let created_name = created_meta.map(|m| m.name.value.clone()).unwrap_or_else(|| format!("{}:{}", created.block, created.tx));
@@ -690,7 +691,7 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
     }
 }
 
-pub fn render_trace_summaries(traces: &[EspoTrace], essentials_mdb: &Mdb) -> Markup {
+pub fn render_trace_summaries(traces: &[EspoTrace], essentials_mdb: &Mdb, base_path: &str) -> Markup {
     if traces.is_empty() {
         return html! {};
     }
@@ -703,7 +704,7 @@ pub fn render_trace_summaries(traces: &[EspoTrace], essentials_mdb: &Mdb) -> Mar
             @for trace in traces {
                 @let summary = summarize_contract_call(trace, &mut inspection_cache, &mut meta_cache, &mut impl_cache, essentials_mdb);
                 @if let Some(s) = summary {
-                    (render_trace_summary(&s))
+                    (render_trace_summary(&s, base_path))
                 }
             }
         }
@@ -975,7 +976,7 @@ fn render_op_return(
                         @let summary = summarize_contract_call(*trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
                         div class="trace-view" {
                             @if let Some(s) = summary {
-                                (render_trace_summary(&s))
+                                (render_trace_summary(&s, get_base_path()))
                             }
                             details class="opret-toggle" {
                                 summary class="opret-toggle-summary" {

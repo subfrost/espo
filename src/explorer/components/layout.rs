@@ -3,6 +3,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::config::get_base_path;
 use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::{dots, icon_search, logo_espo};
 
@@ -72,7 +73,31 @@ pub async fn style() -> impl IntoResponse {
     (StatusCode::OK, [(CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS)
 }
 
+/// Helper to prefix a path with base_path
+fn prefixed(base_path: &str, path: &str) -> String {
+    if base_path.is_empty() {
+        path.to_string()
+    } else if path.starts_with('/') {
+        format!("{}{}", base_path, path)
+    } else {
+        format!("{}/{}", base_path, path)
+    }
+}
+
+/// Main layout function that wraps page content
+/// base_path is optional - if not provided, it uses the global config value
 pub fn layout(title: &str, content: Markup) -> Html<String> {
+    layout_with_base_path(title, content, get_base_path())
+}
+
+/// Layout with explicit base path (for internal use)
+fn layout_with_base_path(title: &str, content: Markup, base_path: &str) -> Html<String> {
+    let home_url = prefixed(base_path, "/");
+    let search_url = prefixed(base_path, "/search");
+    let alkanes_url = prefixed(base_path, "/alkanes");
+    let style_url = prefixed(base_path, "/static/style.css");
+    let api_base = base_path.to_string();
+
     let markup = html! {
         (DOCTYPE)
         html lang="en" {
@@ -80,18 +105,20 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
-                link rel="stylesheet" href="/static/style.css";
+                link rel="stylesheet" href=(style_url);
+                // Store base path for JavaScript use
+                script { (PreEscaped(format!("window.ESPO_BASE_PATH = \"{}\";", base_path))) }
             }
             body {
                 header class="topbar" data-topbar="" {
                     div class="app" {
                         nav class="nav" data-nav-menu="" {
-                            a class="brand" href="/" {
+                            a class="brand" href=(home_url) {
                                 (logo_espo())
                                 span class="brand-text" { "Espo" }
                             }
                             div class="nav-search hero-search" data-search="" {
-                                form class="hero-search-form" method="get" action="/search" autocomplete="off" data-search-form="" {
+                                form class="hero-search-form" method="get" action=(search_url) autocomplete="off" data-search-form="" data-api-base=(api_base) {
                                     div class="hero-search-input" {
                                         span class="hero-search-icon" aria-hidden="true" { (icon_search()) }
                                         input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions" data-search-input="" aria-label="Search blocks, alkanes, transactions" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
@@ -103,8 +130,8 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 }
                             }
                             div class="navlinks-container" {
-                                a class="navlink" href="/" { "Blocks" }
-                                a class="navlink" href="/alkanes" { "Alkanes" }
+                                a class="navlink" href=(home_url) { "Blocks" }
+                                a class="navlink" href=(alkanes_url) { "Alkanes" }
                             }
                             div class="nav-actions" {
                                 button class="nav-icon-btn nav-search-toggle" type="button" aria-label="Search" data-search-toggle="" {
@@ -115,15 +142,15 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 }
                             }
                             div class="nav-menu" data-menu="" aria-hidden="true" {
-                                a class="nav-menu-link" href="/" { "Blocks" }
-                                a class="nav-menu-link" href="/alkanes" { "Alkanes" }
+                                a class="nav-menu-link" href=(home_url) { "Blocks" }
+                                a class="nav-menu-link" href=(alkanes_url) { "Alkanes" }
                             }
                         }
                     }
                     div class="nav-search-mobile" data-search-mobile="" aria-hidden="true" {
                         div class="app" {
                             div class="nav-search hero-search" data-search="" {
-                                form class="hero-search-form" method="get" action="/search" autocomplete="off" data-search-form="" {
+                                form class="hero-search-form" method="get" action=(search_url) autocomplete="off" data-search-form="" data-api-base=(api_base) {
                                     div class="hero-search-input" {
                                         span class="hero-search-icon" aria-hidden="true" { (icon_search()) }
                                         input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions" data-search-input="" aria-label="Search blocks, alkanes, transactions" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
@@ -255,7 +282,8 @@ fn search_scripts() -> Markup {
     const fetchResults = (value) => {{
       if (abortController) abortController.abort();
       abortController = new AbortController();
-      fetch(`/api/search/guess?q=${{encodeURIComponent(value)}}`, {{ signal: abortController.signal }})
+      const basePath = window.ESPO_BASE_PATH || '';
+      fetch(`${{basePath}}/api/search/guess?q=${{encodeURIComponent(value)}}`, {{ signal: abortController.signal }})
         .then((res) => (res.ok ? res.json() : null))
         .then((data) => {{
           if (!data) {{

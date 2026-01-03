@@ -38,6 +38,9 @@ static AOF_MANAGER: OnceLock<std::sync::Arc<AofManager>> = OnceLock::new();
 // NEW: Global bitcoin::Network
 static NETWORK: OnceLock<Network> = OnceLock::new();
 
+// Base path for explorer (e.g. "/mainnet" for espo.subfrost.io/mainnet)
+static BASE_PATH: OnceLock<String> = OnceLock::new();
+
 fn parse_network(s: &str) -> std::result::Result<Network, String> {
     match s.to_ascii_lowercase().as_str() {
         "mainnet" => Ok(Network::Bitcoin),
@@ -144,6 +147,11 @@ pub struct CliArgs {
     /// Test-only: on startup, revert all AOF-covered blocks to simulate a deep reorg.
     #[arg(long, default_value_t = false)]
     pub simulate_reorg: bool,
+
+    /// Base path prefix for explorer URLs (e.g. "/mainnet" for multi-network deployments).
+    /// All explorer routes and links will be prefixed with this path.
+    #[arg(long, default_value = "")]
+    pub base_path: String,
 }
 
 pub fn init_config_from(args: CliArgs) -> Result<()> {
@@ -223,6 +231,24 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
     NETWORK
         .set(args.network)
         .map_err(|_| anyhow::anyhow!("network already initialized"))?;
+
+    // Store base path (normalize: strip trailing slashes, ensure starts with / if non-empty)
+    let base_path = {
+        let p = args.base_path.trim();
+        if p.is_empty() {
+            String::new()
+        } else {
+            let p = p.trim_end_matches('/');
+            if p.starts_with('/') {
+                p.to_string()
+            } else {
+                format!("/{}", p)
+            }
+        }
+    };
+    BASE_PATH
+        .set(base_path)
+        .map_err(|_| anyhow::anyhow!("base path already initialized"))?;
 
     // --- init Electrum-like client once ---
     let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
@@ -355,6 +381,11 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
 /// NEW: Global accessor for bitcoin::Network
 pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
+}
+
+/// Global accessor for explorer base path (e.g. "/mainnet" or empty string)
+pub fn get_base_path() -> &'static str {
+    BASE_PATH.get().map(|s| s.as_str()).unwrap_or("")
 }
 
 pub fn is_debug_mode() -> bool {

@@ -14,7 +14,7 @@ use crate::alkanes::trace::{
     prettyify_protobuf_trace_json, traces_for_block_as_prost,
 };
 use crate::config::{
-    get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
+    get_base_path, get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_metashrew,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
@@ -320,7 +320,7 @@ pub async fn tx_page(
         &format!("Tx {txid}"),
         html! {
             div class="block-hero full-bleed" {
-                (block_carousel(tx_height, espo_tip))
+                (block_carousel(tx_height, espo_tip, get_base_path()))
             }
             (header_markup)
             @if let Some(url) = mempool_url {

@@ -7,7 +7,7 @@ use maud::{Markup, html};
 use std::collections::HashSet;
 
 use crate::alkanes::trace::{EspoTrace, get_espo_block};
-use crate::config::{get_bitcoind_rpc_client, get_espo_next_height};
+use crate::config::{get_base_path, get_bitcoind_rpc_client, get_espo_next_height};
 use crate::consts::alkanes_genesis_block;
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout;
@@ -152,8 +152,8 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let latest_height = espo_tip.min(tip);
     let newest_alkanes = load_newest_alkanes(&state.essentials_mdb, 10);
     let latest_alkane_txs = load_latest_alkane_txs(espo_tip, state.network, 4);
-    let latest_block_link = format!("/block/{espo_tip}?traces=1");
-    let alkanes_link = "/alkanes";
+    let latest_block_link = state.url(&format!("/block/{espo_tip}?traces=1"));
+    let alkanes_link = state.url("/alkanes");
 
     let newest_alkanes_table: Markup = if newest_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
@@ -161,6 +161,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
         alkanes_table(&newest_alkanes, false, false, true)
     };
 
+    let base_path = get_base_path();
     let latest_txs_table: Markup = if latest_alkane_txs.is_empty() {
         html! { p class="muted" { "No alkane transactions found." } }
     } else {
@@ -171,9 +172,9 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
                         tr {
                             td class="tx-trace-cell" {
                                 div class="tx-trace-header" {
-                                    a class="link mono tx-trace-id" href=(format!("/tx/{}", row.txid)) { (row.txid) }
+                                    a class="link mono tx-trace-id" href=(state.url(&format!("/tx/{}", row.txid))) { (row.txid) }
                                 }
-                                (render_trace_summaries(std::slice::from_ref(&row.trace), &state.essentials_mdb))
+                                (render_trace_summaries(std::slice::from_ref(&row.trace), &state.essentials_mdb, base_path))
                             }
                         }
                     }
@@ -186,7 +187,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
         "Blocks",
         html! {
             div class="block-hero full-bleed" {
-                (block_carousel(Some(latest_height), espo_tip))
+                (block_carousel(Some(latest_height), espo_tip, base_path))
             }
 
             div class="home-table-intro" {

@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 
 use api::{carousel_blocks, search_guess, simulate_contract};
 use axum::Router;
+use axum::response::Redirect;
 use axum::routing::{get, post};
 use pages::address::address_page;
 use pages::alkane::alkane_page;
@@ -19,8 +20,9 @@ use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
 use components::layout::style;
+use crate::config::get_base_path;
 
-pub fn explorer_router(state: ExplorerState) -> Router {
+fn inner_router(state: ExplorerState) -> Router {
     Router::new()
         .route("/", get(home_page))
         .route("/search", get(search))
@@ -36,8 +38,27 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .with_state(state)
 }
 
+pub fn explorer_router(state: ExplorerState) -> Router {
+    let base_path = state.base_path.clone();
+    let inner = inner_router(state);
+
+    if base_path.is_empty() {
+        inner
+    } else {
+        // Nest all routes under base path and add redirect from / to base path
+        let redirect_path = format!("{}/", base_path);
+        Router::new()
+            .route("/", get(move || async move { Redirect::permanent(&redirect_path) }))
+            .nest(&base_path, inner)
+    }
+}
+
 pub async fn run_explorer(addr: SocketAddr) -> anyhow::Result<()> {
     let state = ExplorerState::new();
+    let base_path = get_base_path();
+    if !base_path.is_empty() {
+        eprintln!("[explorer] using base path: {}", base_path);
+    }
     let app = explorer_router(state);
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service()).await?;

@@ -12,7 +12,7 @@ use crate::alkanes::trace::{
     EspoTrace, GetEspoBlockOpts, get_espo_block_with_opts, traces_for_block_as_prost,
 };
 use crate::config::{
-    get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
+    get_base_path, get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
 };
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::header::{
@@ -269,7 +269,7 @@ pub async fn block_page(
         &format!("Block {height}"),
         html! {
             div class="block-hero full-bleed" {
-                (block_carousel(Some(height), espo_tip))
+                (block_carousel(Some(height), espo_tip, get_base_path()))
             }
 
             (header_markup)
