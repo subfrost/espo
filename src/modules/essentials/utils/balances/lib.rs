@@ -7,7 +7,7 @@ use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
-use crate::config::{get_metashrew, get_network, is_debug_mode};
+use crate::config::{get_electrum_like, get_metashrew, get_network, is_debug_mode};
 use crate::modules::essentials::consts::ESSENTIALS_DEBUG_BALANCE_WATCH;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
@@ -1003,6 +1003,44 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         block_tx_index.insert(atx.transaction.compute_txid(), idx);
     }
 
+    let mut trace_prevout_txids: Vec<Txid> = Vec::new();
+    let mut trace_prevout_set: HashSet<Txid> = HashSet::new();
+    for atx in &block.transactions {
+        let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
+        if !has_traces {
+            continue;
+        }
+        for input in &atx.transaction.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let prev_txid = input.previous_output.txid;
+            if block_tx_index.contains_key(&prev_txid) {
+                continue;
+            }
+            if trace_prevout_set.insert(prev_txid) {
+                trace_prevout_txids.push(prev_txid);
+            }
+        }
+    }
+
+    // TODO: extend prevout fallback to all alkane txs (not just traced) for full address coverage.
+    let mut trace_prev_tx_map: HashMap<Txid, Transaction> = HashMap::new();
+    if !trace_prevout_txids.is_empty() {
+        let electrum_like = get_electrum_like();
+        let raw_prev = electrum_like
+            .batch_transaction_get_raw(&trace_prevout_txids)
+            .unwrap_or_default();
+        for (i, raw_prev) in raw_prev.into_iter().enumerate() {
+            if raw_prev.is_empty() {
+                continue;
+            }
+            if let Ok(prev_tx) = deserialize::<Transaction>(&raw_prev) {
+                trace_prev_tx_map.insert(trace_prevout_txids[i], prev_tx);
+            }
+        }
+    }
+
     // ---------- Main per-tx loop ----------
     for atx in &block.transactions {
         let tx = &atx.transaction;
@@ -1061,6 +1099,15 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                         input_addr = Some(addr.clone());
                     } else if let Some(spk) = spk_by_outpoint.get(&in_key) {
                         input_addr = spk_to_address_str(spk, network);
+                    }
+                }
+                if input_addr.is_none() && has_traces {
+                    if let Some(prev_tx) = trace_prev_tx_map.get(&input.previous_output.txid) {
+                        if let Some(prev_out) =
+                            prev_tx.output.get(input.previous_output.vout as usize)
+                        {
+                            input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
+                        }
                     }
                 }
                 if let Some(addr) = input_addr {
