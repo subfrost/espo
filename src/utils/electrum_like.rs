@@ -52,6 +52,12 @@ pub trait ElectrumLike: Send + Sync {
         offset: usize,
         limit: usize,
     ) -> Result<AddressHistoryPage>;
+    fn address_history_page_cursor(
+        &self,
+        address: &Address,
+        cursor: Option<&Txid>,
+        limit: usize,
+    ) -> Result<AddressHistoryPage>;
 }
 
 /// Thin wrapper over the native Electrum RPC client.
@@ -159,6 +165,15 @@ impl ElectrumLike for ElectrumRpcClient {
             total: Some(total),
             has_more: offset + limit < total,
         })
+    }
+
+    fn address_history_page_cursor(
+        &self,
+        _address: &Address,
+        _cursor: Option<&Txid>,
+        _limit: usize,
+    ) -> Result<AddressHistoryPage> {
+        Err(anyhow::anyhow!("electrum cursor pagination not supported"))
     }
 }
 
@@ -468,6 +483,67 @@ impl ElectrumLike for EsploraElectrumLike {
                 offset + out.len() < total
             } else {
                 out.len() == limit
+            };
+
+            Ok(AddressHistoryPage { entries: out, total, has_more })
+        })
+    }
+
+    fn address_history_page_cursor(
+        &self,
+        address: &Address,
+        cursor: Option<&Txid>,
+        limit: usize,
+    ) -> Result<AddressHistoryPage> {
+        let addr = address.to_string();
+        self.block_on_result(async {
+            let mut out: Vec<AddressHistoryEntry> = Vec::new();
+            let mut seen: HashSet<Txid> = HashSet::new();
+            let mut last_seen: Option<String> = cursor.map(|t| t.to_string());
+            let mut last_page_len: usize = 0;
+            let page_size: usize = 25;
+
+            let summary = self.fetch_address_summary(&addr).await.ok();
+            let total = summary.as_ref().map(|s| s.chain_stats.tx_count as usize);
+
+            while out.len() < limit {
+                let url = match last_seen.as_ref() {
+                    Some(txid) => format!("{}/address/{}/txs/chain/{}", self.base_url, addr, txid),
+                    None => format!("{}/address/{}/txs", self.base_url, addr),
+                };
+                let page = self.fetch_address_txs(&url).await?;
+                if page.is_empty() {
+                    last_page_len = 0;
+                    break;
+                }
+
+                last_page_len = page.len();
+                for tx in page.iter() {
+                    if let Ok(txid) = Txid::from_str(&tx.txid) {
+                        if seen.insert(txid) {
+                            out.push(AddressHistoryEntry { txid, height: tx.status.block_height });
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let next = page.last().map(|t| t.txid.clone());
+                if next.is_none() || next == last_seen {
+                    break;
+                }
+                last_seen = next;
+
+                if last_page_len < page_size {
+                    break;
+                }
+            }
+
+            let has_more = if let Some(total) = total {
+                out.len() < total
+            } else {
+                out.len() >= limit && last_page_len == page_size
             };
 
             Ok(AddressHistoryPage { entries: out, total, has_more })

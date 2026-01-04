@@ -3,10 +3,10 @@ use anyhow::Result;
 
 pub fn get_sdb_path_for_metashrew() -> Result<String> {
     let cfg = get_config();
-    Ok(format!("{}{}", cfg.tmp_dbs_dir.clone(), "/metashrew"))
+    Ok(format!("{}/tmp/metashrew", cfg.db_path))
 }
 
 pub fn get_sdb_path_for_electrs() -> Result<String> {
     let cfg = get_config();
-    Ok(format!("{}{}", cfg.tmp_dbs_dir.clone(), "/electrs"))
+    Ok(format!("{}/tmp/electrs", cfg.db_path))
 }

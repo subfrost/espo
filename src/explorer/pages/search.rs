@@ -4,7 +4,8 @@ use bitcoincore_rpc::RpcApi;
 use serde::Deserialize;
 use std::str::FromStr;
 
-use crate::config::get_bitcoind_rpc_client;
+use crate::config::{get_bitcoind_rpc_client, get_network};
+use bitcoin::Address;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -26,6 +27,12 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
 
     if let Some(alk) = parse_alkane_id(&query) {
         return Redirect::to(&format!("/alkane/{}:{}", alk.block, alk.tx)).into_response();
+    }
+
+    if let Ok(addr) = Address::from_str(&query) {
+        if let Ok(addr) = addr.require_network(get_network()) {
+            return Redirect::to(&format!("/address/{addr}")).into_response();
+        }
     }
 
     if query.len() == 64 && query.chars().all(|c| c.is_ascii_hexdigit()) {

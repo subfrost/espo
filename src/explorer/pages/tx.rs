@@ -314,6 +314,7 @@ pub async fn tx_page(
         pill,
         summary_items,
         cta,
+        hero_class: None,
     });
 
     layout(

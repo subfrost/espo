@@ -11,10 +11,12 @@ use crate::config::{get_metashrew, get_network, is_debug_mode};
 use crate::modules::essentials::consts::ESSENTIALS_DEBUG_BALANCE_WATCH;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, BalanceEntry, HolderEntry, HolderId, addr_spk_key,
-    alkane_balance_txs_by_height_key, alkane_balance_txs_by_token_key, alkane_balance_txs_key,
-    alkane_balances_key, balances_key, decode_alkane_balance_tx_entries, decode_balances_vec,
-    decode_holders_vec, encode_vec, holders_count_key, holders_key, mk_outpoint, outpoint_addr_key,
+    AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, addr_spk_key,
+    alkane_address_len_key, alkane_address_txid_key, alkane_balance_txs_by_height_key,
+    alkane_balance_txs_by_token_key, alkane_balance_txs_key, alkane_balances_key,
+    alkane_block_len_key, alkane_block_txid_key, alkane_latest_traces_key, alkane_tx_summary_key,
+    balances_key, decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec,
+    encode_vec, holders_count_key, holders_key, mk_outpoint, outpoint_addr_key,
     outpoint_balances_key, outpoint_balances_prefix, spk_to_address_str, utxo_spk_key,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -661,6 +663,15 @@ fn apply_transfers_multi(
             Some(trace) => compute_nets(trace),
             None => (None, None, EspoTraceType::NOTRACE),
         };
+        // Metashrew can omit incoming_alkanes on reverted traces; fall back to NOTRACE
+        // so original VIN balances are still available for edicts/pointers.
+        let revert_missing_incoming = status == EspoTraceType::REVERT
+            && net_in.as_ref().map_or(true, |m| m.is_empty());
+        let status = if revert_missing_incoming {
+            EspoTraceType::NOTRACE
+        } else {
+            status
+        };
 
         // add net_out to sheet
         if status == EspoTraceType::SUCCESS {
@@ -840,6 +851,10 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
     let mut stat_outpoints_written: usize = 0;
     let mut stat_minus_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
     let mut stat_plus_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+    let mut alkane_tx_summaries: Vec<AlkaneTxSummary> = Vec::new();
+    let mut alkane_block_txids: Vec<[u8; 32]> = Vec::new();
+    let mut alkane_address_txids: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
+    let mut latest_trace_txids: Vec<[u8; 32]> = Vec::new();
 
     let push_balance_tx_entry = |map: &mut HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>,
                                  alk: SchemaAlkaneId,
@@ -988,6 +1003,9 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         let tx = &atx.transaction;
         let txid = tx.compute_txid();
         let txid_bytes = txid.to_byte_array();
+        let mut tx_addrs: HashSet<String> = HashSet::new();
+        let mut has_alkane_vin = false;
+        let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
         let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
             HashMap::new();
@@ -1027,8 +1045,10 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             // 1) Ephemeral? (created earlier in this same block)
             if let Some(bals) = ephem_outpoint_balances.get(&in_str) {
                 consumed_ephem_outpoints.insert(in_str.clone(), txid.as_byte_array().to_vec());
+                has_alkane_vin = true;
 
                 if let Some(addr) = ephem_outpoint_addr.get(&in_str) {
+                    tx_addrs.insert(addr.clone());
                     for be in bals {
                         add_holder_delta(
                             be.alkane,
@@ -1061,6 +1081,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
             // 2) External input: resolve from prefetched maps (no DB calls here)
             if let Some(bals) = balances_by_outpoint.get(&in_key).cloned() {
+                has_alkane_vin = true;
                 // resolve address: /outpoint_addr first, else /utxo_spk → address
                 let mut resolved_addr = addr_by_outpoint.get(&in_key).cloned();
                 if resolved_addr.is_none() {
@@ -1070,6 +1091,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 }
 
                 if let Some(ref addr) = resolved_addr {
+                    tx_addrs.insert(addr.clone());
                     // holders-- and mark legacy addr-row delete
                     for be in &bals {
                         add_holder_delta(
@@ -1149,6 +1171,7 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             }
 
             if let Some(address_str) = spk_to_address_str(&output.script_pubkey, network) {
+                tx_addrs.insert(address_str.clone());
                 // Combine duplicates
                 let mut amounts_by_alkane: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
                 for entry in entries_for_vout {
@@ -1235,6 +1258,44 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             let outflow = local_alkane_delta.get(owner).cloned().unwrap_or_else(BTreeMap::new);
             let entry = AlkaneBalanceTxEntry { txid: txid_bytes, height: block.height, outflow };
             push_balance_tx_entry(&mut alkane_balance_tx_entries, *owner, entry);
+        }
+
+        let is_alkane_tx = has_alkane_vin || has_traces;
+        if is_alkane_tx {
+            let mut outflows: Vec<AlkaneBalanceTxEntry> = Vec::new();
+            for (_owner, per_token) in &local_alkane_delta {
+                if per_token.is_empty() {
+                    continue;
+                }
+                outflows.push(AlkaneBalanceTxEntry {
+                    txid: txid_bytes,
+                    height: block.height,
+                    outflow: per_token.clone(),
+                });
+            }
+
+            let traces: Vec<EspoSandshrewLikeTrace> = if has_traces {
+                atx.traces
+                    .as_ref()
+                    .map(|list| list.iter().map(|t| t.sandshrew_trace.clone()).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            alkane_tx_summaries.push(AlkaneTxSummary {
+                txid: txid_bytes,
+                traces,
+                outflows,
+                height: block.height,
+            });
+            alkane_block_txids.push(txid_bytes);
+            for addr in &tx_addrs {
+                alkane_address_txids.entry(addr.clone()).or_default().push(txid_bytes);
+            }
+            if has_traces {
+                latest_trace_txids.push(txid_bytes);
+            }
         }
     }
 
@@ -1413,6 +1474,48 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         }
     }
 
+    let mut address_offsets: HashMap<String, u64> = HashMap::new();
+    if !alkane_address_txids.is_empty() {
+        let mut addrs: Vec<String> = alkane_address_txids.keys().cloned().collect();
+        addrs.sort();
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(addrs.len());
+        for addr in &addrs {
+            keys.push(alkane_address_len_key(addr));
+        }
+        let existing = mdb.multi_get(&keys)?;
+        for (idx, addr) in addrs.iter().enumerate() {
+            let len = existing
+                .get(idx)
+                .and_then(|v| v.as_ref())
+                .and_then(|b| {
+                    if b.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(b);
+                        Some(u64::from_le_bytes(arr))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            address_offsets.insert(addr.clone(), len);
+        }
+    }
+
+    let mut latest_traces: Vec<[u8; 32]> = mdb
+        .get(alkane_latest_traces_key())
+        .ok()
+        .flatten()
+        .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
+        .unwrap_or_default();
+    if !latest_trace_txids.is_empty() {
+        for txid in latest_trace_txids {
+            latest_traces.insert(0, txid);
+        }
+        if latest_traces.len() > 20 {
+            latest_traces.truncate(20);
+        }
+    }
+
     // logging metric
     stat_outpoints_marked_spent = spent_outpoints.len();
 
@@ -1579,6 +1682,37 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             wb.delete(&height_key);
         } else if let Ok(buf) = borsh::to_vec(&alkane_balance_txs_by_height_row) {
             wb.put(&height_key, &buf);
+        }
+
+        // C4) Persist alkane tx summaries + block/address indexes
+        for summary in &alkane_tx_summaries {
+            if let Ok(buf) = borsh::to_vec(summary) {
+                wb.put(&alkane_tx_summary_key(&summary.txid), &buf);
+            }
+        }
+
+        let block_len = alkane_block_txids.len() as u64;
+        wb.put(&alkane_block_len_key(block.height as u64), &block_len.to_le_bytes());
+        for (idx, txid_bytes) in alkane_block_txids.iter().enumerate() {
+            wb.put(&alkane_block_txid_key(block.height as u64, idx as u64), txid_bytes);
+        }
+
+        for (addr, txids) in alkane_address_txids.iter() {
+            let start = address_offsets.get(addr).copied().unwrap_or(0);
+            for (i, txid_bytes) in txids.iter().enumerate() {
+                let idx = start + i as u64;
+                wb.put(&alkane_address_txid_key(addr, idx), txid_bytes);
+            }
+            let new_len = start + txids.len() as u64;
+            wb.put(&alkane_address_len_key(addr), &new_len.to_le_bytes());
+        }
+
+        if let Ok(buf) = borsh::to_vec(&latest_traces) {
+            if latest_traces.is_empty() {
+                wb.delete(alkane_latest_traces_key());
+            } else {
+                wb.put(alkane_latest_traces_key(), &buf);
+            }
         }
 
         // D) Holders deltas
@@ -1855,6 +1989,54 @@ pub fn get_outpoint_balances_with_spent(
     }
 
     Ok(fallback.unwrap_or_default())
+}
+
+pub fn get_outpoint_balances_with_spent_batch(
+    mdb: &Mdb,
+    outpoints: &[(Txid, u32)],
+) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    const OUTPOINT_BALANCES_PREFIX: &[u8] = b"/outpoint_balances/";
+
+    let mut key_map: Vec<(Vec<u8>, Txid, u32)> = Vec::new();
+    for (txid, vout) in outpoints {
+        let pref = outpoint_balances_prefix(txid.as_byte_array().as_slice(), *vout)?;
+        let keys = mdb.scan_prefix(&pref)?;
+        for k in keys {
+            key_map.push((k, *txid, *vout));
+        }
+    }
+
+    let mut out: HashMap<(Txid, u32), OutpointLookup> = HashMap::new();
+    if key_map.is_empty() {
+        return Ok(out);
+    }
+
+    let keys: Vec<Vec<u8>> = key_map.iter().map(|(k, _, _)| k.clone()).collect();
+    let vals = mdb.multi_get(&keys)?;
+
+    for ((k, txid, vout), val) in key_map.into_iter().zip(vals.into_iter()) {
+        let Some(bytes) = val else { continue };
+        let spent_by = if k.len() > OUTPOINT_BALANCES_PREFIX.len() {
+            EspoOutpoint::try_from_slice(&k[OUTPOINT_BALANCES_PREFIX.len()..])
+                .ok()
+                .and_then(|op| op.tx_spent.and_then(|t| Txid::from_slice(&t).ok()))
+        } else {
+            None
+        };
+        if let Ok(balances) = decode_balances_vec(&bytes) {
+            let entry = OutpointLookup { balances, spent_by };
+            let slot = out.entry((txid, vout)).or_insert_with(OutpointLookup::default);
+            if entry.spent_by.is_some() || slot.balances.is_empty() {
+                *slot = entry;
+            }
+        }
+    }
+
+    for (txid, vout) in outpoints {
+        out.entry((*txid, *vout)).or_insert_with(OutpointLookup::default);
+    }
+
+    Ok(out)
 }
 
 pub fn get_holders_for_alkane(

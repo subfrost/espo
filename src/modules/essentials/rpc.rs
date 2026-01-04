@@ -3,8 +3,10 @@ use crate::config::{get_metashrew, get_network};
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, HolderId, HoldersCountEntry, alkane_balance_txs_by_token_key,
-    alkane_balance_txs_key, alkane_creation_ordered_prefix, block_summary_key,
+    AlkaneBalanceTxEntry, AlkaneTxSummary, HolderId, HoldersCountEntry, alkane_address_len_key,
+    alkane_address_txid_key, alkane_balance_txs_by_token_key, alkane_balance_txs_key,
+    alkane_block_len_key, alkane_block_txid_key, alkane_creation_ordered_prefix,
+    alkane_latest_traces_key, alkane_tx_summary_key, block_summary_key,
     decode_alkane_balance_tx_entries, decode_creation_record, holders_count_key,
     load_creation_record, outpoint_addr_key, outpoint_balances_prefix, BlockSummary,
 };
@@ -1397,6 +1399,283 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             "ok": true,
                             "address": address,
                             "outpoints": outpoints
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_tx_summary = reg.clone();
+        let mdb_tx_summary = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_tx_summary
+                .register("get_alkane_tx_summary", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_tx_summary);
+                    async move {
+                        let txid_hex = match payload.get("txid").and_then(|v| v.as_str()) {
+                            Some(s) if !s.is_empty() => s.trim(),
+                            _ => {
+                                log_rpc("get_alkane_tx_summary", "missing_or_invalid_txid");
+                                return json!({"ok": false, "error": "missing_or_invalid_txid"});
+                            }
+                        };
+                        let txid = match Txid::from_str(txid_hex) {
+                            Ok(t) => t,
+                            Err(_) => {
+                                log_rpc("get_alkane_tx_summary", "invalid_txid_format");
+                                return json!({"ok": false, "error": "invalid_txid_format"});
+                            }
+                        };
+                        log_rpc("get_alkane_tx_summary", &format!("txid={txid}"));
+
+                        let key = alkane_tx_summary_key(&txid.to_byte_array());
+                        let Some(bytes) = mdb.get(&key).ok().flatten() else {
+                            return json!({"ok": false, "error": "not_found"});
+                        };
+                        let summary = match AlkaneTxSummary::try_from_slice(&bytes) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log_rpc(
+                                    "get_alkane_tx_summary",
+                                    &format!("decode failed: {e:?}"),
+                                );
+                                return json!({"ok": false, "error": "decode_failed"});
+                            }
+                        };
+
+                        let traces_json =
+                            serde_json::to_value(&summary.traces).unwrap_or(Value::Null);
+                        let mut outflows_json: Vec<Value> = Vec::new();
+                        for entry in &summary.outflows {
+                            let mut outflow_map = Map::new();
+                            for (alk, delta) in &entry.outflow {
+                                outflow_map.insert(
+                                    format!("{}:{}", alk.block, alk.tx),
+                                    Value::String(delta.to_string()),
+                                );
+                            }
+                            outflows_json.push(json!({
+                                "txid": Txid::from_byte_array(entry.txid).to_string(),
+                                "height": entry.height,
+                                "outflow": outflow_map,
+                            }));
+                        }
+
+                        json!({
+                            "ok": true,
+                            "txid": txid.to_string(),
+                            "height": summary.height,
+                            "traces": traces_json,
+                            "outflows": outflows_json,
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_block_txs = reg.clone();
+        let mdb_block_txs = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_block_txs
+                .register("get_alkane_block_txs", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_block_txs);
+                    async move {
+                        let height = match payload.get("height").and_then(|v| v.as_u64()) {
+                            Some(h) => h,
+                            None => {
+                                log_rpc("get_alkane_block_txs", "missing_or_invalid_height");
+                                return json!({"ok": false, "error": "missing_or_invalid_height"});
+                            }
+                        };
+                        let page =
+                            payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                                as usize;
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).max(1)
+                                as usize;
+                        let off = limit.saturating_mul(page.saturating_sub(1));
+                        log_rpc(
+                            "get_alkane_block_txs",
+                            &format!("height={height}, page={page}, limit={limit}"),
+                        );
+
+                        let total = mdb
+                            .get(&alkane_block_len_key(height))
+                            .ok()
+                            .flatten()
+                            .and_then(|b| {
+                                if b.len() == 8 {
+                                    let mut arr = [0u8; 8];
+                                    arr.copy_from_slice(&b);
+                                    Some(u64::from_le_bytes(arr) as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        if total == 0 {
+                            return json!({
+                                "ok": true,
+                                "height": height,
+                                "page": page,
+                                "limit": limit,
+                                "total": 0,
+                                "txids": []
+                            });
+                        }
+
+                        let end = (off + limit).min(total);
+                        let mut keys: Vec<Vec<u8>> = Vec::new();
+                        for idx in off..end {
+                            keys.push(alkane_block_txid_key(height, idx as u64));
+                        }
+                        let vals = mdb.multi_get(&keys).unwrap_or_default();
+                        let mut txids: Vec<String> = Vec::new();
+                        for v in vals {
+                            let Some(bytes) = v else { continue };
+                            if bytes.len() != 32 {
+                                continue;
+                            }
+                            if let Ok(txid) = Txid::from_slice(&bytes) {
+                                txids.push(txid.to_string());
+                            }
+                        }
+
+                        json!({
+                            "ok": true,
+                            "height": height,
+                            "page": page,
+                            "limit": limit,
+                            "total": total,
+                            "txids": txids
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_addr_txs = reg.clone();
+        let mdb_addr_txs = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_addr_txs
+                .register("get_alkane_address_txs", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_addr_txs);
+                    async move {
+                        let address_raw = match payload.get("address").and_then(|v| v.as_str()) {
+                            Some(s) if !s.is_empty() => s.trim(),
+                            _ => {
+                                log_rpc("get_alkane_address_txs", "missing_or_invalid_address");
+                                return json!({"ok": false, "error": "missing_or_invalid_address"});
+                            }
+                        };
+                        let address = match normalize_address(address_raw) {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_alkane_address_txs", "invalid_address_format");
+                                return json!({"ok": false, "error": "invalid_address_format"});
+                            }
+                        };
+
+                        let page =
+                            payload.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+                                as usize;
+                        let limit =
+                            payload.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).max(1)
+                                as usize;
+                        let off = limit.saturating_mul(page.saturating_sub(1));
+                        log_rpc(
+                            "get_alkane_address_txs",
+                            &format!("address={address}, page={page}, limit={limit}"),
+                        );
+
+                        let total = mdb
+                            .get(&alkane_address_len_key(&address))
+                            .ok()
+                            .flatten()
+                            .and_then(|b| {
+                                if b.len() == 8 {
+                                    let mut arr = [0u8; 8];
+                                    arr.copy_from_slice(&b);
+                                    Some(u64::from_le_bytes(arr) as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+
+                        if total == 0 {
+                            return json!({
+                                "ok": true,
+                                "address": address,
+                                "page": page,
+                                "limit": limit,
+                                "total": 0,
+                                "txids": []
+                            });
+                        }
+
+                        let end = (off + limit).min(total);
+                        let mut keys: Vec<Vec<u8>> = Vec::new();
+                        for idx in off..end {
+                            keys.push(alkane_address_txid_key(&address, idx as u64));
+                        }
+                        let vals = mdb.multi_get(&keys).unwrap_or_default();
+                        let mut txids: Vec<String> = Vec::new();
+                        for v in vals {
+                            let Some(bytes) = v else { continue };
+                            if bytes.len() != 32 {
+                                continue;
+                            }
+                            if let Ok(txid) = Txid::from_slice(&bytes) {
+                                txids.push(txid.to_string());
+                            }
+                        }
+
+                        json!({
+                            "ok": true,
+                            "address": address,
+                            "page": page,
+                            "limit": limit,
+                            "total": total,
+                            "txids": txids
+                        })
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_latest_traces = reg.clone();
+        let mdb_latest_traces = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_latest_traces
+                .register("get_alkane_latest_traces", move |_cx, _payload| {
+                    let mdb = Arc::clone(&mdb_latest_traces);
+                    async move {
+                        log_rpc("get_alkane_latest_traces", "ok");
+                        let list: Vec<[u8; 32]> = mdb
+                            .get(alkane_latest_traces_key())
+                            .ok()
+                            .flatten()
+                            .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
+                            .unwrap_or_default();
+                        let txids: Vec<String> = list
+                            .into_iter()
+                            .filter_map(|b| Txid::from_slice(&b).ok())
+                            .map(|t| t.to_string())
+                            .collect();
+
+                        json!({
+                            "ok": true,
+                            "txids": txids
                         })
                     }
                 })
