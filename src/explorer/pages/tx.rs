@@ -130,6 +130,7 @@ pub async fn tx_page(
         Ok(t) => t,
         Err(_) => return layout("Transaction", html! { p class="error" { "Invalid txid." } }),
     };
+    let base_path = &state.base_path;
 
     let electrum_like = get_electrum_like();
     let mempool_entry = pending_by_txid(&txid);
@@ -284,7 +285,7 @@ pub async fn tx_page(
     summary_items.push(HeaderSummaryItem {
         label: "Block".to_string(),
         value: match tx_height {
-            Some(h) => html! { a class="summary-value link" href=(format!("/block/{h}")) { (format_with_commas(h)) } },
+            Some(h) => html! { a class="summary-value link" href=(format!("{}/block/{h}", base_path)) { (format_with_commas(h)) } },
             None => html! { span class="summary-value muted" { "Unconfirmed" } },
         },
     });
@@ -333,7 +334,7 @@ pub async fn tx_page(
                 }
             }
             h2 class="h2" { "Inputs & Outputs" }
-            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, false))
+            (render_tx(&txid, &tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, tx_pill, false, base_path))
             (header_scripts())
         },
     )

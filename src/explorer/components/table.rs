@@ -81,6 +81,7 @@ pub fn alkanes_table(
     show_header: bool,
     show_creation_block: bool,
     show_holder_icon: bool,
+    base_path: &str,
 ) -> Markup {
     let table_class = if show_creation_block {
         "table holders_table alkanes-table has-block"
@@ -123,18 +124,18 @@ pub fn alkanes_table(
                                     span class="alk-icon-letter" { (row.fallback) }
                                 }
                                 div class="alkane-meta" {
-                                    a class="alk-sym link mono alkane-name-link" href=(format!("/alkane/{}", row.id)) { (row.name.clone()) }
+                                    a class="alk-sym link mono alkane-name-link" href=(format!("{}/alkane/{}", base_path, row.id)) { (row.name.clone()) }
                                     div class="muted mono alkane-id" { (row.id.clone()) }
                                 }
                             }
                         }
                         @if show_creation_block {
                             td class="alkane-block-cell" {
-                                a class="link mono" href=(format!("/block/{}", row.creation_height)) { (row.creation_height) }
+                                a class="link mono" href=(format!("{}/block/{}", base_path, row.creation_height)) { (row.creation_height) }
                             }
                         }
                         td class="mono alkane-tx-cell" {
-                            a class="link ellipsis alkane-txid" href=(format!("/tx/{}", row.creation_txid)) { (&row.creation_txid) }
+                            a class="link ellipsis alkane-txid" href=(format!("{}/tx/{}", base_path, row.creation_txid)) { (&row.creation_txid) }
                         }
                         td class="alkane-holders-cell" {
                             span class="mono holders-count" {

@@ -60,6 +60,7 @@ pub async fn alkane_page(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let alk_str = format!("{}:{}", alk.block, alk.tx);
+    let base_path = &state.base_path;
     let mut kv_cache: AlkaneMetaCache = Default::default();
     let meta = alkane_meta(&alk, &mut kv_cache, &state.essentials_mdb);
     let display_name = meta.name.value.clone();
@@ -116,7 +117,7 @@ pub async fn alkane_page(
                 HolderId::Address(addr) => {
                     let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
                     html! {
-                        a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
+                        a class="link mono addr-inline" href=(format!("{}/address/{}", base_path, addr)) {
                             span class="addr-rank" { (format!("{rank}.")) }
                             span class="addr-prefix" { (addr_prefix) }
                             span class="addr-suffix" { (addr_suffix) }
@@ -128,7 +129,7 @@ pub async fn alkane_page(
                     let h_meta = alkane_meta(&id, &mut kv_cache, &state.essentials_mdb);
                     let h_fallback_letter = h_meta.name.fallback_letter();
                     html! {
-                        a class="link mono addr-inline" href=(format!("/alkane/{id_str}")) {
+                        a class="link mono addr-inline" href=(format!("{}/alkane/{id_str}", base_path)) {
                             span class="addr-rank" { (format!("{rank}.")) }
                             div class="alk-icon-wrap" aria-hidden="true" {
                                 span class="alk-icon-img" style=(icon_bg_style(&h_meta.icon_url)) {}
@@ -149,7 +150,7 @@ pub async fn alkane_page(
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(h.amount)) }
-                        a class="alk-sym link mono" href=(format!("/alkane/{alk_str}")) { (coin_label.clone()) }
+                        a class="alk-sym link mono" href=(format!("{}/alkane/{alk_str}", base_path)) { (coin_label.clone()) }
                     }
                 },
             ]
@@ -169,7 +170,7 @@ pub async fn alkane_page(
     let balances_markup = if balance_entries.is_empty() {
         html! { p class="muted" { "No alkanes tracked for this alkane." } }
     } else {
-        render_alkane_balance_cards(&balance_entries, &state.essentials_mdb)
+        render_alkane_balance_cards(&balance_entries, &state.essentials_mdb, base_path)
     };
 
     layout(
@@ -227,7 +228,7 @@ pub async fn alkane_page(
                             span class="alkane-stat-label" { "Deploy transaction" }
                             @if let Some(txid) = creation_txid.as_ref() {
                                 div class="alkane-stat-line" {
-                                    a class="alkane-stat-value link mono" href=(format!("/tx/{txid}")) { (short_hex(txid)) }
+                                    a class="alkane-stat-value link mono" href=(format!("{}/tx/{txid}", base_path)) { (short_hex(txid)) }
                                 }
                             } @else {
                                 div class="alkane-stat-line" {
@@ -239,7 +240,7 @@ pub async fn alkane_page(
                             span class="alkane-stat-label" { "Deploy block" }
                             @if let Some(h) = creation_height {
                                 div class="alkane-stat-line" {
-                                    a class="alkane-stat-value link" href=(format!("/block/{h}")) { (h) }
+                                    a class="alkane-stat-value link" href=(format!("{}/block/{h}", base_path)) { (h) }
                                 }
                             } @else {
                                 div class="alkane-stat-line" {
@@ -259,23 +260,23 @@ pub async fn alkane_page(
                     div class="alkane-tabs" {
                         div class="alkane-tab-list" {
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
-                                href=(format!("/alkane/{alk_str}?page={page}&limit={limit}")) { "Holders" }
+                                href=(format!("{}/alkane/{alk_str}?page={page}&limit={limit}", base_path)) { "Holders" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
-                                href=(format!("/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}")) { "Inspect contract" }
+                                href=(format!("{}/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}", base_path)) { "Inspect contract" }
                         }
                         div class="alkane-tab-panel" {
                             @if tab == AlkaneTab::Holders {
                                 (table_markup)
                                 div class="pager" {
                                     @if has_prev {
-                                        a class="pill iconbtn" href=(format!("/alkane/{alk_str}?page=1&limit={limit}")) aria-label="First page" {
+                                        a class="pill iconbtn" href=(format!("{}/alkane/{alk_str}?page=1&limit={limit}", base_path)) aria-label="First page" {
                                             (icon_skip_left())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                                     }
                                     @if has_prev {
-                                        a class="pill iconbtn" href=(format!("/alkane/{alk_str}?page={}&limit={limit}", page - 1)) aria-label="Previous page" {
+                                        a class="pill iconbtn" href=(format!("{}/alkane/{alk_str}?page={}&limit={limit}", base_path, page - 1)) aria-label="Previous page" {
                                             (icon_left())
                                         }
                                     } @else {
@@ -291,14 +292,14 @@ pub async fn alkane_page(
                                         (total)
                                     }
                                     @if has_next {
-                                        a class="pill iconbtn" href=(format!("/alkane/{alk_str}?page={}&limit={limit}", page + 1)) aria-label="Next page" {
+                                        a class="pill iconbtn" href=(format!("{}/alkane/{alk_str}?page={}&limit={limit}", base_path, page + 1)) aria-label="Next page" {
                                             (icon_right())
                                         }
                                     } @else {
                                         span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                                     }
                                     @if has_next {
-                                        a class="pill iconbtn" href=(format!("/alkane/{alk_str}?page={}&limit={limit}", last_page)) aria-label="Last page" {
+                                        a class="pill iconbtn" href=(format!("{}/alkane/{alk_str}?page={}&limit={limit}", base_path, last_page)) aria-label="Last page" {
                                             (icon_skip_right())
                                         }
                                     } @else {

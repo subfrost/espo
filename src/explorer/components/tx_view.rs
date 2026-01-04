@@ -5,7 +5,6 @@ use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, Txid, opcodes};
 use maud::{Markup, PreEscaped, html};
 
-use crate::config::get_base_path;
 use crate::alkanes::trace::{
     EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoSandshrewLikeTraceStatus,
     EspoTrace, prettyify_protobuf_trace_json,
@@ -723,11 +722,12 @@ pub fn render_tx(
     essentials_mdb: &Mdb,
     pill: Option<TxPill>,
     show_tx_title: bool,
+    base_path: &str,
 ) -> Markup {
     let mut alkane_meta_cache: AlkaneMetaCache = HashMap::new();
     let mut alkane_impl_cache: AlkaneImplCache = HashMap::new();
     let vins_markup =
-        render_vins(tx, network, prev_map, outpoint_fn, &mut alkane_meta_cache, essentials_mdb);
+        render_vins(tx, network, prev_map, outpoint_fn, &mut alkane_meta_cache, essentials_mdb, base_path);
     let outspends = outspends_fn(txid);
     let protostone_json = protostone_json(tx);
     let runestone_vouts = runestone_vout_indices(tx);
@@ -743,12 +743,13 @@ pub fn render_tx(
         &mut alkane_meta_cache,
         &mut alkane_impl_cache,
         essentials_mdb,
+        base_path,
     );
 
     html! {
         div class="card tx-card" {
             @if show_tx_title {
-                span class="mono tx-title" { a class="link" href=(format!("/tx/{}", txid)) { (txid) } }
+                span class="mono tx-title" { a class="link" href=(format!("{}/tx/{}", base_path, txid)) { (txid) } }
             }
             div class="tx-io-grid" {
                 div class="io-col" {
@@ -781,6 +782,7 @@ fn render_vins(
     outpoint_fn: &dyn Fn(&Txid, u32) -> OutpointLookup,
     alkane_meta_cache: &mut AlkaneMetaCache,
     essentials_mdb: &Mdb,
+    base_path: &str,
 ) -> Markup {
     html! {
         @if tx.input.is_empty() {
@@ -804,7 +806,7 @@ fn render_vins(
                         @let prevout = prev_map.get(&prev_txid).and_then(|ptx| ptx.output.get(prev_vout as usize));
                         @let prevout_view = outpoint_fn(&prev_txid, prev_vout);
                         div class="io-row" {
-                            a class="io-arrow io-arrow-link in" href=(format!("/tx/{}", prev_txid)) title="View previous transaction" { (arrow_svg()) }
+                            a class="io-arrow io-arrow-link in" href=(format!("{}/tx/{}", base_path, prev_txid)) title="View previous transaction" { (arrow_svg()) }
                             div class="io-main" {
                                 @match prevout {
                                     Some(po) => {
@@ -815,7 +817,7 @@ fn render_vins(
                                                     Some(a) => {
                                                         @let addr = a.to_string();
                                                         @let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
-                                                        a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
+                                                        a class="link mono addr-inline" href=(format!("{}/address/{}", base_path, addr)) {
                                                             span class="addr-prefix" { (addr_prefix) }
                                                             span class="addr-suffix" { (addr_suffix) }
                                                         }
@@ -833,7 +835,7 @@ fn render_vins(
                                         }
                                     }
                                 }
-                                (balances_list(&prevout_view.balances, alkane_meta_cache, essentials_mdb, true))
+                                (balances_list(&prevout_view.balances, alkane_meta_cache, essentials_mdb, true, base_path))
                             }
                         }
                     }
@@ -855,6 +857,7 @@ fn render_vouts(
     alkane_meta_cache: &mut AlkaneMetaCache,
     alkane_impl_cache: &mut AlkaneImplCache,
     essentials_mdb: &Mdb,
+    base_path: &str,
 ) -> Markup {
     let tx_bytes = txid.to_byte_array();
     let tx_hex = txid.to_string();
@@ -892,7 +895,7 @@ fn render_vouts(
                                             .collect();
                                         if !matches.is_empty() { matches } else { ts.iter().collect() }
                                     }).unwrap_or_default();
-                                    (render_op_return(&payload, o.value, is_protostone, protostone_json.as_ref(), &traces_for_vout, &mut inspection_cache, alkane_meta_cache, alkane_impl_cache, essentials_mdb))
+                                    (render_op_return(&payload, o.value, is_protostone, protostone_json.as_ref(), &traces_for_vout, &mut inspection_cache, alkane_meta_cache, alkane_impl_cache, essentials_mdb, base_path))
                                 }
                                 None => {
                                     @let addr_opt = Address::from_script(o.script_pubkey.as_script(), network).ok();
@@ -902,7 +905,7 @@ fn render_vouts(
                                                 Some(a) => {
                                                     @let addr = a.to_string();
                                                     @let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
-                                                    a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
+                                                    a class="link mono addr-inline" href=(format!("{}/address/{}", base_path, addr)) {
                                                         span class="addr-prefix" { (addr_prefix) }
                                                         span class="addr-suffix" { (addr_suffix) }
                                                     }
@@ -914,10 +917,10 @@ fn render_vouts(
                                     }
                                 }
                             }
-                            (balances_list(&balances, alkane_meta_cache, essentials_mdb, true))
+                            (balances_list(&balances, alkane_meta_cache, essentials_mdb, true, base_path))
                         }
                         @match spent_by {
-                            Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(format!("/tx/{}", spender)) title="Spent by transaction" { (arrow_svg()) },
+                            Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(format!("{}/tx/{}", base_path, spender)) title="Spent by transaction" { (arrow_svg()) },
                             None => span class=(if is_opret { "io-arrow out opret-arrow" } else { "io-arrow out" }) title="Unspent output" { (arrow_svg()) },
                         }
                     }
@@ -937,6 +940,7 @@ fn render_op_return(
     meta_cache: &mut AlkaneMetaCache,
     impl_cache: &mut AlkaneImplCache,
     essentials_mdb: &Mdb,
+    base_path: &str,
 ) -> Markup {
     let fallback = opreturn_utf8(&payload.data);
     let trace_views: Vec<(String, Option<Value>)> = traces
@@ -981,7 +985,7 @@ fn render_op_return(
                         @let summary = summarize_contract_call(*trace, inspection_cache, meta_cache, impl_cache, essentials_mdb);
                         div class="trace-view" {
                             @if let Some(s) = summary {
-                                (render_trace_summary(&s, get_base_path()))
+                                (render_trace_summary(&s, base_path))
                             }
                             details class="opret-toggle" {
                                 summary class="opret-toggle-summary" {
@@ -1012,6 +1016,7 @@ fn balances_list(
     meta_cache: &mut AlkaneMetaCache,
     essentials_mdb: &Mdb,
     show_arrow: bool,
+    base_path: &str,
 ) -> Markup {
     if entries.is_empty() {
         return html! {};
@@ -1032,7 +1037,7 @@ fn balances_list(
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
-                        a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (meta.name.value.clone()) }
+                        a class="alk-sym link mono" href=(format!("{}/alkane/{alk}", base_path)) { (meta.name.value.clone()) }
                     }
                 };
                 (inner)
@@ -1041,9 +1046,9 @@ fn balances_list(
     }
 }
 
-pub fn render_alkane_balances(entries: &[BalanceEntry], essentials_mdb: &Mdb) -> Markup {
+pub fn render_alkane_balances(entries: &[BalanceEntry], essentials_mdb: &Mdb, base_path: &str) -> Markup {
     let mut cache: AlkaneMetaCache = HashMap::new();
-    balances_list(entries, &mut cache, essentials_mdb, false)
+    balances_list(entries, &mut cache, essentials_mdb, false, base_path)
 }
 
 pub(crate) fn alkane_meta(

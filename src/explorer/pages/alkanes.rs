@@ -110,10 +110,11 @@ pub async fn alkanes_page(
     let last_page = if total > 0 { ((total + limit as u64 - 1) / limit as u64).max(1) } else { 1 };
     let show_creation_block = has_prev || has_next;
 
+    let base_path = &state.base_path;
     let table: Markup = if rows.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
     } else {
-        html! { div class="alkanes-card" { (alkanes_table(&rows, true, show_creation_block, true)) } }
+        html! { div class="alkanes-card" { (alkanes_table(&rows, true, show_creation_block, true, base_path)) } }
     };
 
     layout(
@@ -125,12 +126,12 @@ pub async fn alkanes_page(
             (table)
             div class="pager" {
                 @if has_prev {
-                    a class="pill iconbtn" href=(format!("/alkanes?page=1&limit={limit}")) aria-label="First page" { (icon_skip_left()) }
+                    a class="pill iconbtn" href=(format!("{}/alkanes?page=1&limit={limit}", base_path)) aria-label="First page" { (icon_skip_left()) }
                 } @else {
                     span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                 }
                 @if has_prev {
-                    a class="pill iconbtn" href=(format!("/alkanes?page={}&limit={limit}", page - 1)) aria-label="Previous page" { (icon_left()) }
+                    a class="pill iconbtn" href=(format!("{}/alkanes?page={}&limit={limit}", base_path, page - 1)) aria-label="Previous page" { (icon_left()) }
                 } @else {
                     span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
                 }
@@ -144,12 +145,12 @@ pub async fn alkanes_page(
                     (total)
                 }
                 @if has_next {
-                    a class="pill iconbtn" href=(format!("/alkanes?page={}&limit={limit}", page + 1)) aria-label="Next page" { (icon_right()) }
+                    a class="pill iconbtn" href=(format!("{}/alkanes?page={}&limit={limit}", base_path, page + 1)) aria-label="Next page" { (icon_right()) }
                 } @else {
                     span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                 }
                 @if has_next {
-                    a class="pill iconbtn" href=(format!("/alkanes?page={}&limit={limit}", last_page)) aria-label="Last page" { (icon_skip_right()) }
+                    a class="pill iconbtn" href=(format!("{}/alkanes?page={}&limit={limit}", base_path, last_page)) aria-label="Last page" { (icon_skip_right()) }
                 } @else {
                     span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
                 }

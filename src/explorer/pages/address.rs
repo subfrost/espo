@@ -125,6 +125,7 @@ pub async fn address_page(
             );
         }
     };
+    let base_path: &str = &state.base_path;
 
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
@@ -378,8 +379,8 @@ pub async fn address_page(
         Some(next_stack_vec.join(","))
     };
     let next_cursor_str = next_cursor.map(|t| t.to_string());
-    let base_path = format!("/address/{}", address_str);
-    let first_href = format!("{base_path}?page=1&limit={limit}&traces={traces_param}");
+    let page_base_path = format!("{}/address/{}", base_path, address_str);
+    let first_href = format!("{page_base_path}?page=1&limit={limit}&traces={traces_param}");
     let prev_href = if use_cursor {
         let mut q = format!("page={}&limit={limit}&traces={traces_param}", page - 1);
         if let Some(prev) = prev_cursor.as_ref() {
@@ -388,9 +389,9 @@ pub async fn address_page(
         if !prev_stack.is_empty() {
             q.push_str(&format!("&stack={}", prev_stack));
         }
-        format!("{base_path}?{q}")
+        format!("{page_base_path}?{q}")
     } else {
-        format!("{base_path}?page={}&limit={limit}&traces={traces_param}", page - 1)
+        format!("{page_base_path}?page={}&limit={limit}&traces={traces_param}", page - 1)
     };
     let next_href = if use_cursor {
         let mut q = format!("page={}&limit={limit}&traces={traces_param}", page + 1);
@@ -400,11 +401,11 @@ pub async fn address_page(
         if let Some(stack) = next_stack.as_ref() {
             q.push_str(&format!("&stack={}", stack));
         }
-        format!("{base_path}?{q}")
+        format!("{page_base_path}?{q}")
     } else {
-        format!("{base_path}?page={}&limit={limit}&traces={traces_param}", page + 1)
+        format!("{page_base_path}?page={}&limit={limit}&traces={traces_param}", page + 1)
     };
-    let last_href = format!("{base_path}?page={last_page}&limit={limit}&traces={traces_param}");
+    let last_href = format!("{page_base_path}?page={last_page}&limit={limit}&traces={traces_param}");
 
     let mut prev_txids: Vec<Txid> = Vec::new();
     for item in &tx_renders {
@@ -468,7 +469,7 @@ pub async fn address_page(
     let balances_markup = if balance_entries.is_empty() {
         html! { p class="muted" { "No alkanes tracked for this address." } }
     } else {
-        render_alkane_balance_cards(&balance_entries, &state.essentials_mdb)
+        render_alkane_balance_cards(&balance_entries, &state.essentials_mdb, base_path)
     };
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
@@ -575,7 +576,7 @@ pub async fn address_page(
                             } else {
                                 None
                             };
-                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, true))
+                            (render_tx(&item.txid, &item.tx, traces_ref, state.network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, pill, true, base_path))
                         }
                     }
 

@@ -106,6 +106,7 @@ pub async fn block_page(
     Path(height): Path<u64>,
     Query(q): Query<BlockPageQuery>,
 ) -> Html<String> {
+    let base_path = &state.base_path;
     let rpc = get_bitcoind_rpc_client();
     let electrum_like = get_electrum_like();
     let network = get_network();
@@ -445,7 +446,7 @@ pub async fn block_page(
                     div class="list" {
                         @for item in tx_items {
                             @let traces: Option<&[EspoTrace]> = item.traces.as_ref().map(|v| v.as_slice());
-                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true))
+                            (render_tx(&item.txid, &item.tx, traces, network, &prev_map, &outpoint_fn, &outspends_fn, &state.essentials_mdb, Some(base_pill.clone()), true, base_path))
                         }
                     }
                 }
@@ -453,14 +454,14 @@ pub async fn block_page(
                 @if espo_indexed {
                     div class="pager" {
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}")) aria-label="First page" {
+                            a class="pill iconbtn" href=(format!("{}/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}", base_path)) aria-label="First page" {
                                 (icon_skip_left())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                         }
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", page - 1)) aria-label="Previous page" {
+                            a class="pill iconbtn" href=(format!("{}/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", base_path, page - 1)) aria-label="Previous page" {
                                 (icon_left())
                             }
                         } @else {
@@ -476,14 +477,14 @@ pub async fn block_page(
                             (tx_total)
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", page + 1)) aria-label="Next page" {
+                            a class="pill iconbtn" href=(format!("{}/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", base_path, page + 1)) aria-label="Next page" {
                                 (icon_right())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", last_page)) aria-label="Last page" {
+                            a class="pill iconbtn" href=(format!("{}/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", base_path, last_page)) aria-label="Last page" {
                                 (icon_skip_right())
                             }
                         } @else {

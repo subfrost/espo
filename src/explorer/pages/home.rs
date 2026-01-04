@@ -154,13 +154,12 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let latest_block_link = state.url(&format!("/block/{espo_tip}?traces=1"));
     let alkanes_link = state.url("/alkanes");
 
+    let base_path = get_base_path();
     let newest_alkanes_table: Markup = if newest_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
     } else {
-        alkanes_table(&newest_alkanes, false, false, true)
+        alkanes_table(&newest_alkanes, false, false, true, base_path)
     };
-
-    let base_path = get_base_path();
     let latest_txs_table: Markup = if latest_alkane_txs.is_empty() {
         html! { p class="muted" { "No alkane transactions found." } }
     } else {

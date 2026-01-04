@@ -49,12 +49,8 @@ if [ -n "$BASE_PATH" ]; then
     ARGS="$ARGS --base-path $BASE_PATH"
 fi
 
-if [ -n "$TMP_DBS_DIR" ]; then
-    ARGS="$ARGS --tmp-dbs-dir $TMP_DBS_DIR"
-fi
-
-if [ -n "$ESPO_DB_PATH" ]; then
-    ARGS="$ARGS --espo-db-path $ESPO_DB_PATH"
+if [ -n "$DB_PATH" ]; then
+    ARGS="$ARGS --db-path $DB_PATH"
 fi
 
 echo "Starting espo with args: $ARGS"
