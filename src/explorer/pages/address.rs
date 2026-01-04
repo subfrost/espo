@@ -191,7 +191,7 @@ pub async fn address_page(
         tx_renders.push(AddressTxRender {
             txid: entry.txid,
             tx: entry.tx.clone(),
-            traces: if traces_only { entry.traces.clone() } else { None },
+            traces: entry.traces.clone(),
             confirmations: None,
             is_mempool: true,
         });
@@ -304,6 +304,12 @@ pub async fn address_page(
                         let confirmed_total = hist_page.total.unwrap_or(entries.len()).max(entries.len());
                         let txids: Vec<Txid> =
                             entries.iter().take(remaining_slots).map(|h| h.txid).collect();
+                        let summary_keys: Vec<Vec<u8>> = txids
+                            .iter()
+                            .map(|t| alkane_tx_summary_key(&t.to_byte_array()))
+                            .collect();
+                        let summary_vals =
+                            state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
                         let raw_txs =
                             electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
@@ -322,13 +328,21 @@ pub async fn address_page(
                                     continue;
                                 }
                             };
+                            let summary = summary_vals
+                                .get(idx)
+                                .and_then(|v| v.as_ref())
+                                .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                            let traces = summary
+                                .as_ref()
+                                .map(|s| traces_from_summary(&entry.txid, s))
+                                .filter(|t| !t.is_empty());
                             let confirmations = entry.height.and_then(|h| {
                                 chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
                             });
                             tx_renders.push(AddressTxRender {
                                 txid: entry.txid,
                                 tx,
-                                traces: None,
+                                traces,
                                 confirmations,
                                 is_mempool: false,
                             });

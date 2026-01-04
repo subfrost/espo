@@ -998,6 +998,11 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         }
     }
 
+    let mut block_tx_index: HashMap<Txid, usize> = HashMap::new();
+    for (idx, atx) in block.transactions.iter().enumerate() {
+        block_tx_index.insert(atx.transaction.compute_txid(), idx);
+    }
+
     // ---------- Main per-tx loop ----------
     for atx in &block.transactions {
         let tx = &atx.transaction;
@@ -1041,6 +1046,27 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             );
             let in_key = (in_op.txid.clone(), in_op.vout);
             let in_str = in_op.as_outpoint_string();
+
+            if !input.previous_output.is_null() {
+                let mut input_addr: Option<String> = None;
+                if let Some(idx) = block_tx_index.get(&input.previous_output.txid) {
+                    if let Some(prev_out) =
+                        block.transactions[*idx].transaction.output.get(input.previous_output.vout as usize)
+                    {
+                        input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
+                    }
+                }
+                if input_addr.is_none() {
+                    if let Some(addr) = addr_by_outpoint.get(&in_key) {
+                        input_addr = Some(addr.clone());
+                    } else if let Some(spk) = spk_by_outpoint.get(&in_key) {
+                        input_addr = spk_to_address_str(spk, network);
+                    }
+                }
+                if let Some(addr) = input_addr {
+                    tx_addrs.insert(addr);
+                }
+            }
 
             // 1) Ephemeral? (created earlier in this same block)
             if let Some(bals) = ephem_outpoint_balances.get(&in_str) {
@@ -1262,6 +1288,15 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
         let is_alkane_tx = has_alkane_vin || has_traces;
         if is_alkane_tx {
+            for output in &tx.output {
+                if is_op_return(&output.script_pubkey) {
+                    continue;
+                }
+                if let Some(addr) = spk_to_address_str(&output.script_pubkey, network) {
+                    tx_addrs.insert(addr);
+                }
+            }
+
             let mut outflows: Vec<AlkaneBalanceTxEntry> = Vec::new();
             for (_owner, per_token) in &local_alkane_delta {
                 if per_token.is_empty() {
