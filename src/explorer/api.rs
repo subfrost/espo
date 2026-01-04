@@ -3,7 +3,7 @@ use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_espo_next_height, get_metashrew_rpc_url};
+use crate::config::{get_espo_next_height, get_metashrew_rpc_url, get_network};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::modules::essentials::storage::{
     block_summary_key, alkane_name_index_prefix, get_cached_block_summary,
@@ -22,7 +22,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::transaction::Version;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
+use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
 use borsh::BorshDeserialize;
 use ordinals::Runestone;
 use prost::Message;
@@ -30,6 +30,7 @@ use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -126,6 +127,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     let mut blocks: Vec<SearchGuessItem> = Vec::new();
     let mut alkanes: Vec<SearchGuessItem> = Vec::new();
     let mut txid: Vec<SearchGuessItem> = Vec::new();
+    let mut addresses: Vec<SearchGuessItem> = Vec::new();
 
     let mut push_alkane_item = |alk: &SchemaAlkaneId| -> bool {
         if !seen_alkanes.insert(*alk) {
@@ -187,6 +189,28 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         let _ = push_alkane_item(&alk);
     }
 
+    if let Ok(addr) = Address::from_str(&query) {
+        if let Ok(addr) = addr.require_network(get_network()) {
+            let addr_str = addr.to_string();
+            let label = if addr_str.len() > 24 {
+                format!(
+                    "{}...{}",
+                    &addr_str[..8],
+                    &addr_str[addr_str.len().saturating_sub(6)..]
+                )
+            } else {
+                addr_str.clone()
+            };
+            addresses.push(SearchGuessItem {
+                label,
+                value: addr_str.clone(),
+                href: Some(format!("/address/{addr_str}")),
+                icon_url: None,
+                fallback_letter: None,
+            });
+        }
+    }
+
     if query.chars().all(|c| c.is_ascii_hexdigit()) {
         let normalized = query.to_lowercase();
         if normalized.len() <= 64 {
@@ -231,6 +255,13 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             kind: "transactions".to_string(),
             title: "Transactions".to_string(),
             items: txid,
+        });
+    }
+    if !addresses.is_empty() {
+        groups.push(SearchGuessGroup {
+            kind: "addresses".to_string(),
+            title: "Addresses".to_string(),
+            items: addresses,
         });
     }
 

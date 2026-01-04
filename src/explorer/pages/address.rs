@@ -440,7 +440,14 @@ pub async fn address_page(
         for (vout, _) in item.tx.output.iter().enumerate() {
             all_outpoints.push((item.txid, vout as u32));
         }
+        for vin in &item.tx.input {
+            if !vin.previous_output.is_null() {
+                all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+            }
+        }
     }
+    all_outpoints.sort();
+    all_outpoints.dedup();
     let outpoint_map =
         get_outpoint_balances_with_spent_batch(&state.essentials_mdb, &all_outpoints)
             .unwrap_or_default();

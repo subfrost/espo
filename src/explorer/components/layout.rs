@@ -94,7 +94,7 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 form class="hero-search-form" method="get" action="/search" autocomplete="off" data-search-form="" {
                                     div class="hero-search-input" {
                                         span class="hero-search-icon" aria-hidden="true" { (icon_search()) }
-                                        input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions" data-search-input="" aria-label="Search blocks, alkanes, transactions" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
+                                        input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions, addresses" data-search-input="" aria-label="Search blocks, alkanes, transactions, addresses" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
                                         button class="hero-search-submit" type="submit" aria-label="Search" { (icon_search()) }
                                     }
                                 }
@@ -126,7 +126,7 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 form class="hero-search-form" method="get" action="/search" autocomplete="off" data-search-form="" {
                                     div class="hero-search-input" {
                                         span class="hero-search-icon" aria-hidden="true" { (icon_search()) }
-                                        input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions" data-search-input="" aria-label="Search blocks, alkanes, transactions" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
+                                        input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions, addresses" data-search-input="" aria-label="Search blocks, alkanes, transactions, addresses" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
                                         button class="hero-search-submit" type="submit" aria-label="Search" { (icon_search()) }
                                     }
                                 }
@@ -184,6 +184,7 @@ fn search_scripts() -> Markup {
 
   const iconTextFor = (kind) => {{
     if (kind === 'blocks') return '#';
+    if (kind === 'addresses') return '@';
     return 'Tx';
   }};
 
