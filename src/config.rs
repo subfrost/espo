@@ -44,8 +44,9 @@ static BASE_PATH: OnceLock<String> = OnceLock::new();
 fn parse_network(s: &str) -> std::result::Result<Network, String> {
     match s.to_ascii_lowercase().as_str() {
         "mainnet" => Ok(Network::Bitcoin),
+        "signet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
-        _ => Err("invalid value for --network: expected 'mainnet' or 'regtest'".into()),
+        _ => Err("invalid value for --network: expected 'mainnet', 'signet', or 'regtest'".into()),
     }
 }
 
