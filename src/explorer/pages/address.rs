@@ -516,6 +516,7 @@ pub async fn address_page(
         pill: None,
         summary_items,
         cta: None,
+        hero_class: Some("tx-hero-address".to_string()),
     });
 
     let mempool_url = mempool_address_url(state.network, &address_str);

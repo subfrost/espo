@@ -386,6 +386,7 @@ pub async fn block_page(
         pill,
         summary_items,
         cta: None,
+        hero_class: None,
     });
 
     layout(

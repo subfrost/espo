@@ -26,11 +26,16 @@ pub struct HeaderProps {
     pub pill: Option<(String, HeaderPillTone)>,
     pub summary_items: Vec<HeaderSummaryItem>,
     pub cta: Option<HeaderCta>,
+    pub hero_class: Option<String>,
 }
 
 pub fn header(props: HeaderProps) -> Markup {
-    let HeaderProps { title, id, show_copy, pill, summary_items, cta } = props;
+    let HeaderProps { title, id, show_copy, pill, summary_items, cta, hero_class } = props;
     let has_summary = !summary_items.is_empty();
+    let hero_class = match hero_class {
+        Some(extra) if !extra.trim().is_empty() => format!("tx-hero {}", extra.trim()),
+        _ => "tx-hero".to_string(),
+    };
 
     let pill_markup = pill.as_ref().map(|(text, tone)| {
         let tone_class = match tone {
@@ -44,7 +49,7 @@ pub fn header(props: HeaderProps) -> Markup {
     });
 
     html! {
-        div class="tx-hero" {
+        div class=(hero_class) {
             div class="tx-hero-head" {
                 div class="tx-hero-title" {
                     h1 class="h1" { (title) }
