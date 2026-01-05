@@ -3,7 +3,7 @@ use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_espo_next_height, get_metashrew_rpc_url, get_network};
+use crate::config::{get_base_path, get_espo_next_height, get_metashrew_rpc_url, get_network};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::modules::essentials::storage::{
     block_summary_key, alkane_name_index_prefix, get_cached_block_summary,
@@ -115,6 +115,18 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     Json(CarouselResponse { espo_tip, blocks })
 }
 
+/// Helper to prefix a path with base_path
+fn prefixed(path: &str) -> String {
+    let base_path = get_base_path();
+    if base_path.is_empty() {
+        path.to_string()
+    } else if path.starts_with('/') {
+        format!("{}{}", base_path, path)
+    } else {
+        format!("{}/{}", base_path, path)
+    }
+}
+
 pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuessResponse> {
     let query = q.q.unwrap_or_default().trim().to_string();
     if query.is_empty() {
@@ -142,7 +154,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         alkanes.push(SearchGuessItem {
             label,
             value: id.clone(),
-            href: Some(format!("/alkane/{id}")),
+            href: Some(prefixed(&format!("/alkane/{id}"))),
             icon_url,
             fallback_letter: Some(meta.name.fallback_letter().to_string()),
         });
@@ -170,7 +182,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
     if let Ok(height) = query.parse::<u64>() {
         let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
-        let href = if height <= espo_tip { Some(format!("/block/{height}")) } else { None };
+        let href = if height <= espo_tip { Some(prefixed(&format!("/block/{height}"))) } else { None };
         blocks.push(SearchGuessItem {
             label: format!("#{height}"),
             value: height.to_string(),
@@ -204,7 +216,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             addresses.push(SearchGuessItem {
                 label,
                 value: addr_str.clone(),
-                href: Some(format!("/address/{addr_str}")),
+                href: Some(prefixed(&format!("/address/{addr_str}"))),
                 icon_url: None,
                 fallback_letter: None,
             });
@@ -224,7 +236,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                 normalized.clone()
             };
             let href =
-                if normalized.len() == 64 { Some(format!("/tx/{normalized}")) } else { None };
+                if normalized.len() == 64 { Some(prefixed(&format!("/tx/{normalized}"))) } else { None };
             txid.push(SearchGuessItem {
                 label,
                 value: normalized,

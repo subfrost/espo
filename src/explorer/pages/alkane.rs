@@ -497,7 +497,8 @@ fn inspect_scripts() -> Markup {
       if (returnsType) {
         payload.returns = returnsType;
       }
-      const res = await fetch('/api/alkane/simulate', {
+      const basePath = window.ESPO_BASE_PATH || '';
+      const res = await fetch(`${basePath}/api/alkane/simulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
