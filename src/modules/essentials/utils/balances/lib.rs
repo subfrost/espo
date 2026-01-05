@@ -28,6 +28,7 @@ use bitcoin::{ScriptBuf, Transaction, Txid, hashes::Hash};
 use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 fn clean_espo_sandshrew_like_trace(
     trace: &EspoSandshrewLikeTrace,
@@ -1028,9 +1029,16 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
     let mut trace_prev_tx_map: HashMap<Txid, Transaction> = HashMap::new();
     if !trace_prevout_txids.is_empty() {
         let electrum_like = get_electrum_like();
+        let start = Instant::now();
         let raw_prev = electrum_like
             .batch_transaction_get_raw(&trace_prevout_txids)
             .unwrap_or_default();
+        eprintln!(
+            "[balances] traced prevout fetch: block={} prevouts={} elapsed_ms={}",
+            block.height,
+            trace_prevout_txids.len(),
+            start.elapsed().as_millis()
+        );
         for (i, raw_prev) in raw_prev.into_iter().enumerate() {
             if raw_prev.is_empty() {
                 continue;

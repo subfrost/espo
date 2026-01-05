@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Transaction, Txid};
@@ -13,8 +13,8 @@ use maud::html;
 use serde::Deserialize;
 
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoTrace, GetEspoBlockOpts, get_espo_block_with_opts,
-    traces_for_block_as_prost,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId, EspoTrace,
+    GetEspoBlockOpts, get_espo_block_with_opts, traces_for_block_as_prost,
 };
 use crate::config::{
     get_bitcoind_rpc_client, get_electrum_like, get_espo_next_height, get_network,
@@ -30,11 +30,11 @@ use crate::explorer::components::svg_assets::{
 use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
-use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_outpoint_balances_with_spent_batch,
-};
 use crate::modules::essentials::storage::{
     AlkaneTxSummary, alkane_block_len_key, alkane_block_txid_key, alkane_tx_summary_key,
+};
+use crate::modules::essentials::utils::balances::{
+    OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
 use crate::schemas::EspoOutpoint;
 
@@ -69,6 +69,7 @@ pub struct BlockPageQuery {
     pub page: Option<usize>,
     pub limit: Option<usize>,
     pub traces: Option<String>,
+    pub hide_diesel_mints: Option<String>,
 }
 
 struct BlockTxItem {
@@ -93,12 +94,85 @@ fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Optio
         sandshrew_trace: trace.clone(),
         protobuf_trace: AlkanesTrace::default(),
         storage_changes: HashMap::new(),
-        outpoint: EspoOutpoint {
-            txid: trace_txid.to_byte_array().to_vec(),
-            vout,
-            tx_spent: None,
-        },
+        outpoint: EspoOutpoint { txid: trace_txid.to_byte_array().to_vec(), vout, tx_spent: None },
     })
+}
+
+fn parse_u128_from_str(s: &str) -> Option<u128> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u128>().ok()
+    }
+}
+
+fn parse_u32_or_hex(s: &str) -> Option<u32> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u32>().ok()
+    }
+}
+
+fn parse_u64_or_hex(s: &str) -> Option<u64> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+fn parse_short_id_to_parts(id: &EspoSandshrewLikeTraceShortId) -> Option<(u32, u64)> {
+    Some((parse_u32_or_hex(&id.block)?, parse_u64_or_hex(&id.tx)?))
+}
+
+fn is_diesel_mint_trace(trace: &EspoTrace) -> bool {
+    let mut invoke_count = 0usize;
+    let mut contract_id: Option<(u32, u64)> = None;
+    let mut inputs: Option<&[String]> = None;
+
+    for ev in &trace.sandshrew_trace.events {
+        if let EspoSandshrewLikeTraceEvent::Invoke(data) = ev {
+            invoke_count += 1;
+            if invoke_count > 1 {
+                return false;
+            }
+            contract_id = parse_short_id_to_parts(&data.context.myself);
+            inputs = Some(&data.context.inputs);
+        }
+    }
+
+    if invoke_count != 1 {
+        return false;
+    }
+    let Some((block, tx)) = contract_id else {
+        return false;
+    };
+    if block != 2 || tx != 0 {
+        return false;
+    }
+    let Some(inputs) = inputs else {
+        return false;
+    };
+    if inputs.is_empty() {
+        return false;
+    }
+    let mut iter = inputs.iter();
+    let opcode = iter.next().and_then(|s| parse_u128_from_str(s)).unwrap_or_default();
+    if opcode != 77 {
+        return false;
+    }
+    iter.all(|s| parse_u128_from_str(s).map_or(false, |v| v == 0))
+}
+
+fn is_diesel_mint_tx(traces: Option<&[EspoTrace]>) -> bool {
+    let Some(traces) = traces else {
+        return false;
+    };
+    if traces.len() != 1 {
+        return false;
+    }
+    is_diesel_mint_trace(&traces[0])
 }
 
 pub async fn block_page(
@@ -118,6 +192,11 @@ pub async fn block_page(
         .as_deref()
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(true);
+    let hide_diesel_mints = q
+        .hide_diesel_mints
+        .as_deref()
+        .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
 
     let block_hash = match rpc.get_block_hash(height) {
         Ok(h) => h,
@@ -160,6 +239,7 @@ pub async fn block_page(
     let mut display_end = 0usize;
     let mut last_page = 1usize;
     let traces_param = if traces_only { "1" } else { "0" };
+    let hide_diesel_param = if hide_diesel_mints { "1" } else { "0" };
 
     if espo_indexed {
         if traces_only {
@@ -178,50 +258,32 @@ pub async fn block_page(
                     }
                 })
                 .unwrap_or(0);
-            tx_total = total;
-            let off = limit.saturating_mul(page.saturating_sub(1));
-            let end = (off + limit).min(tx_total);
-            tx_has_prev = page > 1;
-            tx_has_next = end < tx_total;
-            if tx_total > 0 && off < tx_total {
-                display_start = off + 1;
-                display_end = (off + end.saturating_sub(off)).min(tx_total);
-                last_page = (tx_total + limit - 1) / limit;
-            }
-
-            if end > off {
-                let mut txid_keys: Vec<Vec<u8>> = Vec::new();
-                for idx in off..end {
-                    txid_keys.push(alkane_block_txid_key(height, idx as u64));
-                }
-                let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
-                let mut txids: Vec<Txid> = Vec::new();
-                for v in txid_vals {
-                    let Some(bytes) = v else { continue };
-                    if bytes.len() != 32 {
-                        continue;
+            if hide_diesel_mints {
+                let mut all_txids: Vec<Txid> = Vec::new();
+                if total > 0 {
+                    let mut txid_keys: Vec<Vec<u8>> = Vec::with_capacity(total);
+                    for idx in 0..total {
+                        txid_keys.push(alkane_block_txid_key(height, idx as u64));
                     }
-                    if let Ok(txid) = Txid::from_slice(&bytes) {
-                        txids.push(txid);
+                    let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
+                    for v in txid_vals {
+                        let Some(bytes) = v else { continue };
+                        if bytes.len() != 32 {
+                            continue;
+                        }
+                        if let Ok(txid) = Txid::from_slice(&bytes) {
+                            all_txids.push(txid);
+                        }
                     }
                 }
 
-                let summary_keys: Vec<Vec<u8>> = txids
-                    .iter()
-                    .map(|t| alkane_tx_summary_key(&t.to_byte_array()))
-                    .collect();
+                let summary_keys: Vec<Vec<u8>> =
+                    all_txids.iter().map(|t| alkane_tx_summary_key(&t.to_byte_array())).collect();
                 let summary_vals =
                     state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
-
-                let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
-                for (idx, txid) in txids.iter().enumerate() {
-                    let raw = raw_txs.get(idx).cloned().unwrap_or_default();
-                    if raw.is_empty() {
-                        continue;
-                    }
-                    let Ok(tx) = deserialize::<Transaction>(&raw) else {
-                        continue;
-                    };
+                let mut summary_map: HashMap<Txid, Option<AlkaneTxSummary>> = HashMap::new();
+                let mut filtered_txids: Vec<Txid> = Vec::new();
+                for (idx, txid) in all_txids.iter().enumerate() {
                     let summary = summary_vals
                         .get(idx)
                         .and_then(|v| v.as_ref())
@@ -230,10 +292,103 @@ pub async fn block_page(
                         .as_ref()
                         .map(|s| traces_from_summary(txid, s))
                         .filter(|t| !t.is_empty());
-                    tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                    if !is_diesel_mint_tx(traces.as_deref()) {
+                        filtered_txids.push(*txid);
+                    }
+                    summary_map.insert(*txid, summary);
                 }
+
+                tx_total = filtered_txids.len();
+                let off = limit.saturating_mul(page.saturating_sub(1));
+                let end = (off + limit).min(tx_total);
+                tx_has_prev = page > 1 && off < tx_total;
+                tx_has_next = end < tx_total;
                 if tx_total > 0 && off < tx_total {
-                    display_end = (off + tx_items.len()).min(tx_total);
+                    display_start = off + 1;
+                    display_end = (off + end.saturating_sub(off)).min(tx_total);
+                    last_page = (tx_total + limit - 1) / limit;
+                }
+
+                if end > off {
+                    let page_txids: Vec<Txid> = filtered_txids[off..end].to_vec();
+                    let raw_txs =
+                        electrum_like.batch_transaction_get_raw(&page_txids).unwrap_or_default();
+                    for (idx, txid) in page_txids.iter().enumerate() {
+                        let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        let Ok(tx) = deserialize::<Transaction>(&raw) else {
+                            continue;
+                        };
+                        let summary = summary_map.get(txid).cloned().unwrap_or(None);
+                        let traces = summary
+                            .as_ref()
+                            .map(|s| traces_from_summary(txid, s))
+                            .filter(|t| !t.is_empty());
+                        tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                    }
+                    if tx_total > 0 && off < tx_total {
+                        display_end = (off + tx_items.len()).min(tx_total);
+                    }
+                }
+            } else {
+                tx_total = total;
+                let off = limit.saturating_mul(page.saturating_sub(1));
+                let end = (off + limit).min(tx_total);
+                tx_has_prev = page > 1;
+                tx_has_next = end < tx_total;
+                if tx_total > 0 && off < tx_total {
+                    display_start = off + 1;
+                    display_end = (off + end.saturating_sub(off)).min(tx_total);
+                    last_page = (tx_total + limit - 1) / limit;
+                }
+
+                if end > off {
+                    let mut txid_keys: Vec<Vec<u8>> = Vec::new();
+                    for idx in off..end {
+                        txid_keys.push(alkane_block_txid_key(height, idx as u64));
+                    }
+                    let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
+                    let mut txids: Vec<Txid> = Vec::new();
+                    for v in txid_vals {
+                        let Some(bytes) = v else { continue };
+                        if bytes.len() != 32 {
+                            continue;
+                        }
+                        if let Ok(txid) = Txid::from_slice(&bytes) {
+                            txids.push(txid);
+                        }
+                    }
+
+                    let summary_keys: Vec<Vec<u8>> =
+                        txids.iter().map(|t| alkane_tx_summary_key(&t.to_byte_array())).collect();
+                    let summary_vals =
+                        state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
+
+                    let raw_txs =
+                        electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+                    for (idx, txid) in txids.iter().enumerate() {
+                        let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                        if raw.is_empty() {
+                            continue;
+                        }
+                        let Ok(tx) = deserialize::<Transaction>(&raw) else {
+                            continue;
+                        };
+                        let summary = summary_vals
+                            .get(idx)
+                            .and_then(|v| v.as_ref())
+                            .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                        let traces = summary
+                            .as_ref()
+                            .map(|s| traces_from_summary(txid, s))
+                            .filter(|t| !t.is_empty());
+                        tx_items.push(BlockTxItem { txid: *txid, tx, traces });
+                    }
+                    if tx_total > 0 && off < tx_total {
+                        display_end = (off + tx_items.len()).min(tx_total);
+                    }
                 }
             }
         } else if let Some(espo_block) = espo_block.clone() {
@@ -251,6 +406,9 @@ pub async fn block_page(
                     traces: atx.traces,
                 })
                 .collect();
+            if hide_diesel_mints {
+                tx_items.retain(|item| !is_diesel_mint_tx(item.traces.as_deref()));
+            }
             if tx_total > 0 {
                 display_start = off + 1;
                 display_end = (off + tx_items.len()).min(tx_total);
@@ -419,6 +577,7 @@ pub async fn block_page(
                             input type="hidden" name="limit" value=(limit);
                             input type="hidden" name="page" value="1";
                             input type="hidden" name="traces" value=(traces_param);
+                            input type="hidden" name="hide_diesel_mints" value=(hide_diesel_param);
                             label class="switch" {
                                 span class="switch-label" { "Only Alkanes txs" }
                                 input
@@ -426,6 +585,15 @@ pub async fn block_page(
                                     type="checkbox"
                                     checked[traces_only]
                                     onchange="this.form.traces.value = this.checked ? '1' : '0'; this.form.submit();";
+                                span class="switch-slider" {}
+                            }
+                            label class="switch" {
+                                span class="switch-label" { "Hide Diesel mints" }
+                                input
+                                    class="switch-input"
+                                    type="checkbox"
+                                    checked[hide_diesel_mints]
+                                    onchange="this.form.hide_diesel_mints.value = this.checked ? '1' : '0'; this.form.submit();";
                                 span class="switch-slider" {}
                             }
                         }
@@ -436,6 +604,8 @@ pub async fn block_page(
                     p class="muted" { "Transactions will appear once ESPO indexes this block." }
                 } @else if tx_total == 0 {
                     p class="muted" { "No transactions found." }
+                } @else if tx_items.is_empty() {
+                    p class="muted" { "No transactions match the current filters." }
                 } @else {
                     @let block_confirmations = tip.saturating_sub(height).saturating_add(1);
                     @let base_pill = TxPill {
@@ -453,14 +623,14 @@ pub async fn block_page(
                 @if espo_indexed {
                     div class="pager" {
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}")) aria-label="First page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}")) aria-label="First page" {
                                 (icon_skip_left())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                         }
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", page - 1)) aria-label="Previous page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1)) aria-label="Previous page" {
                                 (icon_left())
                             }
                         } @else {
@@ -476,14 +646,14 @@ pub async fn block_page(
                             (tx_total)
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", page + 1)) aria-label="Next page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1)) aria-label="Next page" {
                                 (icon_right())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}", last_page)) aria-label="Last page" {
+                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", last_page)) aria-label="Last page" {
                                 (icon_skip_right())
                             }
                         } @else {

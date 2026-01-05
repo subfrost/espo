@@ -224,7 +224,8 @@ pub async fn address_page(
         if confirmed_slice_end > confirmed_slice_start {
             let mut txid_keys: Vec<Vec<u8>> = Vec::new();
             for idx in confirmed_slice_start..confirmed_slice_end {
-                txid_keys.push(alkane_address_txid_key(&address_str, idx as u64));
+                let rev_idx = confirmed_total - 1 - idx;
+                txid_keys.push(alkane_address_txid_key(&address_str, rev_idx as u64));
             }
             let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
             let mut txids: Vec<Txid> = Vec::new();
