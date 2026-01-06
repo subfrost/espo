@@ -7,8 +7,8 @@ use crate::modules::essentials::consts::{
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
     alkane_creation_by_id_key, alkane_creation_count_key, alkane_creation_ordered_key,
-    alkane_name_index_key, block_summary_key, encode_creation_record, load_creation_record,
-    BlockSummary, cache_block_summary,
+    alkane_holders_ordered_key, alkane_name_index_key, block_summary_key,
+    encode_creation_record, load_creation_record, BlockSummary, cache_block_summary,
 };
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, created_alkane_records_from_block, inspect_wasm_metadata,
@@ -160,6 +160,7 @@ impl EspoModule for Essentials {
         // creation records rows (by id and by ordered key):
         let mut creation_rows_by_id: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut creation_rows_ordered: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut holders_index_rows: HashSet<Vec<u8>> = HashSet::new();
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
         let mut name_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -439,6 +440,7 @@ impl EspoModule for Essentials {
                     &rec.alkane,
                 );
                 creation_rows_ordered.insert(key_ord, encoded);
+                holders_index_rows.insert(alkane_holders_ordered_key(0, &rec.alkane));
             }
         }
 
@@ -509,6 +511,8 @@ impl EspoModule for Essentials {
         creation_keys_ordered.sort_unstable();
         let mut name_index_keys: Vec<Vec<u8>> = name_index_rows.keys().cloned().collect();
         name_index_keys.sort_unstable();
+        let mut holders_index_keys: Vec<Vec<u8>> = holders_index_rows.into_iter().collect();
+        holders_index_keys.sort_unstable();
         let mut creation_count_row: Option<[u8; 8]> = None;
         if new_creations_added > 0 {
             let current = mdb
@@ -554,6 +558,9 @@ impl EspoModule for Essentials {
                 if let Some(v) = name_index_rows.get(k) {
                     wb.put(k, v);
                 }
+            }
+            for k in &holders_index_keys {
+                wb.put(k, &[]);
             }
             wb.put(&block_summary_key(block.height), &block_summary_bytes);
             if let Some(count_bytes) = creation_count_row {

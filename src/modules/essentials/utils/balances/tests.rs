@@ -1,39 +1,38 @@
 use super::defs::SignedU128;
 use super::lib::accumulate_alkane_balance_deltas;
 use crate::alkanes::trace::{EspoHostFunctionValues, EspoSandshrewLikeTrace, get_espo_block};
-use crate::config::{CliArgs, init_config_from};
+use crate::config::{AppConfig, init_config_from};
+use crate::core::blockfetcher::BlockFetchMode;
 use crate::schemas::SchemaAlkaneId;
 use bitcoin::{Txid, hashes::Hash};
-use clap::Parser;
 
 fn init_test_config_from_run_sh() {
-    let args = CliArgs::parse_from([
-        "espo-tests",
-        "--readonly-metashrew-db-dir",
-        "/data/.metashrew/v9/.metashrew-v9",
-        "--port",
-        "5778",
-        "--electrs-esplora-url",
-        "http://127.0.0.1:4332",
-        "--bitcoind-rpc-url",
-        "http://127.0.0.1:8332",
-        "--bitcoind-rpc-user",
-        "admin",
-        "--bitcoind-rpc-pass",
-        "admin",
-        "--network",
-        "mainnet",
-        "--block-source-mode",
-        "rpc",
-        "--metashrew-rpc-url",
-        "http://127.0.0.1:7044",
-        "--explorer-host",
-        "0.0.0.0:5779",
-        "--reset-mempool-on-startup",
-        "--enable-aof",
-        "--view-only",
-    ]);
-    if let Err(err) = init_config_from(args) {
+    let cfg = AppConfig {
+        readonly_metashrew_db_dir: "/data/.metashrew/v9/.metashrew-v9".to_string(),
+        electrum_rpc_url: None,
+        metashrew_rpc_url: "http://127.0.0.1:7044".to_string(),
+        electrs_esplora_url: Some("http://127.0.0.1:4332".to_string()),
+        bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(),
+        bitcoind_rpc_user: "admin".to_string(),
+        bitcoind_rpc_pass: "admin".to_string(),
+        bitcoind_blocks_dir: "~/.bitcoin/blocks".to_string(),
+        reset_mempool_on_startup: true,
+        view_only: true,
+        db_path: "./db".to_string(),
+        enable_aof: true,
+        sdb_poll_ms: 5000,
+        indexer_block_delay_ms: 0,
+        port: 5778,
+        explorer_host: Some("0.0.0.0:5779".parse().expect("parse explorer_host")),
+        explorer_base_path: "/".to_string(),
+        network: bitcoin::Network::Bitcoin,
+        metashrew_db_label: None,
+        debug: false,
+        block_source_mode: BlockFetchMode::RpcOnly,
+        simulate_reorg: false,
+        explorer_networks: None,
+    };
+    if let Err(err) = init_config_from(cfg) {
         if !err.to_string().contains("already initialized") {
             panic!("init config from run.sh args: {err}");
         }

@@ -25,6 +25,7 @@ use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
+use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
     AlkaneTxSummary, alkane_address_len_key, alkane_address_txid_key, alkane_tx_summary_key,
 };
@@ -393,7 +394,7 @@ pub async fn address_page(
         Some(next_stack_vec.join(","))
     };
     let next_cursor_str = next_cursor.map(|t| t.to_string());
-    let base_path = format!("/address/{}", address_str);
+    let base_path = explorer_path(&format!("/address/{}", address_str));
     let first_href = format!("{base_path}?page=1&limit={limit}&traces={traces_param}");
     let prev_href = if use_cursor {
         let mut q = format!("page={}&limit={limit}&traces={traces_param}", page - 1);
@@ -555,7 +556,7 @@ pub async fn address_page(
             div class="card" {
                 div class="row" {
                     h2 class="h2" { "Transactions" }
-                    form class="trace-toggle" method="get" action=(format!("/address/{}", address_str)) {
+                    form class="trace-toggle" method="get" action=(explorer_path(&format!("/address/{}", address_str))) {
                         input type="hidden" name="page" value="1";
                         input type="hidden" name="limit" value=(limit);
                         input type="hidden" name="traces" value=(traces_param);

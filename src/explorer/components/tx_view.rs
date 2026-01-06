@@ -16,6 +16,7 @@ use crate::explorer::consts::{
     ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
     alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
 };
+use crate::explorer::paths::explorer_path;
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
 use crate::modules::essentials::storage::{BalanceEntry, load_creation_record};
 use crate::modules::essentials::utils::balances::OutpointLookup;
@@ -614,7 +615,7 @@ fn summarize_contract_call(
 fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
     let is_factory_clone = summary.factory_template.is_some();
     let link_id = summary.link_id;
-    let alkane_path = format!("/alkane/{}:{}", link_id.block, link_id.tx);
+    let alkane_path = explorer_path(&format!("/alkane/{}:{}", link_id.block, link_id.tx));
     let status_class = if summary.success { "success" } else { "failure" };
     let status_text = match (summary.response_text.clone(), summary.success) {
         (Some(_), true) => "Call successful".to_string(),
@@ -666,7 +667,7 @@ fn render_trace_summary(summary: &ContractCallSummary) -> Markup {
                 }
             }
             @if let Some(created) = summary.factory_created {
-                @let created_path = format!("/alkane/{}:{}", created.block, created.tx);
+                @let created_path = explorer_path(&format!("/alkane/{}:{}", created.block, created.tx));
                 @let created_meta = summary.factory_created_meta.as_ref();
                 @let created_icon = created_meta.map(|m| m.icon_url.clone()).unwrap_or_default();
                 @let created_name = created_meta.map(|m| m.name.value.clone()).unwrap_or_else(|| format!("{}:{}", created.block, created.tx));
@@ -747,7 +748,7 @@ pub fn render_tx(
     html! {
         div class="card tx-card" {
             @if show_tx_title {
-                span class="mono tx-title" { a class="link" href=(format!("/tx/{}", txid)) { (txid) } }
+                span class="mono tx-title" { a class="link" href=(explorer_path(&format!("/tx/{}", txid))) { (txid) } }
             }
             div class="tx-io-grid" {
                 div class="io-col" {
@@ -803,7 +804,7 @@ fn render_vins(
                         @let prevout = prev_map.get(&prev_txid).and_then(|ptx| ptx.output.get(prev_vout as usize));
                         @let prevout_view = outpoint_fn(&prev_txid, prev_vout);
                         div class="io-row" {
-                            a class="io-arrow io-arrow-link in" href=(format!("/tx/{}", prev_txid)) title="View previous transaction" { (arrow_svg()) }
+                            a class="io-arrow io-arrow-link in" href=(explorer_path(&format!("/tx/{}", prev_txid))) title="View previous transaction" { (arrow_svg()) }
                             div class="io-main" {
                                 @match prevout {
                                     Some(po) => {
@@ -814,7 +815,7 @@ fn render_vins(
                                                     Some(a) => {
                                                         @let addr = a.to_string();
                                                         @let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
-                                                        a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
+                                                        a class="link mono addr-inline" href=(explorer_path(&format!("/address/{}", addr))) {
                                                             span class="addr-prefix" { (addr_prefix) }
                                                             span class="addr-suffix" { (addr_suffix) }
                                                         }
@@ -901,7 +902,7 @@ fn render_vouts(
                                                 Some(a) => {
                                                     @let addr = a.to_string();
                                                     @let (addr_prefix, addr_suffix) = addr_prefix_suffix(&addr);
-                                                    a class="link mono addr-inline" href=(format!("/address/{}", addr)) {
+                                                    a class="link mono addr-inline" href=(explorer_path(&format!("/address/{}", addr))) {
                                                         span class="addr-prefix" { (addr_prefix) }
                                                         span class="addr-suffix" { (addr_suffix) }
                                                     }
@@ -916,7 +917,7 @@ fn render_vouts(
                             (balances_list(&balances, alkane_meta_cache, essentials_mdb, true))
                         }
                         @match spent_by {
-                            Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(format!("/tx/{}", spender)) title="Spent by transaction" { (arrow_svg()) },
+                            Some(spender) => a class=(if is_opret { "io-arrow io-arrow-link out spent opret-arrow" } else { "io-arrow io-arrow-link out spent" }) href=(explorer_path(&format!("/tx/{}", spender))) title="Spent by transaction" { (arrow_svg()) },
                             None => span class=(if is_opret { "io-arrow out opret-arrow" } else { "io-arrow out" }) title="Unspent output" { (arrow_svg()) },
                         }
                     }
@@ -1031,7 +1032,7 @@ fn balances_list(
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
-                        a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (meta.name.value.clone()) }
+                        a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk}"))) { (meta.name.value.clone()) }
                     }
                 };
                 (inner)

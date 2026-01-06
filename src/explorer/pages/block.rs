@@ -30,6 +30,7 @@ use crate::explorer::components::svg_assets::{
 use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::state::ExplorerState;
+use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
     AlkaneTxSummary, alkane_block_len_key, alkane_block_txid_key, alkane_tx_summary_key,
 };
@@ -572,7 +573,7 @@ pub async fn block_page(
                 div class="row" {
                     h2 class="h2" { "Transactions" }
                     @if espo_indexed {
-                        form class="trace-toggle" method="get" action=(format!("/block/{height}")) {
+                        form class="trace-toggle" method="get" action=(explorer_path(&format!("/block/{height}"))) {
                             input type="hidden" name="tab" value="txs";
                             input type="hidden" name="limit" value=(limit);
                             input type="hidden" name="page" value="1";
@@ -623,14 +624,14 @@ pub async fn block_page(
                 @if espo_indexed {
                     div class="pager" {
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}")) aria-label="First page" {
+                            a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page=1&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}"))) aria-label="First page" {
                                 (icon_skip_left())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
                         }
                         @if tx_has_prev {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1)) aria-label="Previous page" {
+                            a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page - 1))) aria-label="Previous page" {
                                 (icon_left())
                             }
                         } @else {
@@ -646,14 +647,14 @@ pub async fn block_page(
                             (tx_total)
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1)) aria-label="Next page" {
+                            a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", page + 1))) aria-label="Next page" {
                                 (icon_right())
                             }
                         } @else {
                             span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
                         }
                         @if tx_has_next {
-                            a class="pill iconbtn" href=(format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", last_page)) aria-label="Last page" {
+                            a class="pill iconbtn" href=(explorer_path(&format!("/block/{height}?tab=txs&page={}&limit={limit}&traces={traces_param}&hide_diesel_mints={hide_diesel_param}", last_page))) aria-label="Last page" {
                                 (icon_skip_right())
                             }
                         } @else {

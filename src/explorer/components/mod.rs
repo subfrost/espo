@@ -1,5 +1,6 @@
 pub mod alk_balances;
 pub mod block_carousel;
+pub mod dropdown;
 pub mod footer;
 pub mod header;
 pub mod layout;

@@ -60,7 +60,7 @@ a:hover {
   z-index: 10;
   backdrop-filter: blur(10px);
   background: rgba(40, 43, 50, 0.95);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.12);
 }
 .nav {
   padding: 6px 10px;
@@ -78,11 +78,110 @@ a:hover {
   gap: 12px;
   font-size: 22px;
 }
+.brand-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 20px;
+}
 
 .brand-logo {
   display: block;
   width: 34px;
   height: 34px;
+}
+.dropdown {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.dropdown > summary::-webkit-details-marker {
+  display: none;
+}
+.dropdown > summary::marker {
+  content: "";
+}
+.dropdown-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.dropdown-caret {
+  transition: ease 0.2s;
+}
+
+.dropdown[open] .dropdown-trigger > .dropdown-caret {
+  transition: ease 0.2s;
+  transform: rotate(180deg);
+}
+.dropdown-panel {
+  position: absolute;
+  flex-direction: column;
+  gap: 5px;
+  top: calc(100% + 8px);
+  left: 0;
+  min-width: 160px;
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.2);
+  z-index: 20;
+  display: none;
+}
+.dropdown[open] .dropdown-panel {
+  display: flex;
+}
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+}
+.dropdown-item:hover {
+  background: var(--panel2);
+  text-decoration: none;
+}
+.dropdown-item.selected {
+  background: var(--panel3);
+}
+.dropdown-icon {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.dropdown-icon svg {
+  width: 18px;
+  height: 18px;
+  display: block;
+}
+.dropdown-trigger-icon svg {
+  width: 20px;
+  height: 20px;
+}
+.dropdown-caret svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.dropdown-svg {
+  fill: currentColor;
+}
+.dropdown-svg path {
+  fill: currentColor;
 }
 .navlinks-container {
   display: flex;
@@ -229,7 +328,7 @@ a:hover {
   right: 0;
   top: 100%;
   background: rgba(40, 43, 50, 0.95);
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.12);
 
   z-index: 9;
 }
@@ -322,6 +421,15 @@ a:hover {
   gap: 14px;
   flex-wrap: wrap;
   min-width: 0;
+}
+.order-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.order-control .muted {
+  font-weight: 600;
 }
 .tx-page-id {
   display: block;
@@ -898,6 +1006,29 @@ a:hover {
     justify-content: flex-end;
     align-items: center;
   }
+  .alkane-holders-card .holders_table tbody tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "holder holder"
+      "balance pct";
+    gap: 8px 12px;
+    align-items: center;
+  }
+  .alkane-holders-card .holders_table td {
+    width: auto;
+  }
+  .alkane-holders-card .holders_table td:first-child {
+    grid-area: holder;
+  }
+  .alkane-holders-card .holders_table td:nth-child(2) {
+    grid-area: balance;
+  }
+  .alkane-holders-card .holders_table td:nth-child(3) {
+    grid-area: pct;
+    text-align: right;
+    justify-self: end;
+  }
 }
 
 .ellipsis {
@@ -1160,8 +1291,17 @@ a:hover {
   white-space: nowrap;
 }
 
-.alkane-holders-card td:last-child {
+.alkane-holders-card col:nth-child(2) {
   width: 220px;
+}
+.alkane-holders-card col:last-child {
+  width: 120px !important;
+}
+.alkane-holders-card td:nth-child(3) {
+  text-align: right;
+}
+.alkane-holders-card th:nth-child(3) {
+  text-align: right;
 }
 
 .io-amount {
@@ -1908,6 +2048,12 @@ button:hover {
   color: var(--muted3);
   font-weight: 600;
   text-transform: uppercase;
+}
+.alk-holding-pct {
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 @media (max-width: 1024px) {
   .io-alkanes-grid {

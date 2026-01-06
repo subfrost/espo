@@ -254,6 +254,40 @@ pub fn parse_alkane_name_index_key(key: &[u8]) -> Option<(String, SchemaAlkaneId
         SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) },
     ))
 }
+
+// /alkanes/holders/ordered/{count_be(8)}{alkane block:u32be}{tx:u64be}
+pub fn alkane_holders_ordered_key(count: u64, alkane: &SchemaAlkaneId) -> Vec<u8> {
+    let mut key = b"/alkanes/holders/ordered/".to_vec();
+    key.extend_from_slice(&count.to_be_bytes());
+    key.extend_from_slice(&alkane.block.to_be_bytes());
+    key.extend_from_slice(&alkane.tx.to_be_bytes());
+    key
+}
+
+pub fn alkane_holders_ordered_prefix() -> &'static [u8] {
+    b"/alkanes/holders/ordered/"
+}
+
+pub fn parse_alkane_holders_ordered_key(key: &[u8]) -> Option<(u64, SchemaAlkaneId)> {
+    let prefix = b"/alkanes/holders/ordered/";
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    let rest = &key[prefix.len()..];
+    if rest.len() != 20 {
+        return None;
+    }
+    let mut count_arr = [0u8; 8];
+    count_arr.copy_from_slice(&rest[..8]);
+    let mut block_arr = [0u8; 4];
+    block_arr.copy_from_slice(&rest[8..12]);
+    let mut tx_arr = [0u8; 8];
+    tx_arr.copy_from_slice(&rest[12..20]);
+    Some((
+        u64::from_be_bytes(count_arr),
+        SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) },
+    ))
+}
 // /alkanes/creation/id/{alkane block:u32be}{tx:u64be}
 pub fn alkane_creation_by_id_key(alkane: &SchemaAlkaneId) -> Vec<u8> {
     let mut key = b"/alkanes/creation/id/".to_vec();

@@ -110,7 +110,7 @@ async fn run_indexer_loop(
     mut next_height: u32,
     network: bitcoin::Network,
     metashrew_sdb: std::sync::Arc<crate::runtime::sdb::SDB>,
-    cfg: crate::config::CliArgs,
+    cfg: crate::config::AppConfig,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let mut last_tip: Option<u32> = None;

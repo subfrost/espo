@@ -17,6 +17,7 @@ use crate::explorer::components::svg_assets::icon_right;
 use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
+use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
     AlkaneTxSummary, HoldersCountEntry, alkane_creation_ordered_prefix, alkane_latest_traces_key,
     alkane_tx_summary_key, decode_creation_record, holders_count_key,
@@ -151,8 +152,8 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let latest_height = espo_tip.min(tip);
     let newest_alkanes = load_newest_alkanes(&state.essentials_mdb, 10);
     let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
-    let latest_block_link = format!("/block/{espo_tip}?traces=1");
-    let alkanes_link = "/alkanes";
+    let latest_block_link = explorer_path(&format!("/block/{espo_tip}?traces=1"));
+    let alkanes_link = explorer_path("/alkanes");
 
     let newest_alkanes_table: Markup = if newest_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
@@ -170,7 +171,7 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
                         tr {
                             td class="tx-trace-cell" {
                                 div class="tx-trace-header" {
-                                    a class="link mono tx-trace-id" href=(format!("/tx/{}", row.txid)) { (row.txid) }
+                                    a class="link mono tx-trace-id" href=(explorer_path(&format!("/tx/{}", row.txid))) { (row.txid) }
                                 }
                                 (render_trace_summaries(std::slice::from_ref(&row.trace), &state.essentials_mdb))
                             }

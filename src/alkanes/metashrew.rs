@@ -6,13 +6,13 @@ use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
 use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use anyhow::{Context, Result, anyhow};
-use bitcoin::{OutPoint, Transaction};
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoin::{OutPoint, Transaction};
+use metashrew_support::utils::consensus_encode;
 use ordinals::{Artifact, Runestone};
 use prost::Message;
 use protorune_support::protostone::Protostone;
-use metashrew_support::utils::consensus_encode;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -83,11 +83,7 @@ fn parse_ascii_or_le_u64(bytes: &[u8]) -> Option<u64> {
 
 fn parse_ascii_or_le_usize(bytes: &[u8]) -> Option<usize> {
     let v = parse_ascii_or_le_u64(bytes)?;
-    if v > usize::MAX as u64 {
-        None
-    } else {
-        Some(v as usize)
-    }
+    if v > usize::MAX as u64 { None } else { Some(v as usize) }
 }
 
 pub struct MetashrewAdapter {
@@ -123,6 +119,55 @@ impl MetashrewAdapter {
             if trimmed.is_empty() { None } else { Some(trimmed) }
         });
         MetashrewAdapter { label: norm_label }
+    }
+
+    fn read_versioned_uint_key<const N: usize, T>(&self, base_key: Vec<u8>) -> Result<Option<T>>
+    where
+        T: FromLeBytes<N>,
+    {
+        let metashrew_sdb = get_metashrew_sdb();
+
+        // Try versioned format first: key/length
+        let mut length_key = base_key.clone();
+        length_key.extend_from_slice(b"/length");
+
+        if let Some(length_bytes) = metashrew_sdb.get(&length_key)? {
+            let length_str = std::str::from_utf8(&length_bytes)
+                .map_err(|e| anyhow!("utf8 decode length: {e}"))?;
+            let length: u64 =
+                length_str.parse().map_err(|e| anyhow!("parse length '{length_str}': {e}"))?;
+
+            if length == 0 {
+                return Ok(None);
+            }
+
+            // Read the latest entry: key/{length-1}
+            let latest_idx = length.saturating_sub(1);
+            let mut entry_key = base_key.clone();
+            entry_key.push(b'/');
+            entry_key.extend_from_slice(latest_idx.to_string().as_bytes());
+
+            if let Some(entry_bytes) = metashrew_sdb.get(&entry_key)? {
+                let entry_str = std::str::from_utf8(&entry_bytes)
+                    .map_err(|e| anyhow!("utf8 decode entry: {e}"))?;
+
+                // Format is "height:HEX_VALUE"
+                let (_height_str, hex_part) =
+                    entry_str.split_once(':').ok_or_else(|| anyhow!("entry missing ':'"))?;
+
+                let raw_bytes = hex::decode(hex_part)
+                    .map_err(|e| anyhow!("hex decode entry '{hex_part}': {e}"))?;
+
+                let arr: [u8; N] = raw_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Expected {} bytes, got {}", N, raw_bytes.len()))?;
+
+                return Ok(Some(T::from_le_bytes(arr)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn next_prefix(&self, mut p: Vec<u8>) -> Option<Vec<u8>> {
@@ -284,10 +329,23 @@ impl MetashrewAdapter {
         db.catch_up_now().context("metashrew catch_up before wasm fetch")?;
         self.get_alkane_wasm_bytes_with_db(db.as_db(), alkane)
     }
-    pub fn get_alkanes_tip_height(&self) -> Result<u32> {
-        let tip_height_prefix: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
 
-        self.read_uint_key::<4, u32>(tip_height_prefix)
+    pub fn get_alkanes_tip_height(&self) -> Result<u32> {
+        let tip_height_key: Vec<u8> = self.apply_label(b"/__INTERNAL/tip-height".to_vec());
+
+        // First try direct read (non-SMT mode)
+        if let Ok(height) = self.read_uint_key::<4, u32>(tip_height_key.clone()) {
+            eprintln!("[metashrew] tip height (direct): {}", height);
+            return Ok(height);
+        }
+
+        // Then try versioned format (SMT mode)
+        if let Some(height) = self.read_versioned_uint_key::<4, u32>(tip_height_key.clone())? {
+            eprintln!("[metashrew] tip height (versioned): {}", height);
+            return Ok(height);
+        }
+
+        Err(anyhow!("ESPO ERROR: failed to find tip height in metashrew database"))
     }
 
     /// Fetch all traces for a txid directly from the secondary DB, without needing block height.
@@ -300,8 +358,10 @@ impl MetashrewAdapter {
         tx_le.reverse();
 
         let mut traces_by_outpoint: HashMap<Vec<u8>, HashMap<u64, AlkanesTrace>> = HashMap::new();
-        let mut events_by_outpoint: HashMap<Vec<u8>, HashMap<u64, BTreeMap<u64, AlkanesTraceEvent>>> =
-            HashMap::new();
+        let mut events_by_outpoint: HashMap<
+            Vec<u8>,
+            HashMap<u64, BTreeMap<u64, AlkanesTraceEvent>>,
+        > = HashMap::new();
         let mut lengths_by_outpoint: HashMap<Vec<u8>, u64> = HashMap::new();
 
         let mut scan_prefix = |tx_bytes: &[u8], tx_bytes_are_be: bool| -> Result<()> {
@@ -403,10 +463,7 @@ impl MetashrewAdapter {
                 }
 
                 if let Some(trace) = decode_trace_blob(&v) {
-                    traces_by_outpoint
-                        .entry(outpoint)
-                        .or_default()
-                        .insert(trace_idx, trace);
+                    traces_by_outpoint.entry(outpoint).or_default().insert(trace_idx, trace);
                 }
             }
 
@@ -436,16 +493,13 @@ impl MetashrewAdapter {
             if outpoint.len() < 36 {
                 continue;
             }
-            let preferred = lengths_by_outpoint
-                .get(&outpoint)
-                .copied()
-                .and_then(|len| len.checked_sub(1));
+            let preferred =
+                lengths_by_outpoint.get(&outpoint).copied().and_then(|len| len.checked_sub(1));
             let selected_idx = preferred
                 .filter(|idx| traces.contains_key(idx))
                 .or_else(|| traces.keys().max().copied());
-            let trace = selected_idx
-                .and_then(|idx| traces.get(&idx))
-                .or_else(|| traces.values().next());
+            let trace =
+                selected_idx.and_then(|idx| traces.get(&idx)).or_else(|| traces.values().next());
             if let Some(trace) = trace {
                 out.push(PartialEspoTrace { protobuf_trace: trace.clone(), outpoint });
             }
@@ -689,11 +743,7 @@ impl MetashrewAdapter {
                 None
             }
             .or_else(|| {
-                if pointer_value.len() >= 36 {
-                    Some(pointer_value[..36].to_vec())
-                } else {
-                    None
-                }
+                if pointer_value.len() >= 36 { Some(pointer_value[..36].to_vec()) } else { None }
             });
 
             let Some(mut outpoint) = outpoint_bytes else {
@@ -713,10 +763,8 @@ impl MetashrewAdapter {
             trace_len_key.extend_from_slice(&outpoint);
             trace_len_key.extend_from_slice(b"/length");
             let trace_len_key = self.apply_label(trace_len_key);
-            let trace_len = db
-                .get(&trace_len_key)?
-                .and_then(|v| parse_ascii_or_le_usize(&v))
-                .unwrap_or(0);
+            let trace_len =
+                db.get(&trace_len_key)?.and_then(|v| parse_ascii_or_le_usize(&v)).unwrap_or(0);
             if trace_len == 0 {
                 missing_trace_blobs = missing_trace_blobs.saturating_add(1);
                 continue;
@@ -757,11 +805,7 @@ impl MetashrewAdapter {
                 None
             }
             .or_else(|| {
-                if pointer_value.len() >= 36 {
-                    Some(pointer_value[..36].to_vec())
-                } else {
-                    None
-                }
+                if pointer_value.len() >= 36 { Some(pointer_value[..36].to_vec()) } else { None }
             });
 
             let Some(mut outpoint) = outpoint_bytes else {
@@ -780,10 +824,8 @@ impl MetashrewAdapter {
             trace_len_key.extend_from_slice(&outpoint);
             trace_len_key.extend_from_slice(b"/length");
             let trace_len_key = self.apply_label(trace_len_key);
-            let trace_len = db
-                .get(&trace_len_key)?
-                .and_then(|v| parse_ascii_or_le_usize(&v))
-                .unwrap_or(0);
+            let trace_len =
+                db.get(&trace_len_key)?.and_then(|v| parse_ascii_or_le_usize(&v)).unwrap_or(0);
             if trace_len == 0 {
                 missing_trace_blobs = missing_trace_blobs.saturating_add(1);
                 continue;
@@ -812,10 +854,7 @@ impl MetashrewAdapter {
 
         let pointer_len = pointer_lengths.len();
         if final_traces.is_empty() {
-            eprintln!(
-                "[metashrew] block {block}: pointers={} traces=0",
-                pointer_len
-            );
+            eprintln!("[metashrew] block {block}: pointers={} traces=0", pointer_len);
         }
 
         let missing_lengths = pointer_idxs_seen.len().saturating_sub(pointer_len);
@@ -944,16 +983,14 @@ impl MetashrewAdapter {
                             decode_failures = decode_failures.saturating_add(1);
                             continue;
                         }
-                        uniq.entry(buf)
-                            .or_insert_with(|| (idx, trace));
+                        uniq.entry(buf).or_insert_with(|| (idx, trace));
                     }
 
                     if uniq.is_empty() {
                         missing_keys = missing_keys.saturating_add(1);
                         continue;
                     }
-                    let mut uniq_traces: Vec<(u32, AlkanesTrace)> =
-                        uniq.into_values().collect();
+                    let mut uniq_traces: Vec<(u32, AlkanesTrace)> = uniq.into_values().collect();
                     uniq_traces.sort_by_key(|(idx, _)| *idx);
                     for (_idx, trace) in uniq_traces {
                         fallback_traces.push(PartialEspoTrace {

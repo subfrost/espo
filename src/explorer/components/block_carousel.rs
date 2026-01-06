@@ -1,12 +1,17 @@
 use maud::{Markup, PreEscaped, html};
 
+use crate::explorer::paths::explorer_base_path;
+
 /// Carousel of blocks around the current height. Uses Embla (CDN) for smooth drag/scroll.
 pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     let current_height = current_height.unwrap_or(espo_tip);
+    let base_path_js = format!("{:?}", explorer_base_path());
 
     let script = PreEscaped(format!(
         r#"
 (function() {{
+  const basePath = {base_path_js};
+  const basePrefix = basePath === '/' ? '' : basePath;
   const root = document.querySelector('[data-block-carousel]');
   if (!root) return;
   const viewport = root.querySelector('[data-bc-viewport]');
@@ -122,7 +127,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
         <div class="bc-top">
           <span class="bc-height-tag">${{b.height}}</span>
         </div>
-        <a class="bc-card${{b.height === current ? ' current' : ''}}" href="/block/${{b.height}}">
+        <a class="bc-card${{b.height === current ? ' current' : ''}}" href="${{basePrefix}}/block/${{b.height}}">
           <div class="bc-face">
             <div class="bc-traces">${{b.traces}} traces</div>
             <div class="bc-time">${{formatAgo(b.time)}}</div>
@@ -194,7 +199,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64) -> Markup {
     if (dir < 0) setLoading('left', true);
     if (dir > 0) setLoading('right', true);
     try {{
-      const res = await fetch(`/api/blocks/carousel?center=${{center}}&radius=8`);
+      const res = await fetch(`${{basePrefix}}/api/blocks/carousel?center=${{center}}&radius=8`);
       if (!res.ok) return;
       const data = await res.json();
       if (!data || !Array.isArray(data.blocks)) return;

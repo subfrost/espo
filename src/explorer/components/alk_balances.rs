@@ -5,6 +5,7 @@ use maud::{Markup, html};
 use crate::explorer::components::tx_view::{
     AlkaneMetaCache, alkane_meta, icon_bg_style,
 };
+use crate::explorer::paths::explorer_path;
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::modules::essentials::storage::BalanceEntry;
 use crate::runtime::mdb::Mdb;
@@ -29,7 +30,7 @@ pub fn render_alkane_balance_cards(entries: &[BalanceEntry], essentials_mdb: &Md
                             span class="alk-icon-letter" { (fallback_letter) }
                         }
                         span class="alk-amt mono" { (fmt_alkane_amount(be.amount)) }
-                        a class="alk-sym link mono" href=(format!("/alkane/{alk}")) { (meta.name.value.clone()) }
+                        a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk}"))) { (meta.name.value.clone()) }
                     }
                 }
             }

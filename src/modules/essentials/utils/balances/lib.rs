@@ -15,9 +15,10 @@ use crate::modules::essentials::storage::{
     alkane_address_len_key, alkane_address_txid_key, alkane_balance_txs_by_height_key,
     alkane_balance_txs_by_token_key, alkane_balance_txs_key, alkane_balances_key,
     alkane_block_len_key, alkane_block_txid_key, alkane_latest_traces_key, alkane_tx_summary_key,
-    balances_key, decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec,
-    encode_vec, holders_count_key, holders_key, mk_outpoint, outpoint_addr_key,
-    outpoint_balances_key, outpoint_balances_prefix, spk_to_address_str, utxo_spk_key,
+    alkane_holders_ordered_key, balances_key, decode_alkane_balance_tx_entries,
+    decode_balances_vec, decode_holders_vec, encode_vec, holders_count_key, holders_key,
+    mk_outpoint, outpoint_addr_key, outpoint_balances_key, outpoint_balances_prefix,
+    spk_to_address_str, utxo_spk_key,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -1815,9 +1816,17 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 Some(bytes) => decode_holders_vec(&bytes).unwrap_or_default(),
                 None => Vec::new(),
             };
+            let prev_count = vec_holders.len() as u64;
             for (holder, delta) in per_holder {
                 vec_holders = apply_holders_delta(vec_holders, holder, *delta);
             }
+            let new_count = vec_holders.len() as u64;
+            let new_index_key = alkane_holders_ordered_key(new_count, alkane);
+            if prev_count != new_count {
+                let prev_index_key = alkane_holders_ordered_key(prev_count, alkane);
+                wb.delete(&prev_index_key);
+            }
+            wb.put(&new_index_key, &[]);
             if vec_holders.is_empty() {
                 wb.delete(&holders_key);
             } else if let Ok((encoded_holders_vec, encoded_holders_count_vec)) =

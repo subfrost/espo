@@ -1,6 +1,7 @@
 mod api;
 pub mod components;
 pub mod consts;
+pub mod paths;
 mod pages;
 
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
 use components::layout::style;
+use crate::config::get_explorer_base_path;
 
 pub fn explorer_router(state: ExplorerState) -> Router {
     Router::new()
@@ -38,7 +40,12 @@ pub fn explorer_router(state: ExplorerState) -> Router {
 
 pub async fn run_explorer(addr: SocketAddr) -> anyhow::Result<()> {
     let state = ExplorerState::new();
-    let app = explorer_router(state);
+    let base_path = get_explorer_base_path();
+    let app = if base_path == "/" {
+        explorer_router(state)
+    } else {
+        Router::new().nest(base_path, explorer_router(state))
+    };
     let listener = TcpListener::bind(addr).await?;
     axum::serve(listener, app.into_make_service()).await?;
     Ok(())

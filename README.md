@@ -24,16 +24,9 @@ git clone git@github.com:bitapeslabs/espo.git
 cargo build --release
 ```
 
-after the binary is built, you can run the indexer with the following command
+after the binary is built, configure `config.json` (see `sample.config.json`) and run:
 ```bash
-./target/release/espo \
-  --readonly-metashrew-db-dir /data/.metashrew/mainnet-v2.0.0/.metashrew-reconcile \
-  --port {YOUR PORT} \
-  --electrum-rpc-url {YOUR ELECTRUM ENDPOINT WITH PORT, NO HTTP:// PREFIX} \
-  --bitcoind-rpc-url {YOUR BITCOIN RPC ENDPOINT WITH PORT, WITH HTTP:// PREFIX} \
-  --bitcoind-rpc-user {BITCOIN RPC USERNAME} \
-  --bitcoind-rpc-pass {BITCOIN RPC PASSWORD} \
-  --bitcoind-blocks-dir {BITCOIN BLOCKS DIR}
+./target/release/espo --config-path ./config.json
 ```
 
 To serve the current database without running the indexer or mempool service, append `--view-only` to the command. This keeps the RPC server (and explorer if enabled) available for read-only access to the existing data.

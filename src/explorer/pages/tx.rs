@@ -24,6 +24,7 @@ use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::icon_arrow_up_right;
 use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
 use crate::explorer::pages::state::ExplorerState;
+use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent,
 };
@@ -284,7 +285,7 @@ pub async fn tx_page(
     summary_items.push(HeaderSummaryItem {
         label: "Block".to_string(),
         value: match tx_height {
-            Some(h) => html! { a class="summary-value link" href=(format!("/block/{h}")) { (format_with_commas(h)) } },
+            Some(h) => html! { a class="summary-value link" href=(explorer_path(&format!("/block/{h}"))) { (format_with_commas(h)) } },
             None => html! { span class="summary-value muted" { "Unconfirmed" } },
         },
     });

@@ -2,6 +2,7 @@ use maud::{Markup, html};
 
 use crate::explorer::components::svg_assets::icon_user;
 use crate::explorer::components::tx_view::icon_bg_style;
+use crate::explorer::paths::explorer_path;
 
 #[derive(Clone, Debug)]
 pub struct AlkaneTableRow {
@@ -123,18 +124,18 @@ pub fn alkanes_table(
                                     span class="alk-icon-letter" { (row.fallback) }
                                 }
                                 div class="alkane-meta" {
-                                    a class="alk-sym link mono alkane-name-link" href=(format!("/alkane/{}", row.id)) { (row.name.clone()) }
+                                    a class="alk-sym link mono alkane-name-link" href=(explorer_path(&format!("/alkane/{}", row.id))) { (row.name.clone()) }
                                     div class="muted mono alkane-id" { (row.id.clone()) }
                                 }
                             }
                         }
                         @if show_creation_block {
                             td class="alkane-block-cell" {
-                                a class="link mono" href=(format!("/block/{}", row.creation_height)) { (row.creation_height) }
+                                a class="link mono" href=(explorer_path(&format!("/block/{}", row.creation_height))) { (row.creation_height) }
                             }
                         }
                         td class="mono alkane-tx-cell" {
-                            a class="link ellipsis alkane-txid" href=(format!("/tx/{}", row.creation_txid)) { (&row.creation_txid) }
+                            a class="link ellipsis alkane-txid" href=(explorer_path(&format!("/tx/{}", row.creation_txid))) { (&row.creation_txid) }
                         }
                         td class="alkane-holders-cell" {
                             span class="mono holders-count" {

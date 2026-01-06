@@ -6,11 +6,13 @@ use crate::runtime::{
 };
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::{ESPO_HEIGHT, SAFE_TIP};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
+use serde::Deserialize;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{
     fs,
@@ -26,7 +28,7 @@ use bitcoincore_rpc::{Auth, Client as CoreClient};
 // Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
 
-static CONFIG: OnceLock<CliArgs> = OnceLock::new();
+static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 static ELECTRUM_CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
 static ELECTRUM_LIKE: OnceLock<Arc<dyn ElectrumLike>> = OnceLock::new();
 static BITCOIND_CLIENT: OnceLock<CoreClient> = OnceLock::new();
@@ -38,12 +40,18 @@ static AOF_MANAGER: OnceLock<std::sync::Arc<AofManager>> = OnceLock::new();
 // NEW: Global bitcoin::Network
 static NETWORK: OnceLock<Network> = OnceLock::new();
 
-fn parse_network(s: &str) -> std::result::Result<Network, String> {
-    match s.to_ascii_lowercase().as_str() {
-        "mainnet" => Ok(Network::Bitcoin),
-        "regtest" => Ok(Network::Regtest),
-        _ => Err("invalid value for --network: expected 'mainnet' or 'regtest'".into()),
-    }
+fn parse_network(s: &str) -> Result<Network> {
+    let normalized = s.trim().to_ascii_lowercase();
+    let mapped = match normalized.as_str() {
+        "mainnet" => "bitcoin",
+        "testnet3" => "testnet",
+        other => other,
+    };
+    Network::from_str(mapped).map_err(|_| {
+        anyhow::anyhow!(
+            "invalid value for network: expected mainnet | regtest | signet | testnet | testnet3 | testnet4"
+        )
+    })
 }
 
 fn parse_block_fetch_mode(s: &str) -> std::result::Result<BlockFetchMode, String> {
@@ -51,115 +59,240 @@ fn parse_block_fetch_mode(s: &str) -> std::result::Result<BlockFetchMode, String
         "auto" => Ok(BlockFetchMode::Auto),
         "rpc" | "rpc-only" | "rpc_only" => Ok(BlockFetchMode::RpcOnly),
         "blk" | "blk-only" | "blk_only" | "files" => Ok(BlockFetchMode::BlkOnly),
-        _ => Err("invalid value for --block-source-mode: use auto | rpc-only | blk-only".into()),
+        _ => Err("invalid value for block_source_mode: use auto | rpc-only | blk-only".into()),
     }
+}
+
+fn normalize_explorer_base_path(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return Ok("/".to_string());
+    }
+    let no_trailing = trimmed.trim_end_matches('/');
+    let normalized = if no_trailing.starts_with('/') {
+        no_trailing.to_string()
+    } else {
+        format!("/{no_trailing}")
+    };
+    Ok(normalized)
+}
+
+fn default_bitcoind_blocks_dir() -> String {
+    "~/.bitcoin/blocks".to_string()
+}
+
+fn default_db_path() -> String {
+    "./db".to_string()
+}
+
+fn default_sdb_poll_ms() -> u16 {
+    5000
+}
+
+fn default_port() -> u16 {
+    8080
+}
+
+fn default_explorer_base_path() -> String {
+    "/".to_string()
+}
+
+fn default_network() -> String {
+    "mainnet".to_string()
+}
+
+fn default_block_source_mode() -> String {
+    "rpc".to_string()
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExplorerNetworks {
+    #[serde(default)]
+    pub mainnet: Option<String>,
+    #[serde(default)]
+    pub signet: Option<String>,
+    #[serde(default, rename = "testnet3")]
+    pub testnet3: Option<String>,
+    #[serde(default, rename = "testnet4")]
+    pub testnet4: Option<String>,
+    #[serde(default)]
+    pub regtest: Option<String>,
+}
+
+impl ExplorerNetworks {
+    fn normalized(&self) -> Option<Self> {
+        let normalized = Self {
+            mainnet: normalize_optional_string(self.mainnet.clone()),
+            signet: normalize_optional_string(self.signet.clone()),
+            testnet3: normalize_optional_string(self.testnet3.clone()),
+            testnet4: normalize_optional_string(self.testnet4.clone()),
+            regtest: normalize_optional_string(self.regtest.clone()),
+        };
+        if normalized.is_empty() { None } else { Some(normalized) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mainnet.is_none()
+            && self.signet.is_none()
+            && self.testnet3.is_none()
+            && self.testnet4.is_none()
+            && self.regtest.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigFile {
+    pub readonly_metashrew_db_dir: String,
+    #[serde(default)]
+    pub electrum_rpc_url: Option<String>,
+    pub metashrew_rpc_url: String,
+    #[serde(default)]
+    pub electrs_esplora_url: Option<String>,
+    pub bitcoind_rpc_url: String,
+    pub bitcoind_rpc_user: String,
+    pub bitcoind_rpc_pass: String,
+    #[serde(default = "default_bitcoind_blocks_dir")]
+    pub bitcoind_blocks_dir: String,
+    #[serde(default)]
+    pub reset_mempool_on_startup: bool,
+    #[serde(default = "default_db_path")]
+    pub db_path: String,
+    #[serde(default)]
+    pub enable_aof: bool,
+    #[serde(default = "default_sdb_poll_ms")]
+    pub sdb_poll_ms: u16,
+    #[serde(default)]
+    pub indexer_block_delay_ms: u64,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub explorer_host: Option<SocketAddr>,
+    #[serde(default = "default_explorer_base_path")]
+    pub explorer_base_path: String,
+    #[serde(default = "default_network")]
+    pub network: String,
+    #[serde(default)]
+    pub metashrew_db_label: Option<String>,
+    #[serde(default)]
+    pub debug: bool,
+    #[serde(default = "default_block_source_mode")]
+    pub block_source_mode: String,
+    #[serde(default)]
+    pub simulate_reorg: bool,
+    #[serde(default)]
+    pub explorer_networks: Option<ExplorerNetworks>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub readonly_metashrew_db_dir: String,
+    pub electrum_rpc_url: Option<String>,
+    pub metashrew_rpc_url: String,
+    pub electrs_esplora_url: Option<String>,
+    pub bitcoind_rpc_url: String,
+    pub bitcoind_rpc_user: String,
+    pub bitcoind_rpc_pass: String,
+    pub bitcoind_blocks_dir: String,
+    pub reset_mempool_on_startup: bool,
+    pub view_only: bool,
+    pub db_path: String,
+    pub enable_aof: bool,
+    pub sdb_poll_ms: u16,
+    pub indexer_block_delay_ms: u64,
+    pub port: u16,
+    pub explorer_host: Option<SocketAddr>,
+    pub explorer_base_path: String,
+    pub network: Network,
+    pub metashrew_db_label: Option<String>,
+    pub debug: bool,
+    pub block_source_mode: BlockFetchMode,
+    pub simulate_reorg: bool,
+    pub explorer_networks: Option<ExplorerNetworks>,
 }
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
 pub struct CliArgs {
-    #[arg(short, long)]
-    pub readonly_metashrew_db_dir: String,
-
-    #[arg(short, long)]
-    pub electrum_rpc_url: Option<String>,
-
-    /// Full HTTP URL to a metashrew JSON-RPC endpoint (required for pending trace previews)
-    #[arg(long)]
-    pub metashrew_rpc_url: String,
-
-    /// HTTP base URL to an electrs/esplora endpoint (e.g. https://myelectrs.example)
-    #[arg(long)]
-    pub electrs_esplora_url: Option<String>,
-
-    /// Full HTTP URL to Bitcoin Core's JSON-RPC (e.g. http://127.0.0.1:8332)
-    #[arg(long)]
-    pub bitcoind_rpc_url: String,
-
-    /// RPC username for Bitcoin Core
-    #[arg(long)]
-    pub bitcoind_rpc_user: String,
-
-    /// RPC password for Bitcoin Core
-    #[arg(long)]
-    pub bitcoind_rpc_pass: String,
-
-    /// Directory containing Core's blk*.dat files (e.g. ~/.bitcoin/blocks)
-    #[arg(long, default_value = "~/.bitcoin/blocks")]
-    pub bitcoind_blocks_dir: String,
-
-    /// If set, clears the persisted mempool namespace on startup.
-    #[arg(long, default_value_t = false)]
-    pub reset_mempool_on_startup: bool,
+    /// Path to JSON config file.
+    #[arg(long, default_value = "./config.json")]
+    pub config_path: String,
 
     /// Serve existing data without running the indexer or mempool service.
     #[arg(long, default_value_t = false)]
     pub view_only: bool,
-
-    /// Base directory for ESPO databases (espo/tmp/aof subdirs).
-    #[arg(long, default_value = "./db")]
-    pub db_path: String,
-
-    /// Enable append-only file logging for module namespaces (reorg protection).
-    #[arg(long, default_value_t = false)]
-    pub enable_aof: bool,
-
-    #[arg(short, long, default_value_t = 5000)]
-    pub sdb_poll_ms: u16,
-
-    /// Optional delay between indexing blocks (ms). Use to throttle catch-up pressure.
-    #[arg(long, default_value_t = 0)]
-    pub indexer_block_delay_ms: u64,
-
-    #[arg(short = 'p', long, default_value_t = 8080)]
-    pub port: u16,
-
-    /// Optional bind address for the SSR explorer (e.g. 127.0.0.1:8081). If omitted, no explorer server is started.
-    #[arg(long)]
-    pub explorer_host: Option<SocketAddr>,
-
-    /// Bitcoin network: 'mainnet' or 'regtest'
-    #[arg(short, long, value_parser = parse_network, default_value = "mainnet")]
-    pub network: Network,
-
-    #[arg(long, short, default_value = None)]
-    pub metashrew_db_label: Option<String>,
-
-    /// Enable debug mode checks (panic on configured invariants).
-    #[arg(long, default_value_t = false)]
-    pub debug: bool,
-
-    /// Choose where block bodies come from: blk files + RPC fallback ("auto", default),
-    /// RPC only ("rpc-only"), or blk files only ("blk-only").
-    #[arg(long, value_parser = parse_block_fetch_mode, default_value = "rpc")]
-    pub block_source_mode: BlockFetchMode,
-
-    /// Test-only: on startup, revert all AOF-covered blocks to simulate a deep reorg.
-    #[arg(long, default_value_t = false)]
-    pub simulate_reorg: bool,
 }
 
-pub fn init_config_from(args: CliArgs) -> Result<()> {
+fn load_config_file(path: &str) -> Result<ConfigFile> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {path}"))?;
+    serde_json::from_str(&raw).context("failed to parse config JSON")
+}
+
+impl AppConfig {
+    fn from_file(file: ConfigFile, view_only: bool) -> Result<Self> {
+        let network = parse_network(&file.network)?;
+        let block_source_mode = parse_block_fetch_mode(&file.block_source_mode)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let explorer_base_path = normalize_explorer_base_path(&file.explorer_base_path)?;
+        let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
+
+        Ok(Self {
+            readonly_metashrew_db_dir: file.readonly_metashrew_db_dir,
+            electrum_rpc_url: normalize_optional_string(file.electrum_rpc_url),
+            metashrew_rpc_url: file.metashrew_rpc_url,
+            electrs_esplora_url: normalize_optional_string(file.electrs_esplora_url),
+            bitcoind_rpc_url: file.bitcoind_rpc_url,
+            bitcoind_rpc_user: file.bitcoind_rpc_user,
+            bitcoind_rpc_pass: file.bitcoind_rpc_pass,
+            bitcoind_blocks_dir: file.bitcoind_blocks_dir,
+            reset_mempool_on_startup: file.reset_mempool_on_startup,
+            view_only,
+            db_path: file.db_path,
+            enable_aof: file.enable_aof,
+            sdb_poll_ms: file.sdb_poll_ms,
+            indexer_block_delay_ms: file.indexer_block_delay_ms,
+            port: file.port,
+            explorer_host: file.explorer_host,
+            explorer_base_path,
+            network,
+            metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
+            debug: file.debug,
+            block_source_mode,
+            simulate_reorg: file.simulate_reorg,
+            explorer_networks,
+        })
+    }
+}
+
+pub fn init_config_from(cfg: AppConfig) -> Result<()> {
+    let mut cfg = cfg;
+
     // --- validations ---
-    let db = Path::new(&args.readonly_metashrew_db_dir);
+    let db = Path::new(&cfg.readonly_metashrew_db_dir);
     if !db.exists() {
-        anyhow::bail!("Database path does not exist: {}", args.readonly_metashrew_db_dir);
+        anyhow::bail!("Database path does not exist: {}", cfg.readonly_metashrew_db_dir);
     }
     if !db.is_dir() {
-        anyhow::bail!("Database path is not a directory: {}", args.readonly_metashrew_db_dir);
+        anyhow::bail!("Database path is not a directory: {}", cfg.readonly_metashrew_db_dir);
     }
 
-    if args.metashrew_rpc_url.trim().is_empty() {
+    if cfg.metashrew_rpc_url.trim().is_empty() {
         anyhow::bail!("metashrew_rpc_url must be provided");
     }
 
-    let db_root = Path::new(&args.db_path);
+    let db_root = Path::new(&cfg.db_path);
     if !db_root.exists() {
         fs::create_dir_all(db_root).map_err(|e| {
-            anyhow::anyhow!("Failed to create db_path {}: {e}", args.db_path)
+            anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path)
         })?;
     } else if !db_root.is_dir() {
-        anyhow::bail!("db_path is not a directory: {}", args.db_path);
+        anyhow::bail!("db_path is not a directory: {}", cfg.db_path);
     }
 
     let tmp = db_root.join("tmp");
@@ -180,7 +313,7 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
         anyhow::bail!("espo db dir is not a directory: {}", espo_dir.display());
     }
 
-    if args.enable_aof {
+    if cfg.enable_aof {
         let aof_dir = db_root.join("aof");
         if !aof_dir.exists() {
             fs::create_dir_all(&aof_dir).map_err(|e| {
@@ -191,24 +324,26 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
         }
     }
 
-    if args.block_source_mode != BlockFetchMode::RpcOnly {
-        let blocks_dir = Path::new(&args.bitcoind_blocks_dir);
+    if cfg.block_source_mode != BlockFetchMode::RpcOnly {
+        let blocks_dir = Path::new(&cfg.bitcoind_blocks_dir);
         if !blocks_dir.exists() {
-            anyhow::bail!("bitcoind blocks dir does not exist: {}", args.bitcoind_blocks_dir);
+            anyhow::bail!("bitcoind blocks dir does not exist: {}", cfg.bitcoind_blocks_dir);
         }
         if !blocks_dir.is_dir() {
-            anyhow::bail!("bitcoind blocks dir is not a directory: {}", args.bitcoind_blocks_dir);
+            anyhow::bail!("bitcoind blocks dir is not a directory: {}", cfg.bitcoind_blocks_dir);
         }
     }
 
-    if args.sdb_poll_ms == 0 {
+    if cfg.sdb_poll_ms == 0 {
         anyhow::bail!("sdb_poll_ms must be greater than 0");
     }
 
-    let electrum_url = args.electrum_rpc_url.clone().filter(|s| !s.is_empty());
-    let esplora_url = args.electrs_esplora_url.clone().filter(|s| !s.is_empty());
+    cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;
+
+    let electrum_url = cfg.electrum_rpc_url.clone().filter(|s| !s.is_empty());
+    let esplora_url = cfg.electrs_esplora_url.clone().filter(|s| !s.is_empty());
     if electrum_url.is_none() && esplora_url.is_none() {
-        anyhow::bail!("provide either --electrum-rpc-url or --electrs-esplora-url");
+        anyhow::bail!("provide either electrum_rpc_url or electrs_esplora_url");
     }
     if electrum_url.is_some() && esplora_url.is_some() {
         eprintln!(
@@ -218,12 +353,12 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
 
     // --- store config ---
     CONFIG
-        .set(args.clone())
+        .set(cfg.clone())
         .map_err(|_| anyhow::anyhow!("config already initialized"))?;
 
     // NEW: store global Network
     NETWORK
-        .set(args.network)
+        .set(cfg.network)
         .map_err(|_| anyhow::anyhow!("network already initialized"))?;
 
     // --- init Electrum-like client once ---
@@ -245,8 +380,8 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
 
     // --- init Bitcoin Core RPC client once ---
     let core = CoreClient::new(
-        &args.bitcoind_rpc_url,
-        Auth::UserPass(args.bitcoind_rpc_user.clone(), args.bitcoind_rpc_pass.clone()),
+        &cfg.bitcoind_rpc_url,
+        Auth::UserPass(cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()),
     )?;
     BITCOIND_CLIENT
         .set(core)
@@ -255,9 +390,9 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
     // --- init Secondary RocksDB (SDB) once ---
     let secondary_path = get_sdb_path_for_metashrew()?;
     let sdb = SDB::open(
-        args.readonly_metashrew_db_dir.clone(),
+        cfg.readonly_metashrew_db_dir.clone(),
         secondary_path,
-        Duration::from_millis(args.sdb_poll_ms as u64),
+        Duration::from_millis(cfg.sdb_poll_ms as u64),
     )?;
     METASHREW_SDB
         .set(std::sync::Arc::new(sdb))
@@ -266,14 +401,14 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
     espo_opts.create_if_missing(true);
-    let espo_path = Path::new(&args.db_path).join("espo");
+    let espo_path = Path::new(&cfg.db_path).join("espo");
     let espo_db = std::sync::Arc::new(DB::open(&espo_opts, espo_path)?);
     ESPO_DB
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
 
-    if args.enable_aof {
-        let aof_path = Path::new(&args.db_path).join("aof");
+    if cfg.enable_aof {
+        let aof_path = Path::new(&cfg.db_path).join("aof");
         let mgr = AofManager::new(espo_db.clone(), aof_path, AOF_REORG_DEPTH)?;
         AOF_MANAGER
             .set(std::sync::Arc::new(mgr))
@@ -286,8 +421,10 @@ pub fn init_config_from(args: CliArgs) -> Result<()> {
 }
 
 pub fn init_config() -> Result<()> {
-    let args = CliArgs::parse();
-    init_config_from(args)
+    let cli = CliArgs::parse();
+    let file = load_config_file(&cli.config_path)?;
+    let cfg = AppConfig::from_file(file, cli.view_only)?;
+    init_config_from(cfg)
 }
 
 // UPDATED: no param; uses global NETWORK
@@ -308,7 +445,7 @@ pub fn init_block_source() -> Result<()> {
     Ok(())
 }
 
-pub fn get_config() -> &'static CliArgs {
+pub fn get_config() -> &'static AppConfig {
     CONFIG.get().expect("init_config() must be called once at startup")
 }
 
@@ -376,6 +513,14 @@ pub fn get_metashrew() -> MetashrewAdapter {
 
 pub fn get_metashrew_rpc_url() -> &'static str {
     &get_config().metashrew_rpc_url
+}
+
+pub fn get_explorer_base_path() -> &'static str {
+    &get_config().explorer_base_path
+}
+
+pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {
+    get_config().explorer_networks.as_ref()
 }
 
 pub fn get_espo_next_height() -> u32 {

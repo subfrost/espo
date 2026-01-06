@@ -3,8 +3,13 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::{Html, IntoResponse};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
+use crate::config::{get_explorer_networks, get_network};
+use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
 use crate::explorer::components::footer::footer;
-use crate::explorer::components::svg_assets::{dots, icon_search, logo_espo};
+use crate::explorer::components::svg_assets::{
+    dots, icon_btc, icon_search, icon_signet, icon_testnet, logo_espo,
+};
+use crate::explorer::paths::{explorer_base_path, explorer_path};
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const SEARCH_DEBOUNCE_MS: u64 = 300;
@@ -73,6 +78,8 @@ pub async fn style() -> impl IntoResponse {
 }
 
 pub fn layout(title: &str, content: Markup) -> Html<String> {
+    let base_path_js = format!("{:?}", explorer_base_path());
+    let network_dropdown = network_dropdown();
     let markup = html! {
         (DOCTYPE)
         html lang="en" {
@@ -80,18 +87,23 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
-                link rel="stylesheet" href="/static/style.css";
+                link rel="stylesheet" href=(explorer_path("/static/style.css"));
             }
             body {
                 header class="topbar" data-topbar="" {
                     div class="app" {
                         nav class="nav" data-nav-menu="" {
-                            a class="brand" href="/" {
-                                (logo_espo())
-                                span class="brand-text" { "Espo" }
+                            div class="brand-group" {
+                                a class="brand" href=(explorer_path("/")) {
+                                    (logo_espo())
+                                    span class="brand-text" { "Espo" }
+                                }
+                                @if let Some(dropdown) = network_dropdown {
+                                    (dropdown)
+                                }
                             }
                             div class="nav-search hero-search" data-search="" {
-                                form class="hero-search-form" method="get" action="/search" autocomplete="off" data-search-form="" {
+                                form class="hero-search-form" method="get" action=(explorer_path("/search")) autocomplete="off" data-search-form="" {
                                     div class="hero-search-input" {
                                         span class="hero-search-icon" aria-hidden="true" { (icon_search()) }
                                         input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions, addresses" data-search-input="" aria-label="Search blocks, alkanes, transactions, addresses" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
@@ -103,8 +115,8 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 }
                             }
                             div class="navlinks-container" {
-                                a class="navlink" href="/" { "Blocks" }
-                                a class="navlink" href="/alkanes" { "Alkanes" }
+                                a class="navlink" href=(explorer_path("/")) { "Blocks" }
+                                a class="navlink" href=(explorer_path("/alkanes")) { "Alkanes" }
                             }
                             div class="nav-actions" {
                                 button class="nav-icon-btn nav-search-toggle" type="button" aria-label="Search" data-search-toggle="" {
@@ -115,15 +127,15 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                                 }
                             }
                             div class="nav-menu" data-menu="" aria-hidden="true" {
-                                a class="nav-menu-link" href="/" { "Blocks" }
-                                a class="nav-menu-link" href="/alkanes" { "Alkanes" }
+                                a class="nav-menu-link" href=(explorer_path("/")) { "Blocks" }
+                                a class="nav-menu-link" href=(explorer_path("/alkanes")) { "Alkanes" }
                             }
                         }
                     }
                     div class="nav-search-mobile" data-search-mobile="" aria-hidden="true" {
                         div class="app" {
                             div class="nav-search hero-search" data-search="" {
-                                form class="hero-search-form" method="get" action="/search" autocomplete="off" data-search-form="" {
+                                form class="hero-search-form" method="get" action=(explorer_path("/search")) autocomplete="off" data-search-form="" {
                                     div class="hero-search-input" {
                                         span class="hero-search-icon" aria-hidden="true" { (icon_search()) }
                                         input class="hero-search-field" type="text" name="q" placeholder="Search blocks, alkanes, transactions, addresses" data-search-input="" aria-label="Search blocks, alkanes, transactions, addresses" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
@@ -141,7 +153,8 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
                     (content)
                 }
                 (footer())
-                (search_scripts())
+                (search_scripts(&base_path_js))
+                (dropdown_scripts())
                 (PreEscaped(NAV_SCRIPT))
             }
         }
@@ -149,12 +162,85 @@ pub fn layout(title: &str, content: Markup) -> Html<String> {
     Html(markup.into_string())
 }
 
-fn search_scripts() -> Markup {
+fn network_dropdown() -> Option<Markup> {
+    let networks = get_explorer_networks()?;
+    if networks.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<(&'static str, &'static str, String)> = Vec::new();
+    if let Some(url) = networks.mainnet.as_ref() {
+        entries.push(("mainnet", "Mainnet", url.clone()));
+    }
+    if let Some(url) = networks.signet.as_ref() {
+        entries.push(("signet", "Signet", url.clone()));
+    }
+    if let Some(url) = networks.testnet3.as_ref() {
+        entries.push(("testnet3", "Testnet3", url.clone()));
+    }
+    if let Some(url) = networks.testnet4.as_ref() {
+        entries.push(("testnet4", "Testnet4", url.clone()));
+    }
+    if let Some(url) = networks.regtest.as_ref() {
+        entries.push(("regtest", "Regtest", url.clone()));
+    }
+    if entries.is_empty() {
+        return None;
+    }
+
+    let current_key = network_key(get_network());
+    let selected_key = entries
+        .iter()
+        .find(|(key, _, _)| *key == current_key)
+        .map(|(key, _, _)| *key)
+        .unwrap_or(entries[0].0);
+
+    let items = entries
+        .iter()
+        .map(|(key, label, url)| DropdownItem {
+            label: (*label).to_string(),
+            href: url.clone(),
+            icon: Some(network_icon(key)),
+            selected: *key == selected_key,
+        })
+        .collect();
+
+    Some(dropdown(DropdownProps {
+        label: None,
+        selected_icon: Some(network_icon(selected_key)),
+        items,
+        aria_label: Some("Network".to_string()),
+    }))
+}
+
+fn network_key(network: bitcoin::Network) -> &'static str {
+    match network {
+        bitcoin::Network::Bitcoin => "mainnet",
+        bitcoin::Network::Regtest => "regtest",
+        bitcoin::Network::Signet => "signet",
+        _ => {
+            let tag = network.to_string();
+            if tag == "testnet4" { "testnet4" } else { "testnet3" }
+        }
+    }
+}
+
+fn network_icon(key: &str) -> Markup {
+    match key {
+        "mainnet" => icon_btc(),
+        "signet" => icon_signet(),
+        _ => icon_testnet(),
+    }
+}
+
+fn search_scripts(base_path_js: &str) -> Markup {
     let script = format!(
         r#"
 <script>
 (() => {{
   const SEARCH_DEBOUNCE_MS = {SEARCH_DEBOUNCE_MS};
+  const basePath = {base_path_js};
+  const basePrefix = basePath === '/' ? '' : basePath;
 
   const initSearch = (root) => {{
     const form = root.querySelector('[data-search-form]');
@@ -256,7 +342,7 @@ fn search_scripts() -> Markup {
     const fetchResults = (value) => {{
       if (abortController) abortController.abort();
       abortController = new AbortController();
-      fetch(`/api/search/guess?q=${{encodeURIComponent(value)}}`, {{ signal: abortController.signal }})
+      fetch(`${{basePrefix}}/api/search/guess?q=${{encodeURIComponent(value)}}`, {{ signal: abortController.signal }})
         .then((res) => (res.ok ? res.json() : null))
         .then((data) => {{
           if (!data) {{
@@ -371,4 +457,42 @@ fn search_scripts() -> Markup {
 "#
     );
     PreEscaped(script)
+}
+
+fn dropdown_scripts() -> Markup {
+    let script = r#"
+<script>
+(() => {
+  const closeAll = () => {
+    document.querySelectorAll('[data-dropdown][open]').forEach((node) => {
+      node.removeAttribute('open');
+    });
+  };
+  document.querySelectorAll('[data-dropdown]').forEach((node) => {
+    node.addEventListener('toggle', () => {
+      if (!node.open) {
+        return;
+      }
+      document.querySelectorAll('[data-dropdown][open]').forEach((openNode) => {
+        if (openNode !== node) {
+          openNode.removeAttribute('open');
+        }
+      });
+    });
+  });
+  document.addEventListener('click', (event) => {
+    if (event.target.closest && event.target.closest('[data-dropdown]')) {
+      return;
+    }
+    closeAll();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      closeAll();
+    }
+  });
+})();
+</script>
+"#;
+    PreEscaped(script.to_string())
 }
