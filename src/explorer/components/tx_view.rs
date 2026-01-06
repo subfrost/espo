@@ -476,7 +476,7 @@ fn is_factory_icon_blacklisted(inspection: Option<&StoredInspectionResult>) -> b
 }
 
 fn icon_url_with_base(id: &SchemaAlkaneId, base: &str) -> String {
-    format!("{}/{}_{}", base, id.block, id.tx)
+    format!("{}/{}-{}.png", base, id.block, id.tx)
 }
 
 pub(crate) fn icon_bg_style(icon_url: &str) -> String {
