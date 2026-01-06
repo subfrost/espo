@@ -7,7 +7,7 @@ use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
-use crate::config::{get_metashrew, get_network, is_debug_mode};
+use crate::config::{get_electrum_like, get_metashrew, get_network, is_debug_mode};
 use crate::modules::essentials::consts::ESSENTIALS_DEBUG_BALANCE_WATCH;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
@@ -28,6 +28,7 @@ use bitcoin::{ScriptBuf, Transaction, Txid, hashes::Hash};
 use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 fn clean_espo_sandshrew_like_trace(
     trace: &EspoSandshrewLikeTrace,
@@ -998,6 +999,56 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
         }
     }
 
+    let mut block_tx_index: HashMap<Txid, usize> = HashMap::new();
+    for (idx, atx) in block.transactions.iter().enumerate() {
+        block_tx_index.insert(atx.transaction.compute_txid(), idx);
+    }
+
+    let mut trace_prevout_txids: Vec<Txid> = Vec::new();
+    let mut trace_prevout_set: HashSet<Txid> = HashSet::new();
+    for atx in &block.transactions {
+        let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
+        if !has_traces {
+            continue;
+        }
+        for input in &atx.transaction.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let prev_txid = input.previous_output.txid;
+            if block_tx_index.contains_key(&prev_txid) {
+                continue;
+            }
+            if trace_prevout_set.insert(prev_txid) {
+                trace_prevout_txids.push(prev_txid);
+            }
+        }
+    }
+
+    // TODO: extend prevout fallback to all alkane txs (not just traced) for full address coverage.
+    let mut trace_prev_tx_map: HashMap<Txid, Transaction> = HashMap::new();
+    if !trace_prevout_txids.is_empty() {
+        let electrum_like = get_electrum_like();
+        let start = Instant::now();
+        let raw_prev = electrum_like
+            .batch_transaction_get_raw(&trace_prevout_txids)
+            .unwrap_or_default();
+        eprintln!(
+            "[balances] traced prevout fetch: block={} prevouts={} elapsed_ms={}",
+            block.height,
+            trace_prevout_txids.len(),
+            start.elapsed().as_millis()
+        );
+        for (i, raw_prev) in raw_prev.into_iter().enumerate() {
+            if raw_prev.is_empty() {
+                continue;
+            }
+            if let Ok(prev_tx) = deserialize::<Transaction>(&raw_prev) {
+                trace_prev_tx_map.insert(trace_prevout_txids[i], prev_tx);
+            }
+        }
+    }
+
     // ---------- Main per-tx loop ----------
     for atx in &block.transactions {
         let tx = &atx.transaction;
@@ -1041,6 +1092,36 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
             );
             let in_key = (in_op.txid.clone(), in_op.vout);
             let in_str = in_op.as_outpoint_string();
+
+            if !input.previous_output.is_null() {
+                let mut input_addr: Option<String> = None;
+                if let Some(idx) = block_tx_index.get(&input.previous_output.txid) {
+                    if let Some(prev_out) =
+                        block.transactions[*idx].transaction.output.get(input.previous_output.vout as usize)
+                    {
+                        input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
+                    }
+                }
+                if input_addr.is_none() {
+                    if let Some(addr) = addr_by_outpoint.get(&in_key) {
+                        input_addr = Some(addr.clone());
+                    } else if let Some(spk) = spk_by_outpoint.get(&in_key) {
+                        input_addr = spk_to_address_str(spk, network);
+                    }
+                }
+                if input_addr.is_none() && has_traces {
+                    if let Some(prev_tx) = trace_prev_tx_map.get(&input.previous_output.txid) {
+                        if let Some(prev_out) =
+                            prev_tx.output.get(input.previous_output.vout as usize)
+                        {
+                            input_addr = spk_to_address_str(&prev_out.script_pubkey, network);
+                        }
+                    }
+                }
+                if let Some(addr) = input_addr {
+                    tx_addrs.insert(addr);
+                }
+            }
 
             // 1) Ephemeral? (created earlier in this same block)
             if let Some(bals) = ephem_outpoint_balances.get(&in_str) {
@@ -1262,6 +1343,15 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
 
         let is_alkane_tx = has_alkane_vin || has_traces;
         if is_alkane_tx {
+            for output in &tx.output {
+                if is_op_return(&output.script_pubkey) {
+                    continue;
+                }
+                if let Some(addr) = spk_to_address_str(&output.script_pubkey, network) {
+                    tx_addrs.insert(addr);
+                }
+            }
+
             let mut outflows: Vec<AlkaneBalanceTxEntry> = Vec::new();
             for (_owner, per_token) in &local_alkane_delta {
                 if per_token.is_empty() {

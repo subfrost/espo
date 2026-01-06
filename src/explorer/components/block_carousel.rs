@@ -33,6 +33,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
   let scrollRaf = null;
   let hasCentered = false;
   const isLatest = current === espoTip;
+  const isRtl = root.dataset.bcRtl === '1';
   let indicator = null;
 
   const setLoading = (side, val) => {{
@@ -97,7 +98,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
   }}
 
   function snapBackIfLatest() {{
-    if (!isLatest || !embla) return;
+    if (!isLatest || !embla || isRtl) return;
     const currentCard = container.querySelector('.bc-card.current');
     if (!currentCard) return;
     const viewportRect = viewport.getBoundingClientRect();
@@ -111,11 +112,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
 
   function render() {{
     if (embla) {{
-      const idx = embla.selectedScrollSnap();
-      const slide = embla.slideNodes()[idx];
-      if (slide && slide.dataset.height) {{
-        selectedHeight = Number(slide.dataset.height);
-      }}
+      updateSelectedHeightFromCenter();
     }}
     blocks.sort((a,b) => a.height - b.height);
     container.innerHTML = '';
@@ -147,7 +144,8 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
       align: 'center',
       dragFree: true,
       containScroll: false,
-      startIndex: targetIdx
+      startIndex: targetIdx,
+      direction: isRtl ? 'rtl' : 'ltr'
     }};
 
     const ensureSelectedHeight = () => {{
@@ -176,9 +174,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
     }}
 
     if (embla) {{
-      const idx = targetIdx;
       window.requestAnimationFrame(() => {{
-        embla.scrollTo(idx, true);
         hasCentered = true;
         suppressSelectUpdate = false;
         ensureSelectedHeight();
@@ -247,13 +243,8 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
       minIdx = Math.min(...inView);
       maxIdx = Math.max(...inView);
     }}
-    let progress = null;
-    if (typeof embla.scrollProgress === 'function') {{
-      progress = embla.scrollProgress();
-    }}
-    const clamped = Number.isFinite(progress) ? Math.max(0, Math.min(1, progress)) : null;
-    const nearLeft = minIdx <= 2 || (clamped !== null && clamped <= 0.03);
-    const nearRight = maxIdx >= blocks.length - 3 || (clamped !== null && clamped >= 0.97);
+    const nearLeft = minIdx <= 2;
+    const nearRight = maxIdx >= blocks.length - 3;
     if (nearLeft && minH > 0 && !leftDepleted) {{
       fetchAround(Math.max(0, minH - 8), -1);
     }}
@@ -262,10 +253,37 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
     }}
   }}
 
+  function updateSelectedHeightFromCenter() {{
+    if (!embla) return;
+    const inView = embla.slidesInView(false);
+    if (!inView || inView.length === 0) return;
+    const slides = embla.slideNodes();
+    const viewportRect = viewport.getBoundingClientRect();
+    const viewportCenter = viewportRect.left + viewportRect.width / 2;
+    let bestIdx = inView[0];
+    let bestDist = Infinity;
+    for (const idx of inView) {{
+      const slide = slides[idx];
+      if (!slide) continue;
+      const rect = slide.getBoundingClientRect();
+      const center = rect.left + rect.width / 2;
+      const dist = Math.abs(center - viewportCenter);
+      if (dist < bestDist) {{
+        bestDist = dist;
+        bestIdx = idx;
+      }}
+    }}
+    const bestSlide = slides[bestIdx];
+    if (bestSlide && bestSlide.dataset.height) {{
+      selectedHeight = Number(bestSlide.dataset.height);
+    }}
+  }}
+
   function throttleMaybeLoad() {{
     if (scrollRaf) return;
     scrollRaf = window.requestAnimationFrame(() => {{
       scrollRaf = null;
+      updateSelectedHeightFromCenter();
       maybeLoadMore();
       updateIndicator();
     }});
@@ -290,7 +308,7 @@ pub fn block_carousel(current_height: Option<u64>, espo_tip: u64, base_path: &st
     ));
 
     html! {
-        div class="block-carousel card full-bleed" data-block-carousel data-current=(current_height) data-espo-tip=(espo_tip) {
+        div class="block-carousel card full-bleed" data-block-carousel data-bc-rtl="1" data-current=(current_height) data-espo-tip=(espo_tip) {
             div class="bc-inner" {
 
                 div class="bc-embla-wrap" {

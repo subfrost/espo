@@ -2248,6 +2248,12 @@ button:hover {
   padding: 0;
   box-sizing: border-box;
 }
+.block-carousel[data-bc-rtl="1"] .bc-embla {
+  direction: rtl;
+}
+.block-carousel[data-bc-rtl="1"] .bc-slide {
+  direction: ltr;
+}
 .bc-slide {
   flex: 0 0 150px;
   position: relative;
@@ -2335,6 +2341,16 @@ button:hover {
 .bc-loader.right {
   right: 0;
   background: linear-gradient(270deg, rgba(26, 27, 30, 0.9), transparent);
+}
+.block-carousel[data-bc-rtl="1"] .bc-loader.left {
+  left: auto;
+  right: 0;
+  background: linear-gradient(270deg, rgba(26, 27, 30, 0.9), transparent);
+}
+.block-carousel[data-bc-rtl="1"] .bc-loader.right {
+  right: auto;
+  left: 0;
+  background: linear-gradient(90deg, rgba(26, 27, 30, 0.9), transparent);
 }
 .block-carousel[data-loadingleft="1"] .bc-loader.left,
 .block-carousel[data-loadingright="1"] .bc-loader.right {
