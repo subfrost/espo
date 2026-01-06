@@ -132,7 +132,7 @@ a:hover {
   background: var(--panel);
   border-radius: 8px;
   padding: 6px;
-  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.4);
   z-index: 20;
   display: none;
 }
