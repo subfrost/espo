@@ -34,6 +34,19 @@ const NAV_SCRIPT: &str = r#"
       node.setAttribute('aria-hidden', 'true');
     });
   };
+  const closeDropdowns = () => {
+    document.querySelectorAll('[data-dropdown]').forEach((node) => {
+      node.dataset.open = '';
+      const toggle = node.querySelector('[data-dropdown-toggle]');
+      const panel = node.querySelector('.dropdown-panel');
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', 'false');
+      }
+      if (panel) {
+        panel.setAttribute('aria-hidden', 'true');
+      }
+    });
+  };
   if (!menu || toggles.length === 0) return;
   const closeMenu = () => {
     nav.dataset.menuOpen = '';
@@ -47,6 +60,7 @@ const NAV_SCRIPT: &str = r#"
     toggles.forEach((btn) => btn.setAttribute('aria-expanded', 'true'));
   };
   const toggleMenu = () => {
+    closeDropdowns();
     if (nav.dataset.menuOpen === '1') {
       closeMenu();
     } else {
@@ -463,21 +477,56 @@ fn dropdown_scripts() -> Markup {
     let script = r#"
 <script>
 (() => {
-  const closeAll = () => {
-    document.querySelectorAll('[data-dropdown][open]').forEach((node) => {
-      node.removeAttribute('open');
-    });
+  const nav = document.querySelector('[data-nav-menu]');
+  const menu = nav ? nav.querySelector('[data-menu]') : null;
+  const menuToggles = nav ? nav.querySelectorAll('[data-menu-toggle]') : [];
+  const closeMenu = () => {
+    if (!nav || !menu) return;
+    nav.dataset.menuOpen = '';
+    menu.setAttribute('aria-hidden', 'true');
+    menuToggles.forEach((btn) => btn.setAttribute('aria-expanded', 'false'));
   };
-  document.querySelectorAll('[data-dropdown]').forEach((node) => {
-    node.addEventListener('toggle', () => {
-      if (!node.open) {
+  const dropdowns = Array.from(document.querySelectorAll('[data-dropdown]'));
+  const setOpen = (node, open) => {
+    node.dataset.open = open ? '1' : '';
+    const toggle = node.querySelector('[data-dropdown-toggle]');
+    const panel = node.querySelector('.dropdown-panel');
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    if (panel) {
+      panel.setAttribute('aria-hidden', open ? 'false' : 'true');
+    }
+  };
+  const closeAll = () => {
+    dropdowns.forEach((node) => setOpen(node, false));
+  };
+  dropdowns.forEach((node) => {
+    const toggle = node.querySelector('[data-dropdown-toggle]');
+    if (!toggle) {
+      return;
+    }
+    let touchHandled = false;
+    const toggleOpen = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const isOpen = node.dataset.open === '1';
+      closeAll();
+      closeMenu();
+      if (!isOpen) {
+        setOpen(node, true);
+      }
+    };
+    toggle.addEventListener('touchstart', (event) => {
+      touchHandled = true;
+      toggleOpen(event);
+    }, { passive: false });
+    toggle.addEventListener('click', (event) => {
+      if (touchHandled) {
+        touchHandled = false;
         return;
       }
-      document.querySelectorAll('[data-dropdown][open]').forEach((openNode) => {
-        if (openNode !== node) {
-          openNode.removeAttribute('open');
-        }
-      });
+      toggleOpen(event);
     });
   });
   document.addEventListener('click', (event) => {
@@ -485,6 +534,18 @@ fn dropdown_scripts() -> Markup {
       return;
     }
     closeAll();
+  });
+  document.addEventListener('touchstart', (event) => {
+    if (event.target.closest && event.target.closest('[data-dropdown]')) {
+      return;
+    }
+    closeAll();
+  }, { passive: true });
+  document.addEventListener('click', (event) => {
+    const item = event.target.closest && event.target.closest('[data-dropdown] a');
+    if (item) {
+      closeAll();
+    }
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {

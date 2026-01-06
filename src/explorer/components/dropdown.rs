@@ -25,8 +25,8 @@ pub fn dropdown(props: DropdownProps) -> Markup {
         .unwrap_or_else(|| "Dropdown".to_string());
 
     html! {
-        details class="dropdown" data-dropdown="" {
-            summary class="dropdown-trigger" aria-label=(aria_label) {
+        div class="dropdown" data-dropdown="" data-open="" {
+            button class="dropdown-trigger" type="button" aria-label=(aria_label) aria-haspopup="true" aria-expanded="false" data-dropdown-toggle="" {
                 @if let Some(icon) = props.selected_icon {
                     span class="dropdown-icon dropdown-trigger-icon" { (icon) }
                 }
@@ -35,10 +35,10 @@ pub fn dropdown(props: DropdownProps) -> Markup {
                 }
                 span class="dropdown-caret" { (icon_dropdown_caret()) }
             }
-            div class="dropdown-panel" {
+            div class="dropdown-panel" role="menu" aria-hidden="true" {
                 @for item in props.items {
                     @let item_class = if item.selected { "dropdown-item selected" } else { "dropdown-item" };
-                    a class=(item_class) href=(item.href) {
+                    a class=(item_class) href=(item.href) role="menuitem" {
                         @if let Some(icon) = item.icon {
                             span class="dropdown-icon" { (icon) }
                         } @else if item.selected {

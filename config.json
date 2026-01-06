@@ -11,7 +11,7 @@
   "db_path": "./db",
   "enable_aof": true,
   "sdb_poll_ms": 5000,
-  "indexer_block_delay_ms": 50,
+  "indexer_block_delay_ms": 0,
   "port": 5780,
   "explorer_host": "0.0.0.0:5081",
   "network": "mainnet",

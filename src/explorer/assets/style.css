@@ -95,30 +95,28 @@ a:hover {
   align-items: center;
   flex-shrink: 0;
 }
-.dropdown > summary::-webkit-details-marker {
-  display: none;
-}
-.dropdown > summary::marker {
-  content: "";
-}
 .dropdown-trigger {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   padding: 10px;
+  border: 0;
   border-radius: 8px;
   background: var(--panel2);
   color: var(--text);
   cursor: pointer;
   font-weight: 600;
   font-size: 14px;
+  font-family: inherit;
+  appearance: none;
+  -webkit-appearance: none;
 }
 
 .dropdown-caret {
   transition: ease 0.2s;
 }
 
-.dropdown[open] .dropdown-trigger > .dropdown-caret {
+.dropdown[data-open="1"] .dropdown-trigger > .dropdown-caret {
   transition: ease 0.2s;
   transform: rotate(180deg);
 }
@@ -136,7 +134,7 @@ a:hover {
   z-index: 20;
   display: none;
 }
-.dropdown[open] .dropdown-panel {
+.dropdown[data-open="1"] .dropdown-panel {
   display: flex;
 }
 .dropdown-item {
