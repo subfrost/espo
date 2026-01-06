@@ -5,8 +5,8 @@ use bitcoin::Network;
 
 use crate::config::get_network;
 
-pub const ALKANE_TOKEN_ICON_BASE: &str = "https://cdn.ordiscan.com/alkanes";
-pub const ALKANE_CONTRACT_ICON_BASE: &str = "https://cdn.ordiscan.com/alkanes";
+pub const ALKANE_TOKEN_ICON_BASE: &str = "https://asset.oyl.gg/alkanes/mainnet";
+pub const ALKANE_CONTRACT_ICON_BASE: &str = "https://asset.oyl.gg/alkanes/mainnet";
 
 // --- Mainnet overrides ---
 const MAINNET_ALKANE_NAME_OVERRIDES: &[(&str, &str, &str)] =
