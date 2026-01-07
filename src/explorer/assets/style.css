@@ -758,12 +758,6 @@ a:hover {
   .home-table-grid {
     gap: 50px;
   }
-  .home-table-grid .home-table-block {
-    order: 1;
-  }
-  .home-table-grid .home-table-block:nth-child(2) {
-    order: 0;
-  }
 }
 .table {
   width: 100%;
@@ -1771,6 +1765,16 @@ a:hover {
   color: var(--muted2);
   white-space: pre-wrap;
   word-break: break-word;
+}
+.alkane-method-value[data-cards="1"] {
+  white-space: normal;
+  word-break: normal;
+}
+.alkane-overflow-note {
+  margin-top: 8px;
+  color: var(--muted2);
+  font-weight: 600;
+  font-size: 15px;
 }
 .alkane-method-result[data-status="success"] .alkane-method-value {
   color: var(--text);

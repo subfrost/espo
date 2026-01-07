@@ -20,8 +20,14 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::storage::{BalanceEntry, HolderId, load_creation_record};
 use crate::modules::essentials::utils::balances::{get_alkane_balances, get_holders_for_alkane};
 use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
+use crate::runtime::mdb::Mdb;
+use crate::schemas::SchemaAlkaneId;
+use std::collections::HashSet;
 
 const ADDR_SUFFIX_LEN: usize = 8;
+const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
+const KV_KEY_BEACON: &[u8] = b"/beacon";
+const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 
 #[derive(Deserialize)]
 pub struct PageQuery {
@@ -105,9 +111,21 @@ pub async fn alkane_page(
     let supply_f64 = circulating_supply as f64;
 
     let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
-    let (view_methods, write_methods) = split_methods(inspection);
-    let (factory_name, factory_id_str) =
-        resolve_factory_contract(inspection, &alk, &mut kv_cache, &state.essentials_mdb);
+    let mut inspect_source = inspection.cloned();
+    let mut proxy_target_label: Option<String> = None;
+    let inspect_alkane_id = alk_str.clone();
+    if let Some(proxy_target) = resolve_proxy_target_recursive(&alk, &state.essentials_mdb) {
+        let label = format!("{}:{}", proxy_target.block, proxy_target.tx);
+        proxy_target_label = Some(label.clone());
+        inspect_source = load_inspection(&state.essentials_mdb, &proxy_target).ok().flatten();
+    }
+    let (view_methods, write_methods) = split_methods(inspect_source.as_ref());
+    let inspect_name = display_name.clone();
+    let inspect_id_label = if let Some(label) = proxy_target_label.as_ref() {
+        format!("{alk_str} (proxied to {label})")
+    } else {
+        alk_str.clone()
+    };
 
     let rows: Vec<Vec<Markup>> = holders
         .into_iter()
@@ -317,10 +335,10 @@ pub async fn alkane_page(
                                     }
                                 }
                             } @else {
-                                div class="alkane-inspect-card" data-alkane-inspect="" data-alkane-id=(alk_str.clone()) {
+                                div class="alkane-inspect-card" data-alkane-inspect="" data-alkane-id=(inspect_alkane_id.clone()) {
                                     div class="alkane-inspect-header" {
-                                        span class="alkane-inspect-name" { (factory_name.clone()) }
-                                        span class="alkane-inspect-id mono" { (factory_id_str.clone()) }
+                                        span class="alkane-inspect-name" { (inspect_name.clone()) }
+                                        span class="alkane-inspect-id mono" { (inspect_id_label.clone()) }
                                     }
                                     @if view_methods.is_empty() && write_methods.is_empty() {
                                         p class="muted" { "No contract methods found." }
@@ -340,7 +358,7 @@ pub async fn alkane_page(
                                                         div class="opret-toggle-body" {
                                                             div class="alkane-method-result" data-sim-result="" data-status="idle" {
                                                                 span class="alkane-method-label" { "Result:" }
-                                                                span class="alkane-method-value" data-sim-value="" { "—" }
+                                                                div class="alkane-method-value" data-sim-value="" { "—" }
                                                             }
                                                         }
                                                     }
@@ -362,7 +380,7 @@ pub async fn alkane_page(
                                                         div class="opret-toggle-body" {
                                                             div class="alkane-method-result" data-sim-result="" data-status="idle" {
                                                                 span class="alkane-method-label" { "Result:" }
-                                                                span class="alkane-method-value muted" data-sim-value="" data-default-text="Providing inputs to simulate methods is not currently supported on espo" {
+                                                                div class="alkane-method-value muted" data-sim-value="" data-default-text="Providing inputs to simulate methods is not currently supported on espo" {
                                                                     "Providing inputs to write methods is not currently supported on Espo"
                                                                 }
                                                             }
@@ -445,24 +463,80 @@ fn split_methods(
     (view, write)
 }
 
-fn resolve_factory_contract(
-    inspection: Option<&crate::modules::essentials::utils::inspections::StoredInspectionResult>,
-    alkane: &crate::schemas::SchemaAlkaneId,
-    meta_cache: &mut AlkaneMetaCache,
-    essentials_mdb: &crate::runtime::mdb::Mdb,
-) -> (String, String) {
-    let factory_id = inspection.and_then(|i| i.factory_alkane).unwrap_or(*alkane);
-    let factory_name = load_inspection(essentials_mdb, &factory_id)
-        .ok()
-        .flatten()
-        .and_then(|i| i.metadata.as_ref().map(|m| m.name.trim().to_string()))
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            let meta = alkane_meta(&factory_id, meta_cache, essentials_mdb);
-            meta.name.value.clone()
-        });
-    let factory_id_str = format!("{}:{}", factory_id.block, factory_id.tx);
-    (factory_name, factory_id_str)
+fn is_upgradeable_proxy(
+    inspection: &crate::modules::essentials::utils::inspections::StoredInspectionResult,
+) -> bool {
+    let Some(meta) = inspection.metadata.as_ref() else { return false };
+    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
+        meta.methods
+            .iter()
+            .any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
+    })
+}
+
+fn kv_row_key(alk: &SchemaAlkaneId, skey: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 4 + 8 + 2 + skey.len());
+    v.push(0x01);
+    v.extend_from_slice(&alk.block.to_be_bytes());
+    v.extend_from_slice(&alk.tx.to_be_bytes());
+    let len = u16::try_from(skey.len()).unwrap_or(u16::MAX);
+    v.extend_from_slice(&len.to_be_bytes());
+    if len as usize != skey.len() {
+        v.extend_from_slice(&skey[..(len as usize)]);
+    } else {
+        v.extend_from_slice(skey);
+    }
+    v
+}
+
+fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
+    if raw.len() < 32 {
+        return None;
+    }
+    let block_bytes: [u8; 16] = raw[0..16].try_into().ok()?;
+    let tx_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+    let block = u128::from_le_bytes(block_bytes);
+    let tx = u128::from_le_bytes(tx_bytes);
+    if block > u32::MAX as u128 || tx > u64::MAX as u128 {
+        return None;
+    }
+    Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
+}
+
+fn proxy_target_from_db(alk: &SchemaAlkaneId, mdb: &Mdb) -> Option<SchemaAlkaneId> {
+    let lookup = |key| {
+        mdb.get(&kv_row_key(alk, key))
+            .ok()
+            .flatten()
+            .and_then(|raw| {
+                if raw.len() >= 32 {
+                    decode_kv_implementation(&raw[32..])
+                } else {
+                    decode_kv_implementation(&raw)
+                }
+            })
+    };
+    lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON))
+}
+
+fn resolve_proxy_target_recursive(
+    start: &SchemaAlkaneId,
+    mdb: &Mdb,
+) -> Option<SchemaAlkaneId> {
+    let mut current = *start;
+    let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
+    for _ in 0..8 {
+        let inspection = load_inspection(mdb, &current).ok().flatten()?;
+        if !is_upgradeable_proxy(&inspection) {
+            return (current != *start).then_some(current);
+        }
+        let next = proxy_target_from_db(&current, mdb)?;
+        if !seen.insert(next) {
+            return None;
+        }
+        current = next;
+    }
+    None
 }
 
 fn inspect_scripts() -> Markup {
@@ -477,6 +551,75 @@ fn inspect_scripts() -> Markup {
   const alkaneId = root.dataset.alkaneId || '';
   if (!alkaneId) return;
   const writeDefault = 'Providing inputs to simulate methods is not currently supported on espo';
+  const clearValueNode = (node) => {
+    if (!node) return;
+    node.removeAttribute('data-cards');
+    node.replaceChildren();
+  };
+  const setValueText = (node, text) => {
+    if (!node) return;
+    node.removeAttribute('data-cards');
+    node.textContent = text;
+  };
+  const buildAlkaneIcon = (item) => {
+    const wrap = document.createElement('span');
+    wrap.className = 'alk-icon-wrap search-alk-icon';
+    const img = document.createElement('span');
+    img.className = 'alk-icon-img';
+    if (item.icon_url) {
+      img.style.backgroundImage = `url("${item.icon_url}")`;
+    }
+    const letter = document.createElement('span');
+    letter.className = 'alk-icon-letter';
+    const fallback = item.fallback_letter || (item.label || '').trim().charAt(0) || '?';
+    letter.textContent = fallback.toUpperCase();
+    wrap.appendChild(img);
+    wrap.appendChild(letter);
+    return wrap;
+  };
+  const buildAddressIcon = () => {
+    const icon = document.createElement('span');
+    icon.className = 'search-result-icon';
+    icon.textContent = '@';
+    return icon;
+  };
+  const buildCardIcon = (kind, item) => {
+    if (kind === 'address') {
+      return buildAddressIcon();
+    }
+    return buildAlkaneIcon(item);
+  };
+  const setValueCards = (node, items, overflow, kind) => {
+    if (!node) return;
+    node.dataset.cards = '1';
+    node.replaceChildren();
+    const wrap = document.createElement('div');
+    wrap.className = 'search-results-items';
+    items.forEach((item) => {
+      const hasHref = Boolean(item.href);
+      const entry = document.createElement(hasHref ? 'a' : 'div');
+      entry.className = 'search-result';
+      if (hasHref) {
+        entry.setAttribute('href', item.href);
+      } else {
+        entry.dataset.disabled = '1';
+      }
+      const icon = buildCardIcon(kind, item);
+      const label = document.createElement('span');
+      label.className = 'search-result-label';
+      label.textContent = item.label || item.value || '';
+      entry.appendChild(icon);
+      entry.appendChild(label);
+      wrap.appendChild(entry);
+    });
+    node.appendChild(wrap);
+    if (overflow && overflow > 0) {
+      const note = document.createElement('div');
+      note.className = 'alkane-overflow-note';
+      note.textContent = `... plus ${overflow} other pools (too many to be displayed)`;
+      node.appendChild(note);
+    }
+  };
 
   const toggles = root.querySelectorAll('[data-alkane-method]');
   const resetWrite = (details) => {
@@ -488,7 +631,7 @@ fn inspect_scripts() -> Markup {
     const valueNode = details.querySelector('[data-sim-value]');
     if (resultWrap && valueNode) {
       resultWrap.dataset.status = 'idle';
-      valueNode.textContent = valueNode.dataset.defaultText || writeDefault;
+      setValueText(valueNode, valueNode.dataset.defaultText || writeDefault);
     }
   };
 
@@ -503,14 +646,14 @@ fn inspect_scripts() -> Markup {
 
     details.dataset.loading = '1';
     resultWrap.dataset.status = 'loading';
-    valueNode.textContent = 'Loading...';
+    setValueText(valueNode, 'Loading...');
 
     try {
       const payload = { alkane: alkaneId, opcode: Number(opcode) };
       if (returnsType) {
         payload.returns = returnsType;
       }
-      const res = await fetch(`${{basePrefix}}/api/alkane/simulate`, {
+      const res = await fetch(`${basePrefix}/api/alkane/simulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -519,15 +662,21 @@ fn inspect_scripts() -> Markup {
       if (!data || !data.ok) {
         const msg = data && data.error ? data.error : 'Simulation failed';
         resultWrap.dataset.status = 'failure';
-        valueNode.textContent = msg;
+        setValueText(valueNode, msg);
       } else {
         const status = data.status || 'success';
         resultWrap.dataset.status = status;
-        valueNode.textContent = data.data || 'No data';
+        if (Array.isArray(data.alkanes) && data.alkanes.length) {
+          setValueCards(valueNode, data.alkanes, data.alkanes_overflow || 0, 'alkane');
+        } else if (Array.isArray(data.addresses) && data.addresses.length) {
+          setValueCards(valueNode, data.addresses, 0, 'address');
+        } else {
+          setValueText(valueNode, data.data || 'No data');
+        }
       }
     } catch (_) {
       resultWrap.dataset.status = 'failure';
-      valueNode.textContent = 'Simulation failed';
+      setValueText(valueNode, 'Simulation failed');
     } finally {
       details.dataset.loading = '0';
     }

@@ -28,6 +28,7 @@ fn init_test_config_from_run_sh() {
         network: bitcoin::Network::Bitcoin,
         metashrew_db_label: None,
         debug: false,
+        trace_index_strict: false,
         block_source_mode: BlockFetchMode::RpcOnly,
         simulate_reorg: false,
         explorer_networks: None,

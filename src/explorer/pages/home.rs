@@ -1,8 +1,8 @@
+use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::State;
 use axum::response::Html;
-use alkanes_cli_common::alkanes_pb::AlkanesTrace;
-use bitcoin::hashes::Hash;
 use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use bitcoincore_rpc::RpcApi;
 use borsh::BorshDeserialize;
 use maud::{Markup, html};
@@ -19,8 +19,8 @@ use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summari
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    AlkaneTxSummary, HoldersCountEntry, alkane_creation_ordered_prefix, alkane_latest_traces_key,
-    alkane_tx_summary_key, decode_creation_record, holders_count_key,
+    AlkaneTxSummary, alkane_holders_ordered_prefix, alkane_latest_traces_key,
+    alkane_tx_summary_key, load_creation_record, parse_alkane_holders_ordered_key,
 };
 use crate::schemas::EspoOutpoint;
 
@@ -29,20 +29,25 @@ struct AlkaneTxRow {
     trace: EspoTrace,
 }
 
-fn load_newest_alkanes(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<AlkaneTableRow> {
+fn load_top_alkanes_by_holders(
+    mdb: &crate::runtime::mdb::Mdb,
+    limit: usize,
+) -> Vec<AlkaneTableRow> {
     let mut rows: Vec<AlkaneTableRow> = Vec::new();
     if limit == 0 {
         return rows;
     }
 
-    let prefix_full = mdb.prefixed(alkane_creation_ordered_prefix());
+    let prefix_full = mdb.prefixed(alkane_holders_ordered_prefix());
     let it = mdb.iter_prefix_rev(&prefix_full);
     for res in it {
         if rows.len() >= limit {
             break;
         }
-        let Ok((_k, v)) = res else { continue };
-        let Ok(rec) = decode_creation_record(&v) else { continue };
+        let Ok((k, _v)) = res else { continue };
+        let rel = &k[mdb.prefix().len()..];
+        let Some((holders, alk)) = parse_alkane_holders_ordered_key(rel) else { continue };
+        let Some(rec) = load_creation_record(mdb, &alk).ok().flatten() else { continue };
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
         let name = rec
@@ -51,13 +56,6 @@ fn load_newest_alkanes(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<Alka
             .map(|s| s.to_string())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "Unnamed".to_string());
-        let holders = mdb
-            .get(&holders_count_key(&rec.alkane))
-            .ok()
-            .flatten()
-            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-            .map(|hc| hc.count)
-            .unwrap_or(0);
         let icon_url = alkane_icon_url(&rec.alkane, mdb);
         let fallback = if name == "Unnamed" {
             '?'
@@ -99,11 +97,7 @@ fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Optio
         sandshrew_trace: trace.clone(),
         protobuf_trace: AlkanesTrace::default(),
         storage_changes: HashMap::new(),
-        outpoint: EspoOutpoint {
-            txid: trace_txid.to_byte_array().to_vec(),
-            vout,
-            tx_spent: None,
-        },
+        outpoint: EspoOutpoint { txid: trace_txid.to_byte_array().to_vec(), vout, tx_spent: None },
     })
 }
 
@@ -150,15 +144,15 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
     let tip = rpc.get_blockchain_info().map(|i| i.blocks).unwrap_or(0);
     let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let latest_height = espo_tip.min(tip);
-    let newest_alkanes = load_newest_alkanes(&state.essentials_mdb, 10);
+    let top_alkanes = load_top_alkanes_by_holders(&state.essentials_mdb, 10);
     let latest_alkane_txs = load_latest_alkane_txs(&state.essentials_mdb, 4);
     let latest_block_link = explorer_path(&format!("/block/{espo_tip}?traces=1"));
     let alkanes_link = explorer_path("/alkanes");
 
-    let newest_alkanes_table: Markup = if newest_alkanes.is_empty() {
+    let top_alkanes_table: Markup = if top_alkanes.is_empty() {
         html! { p class="muted" { "No alkanes found." } }
     } else {
-        alkanes_table(&newest_alkanes, false, false, true)
+        alkanes_table(&top_alkanes, false, false, true)
     };
 
     let latest_txs_table: Markup = if latest_alkane_txs.is_empty() {
@@ -199,26 +193,26 @@ pub async fn home_page(State(state): State<ExplorerState>) -> Html<String> {
             div class="grid2 home-table-grid" {
                 div class="home-table-block" {
                     div class="home-table-header" {
+                        h2 class="h2" { "Top Alkanes" }
+                        a class="home-table-link" href=(alkanes_link) {
+                            "View more Alkanes"
+                            (icon_right())
+                        }
+                    }
+                    div class="home-table-card" {
+                        (top_alkanes_table)
+                    }
+                }
+                div class="home-table-block" {
+                    div class="home-table-header" {
                             h2 class="h2" { "Latest Traces" }
                         a class="home-table-link" href=(latest_block_link) {
-                            "View more alkane txs"
+                            "View more Alkane txs"
                             (icon_right())
                         }
                     }
                     div class="home-table-card" {
                         (latest_txs_table)
-                    }
-                }
-                div class="home-table-block" {
-                    div class="home-table-header" {
-                        h2 class="h2" { "Newest alkanes" }
-                        a class="home-table-link" href=(alkanes_link) {
-                            "View more alkanes"
-                            (icon_right())
-                        }
-                    }
-                    div class="home-table-card" {
-                        (newest_alkanes_table)
                     }
                 }
             }

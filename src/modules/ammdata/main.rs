@@ -32,18 +32,11 @@ use super::rpc::register_rpc;
 /* ---------- module ---------- */
 
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
-const UPGRADEABLE_METHODS: [(&str, u128); 3] =
-    [("initialize", 32767), ("upgrade", 32766), ("forward", 36863)];
-const UPGRADEABLE_NAME: &str = "Upgradeable";
-const UPGRADEABLE_NAME_ALT: &str = "Upgradable";
+const KV_KEY_BEACON: &[u8] = b"/beacon";
+const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 
 fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
     let Some(meta) = inspection.metadata.as_ref() else { return false };
-    let name_matches = meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME)
-        || meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME_ALT);
-    if !name_matches {
-        return false;
-    }
     UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
         meta.methods.iter().any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
     })
@@ -91,12 +84,20 @@ fn resolve_factory_target(
         return Ok(Some(base));
     }
 
-    let key = kv_row_key(&base, KV_KEY_IMPLEMENTATION);
-    if let Some(raw) = essentials_mdb.get(&key)? {
-        let slice = if raw.len() >= 32 { &raw[32..] } else { raw.as_slice() };
-        if let Some(decoded) = decode_kv_implementation(slice) {
-            return Ok(Some(decoded));
+    let lookup = |key| -> Result<Option<SchemaAlkaneId>> {
+        if let Some(raw) = essentials_mdb.get(&kv_row_key(&base, key))? {
+            let slice = if raw.len() >= 32 { &raw[32..] } else { raw.as_slice() };
+            if let Some(decoded) = decode_kv_implementation(slice) {
+                return Ok(Some(decoded));
+            }
         }
+        Ok(None)
+    };
+    if let Some(decoded) = lookup(KV_KEY_IMPLEMENTATION)? {
+        return Ok(Some(decoded));
+    }
+    if let Some(decoded) = lookup(KV_KEY_BEACON)? {
+        return Ok(Some(decoded));
     }
 
     let inspection = load_creation_record(essentials_mdb, &base)?.and_then(|rec| rec.inspection);

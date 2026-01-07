@@ -115,6 +115,7 @@ async fn run_indexer_loop(
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
+    let mut logged_start = false;
     if cfg.reset_mempool_on_startup {
         if let Err(e) = reset_mempool_store() {
             eprintln!("[mempool] failed to reset store on startup: {e:?}");
@@ -153,13 +154,14 @@ async fn run_indexer_loop(
         }
         last_tip = Some(tip);
 
-        if next_height == start_height {
+        if next_height == start_height && !logged_start {
             let remaining = tip.saturating_sub(next_height) + 1;
             let eta_str = fmt_duration(eta.eta(remaining));
             eprintln!(
                 "[indexer] starting at {}, safe tip {}, {} blocks behind, ETA ~ {}",
                 next_height, tip, remaining, eta_str
             );
+            logged_start = true;
         }
 
         if next_height <= tip {

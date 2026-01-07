@@ -107,10 +107,8 @@ pub(crate) struct AlkaneMetaDisplay {
     pub icon_url: String,
 }
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
-const UPGRADEABLE_METHODS: [(&str, u128); 3] =
-    [("initialize", 32767), ("upgrade", 32766), ("forward", 36863)];
-const UPGRADEABLE_NAME: &str = "Upgradeable";
-const UPGRADEABLE_NAME_ALT: &str = "Upgradable";
+const KV_KEY_BEACON: &[u8] = b"/beacon";
+const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 const TOKEN_METHOD_OPCODES: [u128; 6] = [99, 100, 101, 102, 103, 104];
 const TOKEN_METHOD_NAMES: [&str; 6] = [
     "get_name",
@@ -315,14 +313,19 @@ fn kv_implementation_value(
         }
     }
     let mut meta = cache.get(alk).cloned().unwrap_or_default();
-    let implementation =
-        mdb.get(&kv_row_key(alk, KV_KEY_IMPLEMENTATION)).ok().flatten().and_then(|raw| {
-            if raw.len() >= 32 {
-                decode_kv_implementation(&raw[32..])
-            } else {
-                decode_kv_implementation(&raw)
-            }
-        });
+    let lookup = |key| {
+        mdb.get(&kv_row_key(alk, key))
+            .ok()
+            .flatten()
+            .and_then(|raw| {
+                if raw.len() >= 32 {
+                    decode_kv_implementation(&raw[32..])
+                } else {
+                    decode_kv_implementation(&raw)
+                }
+            })
+    };
+    let implementation = lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON));
     meta.implementation = Some(implementation);
     cache.insert(*alk, meta.clone());
     implementation
@@ -342,11 +345,6 @@ fn lookup_inspection<'a>(
 
 fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
     let Some(meta) = inspection.metadata.as_ref() else { return false };
-    let name_matches = meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME)
-        || meta.name.eq_ignore_ascii_case(UPGRADEABLE_NAME_ALT);
-    if !name_matches {
-        return false;
-    }
     UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
         meta.methods
             .iter()
@@ -386,21 +384,40 @@ fn upgradeable_proxy_target(
     impl_cache: &mut AlkaneImplCache,
     mdb: &Mdb,
 ) -> Option<SchemaAlkaneId> {
-    // Prefer storage changes in the trace; fall back to the DB.
-    if let Some(kvs) = trace.storage_changes.get(id) {
-        for (skey, (_txid, value)) in kvs {
-            if skey.as_slice() == KV_KEY_IMPLEMENTATION {
-                if let Some(decoded) = decode_kv_implementation(value) {
-                    if inspection.map_or(false, is_upgradeable_proxy) {
-                        return Some(decoded);
-                    }
-                }
-            }
-        }
+    if !inspection.map_or(false, is_upgradeable_proxy) {
+        return None;
     }
-    let decoded = kv_implementation_value(id, impl_cache, mdb);
-    if decoded.is_some() && inspection.map_or(false, is_upgradeable_proxy) {
-        return decoded;
+    let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
+    let mut current = *id;
+    for depth in 0..8 {
+        let next = if depth == 0 {
+            if let Some(kvs) = trace.storage_changes.get(&current) {
+                kvs.iter()
+                    .find_map(|(skey, (_txid, value))| {
+                        if skey.as_slice() == KV_KEY_IMPLEMENTATION
+                            || skey.as_slice() == KV_KEY_BEACON
+                        {
+                            decode_kv_implementation(value)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| kv_implementation_value(&current, impl_cache, mdb))
+            } else {
+                kv_implementation_value(&current, impl_cache, mdb)
+            }
+        } else {
+            kv_implementation_value(&current, impl_cache, mdb)
+        };
+        let Some(target) = next else { return None };
+        if !seen.insert(target) {
+            return None;
+        }
+        let target_inspection = load_inspection(mdb, &target).ok().flatten();
+        if !target_inspection.as_ref().map_or(false, is_upgradeable_proxy) {
+            return Some(target);
+        }
+        current = target;
     }
     None
 }

@@ -17,6 +17,7 @@
   "network": "mainnet",
   "metashrew_db_label": null,
   "debug": false,
+  "trace_index_strict": false,
   "block_source_mode": "rpc",
   "simulate_reorg": false,
   "explorer_networks": {

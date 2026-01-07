@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::config::{get_espo_next_height, get_metashrew_rpc_url, get_network};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
+use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
     HoldersCountEntry, alkane_holders_ordered_prefix, alkane_name_index_prefix,
@@ -15,15 +16,18 @@ use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
-use alkanes_support::id::AlkaneId;
-use alkanes_support::proto::alkanes::MessageContextParcel;
-use alkanes_support::proto::alkanes::SimulateResponse as SimulateProto;
+use alkanes_support::id::AlkaneId as SupportAlkaneId;
+use alkanes_support::proto::alkanes::{
+    AlkaneId as ProtoAlkaneId, MessageContextParcel, SimulateResponse as SimulateProto,
+};
 use anyhow::Context;
+use bitcoincore_rpc::bitcoin::Network;
 use bitcoin::blockdata::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::transaction::Version;
+use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
 use borsh::BorshDeserialize;
 use ordinals::Runestone;
@@ -32,6 +36,7 @@ use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::str::FromStr;
 
 #[derive(Deserialize)]
@@ -136,7 +141,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     let mut txid: Vec<SearchGuessItem> = Vec::new();
     let mut addresses: Vec<SearchGuessItem> = Vec::new();
 
-    let holders_for = |alk: &SchemaAlkaneId| {
+    fn holders_for(essentials_mdb: &Mdb, alk: &SchemaAlkaneId) -> u64 {
         essentials_mdb
             .get(&holders_count_key(alk))
             .ok()
@@ -144,19 +149,26 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
             .map(|hc| hc.count)
             .unwrap_or(0)
-    };
+    }
 
-    let mut push_alkane_item = |alk: &SchemaAlkaneId, holders_hint: Option<u64>| -> bool {
+    fn push_alkane_item(
+        seen_alkanes: &mut HashSet<SchemaAlkaneId>,
+        alkanes: &mut Vec<RankedAlkaneItem>,
+        meta_cache: &mut AlkaneMetaCache,
+        essentials_mdb: &Mdb,
+        alk: &SchemaAlkaneId,
+        holders_hint: Option<u64>,
+    ) -> bool {
         if !seen_alkanes.insert(*alk) {
             return false;
         }
-        let holders = holders_hint.unwrap_or_else(|| holders_for(alk));
-        let meta = alkane_meta(alk, &mut meta_cache, &essentials_mdb);
+        let holders = holders_hint.unwrap_or_else(|| holders_for(essentials_mdb, alk));
+        let meta = alkane_meta(alk, meta_cache, essentials_mdb);
         let id = format!("{}:{}", alk.block, alk.tx);
         let known = meta.name.known;
         let label = if known { meta.name.value.clone() } else { id.clone() };
         let icon_url =
-            if known && !meta.icon_url.trim().is_empty() { Some(meta.icon_url.clone()) } else { None };
+            if !meta.icon_url.trim().is_empty() { Some(meta.icon_url.clone()) } else { None };
         alkanes.push(RankedAlkaneItem {
             item: SearchGuessItem {
                 label,
@@ -168,7 +180,45 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             holders,
         });
         true
-    };
+    }
+
+    fn push_override_alkane(
+        seen_alkanes: &mut HashSet<SchemaAlkaneId>,
+        alkanes: &mut Vec<RankedAlkaneItem>,
+        meta_cache: &mut AlkaneMetaCache,
+        essentials_mdb: &Mdb,
+        id_s: &str,
+        name: &str,
+    ) {
+        if let Some(alk) = parse_alkane_id(id_s) {
+            if !seen_alkanes.insert(alk) {
+                return;
+            }
+            let meta = alkane_meta(&alk, meta_cache, essentials_mdb);
+            let icon_url = if !meta.icon_url.trim().is_empty() {
+                Some(meta.icon_url.clone())
+            } else {
+                None
+            };
+            let holders = holders_for(essentials_mdb, &alk);
+            alkanes.push(RankedAlkaneItem {
+                item: SearchGuessItem {
+                    label: name.to_string(),
+                    value: id_s.to_string(),
+                    href: Some(explorer_path(&format!("/alkane/{id_s}"))),
+                    icon_url,
+                    fallback_letter: Some(
+                        name.chars()
+                            .find(|c| !c.is_whitespace())
+                            .map(|c| c.to_ascii_uppercase())
+                            .unwrap_or('?')
+                            .to_string(),
+                    ),
+                },
+                holders,
+            });
+        }
+    }
 
     if let Some(query_norm) = normalize_alkane_name(&query) {
         let mut matches = 0usize;
@@ -189,7 +239,14 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             if !matches_name {
                 continue;
             }
-            if push_alkane_item(&alk, Some(holders)) {
+            if push_alkane_item(
+                &mut seen_alkanes,
+                &mut alkanes,
+                &mut meta_cache,
+                &essentials_mdb,
+                &alk,
+                Some(holders),
+            ) {
                 matches += 1;
                 if matches >= 5 {
                     break;
@@ -205,12 +262,47 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                     break;
                 }
                 let Some((_name, alk)) = parse_alkane_name_index_key(rel) else { continue };
-                if push_alkane_item(&alk, None) {
+                if push_alkane_item(
+                    &mut seen_alkanes,
+                    &mut alkanes,
+                    &mut meta_cache,
+                    &essentials_mdb,
+                    &alk,
+                    None,
+                ) {
                     matches += 1;
                     if matches >= 5 {
                         break;
                     }
                 }
+            }
+        }
+    }
+
+    if !query.is_empty() {
+        let query_lower = query.to_ascii_lowercase();
+        for (id_s, name, _sym) in alkane_name_overrides() {
+            if name.to_ascii_lowercase().contains(&query_lower) {
+                push_override_alkane(
+                    &mut seen_alkanes,
+                    &mut alkanes,
+                    &mut meta_cache,
+                    &essentials_mdb,
+                    id_s,
+                    name,
+                );
+            }
+        }
+        for (id_s, name) in alkane_contract_name_overrides() {
+            if name.to_ascii_lowercase().contains(&query_lower) {
+                push_override_alkane(
+                    &mut seen_alkanes,
+                    &mut alkanes,
+                    &mut meta_cache,
+                    &essentials_mdb,
+                    id_s,
+                    name,
+                );
             }
         }
     }
@@ -232,12 +324,26 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
         if height <= u32::MAX as u64 {
             let alk = SchemaAlkaneId { block: height as u32, tx: 0 };
-            let _ = push_alkane_item(&alk, None);
+            let _ = push_alkane_item(
+                &mut seen_alkanes,
+                &mut alkanes,
+                &mut meta_cache,
+                &essentials_mdb,
+                &alk,
+                None,
+            );
         }
     }
 
     if let Some(alk) = parse_alkane_id(&query) {
-        let _ = push_alkane_item(&alk, None);
+        let _ = push_alkane_item(
+            &mut seen_alkanes,
+            &mut alkanes,
+            &mut meta_cache,
+            &essentials_mdb,
+            &alk,
+            None,
+        );
     }
 
     if let Ok(addr) = Address::from_str(&query) {
@@ -340,6 +446,12 @@ pub struct SimulateResponse {
     pub ok: bool,
     pub status: Option<String>,
     pub data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alkanes: Option<Vec<SearchGuessItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alkanes_overflow: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addresses: Option<Vec<SearchGuessItem>>,
     pub error: Option<String>,
 }
 
@@ -349,12 +461,15 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
             ok: false,
             status: None,
             data: None,
+            alkanes: None,
+            alkanes_overflow: None,
+            addresses: None,
             error: Some("invalid_alkane_id".to_string()),
         });
     };
 
     let cellpack = Cellpack {
-        target: AlkaneId { block: alk.block as u128, tx: alk.tx as u128 },
+        target: SupportAlkaneId { block: alk.block as u128, tx: alk.tx as u128 },
         inputs: vec![req.opcode],
     };
     let calldata = cellpack.encipher();
@@ -374,6 +489,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                 ok: false,
                 status: None,
                 data: None,
+                alkanes: None,
+                alkanes_overflow: None,
+                addresses: None,
                 error: Some(format!("protostone_encode_failed: {e}")),
             });
         }
@@ -403,6 +521,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
             ok: false,
             status: None,
             data: None,
+            alkanes: None,
+            alkanes_overflow: None,
+            addresses: None,
             error: Some(format!("tx_encode_failed: {e}")),
         });
     }
@@ -426,6 +547,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
             ok: false,
             status: None,
             data: None,
+            alkanes: None,
+            alkanes_overflow: None,
+            addresses: None,
             error: Some(format!("parcel_encode_failed: {e}")),
         });
     }
@@ -452,6 +576,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                             ok: false,
                             status: None,
                             data: None,
+                            alkanes: None,
+                            alkanes_overflow: None,
+                            addresses: None,
                             error: Some(format!("response_decode_failed: {e}")),
                         });
                     }
@@ -461,6 +588,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                         ok: false,
                         status: None,
                         data: None,
+                        alkanes: None,
+                        alkanes_overflow: None,
+                        addresses: None,
                         error: Some(format!("metashrew_http_error: {e}")),
                     });
                 }
@@ -470,6 +600,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                     ok: false,
                     status: None,
                     data: None,
+                    alkanes: None,
+                    alkanes_overflow: None,
+                    addresses: None,
                     error: Some(format!("metashrew_request_failed: {e}")),
                 });
             }
@@ -481,6 +614,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
             ok: false,
             status: None,
             data: None,
+            alkanes: None,
+            alkanes_overflow: None,
+            addresses: None,
             error: Some("metashrew_empty_result".to_string()),
         });
     }
@@ -493,6 +629,9 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                 ok: false,
                 status: None,
                 data: None,
+                alkanes: None,
+                alkanes_overflow: None,
+                addresses: None,
                 error: Some(format!("result_decode_failed: {e}")),
             });
         }
@@ -504,32 +643,68 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
                 ok: false,
                 status: None,
                 data: None,
+                alkanes: None,
+                alkanes_overflow: None,
+                addresses: None,
                 error: Some(format!("simulate_decode_failed: {e}")),
             });
         }
     };
 
-    let (status, data) = if !sim.error.is_empty() {
-        ("failure".to_string(), sim.error)
+    let (status, data, alkanes, alkanes_overflow, addresses) = if !sim.error.is_empty() {
+        ("failure".to_string(), sim.error, None, None, None)
     } else if let Some(exec) = sim.execution {
-        ("success".to_string(), format_simulation_data(&exec.data, req.returns.as_deref()))
+        let returns_norm = normalize_returns(req.returns.as_deref());
+        let formatted = format_simulation_data(&exec.data, &returns_norm);
+        let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+        let mut meta_cache: AlkaneMetaCache = HashMap::new();
+        let cards = decode_alkane_cards(&exec.data, &mut meta_cache, &essentials_mdb);
+        let (alkanes, alkanes_overflow) = match cards {
+            Some(batch) => (Some(batch.items), batch.overflow),
+            None => (None, None),
+        };
+        let addresses = if should_decode_taproot(&returns_norm) {
+            decode_address_cards(&exec.data, get_network())
+        } else {
+            None
+        };
+        ("success".to_string(), formatted, alkanes, alkanes_overflow, addresses)
     } else {
-        ("success".to_string(), "0x".to_string())
+        ("success".to_string(), "0x".to_string(), None, None, None)
     };
 
-    Json(SimulateResponse { ok: true, status: Some(status), data: Some(data), error: None })
+    Json(SimulateResponse {
+        ok: true,
+        status: Some(status),
+        data: Some(data),
+        alkanes,
+        alkanes_overflow,
+        addresses,
+        error: None,
+    })
 }
 
-fn format_simulation_data(bytes: &[u8], returns: Option<&str>) -> String {
-    let normalized = returns
+fn normalize_returns(returns: Option<&str>) -> String {
+    returns
         .map(|r| r.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase())
         .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| "void".to_string());
+        .unwrap_or_else(|| "void".to_string())
+}
 
-    match normalized.as_str() {
-        "string" => decode_utf8(bytes).unwrap_or_else(|| hex_string(bytes)),
+fn should_decode_taproot(returns_norm: &str) -> bool {
+    matches!(returns_norm, "void" | "vec<u8>")
+}
+
+fn format_simulation_data(bytes: &[u8], normalized: &str) -> String {
+    match normalized {
+        "string" => decode_utf8(bytes)
+            .or_else(|| decode_u128_value(bytes))
+            .unwrap_or_else(|| hex_string(bytes)),
         "u128" => decode_u128(bytes).map(|v| v.to_string()).unwrap_or_else(|| hex_string(bytes)),
-        "vec<u8>" => hex_string(bytes),
+        "tuple<u128,u128>" | "(u128,u128)" | "u128,u128" => decode_u128_tuple(bytes)
+            .map(|(a, b)| format!("({a}, {b})"))
+            .unwrap_or_else(|| hex_string(bytes)),
+        "vec<u8>" => decode_u128_vec(bytes).unwrap_or_else(|| hex_string(bytes)),
         "void" => decode_void(bytes),
         _ => decode_void(bytes),
     }
@@ -543,6 +718,203 @@ fn decode_void(bytes: &[u8]) -> String {
         return num.to_string();
     }
     hex_string(bytes)
+}
+
+fn decode_u128_value(bytes: &[u8]) -> Option<String> {
+    decode_u128(bytes).map(|num| num.to_string())
+}
+
+fn decode_u128_vec(bytes: &[u8]) -> Option<String> {
+    if let Some(value) = decode_u128_value(bytes) {
+        return Some(value);
+    }
+    let payload = strip_len_prefix(bytes)?;
+    decode_u128_value(payload)
+}
+
+fn strip_len_prefix(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() >= 5 {
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&bytes[..4]);
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if len + 4 == bytes.len() {
+            return Some(&bytes[4..]);
+        }
+    }
+    if !bytes.is_empty() {
+        let len = bytes[0] as usize;
+        if len + 1 == bytes.len() {
+            return Some(&bytes[1..]);
+        }
+    }
+    None
+}
+
+fn strip_u128_prefix(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    if bytes.len() <= 16 {
+        return None;
+    }
+    let remaining = bytes.len() - 16;
+    if remaining % 32 != 0 {
+        return None;
+    }
+    let mut count_bytes = [0u8; 16];
+    count_bytes.copy_from_slice(&bytes[..16]);
+    let count_u128 = u128::from_le_bytes(count_bytes);
+    let count = usize::try_from(count_u128).ok()?;
+    if count == 0 || count != (remaining / 32) {
+        return None;
+    }
+    Some((count, &bytes[16..]))
+}
+
+const MAX_ALKANE_BLOCK: u128 = 6;
+const MAX_ALKANE_DISPLAY: usize = 200;
+const MAX_ALKANE_SCAN: usize = 5000;
+
+fn decode_address_cards(bytes: &[u8], network: Network) -> Option<Vec<SearchGuessItem>> {
+    let address = decode_taproot_address(bytes, network)?;
+    let href = explorer_path(&format!("/address/{address}"));
+    Some(vec![SearchGuessItem {
+        label: address.clone(),
+        value: address.clone(),
+        href: Some(href),
+        icon_url: None,
+        fallback_letter: None,
+    }])
+}
+
+fn decode_taproot_address(
+    bytes: &[u8],
+    network: Network,
+) -> Option<String> {
+    let payload = if bytes.len() == 32 {
+        Some(bytes)
+    } else {
+        strip_len_prefix(bytes).filter(|p| p.len() == 32)
+    }?;
+    let key = XOnlyPublicKey::from_slice(payload).ok()?;
+    let secp = Secp256k1::verification_only();
+    Some(Address::p2tr(&secp, key, None, network).to_string())
+}
+
+struct AlkaneDecodeResult {
+    ids: Vec<SchemaAlkaneId>,
+    total: usize,
+}
+
+struct AlkaneCardBatch {
+    items: Vec<SearchGuessItem>,
+    overflow: Option<usize>,
+}
+
+fn decode_alkane_cards(
+    bytes: &[u8],
+    meta_cache: &mut AlkaneMetaCache,
+    essentials_mdb: &Mdb,
+) -> Option<AlkaneCardBatch> {
+    let decoded = decode_alkane_ids(bytes)?;
+    let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
+    let mut items: Vec<SearchGuessItem> = Vec::new();
+    for id in decoded.ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        let meta = alkane_meta(&id, meta_cache, essentials_mdb);
+        let id_s = format!("{}:{}", id.block, id.tx);
+        let label = if meta.name.known { meta.name.value.clone() } else { id_s.clone() };
+        let icon_url =
+            if !meta.icon_url.trim().is_empty() { Some(meta.icon_url.clone()) } else { None };
+        items.push(SearchGuessItem {
+            label,
+            value: id_s.clone(),
+            href: Some(explorer_path(&format!("/alkane/{id_s}"))),
+            icon_url,
+            fallback_letter: Some(meta.name.fallback_letter().to_string()),
+        });
+    }
+    if items.is_empty() {
+        None
+    } else {
+        let overflow = decoded.total.saturating_sub(MAX_ALKANE_DISPLAY);
+        Some(AlkaneCardBatch { items, overflow: if overflow > 0 { Some(overflow) } else { None } })
+    }
+}
+
+fn decode_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
+    decode_support_alkane_ids(bytes)
+        .or_else(|| strip_len_prefix(bytes).and_then(decode_support_alkane_ids))
+        .or_else(|| strip_u128_prefix(bytes).and_then(|(count, payload)| {
+            decode_support_alkane_ids_prefixed(payload, count)
+        }))
+        .or_else(|| decode_proto_alkane_id(bytes).map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 }))
+        .or_else(|| strip_len_prefix(bytes).and_then(|payload| {
+            decode_proto_alkane_id(payload)
+                .map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
+        }))
+        .or_else(|| strip_u128_prefix(bytes).and_then(|(_, payload)| {
+            decode_proto_alkane_id(payload)
+                .map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
+        }))
+}
+
+fn decode_support_alkane_ids_prefixed(bytes: &[u8], total: usize) -> Option<AlkaneDecodeResult> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut cursor = Cursor::new(bytes.to_vec());
+    let mut ids: Vec<SchemaAlkaneId> = Vec::new();
+    let max_read = total.min(MAX_ALKANE_DISPLAY);
+    for _ in 0..max_read {
+        let parsed = SupportAlkaneId::parse(&mut cursor).ok()?;
+        let schema = schema_from_support_id(parsed)?;
+        ids.push(schema);
+    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
+}
+
+fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut cursor = Cursor::new(bytes.to_vec());
+    let mut ids: Vec<SchemaAlkaneId> = Vec::new();
+    let mut total = 0usize;
+    while (cursor.position() as usize) < bytes.len() {
+        if total >= MAX_ALKANE_SCAN {
+            return None;
+        }
+        let parsed = SupportAlkaneId::parse(&mut cursor).ok()?;
+        let schema = schema_from_support_id(parsed)?;
+        total += 1;
+        if ids.len() < MAX_ALKANE_DISPLAY {
+            ids.push(schema);
+        }
+    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
+}
+
+fn decode_proto_alkane_id(bytes: &[u8]) -> Option<SchemaAlkaneId> {
+    let parsed = ProtoAlkaneId::decode(bytes).ok()?;
+    let schema: SchemaAlkaneId = parsed.try_into().ok()?;
+    validate_schema_alkane(schema)
+}
+
+fn schema_from_support_id(id: SupportAlkaneId) -> Option<SchemaAlkaneId> {
+    if id.block > MAX_ALKANE_BLOCK {
+        return None;
+    }
+    let block = u32::try_from(id.block).ok()?;
+    let tx = u64::try_from(id.tx).ok()?;
+    validate_schema_alkane(SchemaAlkaneId { block, tx })
+}
+
+fn validate_schema_alkane(id: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
+    if (id.block as u128) <= MAX_ALKANE_BLOCK {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<String> {
@@ -567,6 +939,17 @@ fn decode_u128(bytes: &[u8]) -> Option<u128> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(bytes);
     Some(u128::from_le_bytes(buf))
+}
+
+fn decode_u128_tuple(bytes: &[u8]) -> Option<(u128, u128)> {
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut a = [0u8; 16];
+    let mut b = [0u8; 16];
+    a.copy_from_slice(&bytes[..16]);
+    b.copy_from_slice(&bytes[16..]);
+    Some((u128::from_le_bytes(a), u128::from_le_bytes(b)))
 }
 
 fn hex_string(bytes: &[u8]) -> String {
