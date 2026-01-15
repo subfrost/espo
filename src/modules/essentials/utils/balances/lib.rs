@@ -648,7 +648,7 @@ fn apply_transfers_multi(
     for (i, ps) in protostones.iter().enumerate() {
         let shadow_vout = shadow_base + i as u32;
 
-        // sheet starts as: net_out (from trace), plus explicitly routed incoming to this shadow.
+        // sheet starts with explicitly routed incoming to this shadow.
         let mut sheet: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
 
         // merge routed-in firstx
@@ -674,6 +674,22 @@ fn apply_transfers_multi(
         } else {
             status
         };
+
+        // On success, consume incoming amounts so only returned/minted balances remain.
+        if status == EspoTraceType::SUCCESS {
+            if let Some(ref net_in_map) = net_in {
+                for (rid, amt) in net_in_map {
+                    if *amt == 0 {
+                        continue;
+                    }
+                    let entry = sheet.entry(*rid).or_default();
+                    *entry = entry.saturating_sub(*amt);
+                    if *entry == 0 {
+                        sheet.remove(rid);
+                    }
+                }
+            }
+        }
 
         // add net_out to sheet
         if status == EspoTraceType::SUCCESS {
