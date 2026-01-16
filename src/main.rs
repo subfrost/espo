@@ -19,6 +19,7 @@ use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
+use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
@@ -333,6 +334,7 @@ async fn main() -> Result<()> {
     let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
+    mods.register_module(Pizzafun::new());
     mods.register_module(AmmData::new());
     // mods.register_module(TracesData::new());
 

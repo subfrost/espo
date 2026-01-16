@@ -355,7 +355,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             .get("limit")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(100)
-                            .clamp(1, 500) as usize;
+                            .max(1) as usize;
                         let offset = limit.saturating_mul(page.saturating_sub(1));
 
                         let total = mdb
@@ -404,6 +404,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                                         "creation_txid": hex::encode(rec.txid),
                                         "creation_height": rec.creation_height,
                                         "creation_timestamp": rec.creation_timestamp,
+                                        "tx_index_in_block": rec.tx_index_in_block,
                                         "name": name,
                                         "symbol": symbol,
                                         "names": rec.names,
@@ -498,6 +499,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                             "creation_txid": hex::encode(record.txid),
                             "creation_height": record.creation_height,
                             "creation_timestamp": record.creation_timestamp,
+                            "tx_index_in_block": record.tx_index_in_block,
                             "name": name,
                             "symbol": symbol,
                             "names": record.names,
