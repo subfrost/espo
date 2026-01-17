@@ -658,10 +658,14 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
         let formatted = format_simulation_data(&exec.data, &returns_norm);
         let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
         let mut meta_cache: AlkaneMetaCache = HashMap::new();
-        let cards = decode_alkane_cards(&exec.data, &mut meta_cache, &essentials_mdb);
-        let (alkanes, alkanes_overflow) = match cards {
-            Some(batch) => (Some(batch.items), batch.overflow),
-            None => (None, None),
+        let (alkanes, alkanes_overflow) = if should_decode_alkanes(&returns_norm) {
+            let cards = decode_alkane_cards(&exec.data, &mut meta_cache, &essentials_mdb);
+            match cards {
+                Some(batch) => (Some(batch.items), batch.overflow),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
         };
         let addresses = if should_decode_taproot(&returns_norm) {
             decode_address_cards(&exec.data, get_network())
@@ -689,6 +693,38 @@ fn normalize_returns(returns: Option<&str>) -> String {
         .map(|r| r.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase())
         .filter(|r| !r.is_empty())
         .unwrap_or_else(|| "void".to_string())
+}
+
+fn should_decode_alkanes(returns_norm: &str) -> bool {
+    if matches!(returns_norm, "void" | "vec<u8>") {
+        return true;
+    }
+
+    let is_alkane_type = |ty: &str| {
+        matches!(
+            ty,
+            "alkane" | "alkaneid" | "alkane_id" | "schemaalkaneid" | "schema_alkane_id"
+        )
+    };
+
+    if is_alkane_type(returns_norm) {
+        return true;
+    }
+
+    let unwrap_inner = |prefix: &str| {
+        returns_norm
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix('>'))
+    };
+
+    if let Some(inner) = unwrap_inner("vec<") {
+        return is_alkane_type(inner);
+    }
+    if let Some(inner) = unwrap_inner("option<") {
+        return is_alkane_type(inner);
+    }
+
+    false
 }
 
 fn should_decode_taproot(returns_norm: &str) -> bool {

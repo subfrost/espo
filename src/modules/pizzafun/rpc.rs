@@ -55,7 +55,7 @@ fn entry_to_json(entry: &SeriesEntry) -> Value {
     })
 }
 
-pub fn register_rpc(reg: RpcNsRegistrar, shared_index: SharedSeriesIndex) {
+pub(crate) fn register_rpc(reg: RpcNsRegistrar, shared_index: SharedSeriesIndex) {
     eprintln!("[RPC::PIZZAFUN] registering RPC handlers...");
 
     /* -------- get_series_id_from_alkane_id -------- */

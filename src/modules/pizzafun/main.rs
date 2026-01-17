@@ -8,9 +8,11 @@ use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::Network;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
 
 #[derive(Clone, Debug)]
@@ -27,6 +29,25 @@ pub(crate) struct SeriesIndex {
 }
 
 pub(crate) type SharedSeriesIndex = Arc<RwLock<Arc<SeriesIndex>>>;
+
+fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
+    let (block_raw, tx_raw) = s.split_once(':')?;
+    let parse_u32 = |v: &str| {
+        if let Some(hex) = v.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            v.parse::<u32>().ok()
+        }
+    };
+    let parse_u64 = |v: &str| {
+        if let Some(hex) = v.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            v.parse::<u64>().ok()
+        }
+    };
+    Some(SchemaAlkaneId { block: parse_u32(block_raw)?, tx: parse_u64(tx_raw)? })
+}
 
 pub struct Pizzafun {
     essentials_mdb: Option<Arc<Mdb>>,
@@ -97,28 +118,62 @@ impl Pizzafun {
                 ))
         });
 
-        let mut name_counts: HashMap<String, u32> = HashMap::new();
+        struct PendingSeriesEntry {
+            alkane_id: SchemaAlkaneId,
+            creation_height: u32,
+            order_idx: usize,
+        }
+
+        let mut priority_index: HashMap<SchemaAlkaneId, usize> = HashMap::new();
+        for (idx, raw) in PRIORITY_SERIES_ALKANES.iter().enumerate() {
+            if let Some(id) = parse_alkane_id_str(raw) {
+                priority_index.entry(id).or_insert(idx);
+            }
+        }
+
+        let mut entries_by_name: HashMap<String, Vec<PendingSeriesEntry>> = HashMap::new();
+        for (order_idx, rec) in records.into_iter().enumerate() {
+            let Some(raw_name) = rec.names.first() else { continue };
+            let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
+            entries_by_name
+                .entry(name_norm)
+                .or_default()
+                .push(PendingSeriesEntry {
+                    alkane_id: rec.alkane,
+                    creation_height: rec.creation_height,
+                    order_idx,
+                });
+        }
+
         let mut series_to_alkane: HashMap<String, SeriesEntry> = HashMap::new();
         let mut alkane_to_series: HashMap<SchemaAlkaneId, SeriesEntry> = HashMap::new();
 
-        for rec in records {
-            let Some(raw_name) = rec.names.first() else { continue };
-            let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
-            let idx = name_counts.entry(name_norm.clone()).or_insert(0);
-            let series_id = if *idx == 0 {
-                name_norm.clone()
-            } else {
-                format!("{}-{}", name_norm, idx)
-            };
-            *idx = idx.saturating_add(1);
+        for (name, mut entries) in entries_by_name {
+            entries.sort_by(|a, b| {
+                let a_pri = priority_index.get(&a.alkane_id);
+                let b_pri = priority_index.get(&b.alkane_id);
+                match (a_pri, b_pri) {
+                    (Some(ai), Some(bi)) => ai.cmp(bi).then_with(|| a.order_idx.cmp(&b.order_idx)),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => a.order_idx.cmp(&b.order_idx),
+                }
+            });
 
-            let entry = SeriesEntry {
-                series_id: series_id.clone(),
-                alkane_id: rec.alkane,
-                creation_height: rec.creation_height,
-            };
-            series_to_alkane.insert(series_id, entry.clone());
-            alkane_to_series.insert(rec.alkane, entry);
+            for (idx, entry) in entries.into_iter().enumerate() {
+                let series_id = if idx == 0 {
+                    name.clone()
+                } else {
+                    format!("{}-{}", name, idx)
+                };
+                let entry = SeriesEntry {
+                    series_id: series_id.clone(),
+                    alkane_id: entry.alkane_id,
+                    creation_height: entry.creation_height,
+                };
+                series_to_alkane.insert(series_id, entry.clone());
+                alkane_to_series.insert(entry.alkane_id, entry);
+            }
         }
 
         SeriesIndex { series_to_alkane, alkane_to_series }
