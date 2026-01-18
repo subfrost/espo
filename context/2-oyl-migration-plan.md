@@ -25,6 +25,7 @@ Below is the migration plan I propose with every step we need to take to get esp
 ### STEP 1 - Setup CI/CD for espo's rpc and explorer
 
 **Proposed Asignee:** @flex
+
 The first thing we should take care of is create a CI/CD attached to espos github repository @ https://github.com/bitapeslabs/espo public. This will make it so everyone is able to contribute and test the result of their changes without having a local electrs and metashrew db.
 
 **Even better idea for flex**, setup a dedicated server with metashrew and electrs running - and then give contributors their own UNIX accounts to ssh in and test their changes directly on the server - where all users have access to the mount location of the metashrew and electrs dbs aswell as the ports the rpcs where these are running on. This will make debugging for everyone a lot easier.
@@ -46,6 +47,7 @@ Once strict mode is implemented, we can properly start running espo in strict mo
 ### STEP 3 - Refactor espo to be reorg aware via metashrew
 
 **Proposed Asignees:** @flex
+
 Currently espo is reorg aware via bitcoind. This should be changed to be reorg aware via metashrew probing via metashrew's height -> block hash index. This will completley eliminate all undefined behavior related to divergences between espo and metashrew.
 
 **Strict mode** should be aware of this aswell (we only want to run strict mode during indexing because of this. rather than when when we are already at tip)
@@ -96,6 +98,7 @@ The body_params field of RequestParams should contain all of the parameters that
 ### STEP 6- Create a markdown for an implementation plan for the oylapi module
 
 **Proposed Asignees:** Anyone!
+
 Using the newly created .TS file as context, have an LLM review the ts file and the current espo codebase to create a detailed implementation plan for every endpoint described in the ts file.
 
 This implementation plan should describe for each endpoint:
@@ -123,6 +126,7 @@ Finally, rerun the indexer in strict mode to ensure 0 divergences exist after al
 ### STEP 8 - Implement the endpoints in the oylapi module
 
 **Proposed Asignees:** Anyone!
+
 Using the markdown from step 6 as a guide, implement all of the endpoints in the oylapi module using the getters and indicies already implemented in step 7.
 
 The oyl api is a REST api not an rpc, so you will need to implement:
@@ -136,4 +140,5 @@ The oyl api is a REST api not an rpc, so you will need to implement:
 ### STEP 9 - Finalization
 
 **Proposed Asignees:** @flex, @drew
+
 Once all endpoints are implemented as espo is fully reindexed and passes strict mode, reverse prooxy to the host and port the oylapi module is running on (and its REST api) and test to see if oyl wallet and the oyl app are back online and fully functional.
