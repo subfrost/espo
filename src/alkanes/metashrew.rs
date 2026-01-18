@@ -6,10 +6,10 @@ use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
 use alkanes_support::gz;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use anyhow::{Context, Result, anyhow};
-use bitcoin::Txid;
-use bitcoin::hashes::Hash;
 use bitcoin::OutPoint;
+use bitcoin::Txid;
 use bitcoin::consensus::encode::serialize;
+use bitcoin::hashes::Hash;
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -101,19 +101,13 @@ fn decode_u128_le(bytes: &[u8]) -> Result<u128> {
 
 fn decode_alkane_id_le(bytes: &[u8]) -> Result<SupportAlkaneId> {
     if bytes.len() != 32 {
-        return Err(anyhow!(
-            "expected 32 bytes for AlkaneId, got {}",
-            bytes.len()
-        ));
+        return Err(anyhow!("expected 32 bytes for AlkaneId, got {}", bytes.len()));
     }
     let mut block = [0u8; 16];
     let mut tx = [0u8; 16];
     block.copy_from_slice(&bytes[..16]);
     tx.copy_from_slice(&bytes[16..]);
-    Ok(SupportAlkaneId {
-        block: u128::from_le_bytes(block),
-        tx: u128::from_le_bytes(tx),
-    })
+    Ok(SupportAlkaneId { block: u128::from_le_bytes(block), tx: u128::from_le_bytes(tx) })
 }
 
 fn encode_alkane_id_le(id: &SupportAlkaneId) -> [u8; 32] {
@@ -586,7 +580,8 @@ impl MetashrewAdapter {
             }
             let mut trace_key = b"/trace/".to_vec();
             trace_key.extend_from_slice(&outpoint);
-            let trace = self.versioned_pointer(db, trace_key)
+            let trace = self
+                .versioned_pointer(db, trace_key)
                 .get()?
                 .and_then(|v| decode_trace_blob(&v))
                 .or_else(|| traces.keys().max().and_then(|idx| traces.get(idx)).cloned())
@@ -670,10 +665,8 @@ impl MetashrewAdapter {
             return Ok(Some(bal));
         };
 
-        let Some(last_idx) = pointer
-            .len()?
-            .and_then(|len| len.checked_sub(1))
-            .map(|len| len as u64)
+        let Some(last_idx) =
+            pointer.len()?.and_then(|len| len.checked_sub(1)).map(|len| len as u64)
         else {
             return Ok(None);
         };
@@ -735,15 +728,18 @@ impl MetashrewAdapter {
         let mut balances_base = base.clone();
         balances_base.extend_from_slice(b"/balances");
 
-        let runes_versions = self
-            .versioned_pointer(db, runes_base.clone())
-            .len()?
-            .unwrap_or(0);
-        let balances_versions = self
-            .versioned_pointer(db, balances_base.clone())
-            .len()?
-            .unwrap_or(0);
+        let runes_base_ptr = self.versioned_pointer(db, runes_base.clone());
+        let balances_base_ptr = self.versioned_pointer(db, balances_base.clone());
+
+        let runes_versions = runes_base_ptr.len()?.unwrap_or(0);
+        let balances_versions = balances_base_ptr.len()?.unwrap_or(0);
+
         if runes_versions == 0 || balances_versions == 0 {
+            let mut runes_length_key = runes_base.clone();
+            runes_length_key.extend_from_slice(b"/length");
+            let mut balances_length_key = balances_base.clone();
+            balances_length_key.extend_from_slice(b"/length");
+
             return Ok(Vec::new());
         }
 
@@ -766,19 +762,24 @@ impl MetashrewAdapter {
         if runes_len == 0 || balances_len == 0 {
             return Ok(Vec::new());
         }
-        if runes_len != balances_len {
+        if balances_len < runes_len {
             return Err(anyhow!(
-                "outpoint balance array length mismatch: runes_len={} balances_len={}",
+                "outpoint balance array missing balances: runes_len={} balances_len={}",
                 runes_len,
                 balances_len
             ));
         }
+        if balances_len > runes_len {
+            eprintln!(
+                "[metashrew] outpoint balance arrays: extra balances ignored (runes_len={} balances_len={})",
+                runes_len, balances_len
+            );
+        }
 
         let mut out = Vec::with_capacity(runes_len);
         for idx in 0..runes_len {
-            let rune_bytes = runes_ptr
-                .get_index(idx as u64)?
-                .ok_or_else(|| anyhow!("missing runes/{idx}"))?;
+            let rune_bytes =
+                runes_ptr.get_index(idx as u64)?.ok_or_else(|| anyhow!("missing runes/{idx}"))?;
             let balance_bytes = balances_ptr
                 .get_index(idx as u64)?
                 .ok_or_else(|| anyhow!("missing balances/{idx}"))?;
@@ -921,9 +922,8 @@ impl MetashrewAdapter {
                 }
                 reason.push_str(&format!("bad_pointers={bad_pointers}"));
             }
-            let warning = format!(
-                "[metashrew] warn: block {block}: trace index looks incomplete ({reason})"
-            );
+            let warning =
+                format!("[metashrew] warn: block {block}: trace index looks incomplete ({reason})");
             eprintln!("{warning}");
             if is_strict_mode() {
                 panic!("{warning}");

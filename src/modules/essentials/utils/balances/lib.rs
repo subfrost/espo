@@ -1921,13 +1921,12 @@ pub fn bulk_update_balances_for_block(mdb: &Mdb, block: &EspoBlock) -> Result<()
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let parse_txid = |txid_be: &[u8]| -> Result<Txid> {
-            if txid_be.len() != 32 {
-                return Err(anyhow!("invalid txid length {}", txid_be.len()));
+        let parse_txid = |txid_bytes: &[u8]| -> Result<Txid> {
+            if txid_bytes.len() != 32 {
+                return Err(anyhow!("invalid txid length {}", txid_bytes.len()));
             }
             let mut arr = [0u8; 32];
-            arr.copy_from_slice(txid_be);
-            arr.reverse();
+            arr.copy_from_slice(txid_bytes);
             Ok(Txid::from_byte_array(arr))
         };
 
