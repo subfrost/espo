@@ -180,9 +180,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub metashrew_db_label: Option<String>,
     #[serde(default)]
-    pub debug: bool,
-    #[serde(default)]
-    pub trace_index_strict: bool,
+    pub strict_mode: bool,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
     #[serde(default)]
@@ -212,8 +210,7 @@ pub struct AppConfig {
     pub explorer_base_path: String,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
-    pub debug: bool,
-    pub trace_index_strict: bool,
+    pub strict_mode: bool,
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
@@ -265,8 +262,7 @@ impl AppConfig {
             explorer_base_path,
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
-            debug: file.debug,
-            trace_index_strict: file.trace_index_strict,
+            strict_mode: file.strict_mode,
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
             explorer_networks,
@@ -505,12 +501,8 @@ pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
 }
 
-pub fn is_debug_mode() -> bool {
-    get_config().debug
-}
-
-pub fn is_trace_index_strict() -> bool {
-    get_config().trace_index_strict
+pub fn is_strict_mode() -> bool {
+    get_config().strict_mode
 }
 
 pub fn get_metashrew() -> MetashrewAdapter {

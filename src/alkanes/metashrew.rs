@@ -1,5 +1,5 @@
 use crate::alkanes::trace::PartialEspoTrace;
-use crate::config::{get_metashrew_sdb, is_trace_index_strict};
+use crate::config::{get_metashrew_sdb, is_strict_mode};
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
@@ -8,6 +8,8 @@ use alkanes_support::id::AlkaneId as SupportAlkaneId;
 use anyhow::{Context, Result, anyhow};
 use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoin::OutPoint;
+use bitcoin::consensus::encode::serialize;
 use prost::Message;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -86,6 +88,50 @@ fn parse_ascii_or_le_u64(bytes: &[u8]) -> Option<u64> {
 fn parse_ascii_or_le_usize(bytes: &[u8]) -> Option<usize> {
     let v = parse_ascii_or_le_u64(bytes)?;
     if v > usize::MAX as u64 { None } else { Some(v as usize) }
+}
+
+fn decode_u128_le(bytes: &[u8]) -> Result<u128> {
+    if bytes.len() != 16 {
+        return Err(anyhow!("expected 16 bytes for u128, got {}", bytes.len()));
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
+    Ok(u128::from_le_bytes(arr))
+}
+
+fn decode_alkane_id_le(bytes: &[u8]) -> Result<SupportAlkaneId> {
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "expected 32 bytes for AlkaneId, got {}",
+            bytes.len()
+        ));
+    }
+    let mut block = [0u8; 16];
+    let mut tx = [0u8; 16];
+    block.copy_from_slice(&bytes[..16]);
+    tx.copy_from_slice(&bytes[16..]);
+    Ok(SupportAlkaneId {
+        block: u128::from_le_bytes(block),
+        tx: u128::from_le_bytes(tx),
+    })
+}
+
+fn encode_alkane_id_le(id: &SupportAlkaneId) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&id.block.to_le_bytes());
+    out[16..].copy_from_slice(&id.tx.to_le_bytes());
+    out
+}
+
+fn decode_versioned_payload(bytes: &[u8]) -> Result<Vec<u8>> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if let Some((_height, hex_part)) = s.split_once(':') {
+            let raw = hex::decode(hex_part)
+                .map_err(|e| anyhow!("hex decode versioned payload '{hex_part}': {e}"))?;
+            return Ok(raw);
+        }
+    }
+    Ok(bytes.to_vec())
 }
 
 struct VersionedPointer<'a> {
@@ -243,6 +289,15 @@ impl MetashrewAdapter {
 
     fn versioned_pointer<'a>(&'a self, sdb: &'a SDB, base: Vec<u8>) -> VersionedPointer<'a> {
         VersionedPointer::new(sdb, base).with_label(self.label.as_deref())
+    }
+
+    fn outpoint_balance_prefix(&self, txid: &Txid, vout: u32) -> Vec<u8> {
+        let op = OutPoint::new(*txid, vout);
+        let outpoint = serialize(&op);
+
+        let mut base = b"/runes/proto/1/byoutpoint/".to_vec();
+        base.extend_from_slice(&outpoint);
+        base
     }
 
     fn read_uint_key<const N: usize, T>(&self, key: Vec<u8>) -> Result<T>
@@ -667,6 +722,107 @@ impl MetashrewAdapter {
         self.get_reserves_for_alkane_with_db(db.as_ref(), who_alkane, what_alkane, height)
     }
 
+    pub fn get_outpoint_alkane_balances_with_db(
+        &self,
+        db: &SDB,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        let base = self.outpoint_balance_prefix(txid, vout);
+
+        let mut runes_base = base.clone();
+        runes_base.extend_from_slice(b"/runes");
+        let mut balances_base = base.clone();
+        balances_base.extend_from_slice(b"/balances");
+
+        let runes_versions = self
+            .versioned_pointer(db, runes_base.clone())
+            .len()?
+            .unwrap_or(0);
+        let balances_versions = self
+            .versioned_pointer(db, balances_base.clone())
+            .len()?
+            .unwrap_or(0);
+        if runes_versions == 0 || balances_versions == 0 {
+            return Ok(Vec::new());
+        }
+
+        let runes_version_idx = runes_versions.saturating_sub(1);
+        let balances_version_idx = balances_versions.saturating_sub(1);
+
+        let mut runes_list_base = runes_base.clone();
+        runes_list_base.push(b'/');
+        runes_list_base.extend_from_slice(runes_version_idx.to_string().as_bytes());
+
+        let mut balances_list_base = balances_base.clone();
+        balances_list_base.push(b'/');
+        balances_list_base.extend_from_slice(balances_version_idx.to_string().as_bytes());
+
+        let runes_ptr = self.versioned_pointer(db, runes_list_base);
+        let balances_ptr = self.versioned_pointer(db, balances_list_base);
+
+        let runes_len = runes_ptr.len()?.unwrap_or(0);
+        let balances_len = balances_ptr.len()?.unwrap_or(0);
+        if runes_len == 0 || balances_len == 0 {
+            return Ok(Vec::new());
+        }
+        if runes_len != balances_len {
+            return Err(anyhow!(
+                "outpoint balance array length mismatch: runes_len={} balances_len={}",
+                runes_len,
+                balances_len
+            ));
+        }
+
+        let mut out = Vec::with_capacity(runes_len);
+        for idx in 0..runes_len {
+            let rune_bytes = runes_ptr
+                .get_index(idx as u64)?
+                .ok_or_else(|| anyhow!("missing runes/{idx}"))?;
+            let balance_bytes = balances_ptr
+                .get_index(idx as u64)?
+                .ok_or_else(|| anyhow!("missing balances/{idx}"))?;
+
+            let rune_payload = decode_versioned_payload(&rune_bytes)?;
+            let balance_payload = decode_versioned_payload(&balance_bytes)?;
+
+            let id = decode_alkane_id_le(&rune_payload)?;
+            let balance = decode_u128_le(&balance_payload)?;
+            out.push((id, balance));
+        }
+
+        Ok(out)
+    }
+
+    pub fn get_outpoint_alkane_balances(
+        &self,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        let db = get_metashrew_sdb();
+        db.catch_up_now().context("metashrew catch_up before outpoint balances")?;
+        self.get_outpoint_alkane_balances_with_db(db.as_ref(), txid, vout)
+    }
+
+    pub fn get_outpoint_alkane_balance_for_id_with_db(
+        &self,
+        db: &SDB,
+        txid: &Txid,
+        vout: u32,
+        id: &SupportAlkaneId,
+    ) -> Result<Option<u128>> {
+        let mut key = self.outpoint_balance_prefix(txid, vout);
+        key.extend_from_slice(b"/id_to_balance/");
+        key.extend_from_slice(&encode_alkane_id_le(id));
+
+        let pointer = self.versioned_pointer(db, key);
+        let Some(bytes) = pointer.get()? else {
+            return Ok(None);
+        };
+        let payload = decode_versioned_payload(&bytes)?;
+        Ok(Some(decode_u128_le(&payload)?))
+    }
+
     pub fn traces_for_block_as_prost(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
         let db = get_metashrew_sdb();
         self.traces_for_block_as_prost_with_db(db.as_ref(), block)
@@ -769,7 +925,7 @@ impl MetashrewAdapter {
                 "[metashrew] warn: block {block}: trace index looks incomplete ({reason})"
             );
             eprintln!("{warning}");
-            if is_trace_index_strict() {
+            if is_strict_mode() {
                 panic!("{warning}");
             }
         }

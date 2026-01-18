@@ -31,6 +31,7 @@ ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326
 protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
 metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"} 
+alkanes-trace-transform = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"} 
 bitcoincore-rpc = "0.19.0"
 lru = "0.16.1"
 prost = "0.12.6"
