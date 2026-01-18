@@ -4,6 +4,8 @@
 
 Before reading this document, please familizarize yourself with the [OYL Overview](./1-overview.md) document. This document builds upon the concepts and context provided there.
 
+#### TO CONTRIBUTE, use the oylapi-migration branch on espo
+
 ### Introduction
 
 The goal of this plan is to outline the steps needed to implement the oylapi module, an informational module that mimics the functionality of the now defunct oyl api - with the plan of reverse proxying requests to Espo's oyl api implementation once finished.
