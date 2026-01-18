@@ -1,0 +1,59 @@
+reference
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+
+# Database directories
+/db/
+*.db
+*.rdb
+
+# Configuration files (keep sample.config.json but ignore config.json)
+config.json
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Testing
+/test-results/
+/coverage/
+
+# Documentation build artifacts
+/book/
+
+# AOF files (append-only file logs)
+*.aof
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg

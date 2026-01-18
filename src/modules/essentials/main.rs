@@ -148,6 +148,11 @@ impl EspoModule for Essentials {
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let mdb = self.mdb();
 
+        // Set current height for versioned storage
+        if mdb.has_height_indexed() {
+            mdb.set_current_height(block.height);
+        }
+
         // -------- Phase A: coalesce per-block writes in memory --------
         // last-write-wins for values:
         //   k_kv(alk,skey) -> [ txid(32) | value(...) ]

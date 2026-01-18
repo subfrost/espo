@@ -1697,6 +1697,109 @@ pub fn register_rpc(reg: RpcNsRegistrar, mdb: Mdb) {
                 .await;
         });
     }
+
+    /* -------- get_balance_at_height -------- */
+    {
+        let reg_balance = reg.clone();
+        let mdb_balance = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_balance
+                .register("get_balance_at_height", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_balance);
+                    async move {
+                        use super::utils::balances::get_alkane_balance_at_height;
+
+                        // Parse parameters
+                        let owner_str = match payload.get("owner").and_then(|v| v.as_str()) {
+                            Some(s) => s,
+                            None => {
+                                log_rpc("get_balance_at_height", "missing_owner");
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_owner",
+                                    "hint": "owner should be an alkane id like \"2:68441\""
+                                });
+                            }
+                        };
+
+                        let token_str = match payload.get("token").and_then(|v| v.as_str()) {
+                            Some(s) => s,
+                            None => {
+                                log_rpc("get_balance_at_height", "missing_token");
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_token",
+                                    "hint": "token should be an alkane id like \"2:68441\""
+                                });
+                            }
+                        };
+
+                        let height = match payload.get("height").and_then(|v| v.as_u64()) {
+                            Some(h) => h as u32,
+                            None => {
+                                log_rpc("get_balance_at_height", "missing_height");
+                                return json!({
+                                    "ok": false,
+                                    "error": "missing_height",
+                                    "hint": "height should be a number"
+                                });
+                            }
+                        };
+
+                        let owner = match parse_alkane_from_str(owner_str) {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_balance_at_height", "invalid_owner");
+                                return json!({
+                                    "ok": false,
+                                    "error": "invalid_owner"
+                                });
+                            }
+                        };
+
+                        let token = match parse_alkane_from_str(token_str) {
+                            Some(a) => a,
+                            None => {
+                                log_rpc("get_balance_at_height", "invalid_token");
+                                return json!({
+                                    "ok": false,
+                                    "error": "invalid_token"
+                                });
+                            }
+                        };
+
+                        log_rpc(
+                            "get_balance_at_height",
+                            &format!(
+                                "owner={}:{}, token={}:{}, height={}",
+                                owner.block, owner.tx, token.block, token.tx, height
+                            ),
+                        );
+
+                        match get_alkane_balance_at_height(&mdb, &owner, &token, height) {
+                            Ok(balance) => json!({
+                                "ok": true,
+                                "owner": format!("{}:{}", owner.block, owner.tx),
+                                "token": format!("{}:{}", token.block, token.tx),
+                                "height": height,
+                                "balance": balance.to_string()
+                            }),
+                            Err(e) => {
+                                log_rpc(
+                                    "get_balance_at_height",
+                                    &format!("error: {}", e)
+                                );
+                                json!({
+                                    "ok": false,
+                                    "error": e.to_string()
+                                })
+                            }
+                        }
+                    }
+                })
+                .await;
+        });
+    }
 }
 
 /* ---------------- helpers ---------------- */
