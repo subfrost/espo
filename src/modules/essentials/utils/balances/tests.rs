@@ -31,6 +31,8 @@ fn init_test_config_from_run_sh() {
         block_source_mode: BlockFetchMode::RpcOnly,
         simulate_reorg: false,
         explorer_networks: None,
+        enable_height_indexed: false,
+        max_reorg_depth: 100,
     };
     if let Err(err) = init_config_from(cfg) {
         if !err.to_string().contains("already initialized") {

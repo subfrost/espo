@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 pub mod electrum_like;
 
 use std::time::{Duration, Instant};

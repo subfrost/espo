@@ -1,12 +1,30 @@
-pub mod alkanes;
-pub mod config;
 pub mod consts;
-pub mod core;
-pub mod explorer;
-pub mod modules;
-pub mod runtime;
 pub mod schemas;
 pub mod utils;
+
+// Modules that require non-WASM dependencies (tokio, rocksdb, etc.)
+#[cfg(not(target_arch = "wasm32"))]
+pub mod alkanes;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod core;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod explorer;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod modules;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod runtime;
+
+// Test utilities available for testing
+// Always compiled to support both unit tests and integration tests
+// Only enable when alkanes is available (test builds have dev-dependencies)
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
+// WASM tests module
+#[cfg(all(test, target_arch = "wasm32"))]
+pub mod tests;
 
 use std::sync::Arc;
 use std::sync::OnceLock;

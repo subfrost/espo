@@ -1,11 +1,21 @@
+// Module declarations - these reference lib.rs modules indirectly
+#[cfg(not(target_arch = "wasm32"))]
 pub mod alkanes;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod consts;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod explorer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod modules;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod schemas;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
 use std::net::SocketAddr;
@@ -371,6 +381,7 @@ async fn run_indexer_loop(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
@@ -523,4 +534,10 @@ async fn main() -> Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
+}
+
+// Dummy main for WASM builds (should never be called)
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    panic!("ESPO binary cannot be compiled for WASM");
 }
