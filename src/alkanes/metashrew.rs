@@ -11,14 +11,19 @@ use bitcoin::Txid;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use prost::Message;
+use protorune::tables::RuneTable;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+
 
 fn try_decode_trace_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
         if raw.len() >= 4 { AlkanesTrace::decode(&raw[..raw.len() - 4]).ok() } else { None }
     })
+
+    RuneTable::HEIGHT_TO_BLOCKHASH
 }
 
 fn try_decode_trace_event_prost(raw: &[u8]) -> Option<AlkanesTraceEvent> {
@@ -292,6 +297,52 @@ impl MetashrewAdapter {
         let mut base = b"/runes/proto/1/byoutpoint/".to_vec();
         base.extend_from_slice(&outpoint);
         base
+    }
+
+    fn outpoint_balances_from_id_to_balance(
+        &self,
+        db: &SDB,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        let mut prefix = self.outpoint_balance_prefix(txid, vout);
+        prefix.extend_from_slice(b"/id_to_balance");
+        let scan_prefix = self.apply_label(prefix);
+
+        let mut ro = ReadOptions::default();
+        if let Some(upper) = self.next_prefix(scan_prefix.clone()) {
+            ro.set_iterate_upper_bound(upper);
+        }
+
+        let mut seen_ids: HashSet<Vec<u8>> = HashSet::new();
+        for item in db.iterator_opt(IteratorMode::From(&scan_prefix, Direction::Forward), ro) {
+            let (k, _v) = item?;
+            if !k.starts_with(&scan_prefix) {
+                break;
+            }
+            let suffix = &k[scan_prefix.len()..];
+            if suffix.len() < 32 {
+                continue;
+            }
+            seen_ids.insert(suffix[..32].to_vec());
+        }
+
+        let mut out = Vec::new();
+        for id_bytes in seen_ids {
+            let mut key = self.outpoint_balance_prefix(txid, vout);
+            key.extend_from_slice(b"/id_to_balance");
+            key.extend_from_slice(&id_bytes);
+            let pointer = self.versioned_pointer(db, key);
+            let Some(bytes) = pointer.get()? else {
+                continue;
+            };
+            let id = decode_alkane_id_le(&id_bytes)?;
+            let payload = decode_versioned_payload(&bytes)?;
+            let balance = decode_u128_le(&payload)?;
+            out.push((id, balance));
+        }
+
+        Ok(out)
     }
 
     fn read_uint_key<const N: usize, T>(&self, key: Vec<u8>) -> Result<T>
@@ -721,6 +772,10 @@ impl MetashrewAdapter {
         txid: &Txid,
         vout: u32,
     ) -> Result<Vec<(SupportAlkaneId, u128)>> {
+        let map_out = self.outpoint_balances_from_id_to_balance(db, txid, vout)?;
+        if !map_out.is_empty() {
+            return Ok(map_out);
+        }
         let base = self.outpoint_balance_prefix(txid, vout);
 
         let mut runes_base = base.clone();
@@ -813,7 +868,7 @@ impl MetashrewAdapter {
         id: &SupportAlkaneId,
     ) -> Result<Option<u128>> {
         let mut key = self.outpoint_balance_prefix(txid, vout);
-        key.extend_from_slice(b"/id_to_balance/");
+        key.extend_from_slice(b"/id_to_balance");
         key.extend_from_slice(&encode_alkane_id_le(id));
 
         let pointer = self.versioned_pointer(db, key);
