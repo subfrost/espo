@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use metashrew_core::index_pointer::{AtomicPointer, IndexPointer};
+use metashrew_core::index_pointer::AtomicPointer;
 use protorune::message::{MessageContext, MessageContextParcel};
 use protorune_support::{balance_sheet::BalanceSheet, rune_transfer::RuneTransfer};
 

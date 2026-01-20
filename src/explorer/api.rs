@@ -8,9 +8,8 @@ use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    HoldersCountEntry, alkane_holders_ordered_prefix, alkane_name_index_prefix,
-    block_summary_key, get_cached_block_summary, holders_count_key, load_creation_record,
-    parse_alkane_holders_ordered_key, parse_alkane_name_index_key, BlockSummary,
+    EssentialsTable, HoldersCountEntry, get_cached_block_summary, load_creation_record,
+    BlockSummary,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -96,12 +95,13 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let end = (center + radius).min(espo_tip);
 
     let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+    let table = EssentialsTable::new(&essentials_mdb);
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
     for h in start..=end {
         let summary = get_cached_block_summary(h as u32).or_else(|| {
             essentials_mdb
-                .get(&block_summary_key(h as u32))
+                .get(&table.block_summary_key(h as u32))
                 .ok()
                 .flatten()
                 .and_then(|b| BlockSummary::try_from_slice(&b).ok())
@@ -129,6 +129,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
+    let table = EssentialsTable::new(&essentials_mdb);
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
     let mut seen_alkanes: HashSet<SchemaAlkaneId> = HashSet::new();
     let mut blocks: Vec<SearchGuessItem> = Vec::new();
@@ -141,9 +142,9 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     let mut txid: Vec<SearchGuessItem> = Vec::new();
     let mut addresses: Vec<SearchGuessItem> = Vec::new();
 
-    fn holders_for(essentials_mdb: &Mdb, alk: &SchemaAlkaneId) -> u64 {
+    fn holders_for(table: &EssentialsTable<'_>, essentials_mdb: &Mdb, alk: &SchemaAlkaneId) -> u64 {
         essentials_mdb
-            .get(&holders_count_key(alk))
+            .get(&table.holders_count_key(alk))
             .ok()
             .flatten()
             .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
@@ -152,6 +153,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     fn push_alkane_item(
+        table: &EssentialsTable<'_>,
         seen_alkanes: &mut HashSet<SchemaAlkaneId>,
         alkanes: &mut Vec<RankedAlkaneItem>,
         meta_cache: &mut AlkaneMetaCache,
@@ -162,7 +164,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         if !seen_alkanes.insert(*alk) {
             return false;
         }
-        let holders = holders_hint.unwrap_or_else(|| holders_for(essentials_mdb, alk));
+        let holders = holders_hint.unwrap_or_else(|| holders_for(table, essentials_mdb, alk));
         let meta = alkane_meta(alk, meta_cache, essentials_mdb);
         let id = format!("{}:{}", alk.block, alk.tx);
         let known = meta.name.known;
@@ -183,6 +185,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     fn push_override_alkane(
+        table: &EssentialsTable<'_>,
         seen_alkanes: &mut HashSet<SchemaAlkaneId>,
         alkanes: &mut Vec<RankedAlkaneItem>,
         meta_cache: &mut AlkaneMetaCache,
@@ -200,7 +203,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             } else {
                 None
             };
-            let holders = holders_for(essentials_mdb, &alk);
+            let holders = holders_for(table, essentials_mdb, &alk);
             alkanes.push(RankedAlkaneItem {
                 item: SearchGuessItem {
                     label: name.to_string(),
@@ -222,12 +225,12 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
     if let Some(query_norm) = normalize_alkane_name(&query) {
         let mut matches = 0usize;
-        let prefix_full = essentials_mdb.prefixed(alkane_holders_ordered_prefix());
+        let prefix_full = essentials_mdb.prefixed(&table.alkane_holders_ordered_prefix());
         let it = essentials_mdb.iter_prefix_rev(&prefix_full);
         for res in it {
             let Ok((k, _)) = res else { continue };
             let rel = &k[essentials_mdb.prefix().len()..];
-            let Some((holders, alk)) = parse_alkane_holders_ordered_key(rel) else { continue };
+            let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
             let Some(rec) = load_creation_record(&essentials_mdb, &alk).ok().flatten() else {
                 continue;
             };
@@ -240,6 +243,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                 continue;
             }
             if push_alkane_item(
+                &table,
                 &mut seen_alkanes,
                 &mut alkanes,
                 &mut meta_cache,
@@ -254,15 +258,16 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             }
         }
         if matches < 5 {
-            let prefix = alkane_name_index_prefix(&query_norm);
+            let prefix = table.alkane_name_index_prefix(&query_norm);
             for res in essentials_mdb.iter_from(&prefix) {
                 let Ok((k, _)) = res else { continue };
                 let rel = &k[essentials_mdb.prefix().len()..];
                 if !rel.starts_with(&prefix) {
                     break;
                 }
-                let Some((_name, alk)) = parse_alkane_name_index_key(rel) else { continue };
+                let Some((_name, alk)) = table.parse_alkane_name_index_key(rel) else { continue };
                 if push_alkane_item(
+                    &table,
                     &mut seen_alkanes,
                     &mut alkanes,
                     &mut meta_cache,
@@ -284,6 +289,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         for (id_s, name, _sym) in alkane_name_overrides() {
             if name.to_ascii_lowercase().contains(&query_lower) {
                 push_override_alkane(
+                    &table,
                     &mut seen_alkanes,
                     &mut alkanes,
                     &mut meta_cache,
@@ -296,6 +302,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         for (id_s, name) in alkane_contract_name_overrides() {
             if name.to_ascii_lowercase().contains(&query_lower) {
                 push_override_alkane(
+                    &table,
                     &mut seen_alkanes,
                     &mut alkanes,
                     &mut meta_cache,
@@ -325,6 +332,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         if height <= u32::MAX as u64 {
             let alk = SchemaAlkaneId { block: height as u32, tx: 0 };
             let _ = push_alkane_item(
+                &table,
                 &mut seen_alkanes,
                 &mut alkanes,
                 &mut meta_cache,
@@ -337,6 +345,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
     if let Some(alk) = parse_alkane_id(&query) {
         let _ = push_alkane_item(
+            &table,
             &mut seen_alkanes,
             &mut alkanes,
             &mut meta_cache,
