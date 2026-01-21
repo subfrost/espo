@@ -1,0 +1,40 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock file (for libraries, typically ignored; for binaries, committed)
+# Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Generated files
+*.orig
+
+# Local configuration
+.env
+config.local.json
+
+# Build outputs
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Debug artifacts
+*.dSYM/
+
+# Profiling data
+*.profraw
+*.profdata
+
+# Test coverage
+*.profraw
+tarpaulin-report.html
+cobertura.xml
