@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, anyhow};
 use bitcoincore_rpc::bitcoin::hashes::Hash; // for to_byte_array()
 use bitcoincore_rpc::bitcoin::{Block, BlockHash, Network, consensus};
-use espo::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
+use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use std::collections::HashMap;

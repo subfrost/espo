@@ -23,7 +23,7 @@ use std::{
 
 // Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
-use espo::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
+use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 
 // Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
