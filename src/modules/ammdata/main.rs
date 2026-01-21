@@ -10,6 +10,7 @@ use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use super::utils::candles::CandleCache;
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{get_espo_db, get_network};
+use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{ammdata_genesis_block, get_amm_contract};
 use crate::modules::ammdata::utils::candles::{price_base_per_quote, price_quote_per_base};
 use crate::modules::ammdata::utils::reserves::{
@@ -518,5 +519,13 @@ impl EspoModule for AmmData {
             .expect("ModuleRegistry must call set_mdb()")
             .clone();
         register_rpc(reg, provider);
+    }
+
+    fn config_spec(&self) -> Option<&'static str> {
+        Some(AmmDataConfig::spec())
+    }
+
+    fn set_config(&mut self, config: &serde_json::Value) -> Result<()> {
+        AmmDataConfig::from_value(config).map(|_| ())
     }
 }

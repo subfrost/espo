@@ -22,5 +22,11 @@
   "explorer_networks": {
     "mainnet": "https://staging.espo.sh",
     "regtest": "https://espo.subfrost.io/regtest"
+  },
+  "modules": {
+    "ammdata": {
+      "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/jhcOomuhnXSw9o9j-8Di_",
+      "eth_call_throttle": 0
+    }
   }
 }

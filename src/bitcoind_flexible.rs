@@ -21,7 +21,6 @@ struct JsonRpcRequest {
 
 #[derive(Deserialize, Debug)]
 struct JsonRpcResponse<T> {
-    id: u32,
     result: Option<T>,
     error: Option<JsonRpcErrorDetail>,
 }

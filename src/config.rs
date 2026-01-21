@@ -11,6 +11,7 @@ use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -189,6 +190,8 @@ pub struct ConfigFile {
     pub simulate_reorg: bool,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
+    #[serde(default)]
+    pub modules: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +219,7 @@ pub struct AppConfig {
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
+    pub modules: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -268,6 +272,7 @@ impl AppConfig {
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
             explorer_networks,
+            modules: file.modules,
         })
     }
 }
@@ -426,9 +431,13 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
-    let file = load_config_file(&cli.config_path)?;
-    let cfg = AppConfig::from_file(file, cli.view_only)?;
+    let cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
     init_config_from(cfg)
+}
+
+pub fn load_config_from_path(path: &str, view_only: bool) -> Result<AppConfig> {
+    let file = load_config_file(path)?;
+    AppConfig::from_file(file, view_only)
 }
 
 // UPDATED: no param; uses global NETWORK
@@ -451,6 +460,10 @@ pub fn init_block_source() -> Result<()> {
 
 pub fn get_config() -> &'static AppConfig {
     CONFIG.get().expect("init_config() must be called once at startup")
+}
+
+pub fn get_module_config(name: &str) -> Option<&'static serde_json::Value> {
+    get_config().modules.get(name)
 }
 
 pub fn get_electrum_client() -> Option<Arc<Client>> {

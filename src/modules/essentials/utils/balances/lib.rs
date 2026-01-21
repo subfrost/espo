@@ -204,7 +204,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     // - Create events: ignored.
     // - Returned alkanes pay to the nearest normal parent (never to a delegate).
     // - We allow negative deltas here; final balance checks happen later.
-    // - We never track `owner == token` deltas (self-token balances are not indexed).
+    // - Self-token deltas are kept for outflow reporting; balances/holders ignore them later.
 
     #[derive(Copy, Clone, Eq, PartialEq, Debug)]
     enum FrameKind {
@@ -233,14 +233,15 @@ pub(crate) fn accumulate_alkane_balance_deltas(
         })
     }
 
-    // Add a signed delta for a (owner, token) pair, skipping self-token balances.
+    // Add a signed delta for a (owner, token) pair.
+    // Self-token deltas are kept for outflow reporting; balances filter them later.
     fn add_delta(
         outflows: &mut HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
         owner: SchemaAlkaneId,
         token: SchemaAlkaneId,
         delta: SignedU128,
     ) {
-        if token == owner || delta.is_zero() {
+        if delta.is_zero() {
             return;
         }
         let remove = {
@@ -1304,9 +1305,19 @@ pub fn bulk_update_balances_for_block(
                 height: block.height,
                 outflow: per_token.clone(),
             };
-            let entry = alkane_balance_delta.entry(*holder_alk).or_default();
             for (token, delta) in per_token {
                 if delta.is_zero() {
+                    continue;
+                }
+                alkane_balance_delta_src.insert((*holder_alk, *token), entry_outflow.clone());
+                push_balance_tx_entry_pair(
+                    &mut alkane_balance_tx_entries_by_token,
+                    *holder_alk,
+                    *token,
+                    entry_outflow.clone(),
+                );
+                if *token == *holder_alk {
+                    // Keep self-token outflows for summaries/ammdata, but don't persist balances.
                     continue;
                 }
                 add_holder_delta(
@@ -1314,12 +1325,6 @@ pub fn bulk_update_balances_for_block(
                     HolderId::Alkane(*holder_alk),
                     *delta,
                     &mut holder_alkanes_changed,
-                );
-                push_balance_tx_entry_pair(
-                    &mut alkane_balance_tx_entries_by_token,
-                    *holder_alk,
-                    *token,
-                    entry_outflow.clone(),
                 );
                 let (is_negative, mag) = delta.as_parts();
                 if is_negative {
@@ -1329,12 +1334,12 @@ pub fn bulk_update_balances_for_block(
                     *stat_plus_by_alk.entry(*token).or_default() =
                         stat_plus_by_alk.get(token).copied().unwrap_or(0).saturating_add(mag);
                 }
+                let entry = alkane_balance_delta.entry(*holder_alk).or_default();
                 let slot = entry.entry(*token).or_insert_with(SignedU128::zero);
                 *slot += *delta;
                 if slot.is_zero() {
                     entry.remove(token);
                 }
-                alkane_balance_delta_src.insert((*holder_alk, *token), entry_outflow.clone());
             }
         }
 
