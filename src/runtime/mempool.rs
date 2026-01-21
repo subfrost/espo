@@ -16,7 +16,7 @@ use bitcoin::{
     Address, Amount, Block, CompactTarget, Network, Sequence, Transaction, TxIn, TxMerkleNode,
     TxOut, Txid, Witness,
 };
-use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
+use espo::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize, to_vec};
 use futures::{StreamExt, stream};
