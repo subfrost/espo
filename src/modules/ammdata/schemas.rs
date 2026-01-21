@@ -94,6 +94,8 @@ pub struct SchemaActivityV1 {
     pub direction: Option<ActivityDirection>,
     pub base_delta: i128,
     pub quote_delta: i128,
+    pub address_spk: Vec<u8>,
+    pub success: bool,
 }
 
 impl SchemaCandleV1 {

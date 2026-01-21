@@ -5,6 +5,7 @@ use crate::modules::essentials::storage::EssentialsProvider;
 use crate::modules::oylapi::config::OylApiConfig;
 use crate::modules::oylapi::server::run as run_oylapi;
 use crate::modules::oylapi::storage::OylApiState;
+use crate::modules::subfrost::storage::SubfrostProvider;
 use crate::runtime::mdb::Mdb;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
@@ -15,11 +16,12 @@ pub struct OylApi {
     config: Option<OylApiConfig>,
     essentials: Option<Arc<EssentialsProvider>>,
     ammdata: Option<Arc<AmmDataProvider>>,
+    subfrost: Option<Arc<SubfrostProvider>>,
 }
 
 impl OylApi {
     pub fn new() -> Self {
-        Self { config: None, essentials: None, ammdata: None }
+        Self { config: None, essentials: None, ammdata: None, subfrost: None }
     }
 }
 
@@ -39,8 +41,11 @@ impl EspoModule for OylApi {
         let essentials = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
         let amm_mdb = Mdb::from_db(get_espo_db(), b"ammdata:");
         let ammdata = Arc::new(AmmDataProvider::new(Arc::new(amm_mdb), essentials.clone()));
+        let subfrost_mdb = Mdb::from_db(get_espo_db(), b"subfrost:");
+        let subfrost = Arc::new(SubfrostProvider::new(Arc::new(subfrost_mdb)));
         self.essentials = Some(essentials);
         self.ammdata = Some(ammdata);
+        self.subfrost = Some(subfrost);
     }
 
     fn get_genesis_block(&self, _network: Network) -> u32 {
@@ -69,6 +74,11 @@ impl EspoModule for OylApi {
             .as_ref()
             .expect("oylapi module missing ammdata provider")
             .clone();
+        let subfrost = self
+            .subfrost
+            .as_ref()
+            .expect("oylapi module missing subfrost provider")
+            .clone();
 
         let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
             .parse()
@@ -78,6 +88,7 @@ impl EspoModule for OylApi {
             config: cfg,
             essentials,
             ammdata,
+            subfrost,
             http_client: reqwest::Client::new(),
         };
 

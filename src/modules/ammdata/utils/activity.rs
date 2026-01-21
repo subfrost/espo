@@ -26,6 +26,16 @@ fn activity_key(pool: &SchemaAlkaneId, ts: u64, seq: u32) -> Vec<u8> {
     k
 }
 
+#[derive(BorshDeserialize)]
+struct SchemaActivityV1Legacy {
+    pub timestamp: u64,
+    pub txid: [u8; 32],
+    pub kind: ActivityKind,
+    pub direction: Option<ActivityDirection>,
+    pub base_delta: i128,
+    pub quote_delta: i128,
+}
+
 // simple encode/decode (borsh) for SchemaActivityV1
 #[inline]
 fn encode_activity_v1(activity: &SchemaActivityV1) -> Result<Vec<u8>> {
@@ -33,8 +43,21 @@ fn encode_activity_v1(activity: &SchemaActivityV1) -> Result<Vec<u8>> {
 }
 
 #[inline]
-fn decode_activity_v1(v: &[u8]) -> Result<SchemaActivityV1> {
-    Ok(SchemaActivityV1::try_from_slice(v)?)
+pub fn decode_activity_v1(v: &[u8]) -> Result<SchemaActivityV1> {
+    if let Ok(parsed) = SchemaActivityV1::try_from_slice(v) {
+        return Ok(parsed);
+    }
+    let legacy = SchemaActivityV1Legacy::try_from_slice(v)?;
+    Ok(SchemaActivityV1 {
+        timestamp: legacy.timestamp,
+        txid: legacy.txid,
+        kind: legacy.kind,
+        direction: legacy.direction,
+        base_delta: legacy.base_delta,
+        quote_delta: legacy.quote_delta,
+        address_spk: Vec::new(),
+        success: true,
+    })
 }
 
 /* ---------------- index helpers ---------------- */

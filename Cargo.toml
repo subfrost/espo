@@ -27,6 +27,7 @@ borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
 tokio-stream = "0.1.17"
 tokio-serde = {version = "0.9.0", features = ["json"]}
+time = { version = "0.3.36", features = ["formatting"] }
 alloy-primitives = "0.8.7"
 alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"}
 ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }

@@ -13,6 +13,7 @@ use super::storage::{
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
+use crate::alkanes::trace::EspoSandshrewLikeTraceStatus;
 use crate::config::{get_electrum_like, get_espo_db, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
@@ -361,6 +362,10 @@ impl EspoModule for AmmData {
         let mut pool_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut pool_lp_supply_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut tvl_versioned_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_swaps_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_creations_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut address_pool_swaps_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut address_token_swaps_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_cache: HashMap<SchemaAlkaneId, SchemaTokenMetricsV1> =
             HashMap::new();
         let mut alkane_label_cache: HashMap<SchemaAlkaneId, String> = HashMap::new();
@@ -391,6 +396,25 @@ impl EspoModule for AmmData {
             block_tx_map.insert(atx.transaction.compute_txid(), &atx.transaction);
         }
         let mut prev_tx_cache: HashMap<Txid, Transaction> = HashMap::new();
+        let mut tx_meta: HashMap<Txid, (Vec<u8>, bool)> = HashMap::new();
+        for atx in &block.transactions {
+            let txid = atx.transaction.compute_txid();
+            let spk_bytes = pool_creator_spk_from_protostone(&atx.transaction)
+                .map(|s| s.as_bytes().to_vec())
+                .unwrap_or_default();
+            let success = atx.traces.as_ref().map_or(true, |traces| {
+                !traces.iter().any(|trace| {
+                    trace.sandshrew_trace.events.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            EspoSandshrewLikeTraceEvent::Return(r)
+                                if r.status == EspoSandshrewLikeTraceStatus::Failure
+                        )
+                    })
+                })
+            });
+            tx_meta.insert(txid, (spk_bytes, success));
+        }
 
         // Discover new pools (per-tx) and record pool creation activity.
         let mut seen_new_pools: HashSet<(u32, u64)> = HashSet::new();
@@ -553,7 +577,12 @@ impl EspoModule for AmmData {
                         encode_pool_creation_info(&creation_info)?,
                     ));
 
-                    let txid_bytes = transaction.transaction.compute_txid().to_byte_array();
+                    let txid = transaction.transaction.compute_txid();
+                    let txid_bytes = txid.to_byte_array();
+                    let (address_spk, success) = tx_meta
+                        .get(&txid)
+                        .cloned()
+                        .unwrap_or_else(|| (Vec::new(), true));
 
                     let activity = SchemaActivityV1 {
                         timestamp: block_ts,
@@ -562,10 +591,14 @@ impl EspoModule for AmmData {
                         direction: None,
                         base_delta: 0,
                         quote_delta: 0,
+                        address_spk,
+                        success,
                     };
 
                     if let Ok(seq) = activity_acc.push(pool_id, block_ts, activity.clone()) {
                         index_acc.add(&pool_id, block_ts, seq, &activity);
+                        pool_creations_writes
+                            .push((table.pool_creations_key(block_ts, seq, &pool_id), Vec::new()));
                     }
 
                     println!(
@@ -627,6 +660,13 @@ impl EspoModule for AmmData {
                 };
                 pools_touched.insert(owner);
 
+                let txid = Txid::from_byte_array(entry.txid);
+                let (address_spk, success) = tx_meta
+                    .get(&txid)
+                    .cloned()
+                    .unwrap_or_else(|| (Vec::new(), true));
+                let address_spk = address_spk.clone();
+
                 let activity = SchemaActivityV1 {
                     timestamp: block_ts,
                     txid: entry.txid,
@@ -634,10 +674,44 @@ impl EspoModule for AmmData {
                     direction,
                     base_delta,
                     quote_delta,
+                    address_spk: address_spk.clone(),
+                    success,
                 };
 
                 if let Ok(seq) = activity_acc.push(owner, block_ts, activity.clone()) {
                     index_acc.add(&owner, block_ts, seq, &activity);
+                    if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
+                        token_swaps_writes
+                            .push((table.token_swaps_key(&defs.base_alkane_id, block_ts, seq, &owner), Vec::new()));
+                        token_swaps_writes
+                            .push((table.token_swaps_key(&defs.quote_alkane_id, block_ts, seq, &owner), Vec::new()));
+                        if !address_spk.is_empty() {
+                            address_pool_swaps_writes.push((
+                                table.address_pool_swaps_key(&address_spk, &owner, block_ts, seq),
+                                Vec::new(),
+                            ));
+                            address_token_swaps_writes.push((
+                                table.address_token_swaps_key(
+                                    &address_spk,
+                                    &defs.base_alkane_id,
+                                    block_ts,
+                                    seq,
+                                    &owner,
+                                ),
+                                Vec::new(),
+                            ));
+                            address_token_swaps_writes.push((
+                                table.address_token_swaps_key(
+                                    &address_spk,
+                                    &defs.quote_alkane_id,
+                                    block_ts,
+                                    seq,
+                                    &owner,
+                                ),
+                                Vec::new(),
+                            ));
+                        }
+                    }
                 }
 
                 if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
@@ -1246,15 +1320,19 @@ impl EspoModule for AmmData {
         let fp_cnt = factory_pools_writes.len();
         let pf_cnt = pool_factory_writes.len();
         let pc_cnt = pool_creation_info_writes.len();
+        let pcg_cnt = pool_creations_writes.len();
+        let aps_cnt = address_pool_swaps_writes.len();
+        let ats_cnt = address_token_swaps_writes.len();
         let pd_cnt = pool_defs_writes.len();
         let pm_cnt = pool_metrics_writes.len();
         let pls_cnt = pool_lp_supply_writes.len();
         let tvl_cnt = tvl_versioned_writes.len();
+        let ts_cnt = token_swaps_writes.len();
         let a_cnt = activity_writes.len();
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
@@ -1265,10 +1343,12 @@ impl EspoModule for AmmData {
             fp_cnt = fp_cnt,
             pf_cnt = pf_cnt,
             pc_cnt = pc_cnt,
+            pcg_cnt = pcg_cnt,
             pd_cnt = pd_cnt,
             pm_cnt = pm_cnt,
             pls_cnt = pls_cnt,
             tvl_cnt = tvl_cnt,
+            ts_cnt = ts_cnt,
             a_cnt = a_cnt,
             i_cnt = i_cnt,
         );
@@ -1282,10 +1362,14 @@ impl EspoModule for AmmData {
             || !factory_pools_writes.is_empty()
             || !pool_factory_writes.is_empty()
             || !pool_creation_info_writes.is_empty()
+            || !pool_creations_writes.is_empty()
             || !pool_defs_writes.is_empty()
             || !pool_metrics_writes.is_empty()
             || !pool_lp_supply_writes.is_empty()
             || !tvl_versioned_writes.is_empty()
+            || !token_swaps_writes.is_empty()
+            || !address_pool_swaps_writes.is_empty()
+            || !address_token_swaps_writes.is_empty()
             || !activity_writes.is_empty()
             || !index_writes.is_empty()
             || !reserves_blob.is_empty()
@@ -1300,10 +1384,14 @@ impl EspoModule for AmmData {
             puts.extend(factory_pools_writes);
             puts.extend(pool_factory_writes);
             puts.extend(pool_creation_info_writes);
+            puts.extend(pool_creations_writes);
             puts.extend(pool_defs_writes);
             puts.extend(pool_metrics_writes);
             puts.extend(pool_lp_supply_writes);
             puts.extend(tvl_versioned_writes);
+            puts.extend(token_swaps_writes);
+            puts.extend(address_pool_swaps_writes);
+            puts.extend(address_token_swaps_writes);
             puts.extend(activity_writes);
             puts.extend(index_writes);
             puts.push((reserves_key_rel, reserves_blob));

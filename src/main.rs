@@ -22,6 +22,7 @@ use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
+use crate::modules::subfrost::main::Subfrost;
 use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
@@ -341,6 +342,11 @@ async fn main() -> Result<()> {
         mods.register_module(AmmData::new());
     } else {
         eprintln!("[modules] ammdata disabled (missing config)");
+    }
+    if get_module_config("subfrost").is_some() {
+        mods.register_module(Subfrost::new());
+    } else {
+        eprintln!("[modules] subfrost disabled (missing config)");
     }
     if get_module_config("oylapi").is_some() {
         mods.register_module(OylApi::new());

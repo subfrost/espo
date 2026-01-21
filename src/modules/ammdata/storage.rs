@@ -1,7 +1,7 @@
 use super::schemas::{
-    SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
-    SchemaPoolMetricsV1, SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1,
-    Timeframe,
+    ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaMarketDefs,
+    SchemaPoolCreationInfoV1, SchemaPoolMetricsV1, SchemaPoolSnapshot, SchemaReservesSnapshot,
+    SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, canonical_quotes,
@@ -10,7 +10,7 @@ use crate::config::get_network;
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
     ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir,
-    read_activity_for_pool, read_activity_for_pool_sorted,
+    decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
 };
 use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
@@ -113,6 +113,10 @@ pub struct AmmDataTable<'a> {
     pub POOL_CREATION_INFO: MdbPointer<'a>,
     pub POOL_LP_SUPPLY: MdbPointer<'a>,
     pub TVL_VERSIONED: MdbPointer<'a>,
+    pub TOKEN_SWAPS: MdbPointer<'a>,
+    pub POOL_CREATIONS: MdbPointer<'a>,
+    pub ADDRESS_POOL_SWAPS: MdbPointer<'a>,
+    pub ADDRESS_TOKEN_SWAPS: MdbPointer<'a>,
 }
 
 impl<'a> AmmDataTable<'a> {
@@ -137,6 +141,10 @@ impl<'a> AmmDataTable<'a> {
             POOL_CREATION_INFO: root.keyword("/pool_creation_info/v1/"),
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
+            TOKEN_SWAPS: root.keyword("/token_swaps/v1/"),
+            POOL_CREATIONS: root.keyword("/pool_creations/v1/"),
+            ADDRESS_POOL_SWAPS: root.keyword("/address_pool_swaps/v1/"),
+            ADDRESS_TOKEN_SWAPS: root.keyword("/address_token_swaps/v1/"),
         }
     }
 }
@@ -147,6 +155,19 @@ impl<'a> AmmDataTable<'a> {
         let tx_hex = format!("{:x}", pool.tx);
         let suffix = format!("{}:{}:{}:", blk_hex, tx_hex, tf.code());
         self.CANDLES.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn activity_ns_prefix(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let suffix = format!("{}:{}:", pool.block, pool.tx);
+        self.ACTIVITY.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn activity_key(&self, pool: &SchemaAlkaneId, ts: u64, seq: u32) -> Vec<u8> {
+        let mut k = self.activity_ns_prefix(pool);
+        k.extend_from_slice(ts.to_string().as_bytes());
+        k.push(b':');
+        k.extend_from_slice(seq.to_string().as_bytes());
+        k
     }
 
     pub fn candle_key_seq(
@@ -301,6 +322,99 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn token_swaps_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1);
+        suffix.extend_from_slice(&token.block.to_be_bytes());
+        suffix.extend_from_slice(&token.tx.to_be_bytes());
+        suffix.push(b'/');
+        self.TOKEN_SWAPS.select(&suffix).key().to_vec()
+    }
+
+    pub fn token_swaps_key(
+        &self,
+        token: &SchemaAlkaneId,
+        ts: u64,
+        seq: u32,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_swaps_prefix(token);
+        k.extend_from_slice(ts.to_string().as_bytes());
+        k.push(b':');
+        k.extend_from_slice(seq.to_string().as_bytes());
+        k.push(b'/');
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn pool_creations_prefix(&self) -> Vec<u8> {
+        self.POOL_CREATIONS.key().to_vec()
+    }
+
+    pub fn pool_creations_key(&self, ts: u64, seq: u32, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.pool_creations_prefix();
+        k.extend_from_slice(ts.to_string().as_bytes());
+        k.push(b':');
+        k.extend_from_slice(seq.to_string().as_bytes());
+        k.push(b'/');
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn address_pool_swaps_prefix(
+        &self,
+        address_spk: &[u8],
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.ADDRESS_POOL_SWAPS.key().to_vec();
+        push_spk(&mut k, address_spk);
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn address_pool_swaps_key(
+        &self,
+        address_spk: &[u8],
+        pool: &SchemaAlkaneId,
+        ts: u64,
+        seq: u32,
+    ) -> Vec<u8> {
+        let mut k = self.address_pool_swaps_prefix(address_spk, pool);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k
+    }
+
+    pub fn address_token_swaps_prefix(
+        &self,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.ADDRESS_TOKEN_SWAPS.key().to_vec();
+        push_spk(&mut k, address_spk);
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn address_token_swaps_key(
+        &self,
+        address_spk: &[u8],
+        token: &SchemaAlkaneId,
+        ts: u64,
+        seq: u32,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.address_token_swaps_prefix(address_spk, token);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
     pub fn pools_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12);
         suffix.extend_from_slice(&pool.block.to_be_bytes());
@@ -311,6 +425,34 @@ impl<'a> AmmDataTable<'a> {
     pub fn reserves_snapshot_key(&self) -> Vec<u8> {
         self.RESERVES_SNAPSHOT.key().to_vec()
     }
+}
+
+fn parse_ts_seq_from_key(bytes: &[u8]) -> Option<(u64, u32)> {
+    let mut parts = bytes.splitn(2, |b| *b == b':');
+    let ts_bytes = parts.next()?;
+    let seq_bytes = parts.next()?;
+    let ts = std::str::from_utf8(ts_bytes).ok()?.parse::<u64>().ok()?;
+    let seq = std::str::from_utf8(seq_bytes).ok()?.parse::<u32>().ok()?;
+    Some((ts, seq))
+}
+
+fn parse_ts_seq_from_tail_be(bytes: &[u8]) -> Option<(u64, u32)> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let ts_bytes = &bytes[bytes.len() - 12..bytes.len() - 4];
+    let seq_bytes = &bytes[bytes.len() - 4..];
+    let mut ts_arr = [0u8; 8];
+    let mut seq_arr = [0u8; 4];
+    ts_arr.copy_from_slice(ts_bytes);
+    seq_arr.copy_from_slice(seq_bytes);
+    Some((u64::from_be_bytes(ts_arr), u32::from_be_bytes(seq_arr)))
+}
+
+fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {
+    let len = spk.len().min(u16::MAX as usize) as u16;
+    dst.extend_from_slice(&len.to_be_bytes());
+    dst.extend_from_slice(&spk[..len as usize]);
 }
 
 #[derive(Clone)]
@@ -604,6 +746,218 @@ impl AmmDataProvider {
             .and_then(|raw| decode_u128_value(&raw).ok())
             .unwrap_or(0);
         Ok(GetPoolLpSupplyLatestResult { supply })
+    }
+
+    pub fn get_pool_activity_entries(
+        &self,
+        params: GetPoolActivityEntriesParams,
+    ) -> Result<GetPoolActivityEntriesResult> {
+        let table = self.table();
+        let prefix = table.activity_ns_prefix(&params.pool);
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+
+        let mut total = 0usize;
+        let mut out: Vec<SchemaActivityV1> = Vec::new();
+        let mut seen = 0usize;
+        for (_k, v) in entries {
+            let entry = match decode_activity_v1(&v) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if let Some(ref kinds) = params.kinds {
+                if !kinds.contains(&entry.kind) {
+                    continue;
+                }
+            }
+            if let Some(want) = params.successful {
+                if want && !entry.success {
+                    continue;
+                }
+            }
+            total += 1;
+            if seen < params.offset {
+                seen += 1;
+                continue;
+            }
+            if out.len() < params.limit {
+                out.push(entry);
+            }
+            if out.len() >= params.limit && params.offset + out.len() >= total && !params.include_total {
+                break;
+            }
+        }
+
+        Ok(GetPoolActivityEntriesResult { entries: out, total })
+    }
+
+    pub fn get_activity_entry(
+        &self,
+        params: GetActivityEntryParams,
+    ) -> Result<GetActivityEntryResult> {
+        let table = self.table();
+        let key = table.activity_key(&params.pool, params.ts, params.seq);
+        let entry = self
+            .get_raw_value(GetRawValueParams { key })?
+            .value
+            .and_then(|raw| decode_activity_v1(&raw).ok());
+        Ok(GetActivityEntryResult { entry })
+    }
+
+    pub fn get_token_swaps_page(
+        &self,
+        params: GetTokenSwapsPageParams,
+    ) -> Result<GetTokenSwapsPageResult> {
+        let table = self.table();
+        let prefix = table.token_swaps_prefix(&params.token);
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+        {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+
+        let mut parsed: Vec<TokenSwapEntry> = Vec::new();
+        for (k, _v) in entries {
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &k[prefix.len()..];
+            let mut parts = rest.splitn(2, |b| *b == b'/');
+            let ts_seq = parts.next().unwrap_or(&[]);
+            let pool_bytes = parts.next().unwrap_or(&[]);
+            let (ts, seq) = match parse_ts_seq_from_key(ts_seq) {
+                Some(v) => v,
+                None => continue,
+            };
+            let pool = match decode_alkane_id_be(pool_bytes) {
+                Some(p) => p,
+                None => continue,
+            };
+            parsed.push(TokenSwapEntry { ts, seq, pool });
+        }
+
+        let total = parsed.len();
+        let offset = params.offset.min(total);
+        let end = (offset + params.limit).min(total);
+        let page = if offset >= total { &[] } else { &parsed[offset..end] };
+
+        Ok(GetTokenSwapsPageResult { entries: page.to_vec(), total })
+    }
+
+    pub fn get_pool_creations_page(
+        &self,
+        params: GetPoolCreationsPageParams,
+    ) -> Result<GetPoolCreationsPageResult> {
+        let table = self.table();
+        let prefix = table.pool_creations_prefix();
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+        {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+
+        let mut parsed: Vec<PoolCreationEntry> = Vec::new();
+        for (k, _v) in entries {
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &k[prefix.len()..];
+            let mut parts = rest.splitn(2, |b| *b == b'/');
+            let ts_seq = parts.next().unwrap_or(&[]);
+            let pool_bytes = parts.next().unwrap_or(&[]);
+            let (ts, seq) = match parse_ts_seq_from_key(ts_seq) {
+                Some(v) => v,
+                None => continue,
+            };
+            let pool = match decode_alkane_id_be(pool_bytes) {
+                Some(p) => p,
+                None => continue,
+            };
+            parsed.push(PoolCreationEntry { ts, seq, pool });
+        }
+
+        let total = parsed.len();
+        let offset = params.offset.min(total);
+        let end = (offset + params.limit).min(total);
+        let page = if offset >= total { &[] } else { &parsed[offset..end] };
+
+        Ok(GetPoolCreationsPageResult { entries: page.to_vec(), total })
+    }
+
+    pub fn get_address_pool_swaps_page(
+        &self,
+        params: GetAddressPoolSwapsPageParams,
+    ) -> Result<GetAddressPoolSwapsPageResult> {
+        let table = self.table();
+        let prefix = table.address_pool_swaps_prefix(&params.address_spk, &params.pool);
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+        {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+
+        let mut parsed: Vec<AddressPoolSwapEntry> = Vec::new();
+        for (k, _v) in entries {
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &k[prefix.len()..];
+            let (ts, seq) = match parse_ts_seq_from_tail_be(rest) {
+                Some(v) => v,
+                None => continue,
+            };
+            parsed.push(AddressPoolSwapEntry { ts, seq });
+        }
+
+        let total = parsed.len();
+        let offset = params.offset.min(total);
+        let end = (offset + params.limit).min(total);
+        let page = if offset >= total { &[] } else { &parsed[offset..end] };
+
+        Ok(GetAddressPoolSwapsPageResult { entries: page.to_vec(), total })
+    }
+
+    pub fn get_address_token_swaps_page(
+        &self,
+        params: GetAddressTokenSwapsPageParams,
+    ) -> Result<GetAddressTokenSwapsPageResult> {
+        let table = self.table();
+        let prefix = table.address_token_swaps_prefix(&params.address_spk, &params.token);
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+        {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+
+        let mut parsed: Vec<AddressTokenSwapEntry> = Vec::new();
+        for (k, _v) in entries {
+            if !k.starts_with(&prefix) {
+                continue;
+            }
+            if k.len() < prefix.len() + 24 {
+                continue;
+            }
+            let pool_bytes = &k[k.len() - 12..];
+            let ts_seq_bytes = &k[k.len() - 24..k.len() - 12];
+            let (ts, seq) = match parse_ts_seq_from_tail_be(ts_seq_bytes) {
+                Some(v) => v,
+                None => continue,
+            };
+            let pool = match decode_alkane_id_be(pool_bytes) {
+                Some(p) => p,
+                None => continue,
+            };
+            parsed.push(AddressTokenSwapEntry { ts, seq, pool });
+        }
+
+        let total = parsed.len();
+        let offset = params.offset.min(total);
+        let end = (offset + params.limit).min(total);
+        let page = if offset >= total { &[] } else { &parsed[offset..end] };
+
+        Ok(GetAddressTokenSwapsPageResult { entries: page.to_vec(), total })
     }
 
     pub fn get_tvl_versioned_at_or_before(
@@ -1376,6 +1730,102 @@ pub struct GetPoolLpSupplyLatestParams {
 
 pub struct GetPoolLpSupplyLatestResult {
     pub supply: u128,
+}
+
+pub struct GetPoolActivityEntriesParams {
+    pub pool: SchemaAlkaneId,
+    pub offset: usize,
+    pub limit: usize,
+    pub kinds: Option<Vec<ActivityKind>>,
+    pub successful: Option<bool>,
+    pub include_total: bool,
+}
+
+pub struct GetPoolActivityEntriesResult {
+    pub entries: Vec<SchemaActivityV1>,
+    pub total: usize,
+}
+
+pub struct GetActivityEntryParams {
+    pub pool: SchemaAlkaneId,
+    pub ts: u64,
+    pub seq: u32,
+}
+
+pub struct GetActivityEntryResult {
+    pub entry: Option<SchemaActivityV1>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TokenSwapEntry {
+    pub ts: u64,
+    pub seq: u32,
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetTokenSwapsPageParams {
+    pub token: SchemaAlkaneId,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetTokenSwapsPageResult {
+    pub entries: Vec<TokenSwapEntry>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoolCreationEntry {
+    pub ts: u64,
+    pub seq: u32,
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolCreationsPageParams {
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetPoolCreationsPageResult {
+    pub entries: Vec<PoolCreationEntry>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AddressPoolSwapEntry {
+    pub ts: u64,
+    pub seq: u32,
+}
+
+pub struct GetAddressPoolSwapsPageParams {
+    pub address_spk: Vec<u8>,
+    pub pool: SchemaAlkaneId,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetAddressPoolSwapsPageResult {
+    pub entries: Vec<AddressPoolSwapEntry>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AddressTokenSwapEntry {
+    pub ts: u64,
+    pub seq: u32,
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetAddressTokenSwapsPageParams {
+    pub address_spk: Vec<u8>,
+    pub token: SchemaAlkaneId,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetAddressTokenSwapsPageResult {
+    pub entries: Vec<AddressTokenSwapEntry>,
+    pub total: usize,
 }
 
 pub struct GetTvlVersionedAtOrBeforeParams {
