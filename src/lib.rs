@@ -1,4 +1,5 @@
 pub mod alkanes;
+pub mod bitcoind_flexible;
 pub mod config;
 pub mod consts;
 pub mod core;

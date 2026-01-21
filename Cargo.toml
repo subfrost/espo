@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0.99"
+base64 = "0.22.0"
 clap = { version = "4.5.47", features = ["derive"] }
 hex = "0.4.3"
 rocksdb = "0.24.0"
@@ -20,7 +21,7 @@ axum = "0.8.4"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net"] }
 bitcoin = "0.32.7"
 electrum-client = "0.24.0"
-reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "tcp"] }
 borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
