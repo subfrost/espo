@@ -173,6 +173,8 @@ pub struct AlkaneCreationRecord {
     pub inspection: Option<StoredInspectionResult>,
     pub names: Vec<String>,
     pub symbols: Vec<String>,
+    pub cap: u128,
+    pub mint_amount: u128,
 }
 
 pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreationRecord> {
@@ -205,6 +207,8 @@ pub fn created_alkane_records_from_block(block: &EspoBlock) -> Vec<AlkaneCreatio
                                 inspection: None,
                                 names: Vec::new(),
                                 symbols: Vec::new(),
+                                cap: 0,
+                                mint_amount: 0,
                             });
                         }
                     }

@@ -111,9 +111,14 @@ pub struct EssentialsTable<'a> {
     // Alkane creation + metadata.
     pub ALKANE_INFO: MdbPointer<'a>,
     pub ALKANE_NAME_INDEX: MdbPointer<'a>,
+    pub ALKANE_SYMBOL_INDEX: MdbPointer<'a>,
     pub ALKANE_CREATION_BY_ID: MdbPointer<'a>,
     pub ALKANE_CREATION_ORDERED: MdbPointer<'a>,
     pub ALKANE_CREATION_COUNT: MdbPointer<'a>,
+    pub CIRCULATING_SUPPLY: MdbPointer<'a>,
+    pub CIRCULATING_SUPPLY_LATEST: MdbPointer<'a>,
+    pub TOTAL_MINTED: MdbPointer<'a>,
+    pub TOTAL_MINTED_LATEST: MdbPointer<'a>,
     // Transaction summaries + reverse indexes.
     pub ALKANE_TX_SUMMARY: MdbPointer<'a>,
     pub ALKANE_BLOCK: MdbPointer<'a>,
@@ -145,9 +150,14 @@ impl<'a> EssentialsTable<'a> {
             ALKANE_BALANCE_TXS_BY_HEIGHT: root.keyword("/alkane_balance_txs_by_height/"),
             ALKANE_INFO: root.keyword("/alkane_info/"),
             ALKANE_NAME_INDEX: root.keyword("/alkanes/name/"),
+            ALKANE_SYMBOL_INDEX: root.keyword("/alkanes/symbol/"),
             ALKANE_CREATION_BY_ID: root.keyword("/alkanes/creation/id/"),
             ALKANE_CREATION_ORDERED: root.keyword("/alkanes/creation/ordered/"),
             ALKANE_CREATION_COUNT: root.keyword("/alkanes/creation/count"),
+            CIRCULATING_SUPPLY: root.keyword("/circulating_supply/v1/"),
+            CIRCULATING_SUPPLY_LATEST: root.keyword("/circulating_supply/latest/"),
+            TOTAL_MINTED: root.keyword("/total_minted/v1/"),
+            TOTAL_MINTED_LATEST: root.keyword("/total_minted/latest/"),
             ALKANE_TX_SUMMARY: root.keyword("/alkane_tx_summary/"),
             ALKANE_BLOCK: root.keyword("/alkane_block/"),
             ALKANE_ADDR: root.keyword("/alkane_addr/"),
@@ -274,6 +284,19 @@ impl<'a> EssentialsTable<'a> {
         self.ALKANE_NAME_INDEX.select(name_prefix.as_bytes()).key().to_vec()
     }
 
+    pub fn alkane_symbol_index_key(&self, symbol: &str, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(symbol.len() + 1 + 12);
+        suffix.extend_from_slice(symbol.as_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.ALKANE_SYMBOL_INDEX.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_symbol_index_prefix(&self, symbol_prefix: &str) -> Vec<u8> {
+        self.ALKANE_SYMBOL_INDEX.select(symbol_prefix.as_bytes()).key().to_vec()
+    }
+
     pub fn alkane_holders_ordered_key(&self, count: u64, alkane: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(8 + 12);
         suffix.extend_from_slice(&count.to_be_bytes());
@@ -305,6 +328,29 @@ impl<'a> EssentialsTable<'a> {
         let name = String::from_utf8(name_bytes.to_vec()).ok()?;
         Some((
             name,
+            SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) },
+        ))
+    }
+
+    pub fn parse_alkane_symbol_index_key(&self, key: &[u8]) -> Option<(String, SchemaAlkaneId)> {
+        let prefix = self.ALKANE_SYMBOL_INDEX.key();
+        if !key.starts_with(prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        let split = rest.iter().rposition(|b| *b == b'/')?;
+        let symbol_bytes = &rest[..split];
+        let id_bytes = &rest[split + 1..];
+        if id_bytes.len() != 12 {
+            return None;
+        }
+        let mut block_arr = [0u8; 4];
+        block_arr.copy_from_slice(&id_bytes[..4]);
+        let mut tx_arr = [0u8; 8];
+        tx_arr.copy_from_slice(&id_bytes[4..12]);
+        let symbol = String::from_utf8(symbol_bytes.to_vec()).ok()?;
+        Some((
+            symbol,
             SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) },
         ))
     }
@@ -358,6 +404,50 @@ impl<'a> EssentialsTable<'a> {
 
     pub fn alkane_creation_ordered_prefix(&self) -> Vec<u8> {
         self.ALKANE_CREATION_ORDERED.key().to_vec()
+    }
+
+    pub fn circulating_supply_key(&self, alkane: &SchemaAlkaneId, height: u32) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 4);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        suffix.extend_from_slice(&height.to_be_bytes());
+        self.CIRCULATING_SUPPLY.select(&suffix).key().to_vec()
+    }
+
+    pub fn circulating_supply_prefix(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.CIRCULATING_SUPPLY.select(&suffix).key().to_vec()
+    }
+
+    pub fn circulating_supply_latest_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.CIRCULATING_SUPPLY_LATEST.select(&suffix).key().to_vec()
+    }
+
+    pub fn total_minted_key(&self, alkane: &SchemaAlkaneId, height: u32) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 4);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        suffix.extend_from_slice(&height.to_be_bytes());
+        self.TOTAL_MINTED.select(&suffix).key().to_vec()
+    }
+
+    pub fn total_minted_prefix(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.TOTAL_MINTED.select(&suffix).key().to_vec()
+    }
+
+    pub fn total_minted_latest_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.TOTAL_MINTED_LATEST.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_creation_count_key(&self) -> Vec<u8> {
@@ -2448,6 +2538,14 @@ pub fn decode_alkane_info(bytes: &[u8]) -> Result<AlkaneInfo> {
     Ok(AlkaneInfo::try_from_slice(bytes)?)
 }
 
+pub fn encode_u128_value(value: u128) -> Result<Vec<u8>> {
+    Ok(borsh::to_vec(&value)?)
+}
+
+pub fn decode_u128_value(bytes: &[u8]) -> Result<u128> {
+    Ok(u128::try_from_slice(bytes)?)
+}
+
 pub fn encode_creation_record(record: &AlkaneCreationRecord) -> Result<Vec<u8>> {
     Ok(borsh::to_vec(record)?)
 }
@@ -2456,6 +2554,33 @@ pub fn decode_creation_record(bytes: &[u8]) -> Result<AlkaneCreationRecord> {
     // Try new schema first; fall back to legacy Option name/symbol layout.
     if let Ok(rec) = AlkaneCreationRecord::try_from_slice(bytes) {
         return Ok(rec);
+    }
+
+    #[derive(BorshDeserialize)]
+    struct LegacyCreationRecordV2 {
+        alkane: SchemaAlkaneId,
+        txid: [u8; 32],
+        creation_height: u32,
+        creation_timestamp: u32,
+        tx_index_in_block: u32,
+        inspection: Option<crate::modules::essentials::utils::inspections::StoredInspectionResult>,
+        names: Vec<String>,
+        symbols: Vec<String>,
+    }
+
+    if let Ok(legacy) = LegacyCreationRecordV2::try_from_slice(bytes) {
+        return Ok(AlkaneCreationRecord {
+            alkane: legacy.alkane,
+            txid: legacy.txid,
+            creation_height: legacy.creation_height,
+            creation_timestamp: legacy.creation_timestamp,
+            tx_index_in_block: legacy.tx_index_in_block,
+            inspection: legacy.inspection,
+            names: legacy.names,
+            symbols: legacy.symbols,
+            cap: 0,
+            mint_amount: 0,
+        });
     }
 
     #[derive(BorshDeserialize)]
@@ -2488,6 +2613,8 @@ pub fn decode_creation_record(bytes: &[u8]) -> Result<AlkaneCreationRecord> {
         inspection: legacy.inspection,
         names,
         symbols,
+        cap: 0,
+        mint_amount: 0,
     })
 }
 
@@ -2687,6 +2814,8 @@ mod tests {
             inspection: None,
             names: vec!["demo".to_string(), "demo2".to_string()],
             symbols: vec!["DMO".to_string()],
+            cap: 500,
+            mint_amount: 25,
         };
 
         let encoded = encode_creation_record(&rec).expect("encode");

@@ -1,4 +1,7 @@
-use super::schemas::{SchemaPoolSnapshot, SchemaReservesSnapshot, Timeframe};
+use super::schemas::{
+    SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaPoolSnapshot, SchemaReservesSnapshot,
+    SchemaTokenMetricsV1, Timeframe,
+};
 use crate::modules::ammdata::consts::{KEY_INDEX_HEIGHT, PRICE_SCALE};
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -90,9 +93,14 @@ pub struct AmmDataTable<'a> {
     pub POOLS: MdbPointer<'a>,
     // Candle series (fc1:<blk>:<tx>:<tf>:...).
     pub CANDLES: MdbPointer<'a>,
+    pub TOKEN_USD_CANDLES: MdbPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
     pub ACTIVITY: MdbPointer<'a>,
     pub ACTIVITY_INDEX: MdbPointer<'a>,
+    // Token-level indices.
+    pub CANONICAL_POOL: MdbPointer<'a>,
+    pub TOKEN_METRICS: MdbPointer<'a>,
+    pub POOL_NAME_INDEX: MdbPointer<'a>,
 }
 
 impl<'a> AmmDataTable<'a> {
@@ -104,8 +112,12 @@ impl<'a> AmmDataTable<'a> {
             RESERVES_SNAPSHOT: root.keyword("/reserves_snapshot_v1"),
             POOLS: root.keyword("/pools/"),
             CANDLES: root.keyword("fc1:"),
+            TOKEN_USD_CANDLES: root.keyword("tuc1:"),
             ACTIVITY: root.keyword("activity:v1:"),
             ACTIVITY_INDEX: root.keyword("activity:idx:"),
+            CANONICAL_POOL: root.keyword("/canonical_pool/v1/"),
+            TOKEN_METRICS: root.keyword("/token_metrics/v1/"),
+            POOL_NAME_INDEX: root.keyword("/pool_name_index/"),
         }
     }
 }
@@ -136,6 +148,51 @@ impl<'a> AmmDataTable<'a> {
         let mut k = self.candle_ns_prefix(pool, tf);
         k.extend_from_slice(bucket_ts.to_string().as_bytes());
         k
+    }
+
+    pub fn token_usd_candle_ns_prefix(&self, token: &SchemaAlkaneId, tf: Timeframe) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let suffix = format!("{}:{}:{}:", blk_hex, tx_hex, tf.code());
+        self.TOKEN_USD_CANDLES.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_usd_candle_key(
+        &self,
+        token: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_usd_candle_ns_prefix(token, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn canonical_pool_key(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&token.block.to_be_bytes());
+        suffix.extend_from_slice(&token.tx.to_be_bytes());
+        self.CANONICAL_POOL.select(&suffix).key().to_vec()
+    }
+
+    pub fn token_metrics_key(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&token.block.to_be_bytes());
+        suffix.extend_from_slice(&token.tx.to_be_bytes());
+        self.TOKEN_METRICS.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_name_index_key(&self, name: &str, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(name.len() + 1 + 12);
+        suffix.extend_from_slice(name.as_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_NAME_INDEX.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_name_index_prefix(&self, name_prefix: &str) -> Vec<u8> {
+        self.POOL_NAME_INDEX.select(name_prefix.as_bytes()).key().to_vec()
     }
 
     pub fn pools_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
@@ -951,6 +1008,37 @@ pub fn encode_full_candle_v1(v: &SchemaFullCandleV1) -> anyhow::Result<Vec<u8>> 
     let mut out = Vec::with_capacity(64);
     v.serialize(&mut out)?;
     Ok(out)
+}
+
+pub fn decode_candle_v1(bytes: &[u8]) -> anyhow::Result<SchemaCandleV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaCandleV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_candle_v1(v: &SchemaCandleV1) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(40);
+    v.serialize(&mut out)?;
+    Ok(out)
+}
+
+pub fn decode_canonical_pools(bytes: &[u8]) -> anyhow::Result<Vec<SchemaCanonicalPoolEntry>> {
+    use borsh::BorshDeserialize;
+    Ok(Vec::<SchemaCanonicalPoolEntry>::try_from_slice(bytes)?)
+}
+
+pub fn encode_canonical_pools(
+    entries: &[SchemaCanonicalPoolEntry],
+) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(entries)?)
+}
+
+pub fn decode_token_metrics(bytes: &[u8]) -> anyhow::Result<SchemaTokenMetricsV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaTokenMetricsV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_token_metrics(v: &SchemaTokenMetricsV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
 }
 
 // Encode Snapshot -> BORSH (deterministic order via BTreeMap)

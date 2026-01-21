@@ -11,6 +11,7 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, created_alkane_records_from_block, inspect_wasm_metadata,
 };
+use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::names::{
     get_name as get_alkane_name, normalize_alkane_name,
 };
@@ -119,12 +120,19 @@ impl EspoModule for Essentials {
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
         let mut name_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut symbol_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let add_name_index =
             |rows: &mut HashMap<Vec<u8>, Vec<u8>>, alk: &SchemaAlkaneId, name: &str| {
             if let Some(norm) = normalize_alkane_name(name) {
                 rows.insert(table.alkane_name_index_key(&norm, alk), Vec::new());
             }
         };
+        let add_symbol_index =
+            |rows: &mut HashMap<Vec<u8>, Vec<u8>>, alk: &SchemaAlkaneId, symbol: &str| {
+                if let Some(norm) = normalize_alkane_name(symbol) {
+                    rows.insert(table.alkane_symbol_index_key(&norm, alk), Vec::new());
+                }
+            };
         // block summary row (trace count + header)
         let trace_count = block
             .transactions
@@ -234,6 +242,8 @@ impl EspoModule for Essentials {
                     inspection: None,
                     names,
                     symbols,
+                    cap: 0,
+                    mint_amount: 0,
                 });
             }
         }
@@ -293,9 +303,27 @@ impl EspoModule for Essentials {
             }
         }
 
+        for rec in created_records.iter_mut() {
+            if rec.cap == 0 {
+                if let Some(cap) = get_cap(block.height, &rec.alkane, rec.inspection.as_ref()) {
+                    rec.cap = cap;
+                }
+            }
+            if rec.mint_amount == 0 {
+                if let Some(mint_amount) =
+                    get_value_per_mint(block.height, &rec.alkane, rec.inspection.as_ref())
+                {
+                    rec.mint_amount = mint_amount;
+                }
+            }
+        }
+
         for rec in created_records.iter() {
             for name in rec.names.iter() {
                 add_name_index(&mut name_index_rows, &rec.alkane, name);
+            }
+            for symbol in rec.symbols.iter() {
+                add_symbol_index(&mut symbol_index_rows, &rec.alkane, symbol);
             }
         }
 
@@ -435,6 +463,11 @@ impl EspoModule for Essentials {
                     add_name_index(&mut name_index_rows, &rec.alkane, name);
                 }
             }
+            if symbol_dirty {
+                for symbol in rec.symbols.iter() {
+                    add_symbol_index(&mut symbol_index_rows, &rec.alkane, symbol);
+                }
+            }
             let encoded = match encode_creation_record(&rec) {
                 Ok(v) => v,
                 Err(e) => {
@@ -467,6 +500,8 @@ impl EspoModule for Essentials {
         creation_keys_ordered.sort_unstable();
         let mut name_index_keys: Vec<Vec<u8>> = name_index_rows.keys().cloned().collect();
         name_index_keys.sort_unstable();
+        let mut symbol_index_keys: Vec<Vec<u8>> = symbol_index_rows.keys().cloned().collect();
+        symbol_index_keys.sort_unstable();
         let mut holders_index_keys: Vec<Vec<u8>> = holders_index_rows.into_iter().collect();
         holders_index_keys.sort_unstable();
         let mut creation_count_row: Option<[u8; 8]> = None;
@@ -499,6 +534,11 @@ impl EspoModule for Essentials {
         }
         for k in &name_index_keys {
             if let Some(v) = name_index_rows.get(k) {
+                puts.push((k.clone(), v.clone()));
+            }
+        }
+        for k in &symbol_index_keys {
+            if let Some(v) = symbol_index_rows.get(k) {
                 puts.push((k.clone(), v.clone()));
             }
         }

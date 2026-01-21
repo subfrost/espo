@@ -21,3 +21,29 @@ pub const GET_RESERVES_OPCODE: u8 = 0x61;
 pub const DEPLOY_AMM_OPCODE: u8 = 0x01;
 pub const PRICE_SCALE: u128 = 100_000_000; // 1e18
 pub const K_TOLERANCE: f64 = 0.001; // 0.1%
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalQuoteUnit {
+    Btc,
+    Usd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonicalQuote {
+    pub id: SchemaAlkaneId,
+    pub unit: CanonicalQuoteUnit,
+}
+
+pub fn canonical_quotes(network: Network) -> Vec<CanonicalQuote> {
+    let mainnet = vec![
+        CanonicalQuote { id: SchemaAlkaneId { block: 32, tx: 0 }, unit: CanonicalQuoteUnit::Btc },
+        CanonicalQuote {
+            id: SchemaAlkaneId { block: 2, tx: 56801 },
+            unit: CanonicalQuoteUnit::Usd,
+        },
+    ];
+    match network {
+        Network::Bitcoin => mainnet,
+        _ => mainnet,
+    }
+}

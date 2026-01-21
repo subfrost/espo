@@ -1,0 +1,105 @@
+use crate::config::{get_config, get_espo_db};
+use crate::modules::ammdata::storage::AmmDataProvider;
+use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use crate::modules::essentials::storage::EssentialsProvider;
+use crate::modules::oylapi::config::OylApiConfig;
+use crate::modules::oylapi::server::{OylApiState, run as run_oylapi};
+use crate::runtime::mdb::Mdb;
+use anyhow::{Result, anyhow};
+use bitcoin::Network;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+pub struct OylApi {
+    config: Option<OylApiConfig>,
+    essentials: Option<Arc<EssentialsProvider>>,
+    ammdata: Option<Arc<AmmDataProvider>>,
+}
+
+impl OylApi {
+    pub fn new() -> Self {
+        Self { config: None, essentials: None, ammdata: None }
+    }
+}
+
+impl Default for OylApi {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EspoModule for OylApi {
+    fn get_name(&self) -> &'static str {
+        "oylapi"
+    }
+
+    fn set_mdb(&mut self, _mdb: Arc<Mdb>) {
+        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
+        let essentials = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
+        let amm_mdb = Mdb::from_db(get_espo_db(), b"ammdata:");
+        let ammdata = Arc::new(AmmDataProvider::new(Arc::new(amm_mdb), essentials.clone()));
+        self.essentials = Some(essentials);
+        self.ammdata = Some(ammdata);
+    }
+
+    fn get_genesis_block(&self, _network: Network) -> u32 {
+        u32::MAX
+    }
+
+    fn index_block(&self, _block: crate::alkanes::trace::EspoBlock) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_index_height(&self) -> Option<u32> {
+        None
+    }
+
+    fn register_rpc(&self, _reg: &RpcNsRegistrar) {
+        let Some(cfg) = self.config.clone() else {
+            return;
+        };
+        let essentials = self
+            .essentials
+            .as_ref()
+            .expect("oylapi module missing essentials provider")
+            .clone();
+        let ammdata = self
+            .ammdata
+            .as_ref()
+            .expect("oylapi module missing ammdata provider")
+            .clone();
+
+        let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid oylapi host/port: {e}"));
+
+        let state = OylApiState {
+            config: cfg,
+            essentials,
+            ammdata,
+            http_client: reqwest::Client::new(),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = run_oylapi(addr, state).await {
+                eprintln!("[oylapi] server error: {e:?}");
+            }
+        });
+        eprintln!("[oylapi] listening on {}", addr);
+    }
+
+    fn config_spec(&self) -> Option<&'static str> {
+        Some(OylApiConfig::spec())
+    }
+
+    fn set_config(&mut self, config: &serde_json::Value) -> Result<()> {
+        if get_config().electrs_esplora_url.is_none() {
+            return Err(anyhow!(
+                "oylapi requires electrs_esplora_url (script-hash UTXO support)"
+            ));
+        }
+        let parsed = OylApiConfig::from_value(config)?;
+        self.config = Some(parsed);
+        Ok(())
+    }
+}

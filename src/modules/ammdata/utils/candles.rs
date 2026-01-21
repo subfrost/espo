@@ -34,6 +34,10 @@ fn bucket_start(ts: u64, frame: Timeframe) -> u64 {
     ts / d * d
 }
 
+pub fn bucket_start_for(ts: u64, frame: Timeframe) -> u64 {
+    bucket_start(ts, frame)
+}
+
 /* ---------- in-memory aggregation cache ---------- */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -123,14 +127,22 @@ impl CandleCache {
     /// - close: use cache.close (later)
     /// - volume: sum
     pub fn into_writes(self, provider: &AmmDataProvider) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let (writes, _) = self.into_writes_with_entries(provider)?;
+        Ok(writes)
+    }
+
+    pub fn into_writes_with_entries(
+        self,
+        provider: &AmmDataProvider,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(SchemaAlkaneId, Timeframe, u64, SchemaFullCandleV1)>)>
+    {
         let mut writes = Vec::with_capacity(self.map.len());
+        let mut entries = Vec::with_capacity(self.map.len());
         let table = provider.table();
 
         for (ck, dc_new) in self.map.into_iter() {
-            // Key for this pool/tf/bucket
             let k = table.candle_key(&ck.pool, ck.tf, ck.bucket_ts);
 
-            // Merge with existing (if any)
             let merged = if let Some(raw) = provider
                 .get_raw_value(GetRawValueParams { key: k.clone() })?
                 .value
@@ -156,9 +168,10 @@ impl CandleCache {
 
             let v = encode_full_candle_v1(&merged)?;
             writes.push((k, v));
+            entries.push((ck.pool, ck.tf, ck.bucket_ts, merged));
         }
 
-        Ok(writes)
+        Ok((writes, entries))
     }
 }
 

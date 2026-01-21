@@ -1,25 +1,32 @@
 use super::schemas::{
-    ActivityDirection, ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolSnapshot,
+    ActivityDirection, ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry,
+    SchemaCandleV1, SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolSnapshot, SchemaTokenMetricsV1,
+    Timeframe,
     active_timeframes,
 };
 use super::storage::{
-    AmmDataProvider, GetRawValueParams, SetBatchParams, decode_reserves_snapshot,
-    encode_reserves_snapshot,
+    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams, SetBatchParams, decode_candle_v1,
+    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot, encode_candle_v1,
+    encode_canonical_pools, encode_reserves_snapshot, encode_token_metrics,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
-use super::utils::candles::CandleCache;
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{get_espo_db, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
-use crate::modules::ammdata::consts::{ammdata_genesis_block, get_amm_contract};
-use crate::modules::ammdata::utils::candles::{price_base_per_quote, price_quote_per_base};
+use crate::modules::ammdata::consts::{
+    CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes, get_amm_contract,
+};
+use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
+use crate::modules::ammdata::utils::candles::{
+    CandleCache, bucket_start_for, price_base_per_quote, price_quote_per_base,
+};
 use crate::modules::ammdata::utils::reserves::{
     NewPoolInfo, extract_new_pools_from_espo_transaction,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, GetCreationRecordParams, GetRawValueParams as EssentialsGetRawValueParams,
-    EssentialsProvider,
+    AlkaneBalanceTxEntry, GetCreationRecordParams,
+    GetRawValueParams as EssentialsGetRawValueParams, EssentialsProvider,
 };
 use crate::modules::essentials::utils::balances::SignedU128;
 use crate::modules::essentials::utils::inspections::StoredInspectionResult;
@@ -254,6 +261,11 @@ impl EspoModule for AmmData {
         }
 
         let network = get_network();
+        let canonical_quotes_list = canonical_quotes(network);
+        let mut canonical_quote_units: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
+        for cq in canonical_quotes_list.iter() {
+            canonical_quote_units.insert(cq.id, cq.unit);
+        }
         let base_factory = get_amm_contract(network).ok();
         let factory_target = match resolve_factory_target(network, essentials) {
             Ok(target) => target,
@@ -264,8 +276,34 @@ impl EspoModule for AmmData {
         };
 
         let mut candle_cache = CandleCache::new();
+        let frames = active_timeframes();
         let mut activity_acc = ActivityWriteAcc::new();
         let mut index_acc = ActivityIndexAcc::new();
+        let mut canonical_pool_updates: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>> =
+            HashMap::new();
+        let mut pool_name_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut alkane_label_cache: HashMap<SchemaAlkaneId, String> = HashMap::new();
+        let get_alkane_label = |essentials: &EssentialsProvider,
+                                cache: &mut HashMap<SchemaAlkaneId, String>,
+                                alkane: &SchemaAlkaneId|
+         -> String {
+            if let Some(label) = cache.get(alkane) {
+                return label.clone();
+            }
+            let label = essentials
+                .get_creation_record(GetCreationRecordParams { alkane: *alkane })
+                .ok()
+                .and_then(|resp| resp.record)
+                .and_then(|rec| {
+                    rec.symbols
+                        .first()
+                        .cloned()
+                        .or_else(|| rec.names.first().cloned())
+                })
+                .unwrap_or_else(|| format!("{}:{}", alkane.block, alkane.tx));
+            cache.insert(*alkane, label.clone());
+            label
+        };
 
         // Discover new pools (per-tx) and record pool creation activity.
         let mut seen_new_pools: HashSet<(u32, u64)> = HashSet::new();
@@ -318,6 +356,25 @@ impl EspoModule for AmmData {
                         base_id: defs.base_alkane_id,
                         quote_id: defs.quote_alkane_id,
                     });
+                    if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
+                        canonical_pool_updates
+                            .entry(defs.base_alkane_id)
+                            .or_default()
+                            .push(SchemaCanonicalPoolEntry {
+                                pool_id,
+                                quote_id: defs.quote_alkane_id,
+                            });
+                    }
+
+                    let base_label = get_alkane_label(essentials, &mut alkane_label_cache, &defs.base_alkane_id);
+                    let quote_label =
+                        get_alkane_label(essentials, &mut alkane_label_cache, &defs.quote_alkane_id);
+                    let pool_name = format!("{base_label} / {quote_label}");
+                    let pool_name_norm = pool_name.trim().to_ascii_lowercase();
+                    if !pool_name_norm.is_empty() {
+                        pool_name_index_writes
+                            .push((table.pool_name_index_key(&pool_name_norm, &pool_id), Vec::new()));
+                    }
 
                     let txid_bytes = transaction.transaction.compute_txid().to_byte_array();
 
@@ -360,6 +417,10 @@ impl EspoModule for AmmData {
             }
         };
 
+        let mut has_trades = false;
+        let mut canonical_trade_buckets: HashMap<SchemaAlkaneId, HashSet<(Timeframe, u64)>> =
+            HashMap::new();
+
         // Apply balance deltas per pool and emit activity + candles.
         for (owner, entries) in balance_txs {
             let Some(defs) = pools_map.get(&owner) else { continue };
@@ -401,6 +462,7 @@ impl EspoModule for AmmData {
                 }
 
                 if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
+                    has_trades = true;
                     let p_q_per_b = price_quote_per_base(new_base, new_quote);
                     let p_b_per_q = price_base_per_quote(new_base, new_quote);
                     let base_in = if base_delta > 0 { base_delta as u128 } else { 0 };
@@ -409,18 +471,348 @@ impl EspoModule for AmmData {
                     candle_cache.apply_trade_for_frames(
                         block_ts,
                         owner,
-                        &active_timeframes(),
+                        &frames,
                         p_b_per_q,
                         p_q_per_b,
                         base_in,
                         quote_out,
                     );
+
+                    if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
+                        let entry = canonical_trade_buckets
+                            .entry(defs.base_alkane_id)
+                            .or_default();
+                        for tf in &frames {
+                            entry.insert((*tf, bucket_start_for(block_ts, *tf)));
+                        }
+                    }
                 }
             }
         }
 
+        // ---------- derived data (canonical pools + token USD candles + metrics) ----------
+        let btc_usd_price = if has_trades {
+            match UniswapPriceFeed::from_global_config() {
+                Ok(feed) => Some(feed.get_bitcoin_price_usd_at_block_height(height as u64)),
+                Err(e) => {
+                    eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut canonical_pools_by_token: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>> =
+            HashMap::new();
+        for (pool, defs) in pools_map.iter() {
+            if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
+                canonical_pools_by_token
+                    .entry(defs.base_alkane_id)
+                    .or_default()
+                    .push(SchemaCanonicalPoolEntry {
+                        pool_id: *pool,
+                        quote_id: defs.quote_alkane_id,
+                    });
+            }
+        }
+
+        let (candle_writes, candle_entries) = candle_cache.into_writes_with_entries(provider)?;
+        let mut pool_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaFullCandleV1> =
+            HashMap::new();
+        for (pool, tf, bucket_ts, candle) in candle_entries {
+            pool_candle_overrides.insert((pool, tf, bucket_ts), candle);
+        }
+
+        let mut canonical_pool_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (token, new_entries) in canonical_pool_updates.iter() {
+            let key = table.canonical_pool_key(token);
+            let mut existing = if let Some(raw) =
+                provider.get_raw_value(GetRawValueParams { key: key.clone() })?.value
+            {
+                decode_canonical_pools(&raw).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut changed = false;
+            for entry in new_entries {
+                if !existing.iter().any(|e| e == entry) {
+                    existing.push(*entry);
+                    changed = true;
+                }
+            }
+            if changed {
+                let encoded = encode_canonical_pools(&existing)?;
+                canonical_pool_writes.push((key, encoded));
+            }
+        }
+
+        let mut token_usd_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaCandleV1> =
+            HashMap::new();
+        let mut token_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        if !canonical_trade_buckets.is_empty() {
+            let load_pool_candle = |pool: &SchemaAlkaneId,
+                                    tf: Timeframe,
+                                    bucket_ts: u64,
+                                    provider: &AmmDataProvider,
+                                    table: &super::storage::AmmDataTable<'_>,
+                                    overrides: &HashMap<
+                                        (SchemaAlkaneId, Timeframe, u64),
+                                        SchemaFullCandleV1,
+                                    >|
+             -> Result<Option<SchemaFullCandleV1>> {
+                if let Some(c) = overrides.get(&(*pool, tf, bucket_ts)) {
+                    return Ok(Some(*c));
+                }
+                let key = table.candle_key(pool, tf, bucket_ts);
+                if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value {
+                    return Ok(Some(decode_full_candle_v1(&raw)?));
+                }
+                Ok(None)
+            };
+
+            for (token, buckets) in canonical_trade_buckets.iter() {
+                let Some(pools) = canonical_pools_by_token.get(token) else { continue };
+                for (tf, bucket_ts) in buckets {
+                    let mut btc_candle: Option<SchemaCandleV1> = None;
+                    let mut usd_candle: Option<SchemaCandleV1> = None;
+
+                    for entry in pools.iter() {
+                        let Some(unit) = canonical_quote_units.get(&entry.quote_id) else { continue };
+                        let Some(pool_candle) = load_pool_candle(
+                            &entry.pool_id,
+                            *tf,
+                            *bucket_ts,
+                            provider,
+                            &table,
+                            &pool_candle_overrides,
+                        )? else {
+                            continue;
+                        };
+
+                        let quote_volume = pool_candle.quote_candle.volume;
+                        let conv = |p: u128| -> Option<u128> {
+                            match unit {
+                                CanonicalQuoteUnit::Usd => Some(p),
+                                CanonicalQuoteUnit::Btc => btc_usd_price
+                                    .map(|btc| p.saturating_mul(btc) / PRICE_SCALE),
+                            }
+                        };
+                        let conv_vol = |v: u128| -> Option<u128> {
+                            match unit {
+                                CanonicalQuoteUnit::Usd => Some(v),
+                                CanonicalQuoteUnit::Btc => btc_usd_price
+                                    .map(|btc| v.saturating_mul(btc) / PRICE_SCALE),
+                            }
+                        };
+
+                        let Some(open) = conv(pool_candle.base_candle.open) else { continue };
+                        let Some(high) = conv(pool_candle.base_candle.high) else { continue };
+                        let Some(low) = conv(pool_candle.base_candle.low) else { continue };
+                        let Some(close) = conv(pool_candle.base_candle.close) else { continue };
+                        let Some(volume) = conv_vol(quote_volume) else { continue };
+
+                        let converted = SchemaCandleV1 { open, high, low, close, volume };
+                        match unit {
+                            CanonicalQuoteUnit::Usd => {
+                                usd_candle = Some(converted);
+                            }
+                            CanonicalQuoteUnit::Btc => {
+                                btc_candle = Some(converted);
+                            }
+                        }
+                    }
+
+                    let mut derived = match (btc_candle, usd_candle) {
+                        (Some(btc), Some(usd)) => SchemaCandleV1 {
+                            open: 0,
+                            high: (btc.high.saturating_add(usd.high)) / 2,
+                            low: (btc.low.saturating_add(usd.low)) / 2,
+                            close: (btc.close.saturating_add(usd.close)) / 2,
+                            volume: btc.volume.saturating_add(usd.volume),
+                        },
+                        (Some(one), None) | (None, Some(one)) => SchemaCandleV1 {
+                            open: 0,
+                            high: one.high,
+                            low: one.low,
+                            close: one.close,
+                            volume: one.volume,
+                        },
+                        _ => continue,
+                    };
+
+                    let existing = if let Some(c) =
+                        token_usd_candle_overrides.get(&(*token, *tf, *bucket_ts))
+                    {
+                        Some(*c)
+                    } else {
+                        let key = table.token_usd_candle_key(token, *tf, *bucket_ts);
+                        if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value
+                        {
+                            Some(decode_candle_v1(&raw)?)
+                        } else {
+                            None
+                        }
+                    };
+
+                    let open = if let Some(prev) = existing {
+                        prev.open
+                    } else {
+                        let prev_bucket = bucket_ts
+                            .checked_sub(tf.duration_secs())
+                            .unwrap_or(*bucket_ts);
+                        if let Some(c) =
+                            token_usd_candle_overrides.get(&(*token, *tf, prev_bucket))
+                        {
+                            c.close
+                        } else {
+                            let key = table.token_usd_candle_key(token, *tf, prev_bucket);
+                            provider
+                                .get_raw_value(GetRawValueParams { key })?
+                                .value
+                                .and_then(|raw| decode_candle_v1(&raw).ok())
+                                .map(|c| c.close)
+                                .unwrap_or(0)
+                        }
+                    };
+                    derived.open = open;
+                    if derived.open > derived.high {
+                        derived.high = derived.open;
+                    }
+                    if derived.open < derived.low {
+                        derived.low = derived.open;
+                    }
+
+                    token_usd_candle_overrides.insert((*token, *tf, *bucket_ts), derived);
+                }
+            }
+
+            for ((token, tf, bucket_ts), candle) in token_usd_candle_overrides.iter() {
+                let key = table.token_usd_candle_key(token, *tf, *bucket_ts);
+                let encoded = encode_candle_v1(candle)?;
+                token_usd_candle_writes.push((key, encoded));
+            }
+
+            for token in canonical_trade_buckets.keys() {
+                let prefix = table.token_usd_candle_ns_prefix(token, Timeframe::M10);
+                let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+                for (k, v) in provider
+                    .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+                    .entries
+                {
+                    if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+                        if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                            if let Ok(ts) = ts_str.parse::<u64>() {
+                                if !per_bucket.contains_key(&ts) {
+                                    if let Ok(c) = decode_candle_v1(&v) {
+                                        per_bucket.insert(ts, c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for ((tok, tf, bucket), candle) in token_usd_candle_overrides.iter() {
+                    if tok == token && *tf == Timeframe::M10 {
+                        per_bucket.insert(*bucket, *candle);
+                    }
+                }
+
+                let now_bucket = bucket_start_for(block_ts, Timeframe::M10);
+                let earliest_bucket = per_bucket.keys().next().copied().unwrap_or(now_bucket);
+
+                let close_at = |target_bucket: u64| -> u128 {
+                    if per_bucket.is_empty() {
+                        return 0;
+                    }
+                    if target_bucket <= earliest_bucket {
+                        return per_bucket
+                            .get(&earliest_bucket)
+                            .map(|c| c.close)
+                            .unwrap_or(0);
+                    }
+                    let mut bts = earliest_bucket;
+                    let mut last_close = 0u128;
+                    while bts <= target_bucket {
+                        if let Some(c) = per_bucket.get(&bts) {
+                            last_close = c.close;
+                        }
+                        bts = match bts.checked_add(Timeframe::M10.duration_secs()) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                    }
+                    last_close
+                };
+
+                let latest_close = close_at(now_bucket);
+                let first_close = per_bucket
+                    .get(&earliest_bucket)
+                    .map(|c| c.close)
+                    .unwrap_or(0);
+
+                let window_close = |secs: u64| -> u128 {
+                    let target = now_bucket.saturating_sub(secs);
+                    close_at(target)
+                };
+
+                let percent_change = |prev: u128, now: u128| -> String {
+                    if prev == 0 {
+                        return "0".to_string();
+                    }
+                    let prev_f = prev as f64;
+                    let now_f = now as f64;
+                    let pct = (now_f - prev_f) / prev_f * 100.0;
+                    format!("{:.4}", pct)
+                };
+
+                let volume_window = |secs: u64| -> u128 {
+                    let start = now_bucket.saturating_sub(secs);
+                    per_bucket
+                        .range(start..=now_bucket)
+                        .map(|(_, c)| c.volume)
+                        .sum()
+                };
+
+                let volume_all_time: u128 = per_bucket.values().map(|c| c.volume).sum();
+
+                let supply = {
+                    let table_e = essentials.table();
+                    let key = table_e.circulating_supply_latest_key(token);
+                    essentials
+                        .get_raw_value(EssentialsGetRawValueParams { key })?
+                        .value
+                        .and_then(|v| crate::modules::essentials::storage::decode_u128_value(&v).ok())
+                        .unwrap_or(0)
+                };
+
+                let price_usd = latest_close;
+                let fdv_usd = price_usd.saturating_mul(supply) / PRICE_SCALE;
+                let marketcap_usd = fdv_usd;
+
+                let metrics = SchemaTokenMetricsV1 {
+                    price_usd,
+                    fdv_usd,
+                    marketcap_usd,
+                    volume_all_time,
+                    volume_1d: volume_window(24 * 60 * 60),
+                    volume_7d: volume_window(7 * 24 * 60 * 60),
+                    volume_30d: volume_window(30 * 24 * 60 * 60),
+                    change_1d: percent_change(window_close(24 * 60 * 60), latest_close),
+                    change_7d: percent_change(window_close(7 * 24 * 60 * 60), latest_close),
+                    change_30d: percent_change(window_close(30 * 24 * 60 * 60), latest_close),
+                    change_all_time: percent_change(first_close, latest_close),
+                };
+
+                let encoded = encode_token_metrics(&metrics)?;
+                token_metrics_writes.push((table.token_metrics_key(token), encoded));
+            }
+        }
+
         // ---------- one atomic DB write (candles + activity + indexes + reserves snapshot) ----------
-        let candle_writes = candle_cache.into_writes(provider)?;
         let activity_writes = activity_acc.into_writes();
         let idx_delta = index_acc.clone().per_pool_delta();
         let idx_group_delta = index_acc.clone().per_pool_group_delta();
@@ -471,24 +863,40 @@ impl EspoModule for AmmData {
         let reserves_key_rel = table.reserves_snapshot_key();
 
         let c_cnt = candle_writes.len();
+        let tc_cnt = token_usd_candle_writes.len();
+        let tm_cnt = token_metrics_writes.len();
+        let cp_cnt = canonical_pool_writes.len();
+        let pn_cnt = pool_name_index_writes.len();
         let a_cnt = activity_writes.len();
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
+            tc_cnt = tc_cnt,
+            tm_cnt = tm_cnt,
+            cp_cnt = cp_cnt,
+            pn_cnt = pn_cnt,
             a_cnt = a_cnt,
             i_cnt = i_cnt,
         );
 
         if !candle_writes.is_empty()
+            || !token_usd_candle_writes.is_empty()
+            || !token_metrics_writes.is_empty()
+            || !canonical_pool_writes.is_empty()
+            || !pool_name_index_writes.is_empty()
             || !activity_writes.is_empty()
             || !index_writes.is_empty()
             || !reserves_blob.is_empty()
         {
             let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             puts.extend(candle_writes);
+            puts.extend(token_usd_candle_writes);
+            puts.extend(token_metrics_writes);
+            puts.extend(canonical_pool_writes);
+            puts.extend(pool_name_index_writes);
             puts.extend(activity_writes);
             puts.extend(index_writes);
             puts.push((reserves_key_rel, reserves_blob));

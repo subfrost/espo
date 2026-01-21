@@ -13,7 +13,8 @@ use crate::config::{
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
-    decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, encode_vec,
+    decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, decode_u128_value,
+    encode_u128_value, encode_vec,
     mk_outpoint, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
@@ -850,6 +851,7 @@ pub fn bulk_update_balances_for_block(
     let mut stat_outpoints_written: usize = 0;
     let mut stat_minus_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
     let mut stat_plus_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+    let mut minted_delta_by_alk: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
     let mut alkane_tx_summaries: Vec<AlkaneTxSummary> = Vec::new();
     let mut alkane_block_txids: Vec<[u8; 32]> = Vec::new();
     let mut alkane_address_txids: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
@@ -1318,6 +1320,11 @@ pub fn bulk_update_balances_for_block(
                 );
                 if *token == *holder_alk {
                     // Keep self-token outflows for summaries/ammdata, but don't persist balances.
+                    let (is_negative, mag) = delta.as_parts();
+                    if is_negative && mag > 0 {
+                        *minted_delta_by_alk.entry(*token).or_default() =
+                            minted_delta_by_alk.get(token).copied().unwrap_or(0).saturating_add(mag);
+                    }
                     continue;
                 }
                 add_holder_delta(
@@ -1839,6 +1846,20 @@ pub fn bulk_update_balances_for_block(
             deletes.push(prev_index_key);
         }
         puts.push((new_index_key, Vec::new()));
+
+        let supply: u128 = vec_holders.iter().map(|h| h.amount).sum();
+        let supply_latest_key = table.circulating_supply_latest_key(alkane);
+        let prev_supply = provider
+            .get_raw_value(GetRawValueParams { key: supply_latest_key.clone() })?
+            .value
+            .and_then(|v| decode_u128_value(&v).ok())
+            .unwrap_or(0);
+        if supply != prev_supply {
+            let encoded = encode_u128_value(supply)?;
+            puts.push((table.circulating_supply_key(alkane, block.height), encoded.clone()));
+            puts.push((supply_latest_key, encoded));
+        }
+
         if vec_holders.is_empty() {
             deletes.push(holders_key);
         } else if let Ok((encoded_holders_vec, encoded_holders_count_vec)) =
@@ -1847,6 +1868,22 @@ pub fn bulk_update_balances_for_block(
             puts.push((holders_key, encoded_holders_vec));
             puts.push((holders_count_key, encoded_holders_count_vec));
         }
+    }
+
+    for (alkane, delta) in minted_delta_by_alk.iter() {
+        if *delta == 0 {
+            continue;
+        }
+        let latest_key = table.total_minted_latest_key(alkane);
+        let prev_total = provider
+            .get_raw_value(GetRawValueParams { key: latest_key.clone() })?
+            .value
+            .and_then(|v| decode_u128_value(&v).ok())
+            .unwrap_or(0);
+        let new_total = prev_total.saturating_add(*delta);
+        let encoded = encode_u128_value(new_total)?;
+        puts.push((table.total_minted_key(alkane, block.height), encoded.clone()));
+        puts.push((latest_key, encoded));
     }
 
     if is_strict_mode() {

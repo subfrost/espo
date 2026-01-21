@@ -18,6 +18,27 @@ pub struct SchemaFullCandleV1 {
 }
 
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy)]
+pub struct SchemaCanonicalPoolEntry {
+    pub pool_id: SchemaAlkaneId,
+    pub quote_id: SchemaAlkaneId,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Default)]
+pub struct SchemaTokenMetricsV1 {
+    pub price_usd: u128,
+    pub fdv_usd: u128,
+    pub marketcap_usd: u128,
+    pub volume_all_time: u128,
+    pub volume_1d: u128,
+    pub volume_7d: u128,
+    pub volume_30d: u128,
+    pub change_1d: String,
+    pub change_7d: String,
+    pub change_30d: String,
+    pub change_all_time: String,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Copy)]
 pub struct SchemaMarketDefs {
     pub base_alkane_id: SchemaAlkaneId,
     pub quote_alkane_id: SchemaAlkaneId,
@@ -60,7 +81,7 @@ impl SchemaCandleV1 {
         Self { open, high, low, close, volume }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Timeframe {
     M10,
     H1,
