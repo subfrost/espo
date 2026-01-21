@@ -1,14 +1,18 @@
 use super::schemas::{
-    SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaPoolSnapshot, SchemaReservesSnapshot,
-    SchemaTokenMetricsV1, Timeframe,
+    SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
+    SchemaPoolMetricsV1, SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1,
+    Timeframe,
 };
-use crate::modules::ammdata::consts::{KEY_INDEX_HEIGHT, PRICE_SCALE};
+use crate::modules::ammdata::consts::{
+    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, canonical_quotes,
+};
+use crate::config::get_network;
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
     ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir,
     read_activity_for_pool, read_activity_for_pool_sorted,
 };
-use crate::modules::ammdata::utils::candles::{PriceSide, read_candles_v1};
+use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
 use crate::modules::ammdata::utils::pathfinder::{
     DEFAULT_FEE_BPS, plan_best_mev_swap, plan_exact_in_default_fee, plan_exact_out_default_fee,
@@ -21,7 +25,7 @@ use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,6 +105,14 @@ pub struct AmmDataTable<'a> {
     pub CANONICAL_POOL: MdbPointer<'a>,
     pub TOKEN_METRICS: MdbPointer<'a>,
     pub POOL_NAME_INDEX: MdbPointer<'a>,
+    // Factory + pool indices.
+    pub AMM_FACTORIES: MdbPointer<'a>,
+    pub FACTORY_POOLS: MdbPointer<'a>,
+    pub POOL_FACTORY: MdbPointer<'a>,
+    pub POOL_METRICS: MdbPointer<'a>,
+    pub POOL_CREATION_INFO: MdbPointer<'a>,
+    pub POOL_LP_SUPPLY: MdbPointer<'a>,
+    pub TVL_VERSIONED: MdbPointer<'a>,
 }
 
 impl<'a> AmmDataTable<'a> {
@@ -118,6 +130,13 @@ impl<'a> AmmDataTable<'a> {
             CANONICAL_POOL: root.keyword("/canonical_pool/v1/"),
             TOKEN_METRICS: root.keyword("/token_metrics/v1/"),
             POOL_NAME_INDEX: root.keyword("/pool_name_index/"),
+            AMM_FACTORIES: root.keyword("/amm_factories/v1/"),
+            FACTORY_POOLS: root.keyword("/factory_pools/v1/"),
+            POOL_FACTORY: root.keyword("/pool_factory/v1/"),
+            POOL_METRICS: root.keyword("/pool_metrics/v1/"),
+            POOL_CREATION_INFO: root.keyword("/pool_creation_info/v1/"),
+            POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
+            TVL_VERSIONED: root.keyword("/tvlVersioned/"),
         }
     }
 }
@@ -193,6 +212,93 @@ impl<'a> AmmDataTable<'a> {
 
     pub fn pool_name_index_prefix(&self, name_prefix: &str) -> Vec<u8> {
         self.POOL_NAME_INDEX.select(name_prefix.as_bytes()).key().to_vec()
+    }
+
+    pub fn parse_pool_name_index_key(&self, key: &[u8]) -> Option<(String, SchemaAlkaneId)> {
+        let prefix = self.POOL_NAME_INDEX.key();
+        if !key.starts_with(prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        let split = rest.iter().rposition(|b| *b == b'/')?;
+        let name_bytes = &rest[..split];
+        let id_bytes = &rest[split + 1..];
+        if id_bytes.len() != 12 {
+            return None;
+        }
+        let mut block_arr = [0u8; 4];
+        block_arr.copy_from_slice(&id_bytes[..4]);
+        let mut tx_arr = [0u8; 8];
+        tx_arr.copy_from_slice(&id_bytes[4..12]);
+        let name = String::from_utf8(name_bytes.to_vec()).ok()?;
+        Some((name, SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) }))
+    }
+
+    pub fn amm_factory_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        self.AMM_FACTORIES.select(&suffix).key().to_vec()
+    }
+
+    pub fn factory_pools_key(&self, factory: &SchemaAlkaneId, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1 + 12);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.FACTORY_POOLS.select(&suffix).key().to_vec()
+    }
+
+    pub fn factory_pools_prefix(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        suffix.push(b'/');
+        self.FACTORY_POOLS.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_factory_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_FACTORY.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_metrics_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_METRICS.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_creation_info_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_CREATION_INFO.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_lp_supply_latest_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_LP_SUPPLY.select(&suffix).key().to_vec()
+    }
+
+    pub fn tvl_versioned_prefix(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        suffix.push(b'/');
+        self.TVL_VERSIONED.select(&suffix).key().to_vec()
+    }
+
+    pub fn tvl_versioned_key(&self, pool: &SchemaAlkaneId, height: u32) -> Vec<u8> {
+        let mut k = self.tvl_versioned_prefix(pool);
+        k.extend_from_slice(&height.to_be_bytes());
+        k
     }
 
     pub fn pools_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
@@ -327,6 +433,237 @@ impl AmmDataProvider {
         table.RESERVES_SNAPSHOT.put(&encoded)
     }
 
+    pub fn get_canonical_pools(
+        &self,
+        params: GetCanonicalPoolsParams,
+    ) -> Result<GetCanonicalPoolsResult> {
+        let table = self.table();
+        let pools = self
+            .get_raw_value(GetRawValueParams { key: table.canonical_pool_key(&params.token) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_canonical_pools(&raw).ok())
+            .unwrap_or_default();
+        Ok(GetCanonicalPoolsResult { pools })
+    }
+
+    pub fn get_latest_token_usd_close(
+        &self,
+        params: GetLatestTokenUsdCloseParams,
+    ) -> Result<GetLatestTokenUsdCloseResult> {
+        let table = self.table();
+        let prefix = table.token_usd_candle_ns_prefix(&params.token, params.timeframe);
+        let entries = self
+            .get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+            .ok()
+            .map(|resp| resp.entries)
+            .unwrap_or_default();
+        let close = entries
+            .into_iter()
+            .next()
+            .and_then(|(_k, v)| decode_candle_v1(&v).ok())
+            .map(|c| c.close);
+        Ok(GetLatestTokenUsdCloseResult { close })
+    }
+
+    pub fn get_token_metrics(
+        &self,
+        params: GetTokenMetricsParams,
+    ) -> Result<GetTokenMetricsResult> {
+        let table = self.table();
+        let metrics = self
+            .get_raw_value(GetRawValueParams { key: table.token_metrics_key(&params.token) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_token_metrics(&raw).ok())
+            .unwrap_or_default();
+        Ok(GetTokenMetricsResult { metrics })
+    }
+
+    pub fn get_pool_ids_by_name_prefix(
+        &self,
+        params: GetPoolIdsByNamePrefixParams,
+    ) -> Result<GetPoolIdsByNamePrefixResult> {
+        let table = self.table();
+        let keys = match self.get_scan_prefix(GetScanPrefixParams {
+            prefix: table.pool_name_index_prefix(&params.prefix),
+        }) {
+            Ok(v) => v.keys,
+            Err(_) => Vec::new(),
+        };
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for key in keys {
+            if let Some((_name, id)) = table.parse_pool_name_index_key(&key) {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(GetPoolIdsByNamePrefixResult { ids })
+    }
+
+    pub fn get_amm_factories(
+        &self,
+        _params: GetAmmFactoriesParams,
+    ) -> Result<GetAmmFactoriesResult> {
+        let table = self.table();
+        let keys = match self.get_scan_prefix(GetScanPrefixParams {
+            prefix: table.AMM_FACTORIES.key().to_vec(),
+        }) {
+            Ok(v) => v.keys,
+            Err(_) => Vec::new(),
+        };
+        let mut ids = Vec::new();
+        for key in keys {
+            if let Some(id) = parse_alkane_id_from_prefixed_key(table.AMM_FACTORIES.key(), &key) {
+                ids.push(id);
+            }
+        }
+        Ok(GetAmmFactoriesResult { factories: ids })
+    }
+
+    pub fn get_factory_pools(
+        &self,
+        params: GetFactoryPoolsParams,
+    ) -> Result<GetFactoryPoolsResult> {
+        let table = self.table();
+        let prefix = table.factory_pools_prefix(&params.factory);
+        let keys = match self.get_scan_prefix(GetScanPrefixParams { prefix: prefix.clone() }) {
+            Ok(v) => v.keys,
+            Err(_) => Vec::new(),
+        };
+        let mut pools = Vec::new();
+        for key in keys {
+            if let Some(id) = parse_alkane_id_from_prefixed_key(prefix.as_slice(), &key) {
+                pools.push(id);
+            }
+        }
+        Ok(GetFactoryPoolsResult { pools })
+    }
+
+    pub fn get_pool_defs(&self, params: GetPoolDefsParams) -> Result<GetPoolDefsResult> {
+        let table = self.table();
+        let defs = self
+            .get_raw_value(GetRawValueParams { key: table.pools_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| SchemaMarketDefs::try_from_slice(&raw).ok());
+        Ok(GetPoolDefsResult { defs })
+    }
+
+    pub fn get_pool_factory(
+        &self,
+        params: GetPoolFactoryParams,
+    ) -> Result<GetPoolFactoryResult> {
+        let table = self.table();
+        let factory = self
+            .get_raw_value(GetRawValueParams { key: table.pool_factory_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_alkane_id_be(&raw));
+        Ok(GetPoolFactoryResult { factory })
+    }
+
+    pub fn get_pool_metrics(
+        &self,
+        params: GetPoolMetricsParams,
+    ) -> Result<GetPoolMetricsResult> {
+        let table = self.table();
+        let metrics = self
+            .get_raw_value(GetRawValueParams { key: table.pool_metrics_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_pool_metrics(&raw).ok())
+            .unwrap_or_default();
+        Ok(GetPoolMetricsResult { metrics })
+    }
+
+    pub fn get_pool_creation_info(
+        &self,
+        params: GetPoolCreationInfoParams,
+    ) -> Result<GetPoolCreationInfoResult> {
+        let table = self.table();
+        let info = self
+            .get_raw_value(GetRawValueParams { key: table.pool_creation_info_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_pool_creation_info(&raw).ok());
+        Ok(GetPoolCreationInfoResult { info })
+    }
+
+    pub fn get_pool_lp_supply_latest(
+        &self,
+        params: GetPoolLpSupplyLatestParams,
+    ) -> Result<GetPoolLpSupplyLatestResult> {
+        let table = self.table();
+        let supply = self
+            .get_raw_value(GetRawValueParams { key: table.pool_lp_supply_latest_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_u128_value(&raw).ok())
+            .unwrap_or(0);
+        Ok(GetPoolLpSupplyLatestResult { supply })
+    }
+
+    pub fn get_tvl_versioned_at_or_before(
+        &self,
+        params: GetTvlVersionedAtOrBeforeParams,
+    ) -> Result<GetTvlVersionedAtOrBeforeResult> {
+        let table = self.table();
+        let prefix = table.tvl_versioned_prefix(&params.pool);
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+        let mut value = None;
+        for (k, v) in entries {
+            let height = parse_height_from_tvl_key(&k)?;
+            if height <= params.height {
+                value = decode_u128_value(&v).ok();
+                break;
+            }
+        }
+        Ok(GetTvlVersionedAtOrBeforeResult { value })
+    }
+
+    pub fn get_canonical_pool_prices(
+        &self,
+        params: GetCanonicalPoolPricesParams,
+    ) -> Result<GetCanonicalPoolPricesResult> {
+        let mut frbtc_price = 0u128;
+        let mut busd_price = 0u128;
+        let mut unit_map: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
+        for cq in canonical_quotes(get_network()) {
+            unit_map.insert(cq.id, cq.unit);
+        }
+        let pools = self.get_canonical_pools(GetCanonicalPoolsParams { token: params.token })?.pools;
+        for entry in pools {
+            let unit = match unit_map.get(&entry.quote_id) {
+                Some(u) => *u,
+                None => continue,
+            };
+            let res = read_candles_v1(
+                self,
+                entry.pool_id,
+                Timeframe::M10,
+                1,
+                params.now_ts,
+                PriceSide::Base,
+            )
+            .ok();
+            let close = res
+                .and_then(|slice| slice.candles_newest_first.first().copied())
+                .map(|c| c.close)
+                .unwrap_or(0);
+            match unit {
+                CanonicalQuoteUnit::Btc => frbtc_price = close,
+                CanonicalQuoteUnit::Usd => busd_price = close,
+            }
+        }
+        Ok(GetCanonicalPoolPricesResult { frbtc_price, busd_price })
+    }
+
     pub fn rpc_get_candles(&self, params: RpcGetCandlesParams) -> Result<RpcGetCandlesResult> {
         let tf = params
             .timeframe
@@ -346,20 +683,54 @@ impl AmmDataProvider {
 
         let now = params.now.unwrap_or_else(now_ts);
 
-        let pool = match params.pool.as_deref().and_then(parse_id_from_str) {
+        let pool_raw = match params.pool.as_deref() {
             Some(p) => p,
             None => {
                 return Ok(RpcGetCandlesResult {
                     value: json!({
                         "ok": false,
                         "error": "missing_or_invalid_pool",
-                        "hint": "pool should be a string like \"2:68441\""
+                        "hint": "pool should be a string like \"2:68441\" or \"2:0-usd\""
                     }),
                 });
             }
         };
 
-        match read_candles_v1(self, pool, tf, /*unused*/ limit, now, side) {
+        let (pool, is_usd) = if let Some(stripped) = pool_raw.strip_suffix("-usd") {
+            match parse_id_from_str(stripped) {
+                Some(p) => (p, true),
+                None => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\" or \"2:0-usd\""
+                        }),
+                    });
+                }
+            }
+        } else {
+            match parse_id_from_str(pool_raw) {
+                Some(p) => (p, false),
+                None => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\" or \"2:0-usd\""
+                        }),
+                    });
+                }
+            }
+        };
+
+        let slice = if is_usd {
+            read_token_usd_candles_v1(self, pool, tf, now)
+        } else {
+            read_candles_v1(self, pool, tf, /*unused*/ limit, now, side)
+        };
+
+        match slice {
             Ok(slice) => {
                 let total = slice.candles_newest_first.len();
                 let dur = tf.duration_secs();
@@ -393,9 +764,13 @@ impl AmmDataProvider {
                 Ok(RpcGetCandlesResult {
                     value: json!({
                         "ok": true,
-                        "pool": id_str(&pool),
+                        "pool": if is_usd {
+                            format!("{}-usd", id_str(&pool))
+                        } else {
+                            id_str(&pool)
+                        },
                         "timeframe": tf.code(),
-                        "side": match side { PriceSide::Base => "base", PriceSide::Quote => "quote" },
+                        "side": if is_usd { "base" } else { match side { PriceSide::Base => "base", PriceSide::Quote => "quote" } },
                         "page": page,
                         "limit": limit,
                         "total": total,
@@ -916,6 +1291,112 @@ pub struct GetReservesSnapshotResult {
     pub snapshot: Option<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>>,
 }
 
+pub struct GetCanonicalPoolsParams {
+    pub token: SchemaAlkaneId,
+}
+
+pub struct GetCanonicalPoolsResult {
+    pub pools: Vec<SchemaCanonicalPoolEntry>,
+}
+
+pub struct GetLatestTokenUsdCloseParams {
+    pub token: SchemaAlkaneId,
+    pub timeframe: Timeframe,
+}
+
+pub struct GetLatestTokenUsdCloseResult {
+    pub close: Option<u128>,
+}
+
+pub struct GetTokenMetricsParams {
+    pub token: SchemaAlkaneId,
+}
+
+pub struct GetTokenMetricsResult {
+    pub metrics: SchemaTokenMetricsV1,
+}
+
+pub struct GetPoolIdsByNamePrefixParams {
+    pub prefix: String,
+}
+
+pub struct GetPoolIdsByNamePrefixResult {
+    pub ids: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetAmmFactoriesParams;
+
+pub struct GetAmmFactoriesResult {
+    pub factories: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetFactoryPoolsParams {
+    pub factory: SchemaAlkaneId,
+}
+
+pub struct GetFactoryPoolsResult {
+    pub pools: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetPoolDefsParams {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolDefsResult {
+    pub defs: Option<SchemaMarketDefs>,
+}
+
+pub struct GetPoolFactoryParams {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolFactoryResult {
+    pub factory: Option<SchemaAlkaneId>,
+}
+
+pub struct GetPoolMetricsParams {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolMetricsResult {
+    pub metrics: SchemaPoolMetricsV1,
+}
+
+pub struct GetPoolCreationInfoParams {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolCreationInfoResult {
+    pub info: Option<SchemaPoolCreationInfoV1>,
+}
+
+pub struct GetPoolLpSupplyLatestParams {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolLpSupplyLatestResult {
+    pub supply: u128,
+}
+
+pub struct GetTvlVersionedAtOrBeforeParams {
+    pub pool: SchemaAlkaneId,
+    pub height: u32,
+}
+
+pub struct GetTvlVersionedAtOrBeforeResult {
+    pub value: Option<u128>,
+}
+
+pub struct GetCanonicalPoolPricesParams {
+    pub token: SchemaAlkaneId,
+    pub now_ts: u64,
+}
+
+pub struct GetCanonicalPoolPricesResult {
+    pub frbtc_price: u128,
+    pub busd_price: u128,
+}
+
 pub struct SetReservesSnapshotParams {
     pub snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot>,
 }
@@ -1041,6 +1522,37 @@ pub fn encode_token_metrics(v: &SchemaTokenMetricsV1) -> anyhow::Result<Vec<u8>>
     Ok(borsh::to_vec(v)?)
 }
 
+pub fn decode_pool_metrics(bytes: &[u8]) -> anyhow::Result<SchemaPoolMetricsV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaPoolMetricsV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_pool_metrics(v: &SchemaPoolMetricsV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
+}
+
+pub fn decode_pool_creation_info(bytes: &[u8]) -> anyhow::Result<SchemaPoolCreationInfoV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaPoolCreationInfoV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_pool_creation_info(v: &SchemaPoolCreationInfoV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
+}
+
+pub fn decode_u128_value(bytes: &[u8]) -> anyhow::Result<u128> {
+    if bytes.len() != 16 {
+        return Err(anyhow!("invalid u128 length {}", bytes.len()));
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes[..16]);
+    Ok(u128::from_le_bytes(arr))
+}
+
+pub fn encode_u128_value(value: u128) -> anyhow::Result<Vec<u8>> {
+    Ok(value.to_le_bytes().to_vec())
+}
+
 // Encode Snapshot -> BORSH (deterministic order via BTreeMap)
 pub fn encode_reserves_snapshot(
     map: &HashMap<SchemaAlkaneId, SchemaPoolSnapshot>,
@@ -1083,6 +1595,131 @@ fn parse_id_from_str(s: &str) -> Option<SchemaAlkaneId> {
         }
     };
     Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
+}
+
+fn decode_alkane_id_be(bytes: &[u8]) -> Option<SchemaAlkaneId> {
+    if bytes.len() != 12 {
+        return None;
+    }
+    let mut block_arr = [0u8; 4];
+    block_arr.copy_from_slice(&bytes[..4]);
+    let mut tx_arr = [0u8; 8];
+    tx_arr.copy_from_slice(&bytes[4..12]);
+    Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+}
+
+fn parse_alkane_id_from_prefixed_key(prefix: &[u8], key: &[u8]) -> Option<SchemaAlkaneId> {
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    let rest = &key[prefix.len()..];
+    decode_alkane_id_be(rest)
+}
+
+fn parse_height_from_tvl_key(key: &[u8]) -> Result<u32> {
+    if key.len() < 4 {
+        return Err(anyhow!("tvlVersioned key too short"));
+    }
+    let height_bytes = &key[key.len() - 4..];
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(height_bytes);
+    Ok(u32::from_be_bytes(arr))
+}
+
+fn read_token_usd_candles_v1(
+    provider: &AmmDataProvider,
+    token: SchemaAlkaneId,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<CandleSlice> {
+    let dur = tf.duration_secs();
+    let table = provider.table();
+    let logical = table.token_usd_candle_ns_prefix(&token, tf);
+    let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    for (k, v) in provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .entries
+    {
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                if let Ok(ts) = ts_str.parse::<u64>() {
+                    if !per_bucket.contains_key(&ts) {
+                        if let Ok(c) = decode_candle_v1(&v) {
+                            per_bucket.insert(ts, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut last_close: u128 = 0;
+    let mut have_prev: bool = false;
+    let mut forward: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    let mut bts = start_bucket;
+
+    while bts <= newest_bucket_with_data {
+        if let Some(candle) = per_bucket.get(&bts) {
+            let mut c = *candle;
+            if have_prev {
+                c.open = last_close;
+                if c.open > c.high {
+                    c.high = c.open;
+                }
+                if c.open < c.low {
+                    c.low = c.open;
+                }
+            }
+            last_close = c.close;
+            have_prev = true;
+            forward.insert(bts, c);
+        } else {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            have_prev = true;
+            forward.insert(bts, c);
+        }
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            forward.insert(t, c);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_first: Vec<SchemaCandleV1> =
+        forward.into_iter().rev().map(|(_ts, c)| c).collect();
+
+    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
 fn parse_timeframe(s: &str) -> Option<Timeframe> {

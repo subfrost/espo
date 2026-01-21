@@ -13,7 +13,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use crate::runtime::mempool::{
     MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
 };
@@ -652,6 +652,72 @@ impl EssentialsProvider {
         Ok(GetCreationRecordsByIdResult { records })
     }
 
+    pub fn get_creation_records_ordered(
+        &self,
+        _params: GetCreationRecordsOrderedParams,
+    ) -> Result<GetCreationRecordsOrderedResult> {
+        let table = self.table();
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams {
+            prefix: table.alkane_creation_ordered_prefix(),
+        }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+        let mut records = Vec::with_capacity(entries.len());
+        for (_k, v) in entries {
+            if let Ok(rec) = decode_creation_record(&v) {
+                records.push(rec);
+            }
+        }
+        Ok(GetCreationRecordsOrderedResult { records })
+    }
+
+    pub fn get_alkane_ids_by_name_prefix(
+        &self,
+        params: GetAlkaneIdsByNamePrefixParams,
+    ) -> Result<GetAlkaneIdsByNamePrefixResult> {
+        let table = self.table();
+        let keys = match self.get_scan_prefix(GetScanPrefixParams {
+            prefix: table.alkane_name_index_prefix(&params.prefix),
+        }) {
+            Ok(v) => v.keys,
+            Err(_) => Vec::new(),
+        };
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for key in keys {
+            if let Some((_name, id)) = table.parse_alkane_name_index_key(&key) {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(GetAlkaneIdsByNamePrefixResult { ids })
+    }
+
+    pub fn get_alkane_ids_by_symbol_prefix(
+        &self,
+        params: GetAlkaneIdsBySymbolPrefixParams,
+    ) -> Result<GetAlkaneIdsBySymbolPrefixResult> {
+        let table = self.table();
+        let keys = match self.get_scan_prefix(GetScanPrefixParams {
+            prefix: table.alkane_symbol_index_prefix(&params.prefix),
+        }) {
+            Ok(v) => v.keys,
+            Err(_) => Vec::new(),
+        };
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        for key in keys {
+            if let Some((_sym, id)) = table.parse_alkane_symbol_index_key(&key) {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(GetAlkaneIdsBySymbolPrefixResult { ids })
+    }
+
     pub fn get_creation_count(
         &self,
         _params: GetCreationCountParams,
@@ -671,6 +737,68 @@ impl EssentialsProvider {
             })
             .unwrap_or(0);
         Ok(GetCreationCountResult { count })
+    }
+
+    pub fn get_holders_count(
+        &self,
+        params: GetHoldersCountParams,
+    ) -> Result<GetHoldersCountResult> {
+        let table = self.table();
+        let count = self
+            .get_raw_value(GetRawValueParams {
+                key: table.holders_count_key(&params.alkane),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| HoldersCountEntry::try_from_slice(&raw).ok())
+            .map(|entry| entry.count)
+            .unwrap_or(0);
+        Ok(GetHoldersCountResult { count })
+    }
+
+    pub fn get_latest_circulating_supply(
+        &self,
+        params: GetLatestCirculatingSupplyParams,
+    ) -> Result<GetLatestCirculatingSupplyResult> {
+        let table = self.table();
+        let supply = self
+            .get_raw_value(GetRawValueParams {
+                key: table.circulating_supply_latest_key(&params.alkane),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_u128_value(&raw).ok())
+            .unwrap_or(0);
+        Ok(GetLatestCirculatingSupplyResult { supply })
+    }
+
+    pub fn get_latest_total_minted(
+        &self,
+        params: GetLatestTotalMintedParams,
+    ) -> Result<GetLatestTotalMintedResult> {
+        let table = self.table();
+        let total_minted = self
+            .get_raw_value(GetRawValueParams {
+                key: table.total_minted_latest_key(&params.alkane),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_u128_value(&raw).ok())
+            .unwrap_or(0);
+        Ok(GetLatestTotalMintedResult { total_minted })
+    }
+
+    pub fn get_alkane_storage_value(
+        &self,
+        params: GetAlkaneStorageValueParams,
+    ) -> Result<GetAlkaneStorageValueResult> {
+        let table = self.table();
+        let key = table.kv_row_key(&params.alkane, &params.key);
+        let value = self
+            .get_raw_value(GetRawValueParams { key })?
+            .value
+            .map(|raw| split_txid_value(&raw).1.to_vec());
+        Ok(GetAlkaneStorageValueResult { value })
     }
 
     pub fn get_block_summary(
@@ -2103,10 +2231,65 @@ pub struct GetCreationRecordsByIdResult {
     pub records: Vec<Option<AlkaneCreationRecord>>,
 }
 
+pub struct GetCreationRecordsOrderedParams;
+
+pub struct GetCreationRecordsOrderedResult {
+    pub records: Vec<AlkaneCreationRecord>,
+}
+
+pub struct GetAlkaneIdsByNamePrefixParams {
+    pub prefix: String,
+}
+
+pub struct GetAlkaneIdsByNamePrefixResult {
+    pub ids: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetAlkaneIdsBySymbolPrefixParams {
+    pub prefix: String,
+}
+
+pub struct GetAlkaneIdsBySymbolPrefixResult {
+    pub ids: Vec<SchemaAlkaneId>,
+}
+
 pub struct GetCreationCountParams;
 
 pub struct GetCreationCountResult {
     pub count: u64,
+}
+
+pub struct GetHoldersCountParams {
+    pub alkane: SchemaAlkaneId,
+}
+
+pub struct GetHoldersCountResult {
+    pub count: u64,
+}
+
+pub struct GetLatestCirculatingSupplyParams {
+    pub alkane: SchemaAlkaneId,
+}
+
+pub struct GetLatestCirculatingSupplyResult {
+    pub supply: u128,
+}
+
+pub struct GetLatestTotalMintedParams {
+    pub alkane: SchemaAlkaneId,
+}
+
+pub struct GetLatestTotalMintedResult {
+    pub total_minted: u128,
+}
+
+pub struct GetAlkaneStorageValueParams {
+    pub alkane: SchemaAlkaneId,
+    pub key: Vec<u8>,
+}
+
+pub struct GetAlkaneStorageValueResult {
+    pub value: Option<Vec<u8>>,
 }
 
 pub struct GetBlockSummaryParams {

@@ -1,41 +1,46 @@
 use super::schemas::{
     ActivityDirection, ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry,
-    SchemaCandleV1, SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolSnapshot, SchemaTokenMetricsV1,
-    Timeframe,
+    SchemaCandleV1, SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
+    SchemaPoolMetricsV1, SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
     active_timeframes,
 };
 use super::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams, SetBatchParams, decode_candle_v1,
-    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot, encode_candle_v1,
-    encode_canonical_pools, encode_reserves_snapshot, encode_token_metrics,
+    AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetRawValueParams,
+    GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, SetBatchParams, decode_candle_v1,
+    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot,
+    encode_candle_v1, encode_canonical_pools, encode_pool_creation_info, encode_pool_metrics,
+    encode_reserves_snapshot, encode_token_metrics, encode_u128_value,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
-use crate::alkanes::trace::EspoBlock;
-use crate::config::{get_espo_db, get_network};
+use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
+use crate::config::{get_electrum_like, get_espo_db, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes, get_amm_contract,
+    CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
 };
 use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::utils::candles::{
     CandleCache, bucket_start_for, price_base_per_quote, price_quote_per_base,
 };
-use crate::modules::ammdata::utils::reserves::{
-    NewPoolInfo, extract_new_pools_from_espo_transaction,
-};
+use crate::modules::ammdata::utils::reserves::{NewPoolInfo, extract_new_pools_from_espo_transaction};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, GetCreationRecordParams,
-    GetRawValueParams as EssentialsGetRawValueParams, EssentialsProvider,
+    AlkaneBalanceTxEntry, GetAlkaneStorageValueParams, GetCreationRecordParams,
+    GetLatestCirculatingSupplyParams, GetRawValueParams as EssentialsGetRawValueParams,
+    EssentialsProvider,
 };
-use crate::modules::essentials::utils::balances::SignedU128;
-use crate::modules::essentials::utils::inspections::StoredInspectionResult;
+use crate::modules::essentials::utils::balances::{SignedU128, get_alkane_balances};
+use crate::modules::essentials::utils::inspections::{StoredInspectionMetadata, StoredInspectionResult};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
 use bitcoin::hashes::Hash;
+use bitcoin::consensus::encode::deserialize;
+use bitcoin::{ScriptBuf, Transaction, Txid};
 use borsh::BorshDeserialize;
+use ordinals::{Artifact, Runestone};
+use protorune_support::protostone::Protostone;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -44,14 +49,17 @@ use super::rpc::register_rpc;
 /* ---------- module ---------- */
 
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
-const KV_KEY_BEACON: &[u8] = b"/beacon";
-const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
+const AMM_FACTORY_OPCODES: [u128; 14] = [0, 1, 2, 3, 4, 7, 10, 11, 12, 13, 14, 21, 29, 50];
 
-fn is_upgradeable_proxy(inspection: &StoredInspectionResult) -> bool {
+fn is_amm_factory_metadata(meta: &StoredInspectionMetadata) -> bool {
+    AMM_FACTORY_OPCODES
+        .iter()
+        .all(|opcode| meta.methods.iter().any(|m| m.opcode == *opcode))
+}
+
+fn inspection_is_amm_factory(inspection: &StoredInspectionResult) -> bool {
     let Some(meta) = inspection.metadata.as_ref() else { return false };
-    UPGRADEABLE_METHODS.iter().all(|(name, opcode)| {
-        meta.methods.iter().any(|m| m.name.eq_ignore_ascii_case(name) && m.opcode == *opcode)
-    })
+    is_amm_factory_metadata(meta)
 }
 
 fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
@@ -68,52 +76,59 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
 }
 
-fn resolve_factory_target(
-    network: Network,
-    essentials: &EssentialsProvider,
-) -> Result<Option<SchemaAlkaneId>> {
-    let base = match get_amm_contract(network) {
-        Ok(id) => id,
-        Err(_) => return Ok(None),
-    };
+fn parse_hex_u32(s: &str) -> Option<u32> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
+        if v > u32::MAX as u128 { None } else { Some(v as u32) }
+    })
+}
 
-    if network != Network::Bitcoin {
-        return Ok(Some(base));
+fn parse_hex_u64(s: &str) -> Option<u64> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
+        if v > u64::MAX as u128 { None } else { Some(v as u64) }
+    })
+}
+
+fn parse_factory_create_call(
+    inputs: &[String],
+    factories: &HashSet<SchemaAlkaneId>,
+) -> Option<SchemaAlkaneId> {
+    if inputs.len() < 3 {
+        return None;
     }
+    let block = parse_hex_u32(&inputs[0])?;
+    let tx = parse_hex_u64(&inputs[1])?;
+    let opcode = u128::from_str_radix(inputs[2].trim_start_matches("0x"), 16).ok()?;
+    if opcode != 1 {
+        return None;
+    }
+    let id = SchemaAlkaneId { block, tx };
+    if factories.contains(&id) {
+        Some(id)
+    } else {
+        None
+    }
+}
 
-    let table = essentials.table();
-    let lookup = |key| -> Result<Option<SchemaAlkaneId>> {
-        if let Some(raw) = essentials
-            .get_raw_value(EssentialsGetRawValueParams {
-                key: table.kv_row_key(&base, key),
-            })?
-            .value
-        {
-            let slice = if raw.len() >= 32 { &raw[32..] } else { raw.as_slice() };
-            if let Some(decoded) = decode_kv_implementation(slice) {
-                return Ok(Some(decoded));
+fn pool_creator_spk_from_protostone(tx: &Transaction) -> Option<ScriptBuf> {
+    let runestone = match Runestone::decipher(tx) {
+        Some(Artifact::Runestone(r)) => r,
+        _ => return None,
+    };
+    let protos = Protostone::from_runestone(&runestone).ok()?;
+    for ps in protos {
+        if ps.protocol_tag != 1 {
+            continue;
+        }
+        if let Some(ptr) = ps.pointer {
+            let idx = ptr as usize;
+            if let Some(out) = tx.output.get(idx) {
+                return Some(out.script_pubkey.clone());
             }
         }
-        Ok(None)
-    };
-    if let Some(decoded) = lookup(KV_KEY_IMPLEMENTATION)? {
-        return Ok(Some(decoded));
     }
-    if let Some(decoded) = lookup(KV_KEY_BEACON)? {
-        return Ok(Some(decoded));
-    }
-
-    let inspection = essentials
-        .get_creation_record(GetCreationRecordParams { alkane: base })?
-        .record
-        .and_then(|rec| rec.inspection);
-    if let Some(inspection) = inspection.as_ref() {
-        if is_upgradeable_proxy(inspection) {
-            return Ok(Some(base));
-        }
-    }
-
-    Ok(Some(base))
+    None
 }
 
 fn signed_from_delta(delta: Option<&SignedU128>) -> i128 {
@@ -266,14 +281,71 @@ impl EspoModule for AmmData {
         for cq in canonical_quotes_list.iter() {
             canonical_quote_units.insert(cq.id, cq.unit);
         }
-        let base_factory = get_amm_contract(network).ok();
-        let factory_target = match resolve_factory_target(network, essentials) {
-            Ok(target) => target,
-            Err(e) => {
-                eprintln!("[AMMDATA] failed to resolve factory target: {e:?}");
-                None
+        let mut amm_factories: HashSet<SchemaAlkaneId> = provider
+            .get_amm_factories(GetAmmFactoriesParams)
+            .map(|res| res.factories.into_iter().collect())
+            .unwrap_or_default();
+        let mut amm_factory_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        let mut created_alkanes: Vec<SchemaAlkaneId> = Vec::new();
+        for tx in &block.transactions {
+            if let Some(traces) = &tx.traces {
+                for trace in traces {
+                    for ev in &trace.sandshrew_trace.events {
+                        if let EspoSandshrewLikeTraceEvent::Create(c) = ev {
+                            if let (Some(block), Some(tx)) =
+                                (parse_hex_u32(&c.block), parse_hex_u64(&c.tx))
+                            {
+                                created_alkanes.push(SchemaAlkaneId { block, tx });
+                            }
+                        }
+                    }
+                }
             }
-        };
+        }
+
+        for alk in created_alkanes {
+            if amm_factories.contains(&alk) {
+                continue;
+            }
+            let mut is_factory = false;
+            if let Ok(resp) = essentials.get_creation_record(GetCreationRecordParams { alkane: alk }) {
+                if let Some(rec) = resp.record {
+                    if let Some(inspection) = rec.inspection.as_ref() {
+                        if inspection_is_amm_factory(inspection) {
+                            is_factory = true;
+                        }
+                    }
+                }
+            }
+            if !is_factory {
+                let impl_val = essentials
+                    .get_alkane_storage_value(GetAlkaneStorageValueParams {
+                        alkane: alk,
+                        key: KV_KEY_IMPLEMENTATION.to_vec(),
+                    })
+                    .ok()
+                    .and_then(|resp| resp.value)
+                    .and_then(|raw| decode_kv_implementation(&raw));
+                if let Some(proxy_target) = impl_val {
+                    if let Ok(resp) =
+                        essentials.get_creation_record(GetCreationRecordParams { alkane: proxy_target })
+                    {
+                        if let Some(rec) = resp.record {
+                            if let Some(inspection) = rec.inspection.as_ref() {
+                                if inspection_is_amm_factory(inspection) {
+                                    is_factory = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if is_factory {
+                amm_factories.insert(alk);
+                amm_factory_writes.push((table.amm_factory_key(&alk), Vec::new()));
+            }
+        }
 
         let mut candle_cache = CandleCache::new();
         let frames = active_timeframes();
@@ -282,6 +354,15 @@ impl EspoModule for AmmData {
         let mut canonical_pool_updates: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>> =
             HashMap::new();
         let mut pool_name_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut factory_pools_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_factory_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_creation_info_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_defs_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_lp_supply_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut tvl_versioned_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_metrics_cache: HashMap<SchemaAlkaneId, SchemaTokenMetricsV1> =
+            HashMap::new();
         let mut alkane_label_cache: HashMap<SchemaAlkaneId, String> = HashMap::new();
         let get_alkane_label = |essentials: &EssentialsProvider,
                                 cache: &mut HashMap<SchemaAlkaneId, String>,
@@ -305,6 +386,12 @@ impl EspoModule for AmmData {
             label
         };
 
+        let mut block_tx_map: HashMap<Txid, &Transaction> = HashMap::new();
+        for atx in &block.transactions {
+            block_tx_map.insert(atx.transaction.compute_txid(), &atx.transaction);
+        }
+        let mut prev_tx_cache: HashMap<Txid, Transaction> = HashMap::new();
+
         // Discover new pools (per-tx) and record pool creation activity.
         let mut seen_new_pools: HashSet<(u32, u64)> = HashSet::new();
         for transaction in block.transactions.iter() {
@@ -312,44 +399,52 @@ impl EspoModule for AmmData {
                 continue;
             }
 
+            let mut pool_factory_by_id: HashMap<SchemaAlkaneId, SchemaAlkaneId> = HashMap::new();
+            if let Some(traces) = &transaction.traces {
+                for trace in traces {
+                    let mut pending_factory: Option<SchemaAlkaneId> = None;
+                    for ev in &trace.sandshrew_trace.events {
+                        match ev {
+                            EspoSandshrewLikeTraceEvent::Invoke(inv) => {
+                                if let Some(factory) =
+                                    parse_factory_create_call(&inv.context.inputs, &amm_factories)
+                                {
+                                    pending_factory = Some(factory);
+                                }
+                            }
+                            EspoSandshrewLikeTraceEvent::Create(c) => {
+                                if let Some(factory) = pending_factory.take() {
+                                    if let (Some(block), Some(tx)) =
+                                        (parse_hex_u32(&c.block), parse_hex_u64(&c.tx))
+                                    {
+                                        pool_factory_by_id.insert(
+                                            SchemaAlkaneId { block, tx },
+                                            factory,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
             if let Ok(new_pools) = extract_new_pools_from_espo_transaction(transaction) {
                 for NewPoolInfo { pool_id, defs, factory_id } in new_pools {
                     if !seen_new_pools.insert((pool_id.block, pool_id.tx)) {
                         continue;
                     }
-
-                    let should_track = match factory_target {
-                        Some(factory) => match factory_id {
-                            Some(fid) => {
-                                let matches_base = base_factory.map(|b| b == fid).unwrap_or(false);
-                                fid == factory || matches_base
-                            }
-                            None => match essentials
-                                .get_creation_record(GetCreationRecordParams { alkane: pool_id })?
-                                .record
-                            {
-                                Some(rec) => rec
-                                    .inspection
-                                    .and_then(|i| i.factory_alkane)
-                                    .map(|id| id == factory)
-                                    .unwrap_or(true),
-                                None => true,
-                            },
-                        },
-                        None => {
-                            if let Some(fid) = factory_id {
-                                base_factory.map(|b| b == fid).unwrap_or(true)
-                            } else {
-                                true
-                            }
-                        }
-                    };
-
-                    if !should_track {
+                    let factory_from_call = pool_factory_by_id.get(&pool_id).copied();
+                    if factory_from_call.is_none() {
                         continue;
                     }
+                    let factory_id = factory_id.or(factory_from_call);
 
                     pools_map.insert(pool_id, defs);
+                    if let Ok(encoded_defs) = borsh::to_vec(&defs) {
+                        pool_defs_writes.push((table.pools_key(&pool_id), encoded_defs));
+                    }
                     reserves_snapshot.entry(pool_id).or_insert(SchemaPoolSnapshot {
                         base_reserve: 0,
                         quote_reserve: 0,
@@ -375,6 +470,88 @@ impl EspoModule for AmmData {
                         pool_name_index_writes
                             .push((table.pool_name_index_key(&pool_name_norm, &pool_id), Vec::new()));
                     }
+
+                    if let Some(factory_id) = factory_id {
+                        factory_pools_writes
+                            .push((table.factory_pools_key(&factory_id, &pool_id), Vec::new()));
+                        let mut factory_bytes = Vec::with_capacity(12);
+                        factory_bytes.extend_from_slice(&factory_id.block.to_be_bytes());
+                        factory_bytes.extend_from_slice(&factory_id.tx.to_be_bytes());
+                        pool_factory_writes.push((table.pool_factory_key(&pool_id), factory_bytes));
+                    }
+
+                    // Pool creation info
+                    let mut creator_spk =
+                        pool_creator_spk_from_protostone(&transaction.transaction);
+                    if creator_spk.is_none() {
+                        let mut lowest_spk: Option<ScriptBuf> = None;
+                        let mut lowest_value: Option<u64> = None;
+                        for vin in &transaction.transaction.input {
+                            if vin.previous_output.is_null() {
+                                continue;
+                            }
+                            let prev_txid = vin.previous_output.txid;
+                            let prev_tx = if let Some(tx) = block_tx_map.get(&prev_txid) {
+                                Some((*tx).clone())
+                            } else if let Some(tx) = prev_tx_cache.get(&prev_txid) {
+                                Some(tx.clone())
+                            } else {
+                                let raw = get_electrum_like()
+                                    .batch_transaction_get_raw(&[prev_txid])
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .next()
+                                    .unwrap_or_default();
+                                if raw.is_empty() {
+                                    None
+                                } else {
+                                    deserialize::<Transaction>(&raw).ok().map(|tx| {
+                                        prev_tx_cache.insert(prev_txid, tx.clone());
+                                        tx
+                                    })
+                                }
+                            };
+                            let Some(prev_tx) = prev_tx else { continue };
+                            let idx = vin.previous_output.vout as usize;
+                            let Some(prev_out) = prev_tx.output.get(idx) else { continue };
+                            let value = prev_out.value.to_sat();
+                            if lowest_value.map_or(true, |v| value < v) {
+                                lowest_value = Some(value);
+                                lowest_spk = Some(prev_out.script_pubkey.clone());
+                            }
+                        }
+                        creator_spk = lowest_spk;
+                    }
+
+                    let mut pool_balances = get_alkane_balances(essentials, &pool_id)
+                        .unwrap_or_default();
+                    let initial_token0_amount = pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
+                    let initial_token1_amount = pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
+                    let initial_lp_supply = essentials
+                        .get_latest_circulating_supply(
+                            crate::modules::essentials::storage::GetLatestCirculatingSupplyParams {
+                                alkane: pool_id,
+                            },
+                        )
+                        .map(|res| res.supply)
+                        .unwrap_or(0);
+
+                    pool_lp_supply_writes.push((
+                        table.pool_lp_supply_latest_key(&pool_id),
+                        encode_u128_value(initial_lp_supply)?,
+                    ));
+
+                    let creation_info = SchemaPoolCreationInfoV1 {
+                        creator_spk: creator_spk.map(|s| s.as_bytes().to_vec()).unwrap_or_default(),
+                        creation_height: block.height,
+                        initial_token0_amount,
+                        initial_token1_amount,
+                        initial_lp_supply,
+                    };
+                    pool_creation_info_writes.push((
+                        table.pool_creation_info_key(&pool_id),
+                        encode_pool_creation_info(&creation_info)?,
+                    ));
 
                     let txid_bytes = transaction.transaction.compute_txid().to_byte_array();
 
@@ -420,6 +597,7 @@ impl EspoModule for AmmData {
         let mut has_trades = false;
         let mut canonical_trade_buckets: HashMap<SchemaAlkaneId, HashSet<(Timeframe, u64)>> =
             HashMap::new();
+        let mut pools_touched: HashSet<SchemaAlkaneId> = HashSet::new();
 
         // Apply balance deltas per pool and emit activity + candles.
         for (owner, entries) in balance_txs {
@@ -447,6 +625,7 @@ impl EspoModule for AmmData {
                     (-1, -1) => (ActivityKind::LiquidityRemove, None),
                     _ => continue,
                 };
+                pools_touched.insert(owner);
 
                 let activity = SchemaActivityV1 {
                     timestamp: block_ts,
@@ -524,6 +703,20 @@ impl EspoModule for AmmData {
             pool_candle_overrides.insert((pool, tf, bucket_ts), candle);
         }
 
+        let load_pool_candle = |pool: &SchemaAlkaneId,
+                                tf: Timeframe,
+                                bucket_ts: u64|
+         -> Result<Option<SchemaFullCandleV1>> {
+            if let Some(c) = pool_candle_overrides.get(&(*pool, tf, bucket_ts)) {
+                return Ok(Some(*c));
+            }
+            let key = table.candle_key(pool, tf, bucket_ts);
+            if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value {
+                return Ok(Some(decode_full_candle_v1(&raw)?));
+            }
+            Ok(None)
+        };
+
         let mut canonical_pool_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for (token, new_entries) in canonical_pool_updates.iter() {
             let key = table.canonical_pool_key(token);
@@ -553,26 +746,6 @@ impl EspoModule for AmmData {
         let mut token_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         if !canonical_trade_buckets.is_empty() {
-            let load_pool_candle = |pool: &SchemaAlkaneId,
-                                    tf: Timeframe,
-                                    bucket_ts: u64,
-                                    provider: &AmmDataProvider,
-                                    table: &super::storage::AmmDataTable<'_>,
-                                    overrides: &HashMap<
-                                        (SchemaAlkaneId, Timeframe, u64),
-                                        SchemaFullCandleV1,
-                                    >|
-             -> Result<Option<SchemaFullCandleV1>> {
-                if let Some(c) = overrides.get(&(*pool, tf, bucket_ts)) {
-                    return Ok(Some(*c));
-                }
-                let key = table.candle_key(pool, tf, bucket_ts);
-                if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value {
-                    return Ok(Some(decode_full_candle_v1(&raw)?));
-                }
-                Ok(None)
-            };
-
             for (token, buckets) in canonical_trade_buckets.iter() {
                 let Some(pools) = canonical_pools_by_token.get(token) else { continue };
                 for (tf, bucket_ts) in buckets {
@@ -581,14 +754,9 @@ impl EspoModule for AmmData {
 
                     for entry in pools.iter() {
                         let Some(unit) = canonical_quote_units.get(&entry.quote_id) else { continue };
-                        let Some(pool_candle) = load_pool_candle(
-                            &entry.pool_id,
-                            *tf,
-                            *bucket_ts,
-                            provider,
-                            &table,
-                            &pool_candle_overrides,
-                        )? else {
+                        let Some(pool_candle) =
+                            load_pool_candle(&entry.pool_id, *tf, *bucket_ts)?
+                        else {
                             continue;
                         };
 
@@ -807,8 +975,215 @@ impl EspoModule for AmmData {
                     change_all_time: percent_change(first_close, latest_close),
                 };
 
+                token_metrics_cache.insert(*token, metrics.clone());
                 let encoded = encode_token_metrics(&metrics)?;
                 token_metrics_writes.push((table.token_metrics_key(token), encoded));
+            }
+        }
+
+        // ---------- pool metrics + TVL versioned + LP supply ----------
+        if !pools_touched.is_empty() {
+            let mut token_price_usd_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+            let mut token_price_sats_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+
+            let mut get_token_price_usd = |token: &SchemaAlkaneId| -> u128 {
+                if let Some(price) = token_price_usd_cache.get(token) {
+                    return *price;
+                }
+                let metrics = token_metrics_cache
+                    .get(token)
+                    .cloned()
+                    .or_else(|| {
+                        provider
+                            .get_token_metrics(GetTokenMetricsParams { token: *token })
+                            .ok()
+                            .map(|res| res.metrics)
+                    })
+                    .unwrap_or_default();
+                let price = metrics.price_usd;
+                token_price_usd_cache.insert(*token, price);
+                price
+            };
+
+            let mut get_token_price_sats = |token: &SchemaAlkaneId| -> u128 {
+                if let Some(price) = token_price_sats_cache.get(token) {
+                    return *price;
+                }
+                let mut price = 0u128;
+                if let Some(pools) = canonical_pools_by_token.get(token) {
+                    for entry in pools {
+                        let unit = match canonical_quote_units.get(&entry.quote_id) {
+                            Some(u) => *u,
+                            None => continue,
+                        };
+                        if unit != CanonicalQuoteUnit::Btc {
+                            continue;
+                        }
+                        let bucket = bucket_start_for(block_ts, Timeframe::M10);
+                        if let Ok(Some(candle)) = load_pool_candle(&entry.pool_id, Timeframe::M10, bucket) {
+                            price = candle.base_candle.close;
+                        } else {
+                            let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
+                            if let Ok(res) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                                if let Some((_k, v)) = res.entries.into_iter().next() {
+                                    if let Ok(candle) = decode_full_candle_v1(&v) {
+                                        price = candle.base_candle.close;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+                token_price_sats_cache.insert(*token, price);
+                price
+            };
+
+            let percent_change = |prev: u128, now: u128| -> String {
+                if prev == 0 {
+                    return "0".to_string();
+                }
+                let prev_f = prev as f64;
+                let now_f = now as f64;
+                let pct = (now_f - prev_f) / prev_f * 100.0;
+                format!("{:.4}", pct)
+            };
+
+            let tvl_at_height = |pool: &SchemaAlkaneId, h: u32| -> u128 {
+                provider
+                    .get_tvl_versioned_at_or_before(GetTvlVersionedAtOrBeforeParams {
+                        pool: *pool,
+                        height: h,
+                    })
+                    .ok()
+                    .and_then(|res| res.value)
+                    .unwrap_or(0)
+            };
+
+            for pool in pools_touched.iter() {
+                let Some(defs) = pools_map.get(pool) else { continue };
+
+                let mut balances =
+                    get_alkane_balances(essentials, pool).unwrap_or_default();
+                let token0_amount = balances.remove(&defs.base_alkane_id).unwrap_or(0);
+                let token1_amount = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
+
+                let token0_price_usd = get_token_price_usd(&defs.base_alkane_id);
+                let token1_price_usd = get_token_price_usd(&defs.quote_alkane_id);
+                let token0_price_sats = get_token_price_sats(&defs.base_alkane_id);
+                let token1_price_sats = get_token_price_sats(&defs.quote_alkane_id);
+
+                let token0_tvl_usd =
+                    token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
+                let token1_tvl_usd =
+                    token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
+                let token0_tvl_sats =
+                    token0_amount.saturating_mul(token0_price_sats) / PRICE_SCALE;
+                let token1_tvl_sats =
+                    token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
+
+                let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
+                let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
+
+                let bucket_1d = bucket_start_for(block_ts, Timeframe::D1);
+                let bucket_30d = bucket_start_for(block_ts, Timeframe::M1);
+
+                let (token0_volume_1d, token1_volume_1d) =
+                    if let Ok(Some(c)) = load_pool_candle(pool, Timeframe::D1, bucket_1d) {
+                        (c.base_candle.volume, c.quote_candle.volume)
+                    } else {
+                        (0, 0)
+                    };
+                let (token0_volume_30d, token1_volume_30d) =
+                    if let Ok(Some(c)) = load_pool_candle(pool, Timeframe::M1, bucket_30d) {
+                        (c.base_candle.volume, c.quote_candle.volume)
+                    } else {
+                        (0, 0)
+                    };
+
+                let pool_volume_1d_usd = token0_volume_1d
+                    .saturating_mul(token0_price_usd)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_1d
+                            .saturating_mul(token1_price_usd)
+                            .saturating_div(PRICE_SCALE),
+                    );
+                let pool_volume_30d_usd = token0_volume_30d
+                    .saturating_mul(token0_price_usd)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_30d
+                            .saturating_mul(token1_price_usd)
+                            .saturating_div(PRICE_SCALE),
+                    );
+                let pool_volume_1d_sats = token0_volume_1d
+                    .saturating_mul(token0_price_sats)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_1d
+                            .saturating_mul(token1_price_sats)
+                            .saturating_div(PRICE_SCALE),
+                    );
+                let pool_volume_30d_sats = token0_volume_30d
+                    .saturating_mul(token0_price_sats)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_30d
+                            .saturating_mul(token1_price_sats)
+                            .saturating_div(PRICE_SCALE),
+                    );
+
+                let prev_1d = tvl_at_height(pool, height.saturating_sub(144));
+                let prev_7d = tvl_at_height(pool, height.saturating_sub(1008));
+                let tvl_change_24h = percent_change(prev_1d, pool_tvl_usd);
+                let tvl_change_7d = percent_change(prev_7d, pool_tvl_usd);
+
+                let pool_apr = if pool_tvl_usd == 0 {
+                    "0".to_string()
+                } else {
+                    let fees = (pool_volume_30d_usd as f64) * 0.003;
+                    let apr =
+                        fees / (pool_tvl_usd as f64) * 12.0 * 100.0;
+                    format!("{:.4}", apr)
+                };
+
+                let metrics = SchemaPoolMetricsV1 {
+                    token0_volume_1d,
+                    token1_volume_1d,
+                    token0_volume_30d,
+                    token1_volume_30d,
+                    pool_volume_1d_usd,
+                    pool_volume_30d_usd,
+                    pool_volume_1d_sats,
+                    pool_volume_30d_sats,
+                    pool_tvl_usd,
+                    pool_tvl_sats,
+                    tvl_change_24h,
+                    tvl_change_7d,
+                    pool_apr,
+                };
+
+                pool_metrics_writes.push((
+                    table.pool_metrics_key(pool),
+                    encode_pool_metrics(&metrics)?,
+                ));
+
+                let lp_supply = essentials
+                    .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
+                        alkane: *pool,
+                    })
+                    .map(|res| res.supply)
+                    .unwrap_or(0);
+                pool_lp_supply_writes.push((
+                    table.pool_lp_supply_latest_key(pool),
+                    encode_u128_value(lp_supply)?,
+                ));
+
+                tvl_versioned_writes.push((
+                    table.tvl_versioned_key(pool, height),
+                    encode_u128_value(pool_tvl_usd)?,
+                ));
             }
         }
 
@@ -867,17 +1242,33 @@ impl EspoModule for AmmData {
         let tm_cnt = token_metrics_writes.len();
         let cp_cnt = canonical_pool_writes.len();
         let pn_cnt = pool_name_index_writes.len();
+        let af_cnt = amm_factory_writes.len();
+        let fp_cnt = factory_pools_writes.len();
+        let pf_cnt = pool_factory_writes.len();
+        let pc_cnt = pool_creation_info_writes.len();
+        let pd_cnt = pool_defs_writes.len();
+        let pm_cnt = pool_metrics_writes.len();
+        let pls_cnt = pool_lp_supply_writes.len();
+        let tvl_cnt = tvl_versioned_writes.len();
         let a_cnt = activity_writes.len();
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
             tm_cnt = tm_cnt,
             cp_cnt = cp_cnt,
             pn_cnt = pn_cnt,
+            af_cnt = af_cnt,
+            fp_cnt = fp_cnt,
+            pf_cnt = pf_cnt,
+            pc_cnt = pc_cnt,
+            pd_cnt = pd_cnt,
+            pm_cnt = pm_cnt,
+            pls_cnt = pls_cnt,
+            tvl_cnt = tvl_cnt,
             a_cnt = a_cnt,
             i_cnt = i_cnt,
         );
@@ -887,6 +1278,14 @@ impl EspoModule for AmmData {
             || !token_metrics_writes.is_empty()
             || !canonical_pool_writes.is_empty()
             || !pool_name_index_writes.is_empty()
+            || !amm_factory_writes.is_empty()
+            || !factory_pools_writes.is_empty()
+            || !pool_factory_writes.is_empty()
+            || !pool_creation_info_writes.is_empty()
+            || !pool_defs_writes.is_empty()
+            || !pool_metrics_writes.is_empty()
+            || !pool_lp_supply_writes.is_empty()
+            || !tvl_versioned_writes.is_empty()
             || !activity_writes.is_empty()
             || !index_writes.is_empty()
             || !reserves_blob.is_empty()
@@ -897,6 +1296,14 @@ impl EspoModule for AmmData {
             puts.extend(token_metrics_writes);
             puts.extend(canonical_pool_writes);
             puts.extend(pool_name_index_writes);
+            puts.extend(amm_factory_writes);
+            puts.extend(factory_pools_writes);
+            puts.extend(pool_factory_writes);
+            puts.extend(pool_creation_info_writes);
+            puts.extend(pool_defs_writes);
+            puts.extend(pool_metrics_writes);
+            puts.extend(pool_lp_supply_writes);
+            puts.extend(tvl_versioned_writes);
             puts.extend(activity_writes);
             puts.extend(index_writes);
             puts.push((reserves_key_rel, reserves_blob));

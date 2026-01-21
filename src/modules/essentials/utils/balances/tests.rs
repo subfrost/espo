@@ -5,6 +5,7 @@ use crate::config::{AppConfig, init_config_from};
 use crate::core::blockfetcher::BlockFetchMode;
 use crate::schemas::SchemaAlkaneId;
 use bitcoin::{Txid, hashes::Hash};
+use std::collections::HashMap;
 
 fn init_test_config_from_run_sh() {
     let cfg = AppConfig {
@@ -31,6 +32,7 @@ fn init_test_config_from_run_sh() {
         block_source_mode: BlockFetchMode::RpcOnly,
         simulate_reorg: false,
         explorer_networks: None,
+        modules: HashMap::new(),
     };
     if let Err(err) = init_config_from(cfg) {
         if !err.to_string().contains("already initialized") {
