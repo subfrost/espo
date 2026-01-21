@@ -23,7 +23,7 @@ use std::{
 
 // Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
-use bitcoincore_rpc::{Auth, Client as CoreClient};
+use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 
 // Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
@@ -155,7 +155,9 @@ pub struct ConfigFile {
     #[serde(default)]
     pub electrs_esplora_url: Option<String>,
     pub bitcoind_rpc_url: String,
+    #[serde(default)]
     pub bitcoind_rpc_user: String,
+    #[serde(default)]
     pub bitcoind_rpc_pass: String,
     #[serde(default = "default_bitcoind_blocks_dir")]
     pub bitcoind_blocks_dir: String,
@@ -379,10 +381,12 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
 
     // --- init Bitcoin Core RPC client once ---
-    let core = CoreClient::new(
-        &cfg.bitcoind_rpc_url,
-        Auth::UserPass(cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()),
-    )?;
+    let auth = if !cfg.bitcoind_rpc_user.is_empty() && !cfg.bitcoind_rpc_pass.is_empty() {
+        Some((cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()))
+    } else {
+        None
+    };
+    let core = CoreClient::new(&cfg.bitcoind_rpc_url, auth)?;
     BITCOIND_CLIENT
         .set(core)
         .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
