@@ -15,11 +15,12 @@ use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
     decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, decode_u128_value,
     encode_u128_value, encode_vec,
-    mk_outpoint, spk_to_address_str,
+    mk_outpoint, spk_to_address_str, build_alkane_balances_key,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, GetScanPrefixParams, SetBatchParams,
 };
+use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result, anyhow};
 use bitcoin::block::Header;
@@ -2235,7 +2236,7 @@ pub fn get_alkane_balance_at_height(
         return Err(anyhow!("height-indexed storage not enabled"));
     }
 
-    let key = alkane_balances_key(owner);
+    let key = build_alkane_balances_key(owner);
     if let Some(bytes) = mdb.get_at_height(&key, height)? {
         if let Ok(bals) = decode_balances_vec(&bytes) {
             for be in bals {

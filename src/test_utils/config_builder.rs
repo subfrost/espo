@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::core::blockfetcher::BlockFetchMode;
 use bitcoin::Network;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -46,6 +47,7 @@ impl TestConfigBuilder {
             explorer_networks: None,
             enable_height_indexed: false,
             max_reorg_depth: 100,
+            modules: HashMap::new(),
         };
 
         Self {

@@ -2825,6 +2825,14 @@ pub fn get_holders_values_encoded(holders: Vec<HolderEntry>) -> Result<(Vec<u8>,
     Ok((encode_vec(&holders)?, get_holders_count_encoded(holders.len().try_into()?)?))
 }
 
+/// Build the key for alkane balances (public helper for strict mode validation)
+pub fn build_alkane_balances_key(owner: &SchemaAlkaneId) -> Vec<u8> {
+    let mut key = b"/alkane_balances/".to_vec();
+    key.extend_from_slice(&owner.block.to_be_bytes());
+    key.extend_from_slice(&owner.tx.to_be_bytes());
+    key
+}
+
 fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
     let mut traces_json: Vec<Value> = Vec::new();
     if let Some(traces) = entry.traces.as_ref() {

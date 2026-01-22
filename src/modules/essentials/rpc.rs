@@ -9,8 +9,14 @@ use crate::modules::essentials::storage::{
     RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
     RpcPingParams,
 };
+use crate::utils::parse_alkane_id;
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+#[inline]
+fn log_rpc(method: &str, msg: &str) {
+    eprintln!("[RPC::ESSENTIALS] {method} - {msg}");
+}
 
 pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
     let mdb = Arc::clone(&provider);
@@ -498,7 +504,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             }
                         };
 
-                        let owner = match parse_alkane_from_str(owner_str) {
+                        let owner = match parse_alkane_id(owner_str) {
                             Some(a) => a,
                             None => {
                                 log_rpc("get_balance_at_height", "invalid_owner");
@@ -509,7 +515,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             }
                         };
 
-                        let token = match parse_alkane_from_str(token_str) {
+                        let token = match parse_alkane_id(token_str) {
                             Some(a) => a,
                             None => {
                                 log_rpc("get_balance_at_height", "invalid_token");
@@ -528,7 +534,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             ),
                         );
 
-                        match get_alkane_balance_at_height(&mdb, &owner, &token, height) {
+                        match get_alkane_balance_at_height(mdb.mdb(), &owner, &token, height) {
                             Ok(balance) => json!({
                                 "ok": true,
                                 "owner": format!("{}:{}", owner.block, owner.tx),

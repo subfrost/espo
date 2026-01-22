@@ -105,8 +105,8 @@ impl EspoModule for Essentials {
         let table = provider.table();
 
         // Set current height for versioned storage
-        if mdb.has_height_indexed() {
-            mdb.set_current_height(block.height);
+        if provider.mdb().has_height_indexed() {
+            provider.mdb().set_current_height(block.height);
         }
 
         // -------- Phase A: coalesce per-block writes in memory --------
