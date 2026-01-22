@@ -106,6 +106,8 @@ impl EspoModule for Subfrost {
 
         let mut wrap_seq: u32 = 0;
         let mut unwrap_seq: u32 = 0;
+        let mut unwrap_delta_all: u128 = 0;
+        let mut unwrap_delta_success: u128 = 0;
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
         for tx in &block.transactions {
@@ -145,6 +147,13 @@ impl EspoModule for Subfrost {
                                 address_spk: pending.address_spk,
                                 success,
                             };
+                            if matches!(pending.kind, WrapKind::Unwrap) {
+                                unwrap_delta_all = unwrap_delta_all.saturating_add(amount);
+                                if success {
+                                    unwrap_delta_success =
+                                        unwrap_delta_success.saturating_add(amount);
+                                }
+                            }
                             let bytes = borsh::to_vec(&event)?;
                             match pending.kind {
                                 WrapKind::Wrap => {
@@ -178,6 +187,38 @@ impl EspoModule for Subfrost {
         }
 
         if !puts.is_empty() {
+            if unwrap_delta_all > 0 || unwrap_delta_success > 0 {
+                let prev_all = provider
+                    .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
+                        successful: false,
+                    })
+                    .map(|res| res.total)
+                    .unwrap_or(0);
+                let prev_success = provider
+                    .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
+                        successful: true,
+                    })
+                    .map(|res| res.total)
+                    .unwrap_or(0);
+                let total_all = prev_all.saturating_add(unwrap_delta_all);
+                let total_success = prev_success.saturating_add(unwrap_delta_success);
+                puts.push((
+                    table.unwrap_total_latest_key(false),
+                    encode_u128_value(total_all),
+                ));
+                puts.push((
+                    table.unwrap_total_latest_key(true),
+                    encode_u128_value(total_success),
+                ));
+                puts.push((
+                    table.unwrap_total_by_height_key(block.height, false),
+                    encode_u128_value(total_all),
+                ));
+                puts.push((
+                    table.unwrap_total_by_height_key(block.height, true),
+                    encode_u128_value(total_success),
+                ));
+            }
             let _ = provider.set_batch(SetBatchParams {
                 puts,
                 deletes: Vec::new(),
@@ -354,4 +395,8 @@ fn spk_from_protostone(tx: &Transaction) -> Option<bitcoin::ScriptBuf> {
         }
     }
     None
+}
+
+fn encode_u128_value(value: u128) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
 }

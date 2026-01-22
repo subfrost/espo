@@ -1,19 +1,18 @@
 use super::schemas::{
-    ActivityDirection, ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry,
-    SchemaCandleV1, SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
-    SchemaPoolMetricsV1, SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
-    active_timeframes,
+    ActivityDirection, ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry,
+    SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolMetricsV1,
+    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe, active_timeframes,
 };
 use super::storage::{
     AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetRawValueParams,
     GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, SetBatchParams, decode_candle_v1,
-    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot,
-    encode_candle_v1, encode_canonical_pools, encode_pool_creation_info, encode_pool_metrics,
+    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot, encode_candle_v1,
+    encode_canonical_pools, encode_pool_creation_info, encode_pool_metrics,
     encode_reserves_snapshot, encode_token_metrics, encode_u128_value,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
-use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
 use crate::alkanes::trace::EspoSandshrewLikeTraceStatus;
+use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
 use crate::config::{get_electrum_like, get_espo_db, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
@@ -23,21 +22,24 @@ use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::utils::candles::{
     CandleCache, bucket_start_for, price_base_per_quote, price_quote_per_base,
 };
-use crate::modules::ammdata::utils::reserves::{NewPoolInfo, extract_new_pools_from_espo_transaction};
+use crate::modules::ammdata::utils::reserves::{
+    NewPoolInfo, extract_new_pools_from_espo_transaction,
+};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, GetAlkaneStorageValueParams, GetCreationRecordParams,
+    AlkaneBalanceTxEntry, EssentialsProvider, GetAlkaneStorageValueParams, GetCreationRecordParams,
     GetLatestCirculatingSupplyParams, GetRawValueParams as EssentialsGetRawValueParams,
-    EssentialsProvider,
 };
 use crate::modules::essentials::utils::balances::{SignedU128, get_alkane_balances};
-use crate::modules::essentials::utils::inspections::{StoredInspectionMetadata, StoredInspectionResult};
+use crate::modules::essentials::utils::inspections::{
+    StoredInspectionMetadata, StoredInspectionResult,
+};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::Network;
-use bitcoin::hashes::Hash;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction, Txid};
 use borsh::BorshDeserialize;
 use ordinals::{Artifact, Runestone};
@@ -79,16 +81,16 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
 
 fn parse_hex_u32(s: &str) -> Option<u32> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
-        if v > u32::MAX as u128 { None } else { Some(v as u32) }
-    })
+    u128::from_str_radix(trimmed, 16)
+        .ok()
+        .and_then(|v| if v > u32::MAX as u128 { None } else { Some(v as u32) })
 }
 
 fn parse_hex_u64(s: &str) -> Option<u64> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
-        if v > u64::MAX as u128 { None } else { Some(v as u64) }
-    })
+    u128::from_str_radix(trimmed, 16)
+        .ok()
+        .and_then(|v| if v > u64::MAX as u128 { None } else { Some(v as u64) })
 }
 
 fn parse_factory_create_call(
@@ -105,11 +107,7 @@ fn parse_factory_create_call(
         return None;
     }
     let id = SchemaAlkaneId { block, tx };
-    if factories.contains(&id) {
-        Some(id)
-    } else {
-        None
-    }
+    if factories.contains(&id) { Some(id) } else { None }
 }
 
 fn pool_creator_spk_from_protostone(tx: &Transaction) -> Option<ScriptBuf> {
@@ -152,10 +150,7 @@ fn load_balance_txs_by_height(
 ) -> Result<BTreeMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>> {
     let table = essentials.table();
     let key = table.alkane_balance_txs_by_height_key(height);
-    let Some(bytes) = essentials
-        .get_raw_value(EssentialsGetRawValueParams { key })?
-        .value
-    else {
+    let Some(bytes) = essentials.get_raw_value(EssentialsGetRawValueParams { key })?.value else {
         return Ok(BTreeMap::new());
     };
     let parsed = BTreeMap::<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>::try_from_slice(&bytes)
@@ -170,18 +165,12 @@ pub struct AmmData {
 
 impl AmmData {
     pub fn new() -> Self {
-        Self {
-            provider: None,
-            index_height: Arc::new(std::sync::RwLock::new(None)),
-        }
+        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
     }
 
     #[inline]
     fn provider(&self) -> &AmmDataProvider {
-        self.provider
-            .as_ref()
-            .expect("ModuleRegistry must call set_mdb()")
-            .as_ref()
+        self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
@@ -247,9 +236,7 @@ impl EspoModule for AmmData {
         // ---- Load existing snapshot (single read) ----
         let mut reserves_snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
             if let Some(bytes) = provider
-                .get_raw_value(GetRawValueParams {
-                    key: table.reserves_snapshot_key(),
-                })?
+                .get_raw_value(GetRawValueParams { key: table.reserves_snapshot_key() })?
                 .value
             {
                 match decode_reserves_snapshot(&bytes) {
@@ -310,7 +297,9 @@ impl EspoModule for AmmData {
                 continue;
             }
             let mut is_factory = false;
-            if let Ok(resp) = essentials.get_creation_record(GetCreationRecordParams { alkane: alk }) {
+            if let Ok(resp) =
+                essentials.get_creation_record(GetCreationRecordParams { alkane: alk })
+            {
                 if let Some(rec) = resp.record {
                     if let Some(inspection) = rec.inspection.as_ref() {
                         if inspection_is_amm_factory(inspection) {
@@ -329,8 +318,8 @@ impl EspoModule for AmmData {
                     .and_then(|resp| resp.value)
                     .and_then(|raw| decode_kv_implementation(&raw));
                 if let Some(proxy_target) = impl_val {
-                    if let Ok(resp) =
-                        essentials.get_creation_record(GetCreationRecordParams { alkane: proxy_target })
+                    if let Ok(resp) = essentials
+                        .get_creation_record(GetCreationRecordParams { alkane: proxy_target })
                     {
                         if let Some(rec) = resp.record {
                             if let Some(inspection) = rec.inspection.as_ref() {
@@ -366,8 +355,10 @@ impl EspoModule for AmmData {
         let mut pool_creations_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut address_pool_swaps_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut address_token_swaps_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut token_metrics_cache: HashMap<SchemaAlkaneId, SchemaTokenMetricsV1> =
-            HashMap::new();
+        let mut address_pool_creations_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut address_pool_mints_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut address_pool_burns_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_metrics_cache: HashMap<SchemaAlkaneId, SchemaTokenMetricsV1> = HashMap::new();
         let mut alkane_label_cache: HashMap<SchemaAlkaneId, String> = HashMap::new();
         let get_alkane_label = |essentials: &EssentialsProvider,
                                 cache: &mut HashMap<SchemaAlkaneId, String>,
@@ -380,12 +371,7 @@ impl EspoModule for AmmData {
                 .get_creation_record(GetCreationRecordParams { alkane: *alkane })
                 .ok()
                 .and_then(|resp| resp.record)
-                .and_then(|rec| {
-                    rec.symbols
-                        .first()
-                        .cloned()
-                        .or_else(|| rec.names.first().cloned())
-                })
+                .and_then(|rec| rec.symbols.first().cloned().or_else(|| rec.names.first().cloned()))
                 .unwrap_or_else(|| format!("{}:{}", alkane.block, alkane.tx));
             cache.insert(*alkane, label.clone());
             label
@@ -441,10 +427,8 @@ impl EspoModule for AmmData {
                                     if let (Some(block), Some(tx)) =
                                         (parse_hex_u32(&c.block), parse_hex_u64(&c.tx))
                                     {
-                                        pool_factory_by_id.insert(
-                                            SchemaAlkaneId { block, tx },
-                                            factory,
-                                        );
+                                        pool_factory_by_id
+                                            .insert(SchemaAlkaneId { block, tx }, factory);
                                     }
                                 }
                             }
@@ -476,23 +460,25 @@ impl EspoModule for AmmData {
                         quote_id: defs.quote_alkane_id,
                     });
                     if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
-                        canonical_pool_updates
-                            .entry(defs.base_alkane_id)
-                            .or_default()
-                            .push(SchemaCanonicalPoolEntry {
-                                pool_id,
-                                quote_id: defs.quote_alkane_id,
-                            });
+                        canonical_pool_updates.entry(defs.base_alkane_id).or_default().push(
+                            SchemaCanonicalPoolEntry { pool_id, quote_id: defs.quote_alkane_id },
+                        );
                     }
 
-                    let base_label = get_alkane_label(essentials, &mut alkane_label_cache, &defs.base_alkane_id);
-                    let quote_label =
-                        get_alkane_label(essentials, &mut alkane_label_cache, &defs.quote_alkane_id);
+                    let base_label =
+                        get_alkane_label(essentials, &mut alkane_label_cache, &defs.base_alkane_id);
+                    let quote_label = get_alkane_label(
+                        essentials,
+                        &mut alkane_label_cache,
+                        &defs.quote_alkane_id,
+                    );
                     let pool_name = format!("{base_label} / {quote_label}");
                     let pool_name_norm = pool_name.trim().to_ascii_lowercase();
                     if !pool_name_norm.is_empty() {
-                        pool_name_index_writes
-                            .push((table.pool_name_index_key(&pool_name_norm, &pool_id), Vec::new()));
+                        pool_name_index_writes.push((
+                            table.pool_name_index_key(&pool_name_norm, &pool_id),
+                            Vec::new(),
+                        ));
                     }
 
                     if let Some(factory_id) = factory_id {
@@ -547,10 +533,12 @@ impl EspoModule for AmmData {
                         creator_spk = lowest_spk;
                     }
 
-                    let mut pool_balances = get_alkane_balances(essentials, &pool_id)
-                        .unwrap_or_default();
-                    let initial_token0_amount = pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
-                    let initial_token1_amount = pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
+                    let mut pool_balances =
+                        get_alkane_balances(essentials, &pool_id).unwrap_or_default();
+                    let initial_token0_amount =
+                        pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
+                    let initial_token1_amount =
+                        pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
                     let initial_lp_supply = essentials
                         .get_latest_circulating_supply(
                             crate::modules::essentials::storage::GetLatestCirculatingSupplyParams {
@@ -579,10 +567,8 @@ impl EspoModule for AmmData {
 
                     let txid = transaction.transaction.compute_txid();
                     let txid_bytes = txid.to_byte_array();
-                    let (address_spk, success) = tx_meta
-                        .get(&txid)
-                        .cloned()
-                        .unwrap_or_else(|| (Vec::new(), true));
+                    let (address_spk, success) =
+                        tx_meta.get(&txid).cloned().unwrap_or_else(|| (Vec::new(), true));
 
                     let activity = SchemaActivityV1 {
                         timestamp: block_ts,
@@ -599,6 +585,17 @@ impl EspoModule for AmmData {
                         index_acc.add(&pool_id, block_ts, seq, &activity);
                         pool_creations_writes
                             .push((table.pool_creations_key(block_ts, seq, &pool_id), Vec::new()));
+                        if !activity.address_spk.is_empty() {
+                            address_pool_creations_writes.push((
+                                table.address_pool_creations_key(
+                                    &activity.address_spk,
+                                    block_ts,
+                                    seq,
+                                    &pool_id,
+                                ),
+                                Vec::new(),
+                            ));
+                        }
                     }
 
                     println!(
@@ -661,10 +658,8 @@ impl EspoModule for AmmData {
                 pools_touched.insert(owner);
 
                 let txid = Txid::from_byte_array(entry.txid);
-                let (address_spk, success) = tx_meta
-                    .get(&txid)
-                    .cloned()
-                    .unwrap_or_else(|| (Vec::new(), true));
+                let (address_spk, success) =
+                    tx_meta.get(&txid).cloned().unwrap_or_else(|| (Vec::new(), true));
                 let address_spk = address_spk.clone();
 
                 let activity = SchemaActivityV1 {
@@ -681,10 +676,14 @@ impl EspoModule for AmmData {
                 if let Ok(seq) = activity_acc.push(owner, block_ts, activity.clone()) {
                     index_acc.add(&owner, block_ts, seq, &activity);
                     if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
-                        token_swaps_writes
-                            .push((table.token_swaps_key(&defs.base_alkane_id, block_ts, seq, &owner), Vec::new()));
-                        token_swaps_writes
-                            .push((table.token_swaps_key(&defs.quote_alkane_id, block_ts, seq, &owner), Vec::new()));
+                        token_swaps_writes.push((
+                            table.token_swaps_key(&defs.base_alkane_id, block_ts, seq, &owner),
+                            Vec::new(),
+                        ));
+                        token_swaps_writes.push((
+                            table.token_swaps_key(&defs.quote_alkane_id, block_ts, seq, &owner),
+                            Vec::new(),
+                        ));
                         if !address_spk.is_empty() {
                             address_pool_swaps_writes.push((
                                 table.address_pool_swaps_key(&address_spk, &owner, block_ts, seq),
@@ -712,6 +711,33 @@ impl EspoModule for AmmData {
                             ));
                         }
                     }
+                    if !address_spk.is_empty() {
+                        match kind {
+                            ActivityKind::LiquidityAdd => {
+                                address_pool_mints_writes.push((
+                                    table.address_pool_mints_key(
+                                        &address_spk,
+                                        block_ts,
+                                        seq,
+                                        &owner,
+                                    ),
+                                    Vec::new(),
+                                ));
+                            }
+                            ActivityKind::LiquidityRemove => {
+                                address_pool_burns_writes.push((
+                                    table.address_pool_burns_key(
+                                        &address_spk,
+                                        block_ts,
+                                        seq,
+                                        &owner,
+                                    ),
+                                    Vec::new(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 if matches!(kind, ActivityKind::TradeBuy | ActivityKind::TradeSell) {
@@ -722,19 +748,11 @@ impl EspoModule for AmmData {
                     let quote_out = if quote_delta < 0 { (-quote_delta) as u128 } else { 0 };
 
                     candle_cache.apply_trade_for_frames(
-                        block_ts,
-                        owner,
-                        &frames,
-                        p_b_per_q,
-                        p_q_per_b,
-                        base_in,
-                        quote_out,
+                        block_ts, owner, &frames, p_b_per_q, p_q_per_b, base_in, quote_out,
                     );
 
                     if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
-                        let entry = canonical_trade_buckets
-                            .entry(defs.base_alkane_id)
-                            .or_default();
+                        let entry = canonical_trade_buckets.entry(defs.base_alkane_id).or_default();
                         for tf in &frames {
                             entry.insert((*tf, bucket_start_for(block_ts, *tf)));
                         }
@@ -760,19 +778,17 @@ impl EspoModule for AmmData {
             HashMap::new();
         for (pool, defs) in pools_map.iter() {
             if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
-                canonical_pools_by_token
-                    .entry(defs.base_alkane_id)
-                    .or_default()
-                    .push(SchemaCanonicalPoolEntry {
-                        pool_id: *pool,
-                        quote_id: defs.quote_alkane_id,
-                    });
+                canonical_pools_by_token.entry(defs.base_alkane_id).or_default().push(
+                    SchemaCanonicalPoolEntry { pool_id: *pool, quote_id: defs.quote_alkane_id },
+                );
             }
         }
 
         let (candle_writes, candle_entries) = candle_cache.into_writes_with_entries(provider)?;
-        let mut pool_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaFullCandleV1> =
-            HashMap::new();
+        let mut pool_candle_overrides: HashMap<
+            (SchemaAlkaneId, Timeframe, u64),
+            SchemaFullCandleV1,
+        > = HashMap::new();
         for (pool, tf, bucket_ts, candle) in candle_entries {
             pool_candle_overrides.insert((pool, tf, bucket_ts), candle);
         }
@@ -814,8 +830,10 @@ impl EspoModule for AmmData {
             }
         }
 
-        let mut token_usd_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaCandleV1> =
-            HashMap::new();
+        let mut token_usd_candle_overrides: HashMap<
+            (SchemaAlkaneId, Timeframe, u64),
+            SchemaCandleV1,
+        > = HashMap::new();
         let mut token_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
@@ -827,9 +845,10 @@ impl EspoModule for AmmData {
                     let mut usd_candle: Option<SchemaCandleV1> = None;
 
                     for entry in pools.iter() {
-                        let Some(unit) = canonical_quote_units.get(&entry.quote_id) else { continue };
-                        let Some(pool_candle) =
-                            load_pool_candle(&entry.pool_id, *tf, *bucket_ts)?
+                        let Some(unit) = canonical_quote_units.get(&entry.quote_id) else {
+                            continue;
+                        };
+                        let Some(pool_candle) = load_pool_candle(&entry.pool_id, *tf, *bucket_ts)?
                         else {
                             continue;
                         };
@@ -838,15 +857,17 @@ impl EspoModule for AmmData {
                         let conv = |p: u128| -> Option<u128> {
                             match unit {
                                 CanonicalQuoteUnit::Usd => Some(p),
-                                CanonicalQuoteUnit::Btc => btc_usd_price
-                                    .map(|btc| p.saturating_mul(btc) / PRICE_SCALE),
+                                CanonicalQuoteUnit::Btc => {
+                                    btc_usd_price.map(|btc| p.saturating_mul(btc) / PRICE_SCALE)
+                                }
                             }
                         };
                         let conv_vol = |v: u128| -> Option<u128> {
                             match unit {
                                 CanonicalQuoteUnit::Usd => Some(v),
-                                CanonicalQuoteUnit::Btc => btc_usd_price
-                                    .map(|btc| v.saturating_mul(btc) / PRICE_SCALE),
+                                CanonicalQuoteUnit::Btc => {
+                                    btc_usd_price.map(|btc| v.saturating_mul(btc) / PRICE_SCALE)
+                                }
                             }
                         };
 
@@ -902,11 +923,9 @@ impl EspoModule for AmmData {
                     let open = if let Some(prev) = existing {
                         prev.open
                     } else {
-                        let prev_bucket = bucket_ts
-                            .checked_sub(tf.duration_secs())
-                            .unwrap_or(*bucket_ts);
-                        if let Some(c) =
-                            token_usd_candle_overrides.get(&(*token, *tf, prev_bucket))
+                        let prev_bucket =
+                            bucket_ts.checked_sub(tf.duration_secs()).unwrap_or(*bucket_ts);
+                        if let Some(c) = token_usd_candle_overrides.get(&(*token, *tf, prev_bucket))
                         {
                             c.close
                         } else {
@@ -971,10 +990,7 @@ impl EspoModule for AmmData {
                         return 0;
                     }
                     if target_bucket <= earliest_bucket {
-                        return per_bucket
-                            .get(&earliest_bucket)
-                            .map(|c| c.close)
-                            .unwrap_or(0);
+                        return per_bucket.get(&earliest_bucket).map(|c| c.close).unwrap_or(0);
                     }
                     let mut bts = earliest_bucket;
                     let mut last_close = 0u128;
@@ -991,10 +1007,7 @@ impl EspoModule for AmmData {
                 };
 
                 let latest_close = close_at(now_bucket);
-                let first_close = per_bucket
-                    .get(&earliest_bucket)
-                    .map(|c| c.close)
-                    .unwrap_or(0);
+                let first_close = per_bucket.get(&earliest_bucket).map(|c| c.close).unwrap_or(0);
 
                 let window_close = |secs: u64| -> u128 {
                     let target = now_bucket.saturating_sub(secs);
@@ -1013,10 +1026,7 @@ impl EspoModule for AmmData {
 
                 let volume_window = |secs: u64| -> u128 {
                     let start = now_bucket.saturating_sub(secs);
-                    per_bucket
-                        .range(start..=now_bucket)
-                        .map(|(_, c)| c.volume)
-                        .sum()
+                    per_bucket.range(start..=now_bucket).map(|(_, c)| c.volume).sum()
                 };
 
                 let volume_all_time: u128 = per_bucket.values().map(|c| c.volume).sum();
@@ -1027,7 +1037,9 @@ impl EspoModule for AmmData {
                     essentials
                         .get_raw_value(EssentialsGetRawValueParams { key })?
                         .value
-                        .and_then(|v| crate::modules::essentials::storage::decode_u128_value(&v).ok())
+                        .and_then(|v| {
+                            crate::modules::essentials::storage::decode_u128_value(&v).ok()
+                        })
                         .unwrap_or(0)
                 };
 
@@ -1094,11 +1106,15 @@ impl EspoModule for AmmData {
                             continue;
                         }
                         let bucket = bucket_start_for(block_ts, Timeframe::M10);
-                        if let Ok(Some(candle)) = load_pool_candle(&entry.pool_id, Timeframe::M10, bucket) {
+                        if let Ok(Some(candle)) =
+                            load_pool_candle(&entry.pool_id, Timeframe::M10, bucket)
+                        {
                             price = candle.base_candle.close;
                         } else {
                             let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
-                            if let Ok(res) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                            if let Ok(res) =
+                                provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+                            {
                                 if let Some((_k, v)) = res.entries.into_iter().next() {
                                     if let Ok(candle) = decode_full_candle_v1(&v) {
                                         price = candle.base_candle.close;
@@ -1137,8 +1153,7 @@ impl EspoModule for AmmData {
             for pool in pools_touched.iter() {
                 let Some(defs) = pools_map.get(pool) else { continue };
 
-                let mut balances =
-                    get_alkane_balances(essentials, pool).unwrap_or_default();
+                let mut balances = get_alkane_balances(essentials, pool).unwrap_or_default();
                 let token0_amount = balances.remove(&defs.base_alkane_id).unwrap_or(0);
                 let token1_amount = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
@@ -1147,14 +1162,10 @@ impl EspoModule for AmmData {
                 let token0_price_sats = get_token_price_sats(&defs.base_alkane_id);
                 let token1_price_sats = get_token_price_sats(&defs.quote_alkane_id);
 
-                let token0_tvl_usd =
-                    token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
-                let token1_tvl_usd =
-                    token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
-                let token0_tvl_sats =
-                    token0_amount.saturating_mul(token0_price_sats) / PRICE_SCALE;
-                let token1_tvl_sats =
-                    token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
+                let token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
+                let token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
+                let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / PRICE_SCALE;
+                let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
 
                 let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
                 let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
@@ -1217,8 +1228,7 @@ impl EspoModule for AmmData {
                     "0".to_string()
                 } else {
                     let fees = (pool_volume_30d_usd as f64) * 0.003;
-                    let apr =
-                        fees / (pool_tvl_usd as f64) * 12.0 * 100.0;
+                    let apr = fees / (pool_tvl_usd as f64) * 12.0 * 100.0;
                     format!("{:.4}", apr)
                 };
 
@@ -1238,10 +1248,8 @@ impl EspoModule for AmmData {
                     pool_apr,
                 };
 
-                pool_metrics_writes.push((
-                    table.pool_metrics_key(pool),
-                    encode_pool_metrics(&metrics)?,
-                ));
+                pool_metrics_writes
+                    .push((table.pool_metrics_key(pool), encode_pool_metrics(&metrics)?));
 
                 let lp_supply = essentials
                     .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
@@ -1249,10 +1257,8 @@ impl EspoModule for AmmData {
                     })
                     .map(|res| res.supply)
                     .unwrap_or(0);
-                pool_lp_supply_writes.push((
-                    table.pool_lp_supply_latest_key(pool),
-                    encode_u128_value(lp_supply)?,
-                ));
+                pool_lp_supply_writes
+                    .push((table.pool_lp_supply_latest_key(pool), encode_u128_value(lp_supply)?));
 
                 tvl_versioned_writes.push((
                     table.tvl_versioned_key(pool, height),
@@ -1272,9 +1278,8 @@ impl EspoModule for AmmData {
             let pool = SchemaAlkaneId { block: blk_id, tx: tx_id };
             let count_k_rel = crate::modules::ammdata::utils::activity::idx_count_key(&pool);
 
-            let current = if let Some(v) = provider
-                .get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?
-                .value
+            let current = if let Some(v) =
+                provider.get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?.value
             {
                 crate::modules::ammdata::utils::activity::decode_u64_be(&v).unwrap_or(0)
             } else {
@@ -1292,9 +1297,8 @@ impl EspoModule for AmmData {
             let count_k_rel =
                 crate::modules::ammdata::utils::activity::idx_count_key_group(&pool, group);
 
-            let current = if let Some(v) = provider
-                .get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?
-                .value
+            let current = if let Some(v) =
+                provider.get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?.value
             {
                 crate::modules::ammdata::utils::activity::decode_u64_be(&v).unwrap_or(0)
             } else {
@@ -1323,6 +1327,9 @@ impl EspoModule for AmmData {
         let pcg_cnt = pool_creations_writes.len();
         let aps_cnt = address_pool_swaps_writes.len();
         let ats_cnt = address_token_swaps_writes.len();
+        let apc_cnt = address_pool_creations_writes.len();
+        let apm_cnt = address_pool_mints_writes.len();
+        let apb_cnt = address_pool_burns_writes.len();
         let pd_cnt = pool_defs_writes.len();
         let pm_cnt = pool_metrics_writes.len();
         let pls_cnt = pool_lp_supply_writes.len();
@@ -1332,7 +1339,7 @@ impl EspoModule for AmmData {
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
@@ -1349,6 +1356,9 @@ impl EspoModule for AmmData {
             pls_cnt = pls_cnt,
             tvl_cnt = tvl_cnt,
             ts_cnt = ts_cnt,
+            apc_cnt = apc_cnt,
+            apm_cnt = apm_cnt,
+            apb_cnt = apb_cnt,
             a_cnt = a_cnt,
             i_cnt = i_cnt,
         );
@@ -1370,6 +1380,9 @@ impl EspoModule for AmmData {
             || !token_swaps_writes.is_empty()
             || !address_pool_swaps_writes.is_empty()
             || !address_token_swaps_writes.is_empty()
+            || !address_pool_creations_writes.is_empty()
+            || !address_pool_mints_writes.is_empty()
+            || !address_pool_burns_writes.is_empty()
             || !activity_writes.is_empty()
             || !index_writes.is_empty()
             || !reserves_blob.is_empty()
@@ -1392,14 +1405,14 @@ impl EspoModule for AmmData {
             puts.extend(token_swaps_writes);
             puts.extend(address_pool_swaps_writes);
             puts.extend(address_token_swaps_writes);
+            puts.extend(address_pool_creations_writes);
+            puts.extend(address_pool_mints_writes);
+            puts.extend(address_pool_burns_writes);
             puts.extend(activity_writes);
             puts.extend(index_writes);
             puts.push((reserves_key_rel, reserves_blob));
 
-            let _ = provider.set_batch(SetBatchParams {
-                puts,
-                deletes: Vec::new(),
-            });
+            let _ = provider.set_batch(SetBatchParams { puts, deletes: Vec::new() });
         }
 
         println!(
@@ -1416,11 +1429,7 @@ impl EspoModule for AmmData {
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
-        let provider = self
-            .provider
-            .as_ref()
-            .expect("ModuleRegistry must call set_mdb()")
-            .clone();
+        let provider = self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").clone();
         register_rpc(reg, provider);
     }
 

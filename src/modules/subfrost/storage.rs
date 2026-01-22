@@ -59,6 +59,10 @@ pub struct SubfrostTable<'a> {
     pub WRAP_EVENTS_BY_ADDRESS: MdbPointer<'a>,
     pub UNWRAP_EVENTS_ALL: MdbPointer<'a>,
     pub UNWRAP_EVENTS_BY_ADDRESS: MdbPointer<'a>,
+    pub UNWRAP_TOTAL_LATEST: MdbPointer<'a>,
+    pub UNWRAP_TOTAL_BY_HEIGHT: MdbPointer<'a>,
+    pub UNWRAP_TOTAL_LATEST_SUCCESS: MdbPointer<'a>,
+    pub UNWRAP_TOTAL_BY_HEIGHT_SUCCESS: MdbPointer<'a>,
 }
 
 impl<'a> SubfrostTable<'a> {
@@ -71,6 +75,10 @@ impl<'a> SubfrostTable<'a> {
             WRAP_EVENTS_BY_ADDRESS: root.keyword("/wrap_events_by_address/v1/"),
             UNWRAP_EVENTS_ALL: root.keyword("/unwrap_events_all/v1/"),
             UNWRAP_EVENTS_BY_ADDRESS: root.keyword("/unwrap_events_by_address/v1/"),
+            UNWRAP_TOTAL_LATEST: root.keyword("/unwrap_total_latest/v1"),
+            UNWRAP_TOTAL_BY_HEIGHT: root.keyword("/unwrap_total_by_height/v1/"),
+            UNWRAP_TOTAL_LATEST_SUCCESS: root.keyword("/unwrap_total_latest_success/v1"),
+            UNWRAP_TOTAL_BY_HEIGHT_SUCCESS: root.keyword("/unwrap_total_by_height_success/v1/"),
         }
     }
 }
@@ -115,6 +123,28 @@ impl<'a> SubfrostTable<'a> {
         k.extend_from_slice(&seq.to_be_bytes());
         k
     }
+
+    pub fn unwrap_total_latest_key(&self, successful: bool) -> Vec<u8> {
+        if successful {
+            self.UNWRAP_TOTAL_LATEST_SUCCESS.key().to_vec()
+        } else {
+            self.UNWRAP_TOTAL_LATEST.key().to_vec()
+        }
+    }
+
+    pub fn unwrap_total_by_height_prefix(&self, successful: bool) -> Vec<u8> {
+        if successful {
+            self.UNWRAP_TOTAL_BY_HEIGHT_SUCCESS.key().to_vec()
+        } else {
+            self.UNWRAP_TOTAL_BY_HEIGHT.key().to_vec()
+        }
+    }
+
+    pub fn unwrap_total_by_height_key(&self, height: u32, successful: bool) -> Vec<u8> {
+        let mut k = self.unwrap_total_by_height_prefix(successful);
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
 }
 
 fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {
@@ -130,6 +160,16 @@ fn decode_wrap_event(bytes: &[u8]) -> Result<SchemaWrapEventV1> {
 fn encode_wrap_event(event: &SchemaWrapEventV1) -> Result<Vec<u8>> {
     Ok(borsh::to_vec(event)?)
 }
+
+fn decode_u128_value(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(bytes);
+    Some(u128::from_be_bytes(arr))
+}
+
 
 #[derive(Clone)]
 pub struct SubfrostProvider {
@@ -221,6 +261,56 @@ impl SubfrostProvider {
         let prefix = table.WRAP_EVENTS_ALL.key().to_vec();
         read_events(self, prefix, params.offset, params.limit, params.successful)
     }
+
+    pub fn get_unwrap_events_all(
+        &self,
+        params: GetUnwrapEventsAllParams,
+    ) -> Result<GetWrapEventsResult> {
+        let table = self.table();
+        let prefix = table.UNWRAP_EVENTS_ALL.key().to_vec();
+        read_events(self, prefix, params.offset, params.limit, params.successful)
+    }
+
+    pub fn get_unwrap_total_latest(
+        &self,
+        params: GetUnwrapTotalLatestParams,
+    ) -> Result<GetUnwrapTotalLatestResult> {
+        let table = self.table();
+        let key = table.unwrap_total_latest_key(params.successful);
+        let total = self
+            .get_raw_value(GetRawValueParams { key })?
+            .value
+            .and_then(|v| decode_u128_value(&v))
+            .unwrap_or(0);
+        Ok(GetUnwrapTotalLatestResult { total })
+    }
+
+    pub fn get_unwrap_total_at_or_before(
+        &self,
+        params: GetUnwrapTotalAtOrBeforeParams,
+    ) -> Result<GetUnwrapTotalAtOrBeforeResult> {
+        let table = self.table();
+        let prefix = table.unwrap_total_by_height_prefix(params.successful);
+        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
+        let mut total = None;
+        for (k, v) in entries {
+            if k.len() < 4 {
+                continue;
+            }
+            let height_bytes = &k[k.len() - 4..];
+            let mut arr = [0u8; 4];
+            arr.copy_from_slice(height_bytes);
+            let height = u32::from_be_bytes(arr);
+            if height <= params.height {
+                total = decode_u128_value(&v);
+                break;
+            }
+        }
+        Ok(GetUnwrapTotalAtOrBeforeResult { total })
+    }
 }
 
 fn read_events(
@@ -310,6 +400,29 @@ pub struct GetWrapEventsAllParams {
     pub offset: usize,
     pub limit: usize,
     pub successful: Option<bool>,
+}
+
+pub struct GetUnwrapEventsAllParams {
+    pub offset: usize,
+    pub limit: usize,
+    pub successful: Option<bool>,
+}
+
+pub struct GetUnwrapTotalLatestParams {
+    pub successful: bool,
+}
+
+pub struct GetUnwrapTotalLatestResult {
+    pub total: u128,
+}
+
+pub struct GetUnwrapTotalAtOrBeforeParams {
+    pub height: u32,
+    pub successful: bool,
+}
+
+pub struct GetUnwrapTotalAtOrBeforeResult {
+    pub total: Option<u128>,
 }
 
 pub struct GetWrapEventsResult {

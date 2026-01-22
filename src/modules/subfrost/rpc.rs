@@ -1,8 +1,8 @@
 use crate::config::get_network;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::subfrost::storage::{
-    GetUnwrapEventsByAddressParams, GetWrapEventsAllParams, GetWrapEventsByAddressParams,
-    SubfrostProvider,
+    GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetWrapEventsAllParams,
+    GetWrapEventsByAddressParams, SubfrostProvider,
 };
 use bitcoin::Address;
 use serde_json::{Value, json};
@@ -83,6 +83,29 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
                     provider
                         .get_wrap_events_all(GetWrapEventsAllParams {
+                            offset,
+                            limit: count,
+                            successful,
+                        })
+                        .map(|resp| wrap_events_json(resp.entries, resp.total))
+                        .unwrap_or_else(|_| json!({ "ok": false, "error": "internal_error" }))
+                }
+            })
+            .await;
+    });
+
+    let reg_unwrap_all = reg.clone();
+    let provider_unwrap_all = Arc::clone(&provider);
+    tokio::spawn(async move {
+        reg_unwrap_all
+            .register("get_unwrap_events_all", move |_cx, payload| {
+                let provider = Arc::clone(&provider_unwrap_all);
+                async move {
+                    let count = clamp_count(payload.get("count").and_then(|v| v.as_u64()));
+                    let offset = payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let successful = payload.get("successful").and_then(|v| v.as_bool());
+                    provider
+                        .get_unwrap_events_all(GetUnwrapEventsAllParams {
                             offset,
                             limit: count,
                             successful,

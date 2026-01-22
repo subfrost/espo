@@ -1,10 +1,12 @@
 use crate::modules::oylapi::storage::{
     GetAlkanesParams, OylApiState, get_address_positions, get_address_swap_history_for_pool,
     get_address_swap_history_for_token, get_address_unwrap_history, get_address_wrap_history,
+    get_address_pool_burn_history, get_address_pool_creation_history, get_address_pool_mint_history,
     get_alkane_details, get_alkanes, get_alkanes_by_address, get_alkanes_utxo,
-    get_all_pools_details, get_all_wrap_history, get_amm_utxos, get_global_alkanes_search,
-    get_pool_burn_history, get_pool_creation_history, get_pool_details, get_pool_mint_history,
-    get_pool_swap_history, get_pools, get_token_swap_history,
+    get_all_pools_details, get_all_unwrap_history, get_all_wrap_history, get_amm_utxos,
+    get_global_alkanes_search, get_pool_burn_history, get_pool_creation_history, get_pool_details,
+    get_pool_mint_history, get_pool_swap_history, get_pools, get_token_swap_history,
+    get_total_unwrap_amount,
 };
 use axum::{Json, Router, extract::State, routing::post};
 use serde::Deserialize;
@@ -152,6 +154,35 @@ struct AllWrapHistoryRequest {
 }
 
 #[derive(Deserialize)]
+struct AddressPoolCreationHistoryRequest {
+    address: String,
+    #[serde(rename = "poolId")]
+    pool_id: Option<AlkaneIdRequest>,
+    count: Option<u64>,
+    offset: Option<u64>,
+    successful: Option<bool>,
+    #[serde(rename = "includeTotal")]
+    include_total: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct AddressPoolMintBurnHistoryRequest {
+    address: String,
+    count: Option<u64>,
+    offset: Option<u64>,
+    successful: Option<bool>,
+    #[serde(rename = "includeTotal")]
+    include_total: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct TotalUnwrapAmountRequest {
+    #[serde(rename = "blockHeight")]
+    block_height: Option<u32>,
+    successful: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct GetAllPoolsDetailsRequest {
     #[serde(rename = "factoryId")]
     factory_id: AlkaneIdRequest,
@@ -187,6 +218,14 @@ pub fn router(state: OylApiState) -> Router {
         .route("/get-address-wrap-history", post(get_address_wrap_history_handler))
         .route("/get-address-unwrap-history", post(get_address_unwrap_history_handler))
         .route("/get-all-wrap-history", post(get_all_wrap_history_handler))
+        .route("/get-all-unwrap-history", post(get_all_unwrap_history_handler))
+        .route("/get-total-unwrap-amount", post(get_total_unwrap_amount_handler))
+        .route(
+            "/get-address-pool-creation-history",
+            post(get_address_pool_creation_history_handler),
+        )
+        .route("/get-address-pool-mint-history", post(get_address_pool_mint_history_handler))
+        .route("/get-address-pool-burn-history", post(get_address_pool_burn_history_handler))
         .route("/address-positions", post(get_address_positions_handler))
         .route("/get-all-pools-details", post(get_all_pools_details_handler))
         .with_state(state)
@@ -450,6 +489,81 @@ async fn get_all_wrap_history_handler(
     Json(
         get_all_wrap_history(
             &state,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
+    )
+}
+
+async fn get_all_unwrap_history_handler(
+    State(state): State<OylApiState>,
+    Json(req): Json<AllWrapHistoryRequest>,
+) -> Json<Value> {
+    Json(
+        get_all_unwrap_history(
+            &state,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
+    )
+}
+
+async fn get_total_unwrap_amount_handler(
+    State(state): State<OylApiState>,
+    Json(req): Json<TotalUnwrapAmountRequest>,
+) -> Json<Value> {
+    Json(get_total_unwrap_amount(&state, req.block_height, req.successful).await)
+}
+
+async fn get_address_pool_creation_history_handler(
+    State(state): State<OylApiState>,
+    Json(req): Json<AddressPoolCreationHistoryRequest>,
+) -> Json<Value> {
+    let _ = &req.pool_id;
+    Json(
+        get_address_pool_creation_history(
+            &state,
+            &req.address,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
+    )
+}
+
+async fn get_address_pool_mint_history_handler(
+    State(state): State<OylApiState>,
+    Json(req): Json<AddressPoolMintBurnHistoryRequest>,
+) -> Json<Value> {
+    Json(
+        get_address_pool_mint_history(
+            &state,
+            &req.address,
+            req.count,
+            req.offset,
+            req.successful,
+            req.include_total,
+        )
+        .await,
+    )
+}
+
+async fn get_address_pool_burn_history_handler(
+    State(state): State<OylApiState>,
+    Json(req): Json<AddressPoolMintBurnHistoryRequest>,
+) -> Json<Value> {
+    Json(
+        get_address_pool_burn_history(
+            &state,
+            &req.address,
             req.count,
             req.offset,
             req.successful,

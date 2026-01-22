@@ -117,6 +117,9 @@ pub struct AmmDataTable<'a> {
     pub POOL_CREATIONS: MdbPointer<'a>,
     pub ADDRESS_POOL_SWAPS: MdbPointer<'a>,
     pub ADDRESS_TOKEN_SWAPS: MdbPointer<'a>,
+    pub ADDRESS_POOL_CREATIONS: MdbPointer<'a>,
+    pub ADDRESS_POOL_MINTS: MdbPointer<'a>,
+    pub ADDRESS_POOL_BURNS: MdbPointer<'a>,
 }
 
 impl<'a> AmmDataTable<'a> {
@@ -145,6 +148,9 @@ impl<'a> AmmDataTable<'a> {
             POOL_CREATIONS: root.keyword("/pool_creations/v1/"),
             ADDRESS_POOL_SWAPS: root.keyword("/address_pool_swaps/v1/"),
             ADDRESS_TOKEN_SWAPS: root.keyword("/address_token_swaps/v1/"),
+            ADDRESS_POOL_CREATIONS: root.keyword("/address_pool_creations/v1/"),
+            ADDRESS_POOL_MINTS: root.keyword("/address_pool_mints/v1/"),
+            ADDRESS_POOL_BURNS: root.keyword("/address_pool_burns/v1/"),
         }
     }
 }
@@ -415,6 +421,69 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn address_pool_creations_prefix(&self, address_spk: &[u8]) -> Vec<u8> {
+        let mut k = self.ADDRESS_POOL_CREATIONS.key().to_vec();
+        push_spk(&mut k, address_spk);
+        k
+    }
+
+    pub fn address_pool_creations_key(
+        &self,
+        address_spk: &[u8],
+        ts: u64,
+        seq: u32,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.address_pool_creations_prefix(address_spk);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn address_pool_mints_prefix(&self, address_spk: &[u8]) -> Vec<u8> {
+        let mut k = self.ADDRESS_POOL_MINTS.key().to_vec();
+        push_spk(&mut k, address_spk);
+        k
+    }
+
+    pub fn address_pool_mints_key(
+        &self,
+        address_spk: &[u8],
+        ts: u64,
+        seq: u32,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.address_pool_mints_prefix(address_spk);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn address_pool_burns_prefix(&self, address_spk: &[u8]) -> Vec<u8> {
+        let mut k = self.ADDRESS_POOL_BURNS.key().to_vec();
+        push_spk(&mut k, address_spk);
+        k
+    }
+
+    pub fn address_pool_burns_key(
+        &self,
+        address_spk: &[u8],
+        ts: u64,
+        seq: u32,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.address_pool_burns_prefix(address_spk);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
     pub fn pools_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12);
         suffix.extend_from_slice(&pool.block.to_be_bytes());
@@ -453,6 +522,47 @@ fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {
     let len = spk.len().min(u16::MAX as usize) as u16;
     dst.extend_from_slice(&len.to_be_bytes());
     dst.extend_from_slice(&spk[..len as usize]);
+}
+
+fn read_address_pool_events(
+    provider: &AmmDataProvider,
+    prefix: Vec<u8>,
+    offset: usize,
+    limit: usize,
+) -> Result<GetAddressPoolEventsPageResult> {
+    let entries = match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+    {
+        Ok(v) => v.entries,
+        Err(_) => Vec::new(),
+    };
+
+    let mut parsed: Vec<AddressPoolEventEntry> = Vec::new();
+    for (k, _v) in entries {
+        if !k.starts_with(&prefix) {
+            continue;
+        }
+        if k.len() < prefix.len() + 24 {
+            continue;
+        }
+        let pool_bytes = &k[k.len() - 12..];
+        let ts_seq_bytes = &k[k.len() - 24..k.len() - 12];
+        let (ts, seq) = match parse_ts_seq_from_tail_be(ts_seq_bytes) {
+            Some(v) => v,
+            None => continue,
+        };
+        let pool = match decode_alkane_id_be(pool_bytes) {
+            Some(p) => p,
+            None => continue,
+        };
+        parsed.push(AddressPoolEventEntry { ts, seq, pool });
+    }
+
+    let total = parsed.len();
+    let offset = offset.min(total);
+    let end = (offset + limit).min(total);
+    let page = if offset >= total { &[] } else { &parsed[offset..end] };
+
+    Ok(GetAddressPoolEventsPageResult { entries: page.to_vec(), total })
 }
 
 #[derive(Clone)]
@@ -958,6 +1068,33 @@ impl AmmDataProvider {
         let page = if offset >= total { &[] } else { &parsed[offset..end] };
 
         Ok(GetAddressTokenSwapsPageResult { entries: page.to_vec(), total })
+    }
+
+    pub fn get_address_pool_creations_page(
+        &self,
+        params: GetAddressPoolCreationsPageParams,
+    ) -> Result<GetAddressPoolEventsPageResult> {
+        let table = self.table();
+        let prefix = table.address_pool_creations_prefix(&params.address_spk);
+        read_address_pool_events(self, prefix, params.offset, params.limit)
+    }
+
+    pub fn get_address_pool_mints_page(
+        &self,
+        params: GetAddressPoolMintsPageParams,
+    ) -> Result<GetAddressPoolEventsPageResult> {
+        let table = self.table();
+        let prefix = table.address_pool_mints_prefix(&params.address_spk);
+        read_address_pool_events(self, prefix, params.offset, params.limit)
+    }
+
+    pub fn get_address_pool_burns_page(
+        &self,
+        params: GetAddressPoolBurnsPageParams,
+    ) -> Result<GetAddressPoolEventsPageResult> {
+        let table = self.table();
+        let prefix = table.address_pool_burns_prefix(&params.address_spk);
+        read_address_pool_events(self, prefix, params.offset, params.limit)
     }
 
     pub fn get_tvl_versioned_at_or_before(
@@ -1825,6 +1962,36 @@ pub struct GetAddressTokenSwapsPageParams {
 
 pub struct GetAddressTokenSwapsPageResult {
     pub entries: Vec<AddressTokenSwapEntry>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AddressPoolEventEntry {
+    pub ts: u64,
+    pub seq: u32,
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetAddressPoolCreationsPageParams {
+    pub address_spk: Vec<u8>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetAddressPoolMintsPageParams {
+    pub address_spk: Vec<u8>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetAddressPoolBurnsPageParams {
+    pub address_spk: Vec<u8>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+pub struct GetAddressPoolEventsPageResult {
+    pub entries: Vec<AddressPoolEventEntry>,
     pub total: usize,
 }
 
