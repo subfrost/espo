@@ -101,6 +101,7 @@ impl EspoModule for Essentials {
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let provider = self.provider();
         let table = provider.table();
 
@@ -574,6 +575,12 @@ impl EspoModule for Essentials {
             block.height, total_pairs_dedup, new_alkanes_saved
         );
         self.set_index_height(block.height)?;
+        eprintln!(
+            "[indexer] module={} height={} index_block done in {:?}",
+            self.get_name(),
+            block.height,
+            t0.elapsed()
+        );
         Ok(())
     }
 

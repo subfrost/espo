@@ -215,12 +215,19 @@ impl EspoModule for Pizzafun {
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
+        let t0 = std::time::Instant::now();
         if let Some(tip) = get_last_safe_tip() {
             if block.height >= tip {
                 self.reload_series_index("safe_tip");
             }
         }
         *self.index_height.write().unwrap() = Some(block.height);
+        eprintln!(
+            "[indexer] module={} height={} index_block done in {:?}",
+            self.get_name(),
+            block.height,
+            t0.elapsed()
+        );
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 {
-  "readonly_metashrew_db_dir": "/data/.metashrew/v9",
+  "readonly_metashrew_db_dir": "/data/.metashrew/v9-rb",
   "electrum_rpc_url": null,
-  "metashrew_rpc_url": "http://127.0.0.1:7044",
+  "metashrew_rpc_url": "http://127.0.0.1:7144",
   "electrs_esplora_url": "http://127.0.0.1:4332",
   "bitcoind_rpc_url": "http://127.0.0.1:8332",
   "bitcoind_rpc_user": "admin",
@@ -31,8 +31,8 @@
     },
     "subfrost": {},
     "ammdata": {
-      "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/jhcOomuhnXSw9o9j-8Di_",
-      "eth_call_throttle": 200
+      "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/THWHjh0GMbRvWxCzc865L",
+      "eth_call_throttle": 150
     }
   }
 }

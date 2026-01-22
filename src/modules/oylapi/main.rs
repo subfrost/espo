@@ -52,7 +52,14 @@ impl EspoModule for OylApi {
         u32::MAX
     }
 
-    fn index_block(&self, _block: crate::alkanes::trace::EspoBlock) -> Result<()> {
+    fn index_block(&self, block: crate::alkanes::trace::EspoBlock) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        eprintln!(
+            "[indexer] module={} height={} index_block done in {:?}",
+            self.get_name(),
+            block.height,
+            t0.elapsed()
+        );
         Ok(())
     }
 

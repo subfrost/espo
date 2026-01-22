@@ -225,6 +225,7 @@ impl EspoModule for AmmData {
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let block_ts = block.block_header.time as u64;
         let height = block.height;
         println!("[AMMDATA] Indexing block #{height} for candles and activity...");
@@ -1473,6 +1474,12 @@ impl EspoModule for AmmData {
             block.transactions.len()
         );
         self.set_index_height(block.height)?;
+        eprintln!(
+            "[indexer] module={} height={} index_block done in {:?}",
+            self.get_name(),
+            height,
+            t0.elapsed()
+        );
         Ok(())
     }
 

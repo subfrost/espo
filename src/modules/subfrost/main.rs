@@ -92,6 +92,7 @@ impl EspoModule for Subfrost {
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
+        let t0 = std::time::Instant::now();
         let provider = self.provider();
         let table = provider.table();
 
@@ -112,22 +113,29 @@ impl EspoModule for Subfrost {
 
         for tx in &block.transactions {
             let txid = tx.transaction.compute_txid();
-            let address_spk = tx_owner_spk(&tx.transaction, &block_tx_map, &mut prev_tx_cache);
-            let address_spk_bytes = address_spk.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
-
             let Some(traces) = &tx.traces else { continue };
+            let mut address_spk_bytes: Option<Vec<u8>> = None;
             for trace in traces {
                 let mut stack: Vec<Option<PendingWrap>> = Vec::new();
                 for ev in &trace.sandshrew_trace.events {
                     match ev {
                         EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                            let Some(pending) =
-                                parse_wrap_invoke(inv, frbtc, &address_spk_bytes)
-                            else {
+                            let Some((kind, amount)) = parse_wrap_invoke(inv, frbtc) else {
                                 stack.push(None);
                                 continue;
                             };
-                            stack.push(Some(pending));
+                            let address_spk_bytes = address_spk_bytes.get_or_insert_with(|| {
+                                let address_spk =
+                                    tx_owner_spk(&tx.transaction, &block_tx_map, &mut prev_tx_cache);
+                                address_spk
+                                    .map(|s| s.as_bytes().to_vec())
+                                    .unwrap_or_default()
+                            });
+                            stack.push(Some(PendingWrap {
+                                kind,
+                                amount,
+                                address_spk: address_spk_bytes.clone(),
+                            }));
                         }
                         EspoSandshrewLikeTraceEvent::Return(ret) => {
                             let Some(pending) = stack.pop().flatten() else { continue };
@@ -230,6 +238,12 @@ impl EspoModule for Subfrost {
             block.height, wrap_seq, unwrap_seq
         );
         self.set_index_height(block.height)?;
+        eprintln!(
+            "[indexer] module={} height={} index_block done in {:?}",
+            self.get_name(),
+            block.height,
+            t0.elapsed()
+        );
         Ok(())
     }
 
@@ -264,8 +278,7 @@ struct PendingWrap {
 fn parse_wrap_invoke(
     invoke: &EspoSandshrewLikeTraceInvokeData,
     frbtc: SchemaAlkaneId,
-    address_spk: &[u8],
-) -> Option<PendingWrap> {
+) -> Option<(WrapKind, Option<u128>)> {
     let myself = parse_trace_id(&invoke.context.myself)?;
     if myself != frbtc {
         return None;
@@ -280,11 +293,7 @@ fn parse_wrap_invoke(
         WrapKind::Wrap => None,
         WrapKind::Unwrap => extract_amount_for_alkane(&invoke.context.incoming_alkanes, frbtc),
     };
-    Some(PendingWrap {
-        kind,
-        amount,
-        address_spk: address_spk.to_vec(),
-    })
+    Some((kind, amount))
 }
 
 fn extract_amount_for_alkane(

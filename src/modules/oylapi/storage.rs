@@ -131,12 +131,16 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
     for (alkane, balance) in balances {
         let rec = rec_map.get(&alkane);
         let name = rec.and_then(|r| r.names.first()).cloned().unwrap_or_default();
-        let symbol = rec.and_then(|r| r.symbols.first()).cloned().unwrap_or_default();
+        let symbol = rec
+            .and_then(|r| r.symbols.first())
+            .cloned()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
 
         let (frbtc_price, busd_price) = canonical_pool_prices(state, &alkane, now_ts);
         let price_usd = latest_token_usd_close(state, &alkane).unwrap_or(0);
         let image = format!(
-            "{}/{}:{}.png",
+            "{}/{}-{}.png",
             state.config.alkane_icon_cdn, alkane.block, alkane.tx
         );
 
@@ -298,7 +302,7 @@ pub async fn get_alkane_details(state: &OylApiState, block: &str, tx: &str) -> V
     let now_ts = now_ts();
     let (frbtc_price, _busd_price) = canonical_pool_prices(state, &alkane, now_ts);
     let token_image = format!(
-        "{}/{}:{}.png",
+        "{}/{}-{}.png",
         state.config.alkane_icon_cdn, alkane.block, alkane.tx
     );
 
@@ -2424,7 +2428,12 @@ pub async fn get_address_utxos(
             .records;
         for rec in records.into_iter().flatten() {
             let name = rec.names.first().cloned().unwrap_or_default();
-            let symbol = rec.symbols.first().cloned().unwrap_or_default();
+            let symbol = rec
+                .symbols
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
             names.insert(rec.alkane, (name, symbol));
         }
     }
@@ -3100,23 +3109,28 @@ fn get_token_meta(
         .as_ref()
         .and_then(|r| r.names.first().cloned())
         .unwrap_or_default();
-    let symbol = rec
+    let symbol_raw = rec
         .as_ref()
         .and_then(|r| r.symbols.first().cloned())
         .unwrap_or_default();
-    let label = if !symbol.is_empty() {
-        symbol.clone()
+    let label = if !symbol_raw.is_empty() {
+        symbol_raw.clone()
     } else if !name.is_empty() {
         name.clone()
     } else {
         format!("{}:{}", id.block, id.tx)
     };
-    let display_symbol = if symbol.is_empty() { label.clone() } else { symbol };
+    let display_symbol = if symbol_raw.is_empty() {
+        label.clone()
+    } else {
+        symbol_raw
+    }
+    .to_ascii_uppercase();
     let meta = TokenMeta {
         name,
         symbol: display_symbol,
         label,
-        image: format!("{}/{}:{}.png", state.config.alkane_icon_cdn, id.block, id.tx),
+        image: format!("{}/{}-{}.png", state.config.alkane_icon_cdn, id.block, id.tx),
         decimals: 8,
     };
     cache.insert(*id, meta.clone());
@@ -3291,18 +3305,29 @@ fn build_alkane_token(
     };
     let busd_mcap = if has_busd { metrics.marketcap_usd } else { 0 };
 
+    let id_str = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
+    let mut name = rec.names.first().cloned().unwrap_or_default();
+    if name.is_empty() {
+        name = id_str.clone();
+    }
+    let mut symbol = rec.symbols.first().cloned().unwrap_or_default();
+    if symbol.is_empty() {
+        symbol = id_str;
+    }
+    let symbol = symbol.to_ascii_uppercase();
+
     Ok(json!({
         "id": alkane_id_json(&rec.alkane),
         "alkaneId": alkane_id_json(&rec.alkane),
-        "name": rec.names.first().cloned().unwrap_or_default(),
-        "symbol": rec.symbols.first().cloned().unwrap_or_default(),
+        "name": name,
+        "symbol": symbol,
         "totalSupply": supply.to_string(),
         "cap": rec.cap.to_string(),
         "minted": minted.to_string(),
         "mintActive": mint_active,
         "percentageMinted": percentage_minted.to_string(),
         "mintAmount": rec.mint_amount.to_string(),
-        "image": format!("{}/{}:{}.png", state.config.alkane_icon_cdn, rec.alkane.block, rec.alkane.tx),
+        "image": format!("{}/{}-{}.png", state.config.alkane_icon_cdn, rec.alkane.block, rec.alkane.tx),
         "frbtcPoolPriceInSats": frbtc_price.to_string(),
         "busdPoolPriceInUsd": busd_price.to_string(),
         "maxSupply": max_supply.to_string(),
