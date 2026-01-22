@@ -17,10 +17,11 @@ use crate::explorer::components::tx_view::{
 use crate::explorer::paths::{explorer_base_path, explorer_path};
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
-use crate::modules::essentials::storage::{BalanceEntry, HolderId, load_creation_record};
+use crate::modules::essentials::storage::{
+    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
+};
 use crate::modules::essentials::utils::balances::{get_alkane_balances, get_holders_for_alkane};
 use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
-use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
 
@@ -83,7 +84,8 @@ pub async fn alkane_page(
     let creation_height = creation_record.as_ref().map(|r| r.creation_height);
     let creation_txid = creation_record.as_ref().map(|r| hex::encode(r.txid));
 
-    let balances_map = get_alkane_balances(&state.essentials_mdb, &alk).unwrap_or_default();
+    let balances_map =
+        get_alkane_balances(&state.essentials_provider(), &alk).unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances_map
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -93,7 +95,7 @@ pub async fn alkane_page(
     });
 
     let (total, circulating_supply, holders) =
-        get_holders_for_alkane(&state.essentials_mdb, alk, page, limit).unwrap_or((
+        get_holders_for_alkane(&state.essentials_provider(), alk, page, limit).unwrap_or((
             0,
             0,
             Vec::new(),
@@ -114,10 +116,13 @@ pub async fn alkane_page(
     let mut inspect_source = inspection.cloned();
     let mut proxy_target_label: Option<String> = None;
     let inspect_alkane_id = alk_str.clone();
-    if let Some(proxy_target) = resolve_proxy_target_recursive(&alk, &state.essentials_mdb) {
+    if let Some(proxy_target) =
+        resolve_proxy_target_recursive(&alk, &state.essentials_provider())
+    {
         let label = format!("{}:{}", proxy_target.block, proxy_target.tx);
         proxy_target_label = Some(label.clone());
-        inspect_source = load_inspection(&state.essentials_mdb, &proxy_target).ok().flatten();
+        inspect_source =
+            load_inspection(&state.essentials_provider(), &proxy_target).ok().flatten();
     }
     let (view_methods, write_methods) = split_methods(inspect_source.as_ref());
     let inspect_name = display_name.clone();
@@ -503,11 +508,12 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
 }
 
-fn proxy_target_from_db(alk: &SchemaAlkaneId, mdb: &Mdb) -> Option<SchemaAlkaneId> {
+fn proxy_target_from_db(alk: &SchemaAlkaneId, provider: &EssentialsProvider) -> Option<SchemaAlkaneId> {
     let lookup = |key| {
-        mdb.get(&kv_row_key(alk, key))
+        provider
+            .get_raw_value(GetRawValueParams { key: kv_row_key(alk, key) })
             .ok()
-            .flatten()
+            .and_then(|resp| resp.value)
             .and_then(|raw| {
                 if raw.len() >= 32 {
                     decode_kv_implementation(&raw[32..])
@@ -521,16 +527,16 @@ fn proxy_target_from_db(alk: &SchemaAlkaneId, mdb: &Mdb) -> Option<SchemaAlkaneI
 
 fn resolve_proxy_target_recursive(
     start: &SchemaAlkaneId,
-    mdb: &Mdb,
+    provider: &EssentialsProvider,
 ) -> Option<SchemaAlkaneId> {
     let mut current = *start;
     let mut seen: HashSet<SchemaAlkaneId> = HashSet::new();
     for _ in 0..8 {
-        let inspection = load_inspection(mdb, &current).ok().flatten()?;
+        let inspection = load_inspection(provider, &current).ok().flatten()?;
         if !is_upgradeable_proxy(&inspection) {
             return (current != *start).then_some(current);
         }
-        let next = proxy_target_from_db(&current, mdb)?;
+        let next = proxy_target_from_db(&current, provider)?;
         if !seen.insert(next) {
             return None;
         }

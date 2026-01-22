@@ -11,6 +11,7 @@ use clap::Parser;
 use electrum_client::Client;
 use rocksdb::{DB, Options};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -23,7 +24,7 @@ use std::{
 
 // Bitcoin Core / bitcoin::Network
 use bitcoincore_rpc::bitcoin::Network;
-use bitcoincore_rpc::{Auth, Client as CoreClient};
+use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
 
 // Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
@@ -159,7 +160,9 @@ pub struct ConfigFile {
     #[serde(default)]
     pub electrs_esplora_url: Option<String>,
     pub bitcoind_rpc_url: String,
+    #[serde(default)]
     pub bitcoind_rpc_user: String,
+    #[serde(default)]
     pub bitcoind_rpc_pass: String,
     #[serde(default = "default_bitcoind_blocks_dir")]
     pub bitcoind_blocks_dir: String,
@@ -195,6 +198,8 @@ pub struct ConfigFile {
     pub enable_height_indexed: bool,
     #[serde(default = "default_max_reorg_depth")]
     pub max_reorg_depth: u32,
+    #[serde(default)]
+    pub modules: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +229,7 @@ pub struct AppConfig {
     pub explorer_networks: Option<ExplorerNetworks>,
     pub enable_height_indexed: bool,
     pub max_reorg_depth: u32,
+    pub modules: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -278,6 +284,7 @@ impl AppConfig {
             explorer_networks,
             enable_height_indexed: file.enable_height_indexed,
             max_reorg_depth: file.max_reorg_depth,
+            modules: file.modules,
         })
     }
 }
@@ -396,10 +403,12 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
     // --- init Bitcoin Core RPC client once ---
     // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
     if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
-        let core = CoreClient::new(
-            &cfg.bitcoind_rpc_url,
-            Auth::UserPass(cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()),
-        )?;
+        let auth = if !cfg.bitcoind_rpc_user.is_empty() && !cfg.bitcoind_rpc_pass.is_empty() {
+            Some((cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()))
+        } else {
+            None
+        };
+        let core = CoreClient::new(&cfg.bitcoind_rpc_url, auth)?;
         BITCOIND_CLIENT
             .set(core)
             .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
@@ -446,9 +455,13 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
 pub fn init_config() -> Result<()> {
     let cli = CliArgs::parse();
-    let file = load_config_file(&cli.config_path)?;
-    let cfg = AppConfig::from_file(file, cli.view_only)?;
+    let cfg = load_config_from_path(&cli.config_path, cli.view_only)?;
     init_config_from(cfg)
+}
+
+pub fn load_config_from_path(path: &str, view_only: bool) -> Result<AppConfig> {
+    let file = load_config_file(path)?;
+    AppConfig::from_file(file, view_only)
 }
 
 // UPDATED: no param; uses global NETWORK
@@ -471,6 +484,10 @@ pub fn init_block_source() -> Result<()> {
 
 pub fn get_config() -> &'static AppConfig {
     CONFIG.get().expect("init_config() must be called once at startup")
+}
+
+pub fn get_module_config(name: &str) -> Option<&'static serde_json::Value> {
+    get_config().modules.get(name)
 }
 
 pub fn get_electrum_client() -> Option<Arc<Client>> {

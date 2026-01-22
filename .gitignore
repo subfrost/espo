@@ -1,5 +1,5 @@
 reference
-# Rust
+# Rust build artifacts
 /target/
 **/*.rs.bk
 *.pdb
@@ -19,7 +19,7 @@ config.json
 *.log
 logs/
 
-# IDE
+# IDE and editor files
 .vscode/
 .idea/
 *.swp
@@ -57,3 +57,25 @@ Thumbs.db
 perf.data
 perf.data.old
 flamegraph.svg
+
+# Generated files
+*.orig
+
+# Local configuration
+.env
+config.local.json
+
+# Build outputs
+*.dll
+*.exe
+
+# Debug artifacts
+*.dSYM/
+
+# Profiling data
+*.profraw
+*.profdata
+
+# Test coverage
+tarpaulin-report.html
+cobertura.xml

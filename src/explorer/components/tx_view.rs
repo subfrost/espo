@@ -18,16 +18,21 @@ use crate::explorer::consts::{
 };
 use crate::explorer::paths::explorer_path;
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
-use crate::modules::essentials::storage::{BalanceEntry, load_creation_record};
+use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
 use crate::modules::essentials::utils::balances::OutpointLookup;
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
+use std::sync::Arc;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use serde_json::{Value, json};
 
 const ADDR_SUFFIX_LEN: usize = 8;
+
+fn provider_from_mdb(mdb: &Mdb) -> EssentialsProvider {
+    EssentialsProvider::new(Arc::new(mdb.clone()))
+}
 
 #[derive(Clone, Debug)]
 pub struct TxPill {
@@ -337,7 +342,7 @@ fn lookup_inspection<'a>(
     mdb: &Mdb,
 ) -> Option<&'a StoredInspectionResult> {
     if !cache.contains_key(id) {
-        let loaded = load_inspection(mdb, id).ok().flatten();
+        let loaded = load_inspection(&provider_from_mdb(mdb), id).ok().flatten();
         cache.insert(*id, loaded);
     }
     cache.get(id).and_then(|o| o.as_ref())
@@ -413,7 +418,7 @@ fn upgradeable_proxy_target(
         if !seen.insert(target) {
             return None;
         }
-        let target_inspection = load_inspection(mdb, &target).ok().flatten();
+        let target_inspection = load_inspection(&provider_from_mdb(mdb), &target).ok().flatten();
         if !target_inspection.as_ref().map_or(false, is_upgradeable_proxy) {
             return Some(target);
         }
@@ -465,7 +470,7 @@ fn alkane_icon_url_with_policy(
     if let Some(url) = icon_override_url(id) {
         return url;
     }
-    let inspection = load_inspection(mdb, id).ok().flatten();
+    let inspection = load_inspection(&provider_from_mdb(mdb), id).ok().flatten();
     if !ignore_factory_blacklist && is_factory_icon_blacklisted(inspection.as_ref()) {
         return String::new();
     }

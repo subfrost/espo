@@ -1,8 +1,9 @@
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{get_espo_db, get_last_safe_tip};
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
-use crate::modules::essentials::main::Essentials;
-use crate::modules::essentials::storage::decode_creation_record;
+use crate::modules::essentials::storage::{
+    decode_creation_record, EssentialsProvider, GetIndexHeightParams, GetIterFromParams,
+};
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -50,7 +51,7 @@ fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
 }
 
 pub struct Pizzafun {
-    essentials_mdb: Option<Arc<Mdb>>,
+    essentials_provider: Option<Arc<EssentialsProvider>>,
     index_height: Arc<RwLock<Option<u32>>>,
     series_index: SharedSeriesIndex,
 }
@@ -58,41 +59,40 @@ pub struct Pizzafun {
 impl Pizzafun {
     pub fn new() -> Self {
         Self {
-            essentials_mdb: None,
+            essentials_provider: None,
             index_height: Arc::new(RwLock::new(None)),
             series_index: Arc::new(RwLock::new(Arc::new(SeriesIndex::default()))),
         }
     }
 
     #[inline]
-    fn essentials_mdb(&self) -> &Mdb {
-        self.essentials_mdb
+    fn essentials_provider(&self) -> &EssentialsProvider {
+        self.essentials_provider
             .as_ref()
             .expect("ModuleRegistry must call set_mdb()")
             .as_ref()
     }
 
     fn load_essentials_index_height(&self) -> Option<u32> {
-        let bytes = self
-            .essentials_mdb()
-            .get(Essentials::k_index_height())
-            .ok()
-            .flatten()?;
-        if bytes.len() != 4 {
-            return None;
-        }
-        let mut arr = [0u8; 4];
-        arr.copy_from_slice(&bytes);
-        Some(u32::from_le_bytes(arr))
+        let resp = self
+            .essentials_provider()
+            .get_index_height(GetIndexHeightParams)
+            .ok()?;
+        resp.height
     }
 
-    fn build_series_index(essentials_mdb: &Mdb) -> SeriesIndex {
+    fn build_series_index(essentials_provider: &EssentialsProvider) -> SeriesIndex {
         let mut records = Vec::new();
-        let prefix = b"/alkanes/creation/id/";
-        for res in essentials_mdb.iter_from(prefix) {
-            let Ok((k_full, v)) = res else { continue };
-            let rel = &k_full[essentials_mdb.prefix().len()..];
-            if !rel.starts_with(prefix) {
+        let prefix = b"/alkanes/creation/id/".to_vec();
+        let entries = match essentials_provider.get_iter_from(GetIterFromParams { start: prefix.clone() }) {
+            Ok(resp) => resp.entries,
+            Err(e) => {
+                eprintln!("[PIZZAFUN] iter_from failed: {e}");
+                Vec::new()
+            }
+        };
+        for (rel, v) in entries {
+            if !rel.starts_with(&prefix) {
                 break;
             }
             match decode_creation_record(&v) {
@@ -180,9 +180,9 @@ impl Pizzafun {
     }
 
     fn reload_series_index(&self, reason: &str) {
-        let essentials_mdb = self.essentials_mdb();
+        let essentials_provider = self.essentials_provider();
         eprintln!("[PIZZAFUN] rebuilding series index ({reason})...");
-        let index = Self::build_series_index(essentials_mdb);
+        let index = Self::build_series_index(essentials_provider);
         let entry_count = index.series_to_alkane.len();
         let mut guard = self.series_index.write().expect("series index lock poisoned");
         *guard = Arc::new(index);
@@ -203,7 +203,8 @@ impl EspoModule for Pizzafun {
 
     fn set_mdb(&mut self, _mdb: Arc<Mdb>) {
         let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
-        self.essentials_mdb = Some(Arc::new(essentials_mdb));
+        let provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
+        self.essentials_provider = Some(provider);
 
         *self.index_height.write().unwrap() = self.load_essentials_index_height();
         self.reload_series_index("startup");

@@ -2,10 +2,8 @@ use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timeframe};
 use crate::schemas::SchemaAlkaneId;
 
-use crate::modules::ammdata::storage::{
-    candle_key, candle_ns_prefix, decode_full_candle_v1, encode_full_candle_v1,
-};
-use crate::runtime::mdb::Mdb;
+use crate::modules::ammdata::storage::{decode_full_candle_v1, encode_full_candle_v1};
+use crate::modules::ammdata::storage::{AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams};
 use anyhow::Result;
 use std::collections::BTreeMap;
 
@@ -34,6 +32,10 @@ pub fn price_base_per_quote(base_res: u128, quote_res: u128) -> u128 {
 fn bucket_start(ts: u64, frame: Timeframe) -> u64 {
     let d = frame.duration_secs();
     ts / d * d
+}
+
+pub fn bucket_start_for(ts: u64, frame: Timeframe) -> u64 {
+    bucket_start(ts, frame)
 }
 
 /* ---------- in-memory aggregation cache ---------- */
@@ -124,15 +126,27 @@ impl CandleCache {
     /// - high/low: max/min over existing and cache
     /// - close: use cache.close (later)
     /// - volume: sum
-    pub fn into_writes(self, mdb: &Mdb) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn into_writes(self, provider: &AmmDataProvider) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let (writes, _) = self.into_writes_with_entries(provider)?;
+        Ok(writes)
+    }
+
+    pub fn into_writes_with_entries(
+        self,
+        provider: &AmmDataProvider,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(SchemaAlkaneId, Timeframe, u64, SchemaFullCandleV1)>)>
+    {
         let mut writes = Vec::with_capacity(self.map.len());
+        let mut entries = Vec::with_capacity(self.map.len());
+        let table = provider.table();
 
         for (ck, dc_new) in self.map.into_iter() {
-            // Key for this pool/tf/bucket
-            let k = candle_key(&ck.pool, ck.tf, ck.bucket_ts);
+            let k = table.candle_key(&ck.pool, ck.tf, ck.bucket_ts);
 
-            // Merge with existing (if any)
-            let merged = if let Some(raw) = mdb.get(&k)? {
+            let merged = if let Some(raw) = provider
+                .get_raw_value(GetRawValueParams { key: k.clone() })?
+                .value
+            {
                 let existing = decode_full_candle_v1(&raw)?;
 
                 let mut base = existing.base_candle;
@@ -154,9 +168,10 @@ impl CandleCache {
 
             let v = encode_full_candle_v1(&merged)?;
             writes.push((k, v));
+            entries.push((ck.pool, ck.tf, ck.bucket_ts, merged));
         }
 
-        Ok(writes)
+        Ok((writes, entries))
     }
 }
 
@@ -176,7 +191,7 @@ pub struct CandleSlice {
     pub newest_ts: u64, // bucket start of the newest candle that actually exists
 }
 pub fn read_candles_v1(
-    mdb: &Mdb,
+    provider: &AmmDataProvider,
     pool: SchemaAlkaneId,
     tf: Timeframe,
     _limit_unused: usize,
@@ -185,14 +200,13 @@ pub fn read_candles_v1(
 ) -> Result<CandleSlice> {
     let dur = tf.duration_secs();
 
-    let logical = candle_ns_prefix(&pool, tf);
-    let mut full_prefix = Vec::with_capacity(mdb.prefix().len() + logical.len());
-    full_prefix.extend_from_slice(mdb.prefix());
-    full_prefix.extend_from_slice(&logical);
-
+    let table = provider.table();
+    let logical = table.candle_ns_prefix(&pool, tf);
     let mut per_bucket: BTreeMap<u64, SchemaFullCandleV1> = BTreeMap::new();
-    for res in mdb.iter_prefix_rev(&full_prefix) {
-        let (k, v) = res?;
+    for (k, v) in provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .entries
+    {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
             if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
                 if let Ok(ts) = ts_str.parse::<u64>() {

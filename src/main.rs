@@ -2,6 +2,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod alkanes;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod bitcoind_flexible;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod consts;
@@ -31,7 +33,9 @@ use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
+use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
+use crate::modules::subfrost::main::Subfrost;
 use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
@@ -40,8 +44,8 @@ use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
-        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, init_config,
-        update_safe_tip,
+        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config,
+        init_config, update_safe_tip,
     },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
@@ -438,7 +442,21 @@ async fn main() -> Result<()> {
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());
-    mods.register_module(AmmData::new());
+    if get_module_config("ammdata").is_some() {
+        mods.register_module(AmmData::new());
+    } else {
+        eprintln!("[modules] ammdata disabled (missing config)");
+    }
+    if get_module_config("subfrost").is_some() {
+        mods.register_module(Subfrost::new());
+    } else {
+        eprintln!("[modules] subfrost disabled (missing config)");
+    }
+    if get_module_config("oylapi").is_some() {
+        mods.register_module(OylApi::new());
+    } else {
+        eprintln!("[modules] oylapi disabled (missing config)");
+    }
     // mods.register_module(TracesData::new());
 
     let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");

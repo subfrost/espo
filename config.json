@@ -22,5 +22,17 @@
   "explorer_networks": {
     "mainnet": "https://staging.espo.sh",
     "regtest": "https://espo.subfrost.io/regtest"
+  },
+  "modules": {
+    "oylapi": {
+      "host": "0.0.0.0",
+      "port": 9710,
+      "alkane_icon_cdn": "https://asset.oyl.gg/alkanes/mainnet"
+    },
+    "subfrost": {},
+    "ammdata": {
+      "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/jhcOomuhnXSw9o9j-8Di_",
+      "eth_call_throttle": 200
+    }
   }
 }
