@@ -1,19 +1,32 @@
+// Module declarations - these reference lib.rs modules indirectly
+#[cfg(not(target_arch = "wasm32"))]
 pub mod alkanes;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bitcoind_flexible;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod consts;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod explorer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod modules;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod schemas;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::runtime::block_metadata::BlockMetadata;
 use crate::config::init_block_source;
 //modules
 use crate::config::get_metashrew_sdb;
@@ -47,6 +60,12 @@ use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use tokio::runtime::Builder as TokioBuilder;
+
+static BLOCK_METADATA: OnceLock<Arc<BlockMetadata>> = OnceLock::new();
+
+pub fn get_block_metadata() -> Option<Arc<BlockMetadata>> {
+    BLOCK_METADATA.get().cloned()
+}
 
 fn should_watch_for_reorg(next_height: u32, safe_tip: u32) -> bool {
     safe_tip.saturating_sub(next_height) <= AOF_REORG_DEPTH
@@ -106,6 +125,73 @@ fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
     }
 
     Some(next_height.saturating_sub(revert_count as u32))
+}
+
+fn check_and_handle_reorg_v2(next_height: u32, safe_tip: u32) -> Option<u32> {
+    let cfg = get_config();
+    if !cfg.enable_height_indexed {
+        return check_and_handle_reorg(next_height, safe_tip);
+    }
+
+    let block_meta = match get_block_metadata() {
+        Some(m) => m,
+        None => return check_and_handle_reorg(next_height, safe_tip),
+    };
+
+    if next_height == 0 {
+        return None;
+    }
+
+    let rpc = get_bitcoind_rpc_client();
+    let max_depth = cfg.max_reorg_depth;
+
+    let get_remote_hash = |height: u32| -> Result<Option<String>> {
+        match rpc.get_block_hash(height as u64) {
+            Ok(hash) => Ok(Some(hash.to_string())),
+            Err(e) => Err(anyhow::anyhow!("failed to fetch block hash at {}: {}", height, e)),
+        }
+    };
+
+    let reorg_height = match block_meta.detect_reorg_height(next_height, max_depth, get_remote_hash) {
+        Ok(Some(height)) => height,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!("[reorg] detection failed: {e:?}");
+            if e.to_string().contains("exceeds maximum depth") {
+                eprintln!("[reorg] CRITICAL: reorg depth exceeds {} blocks - manual intervention required", max_depth);
+                std::process::exit(1);
+            }
+            return None;
+        }
+    };
+
+    let rollback_to = reorg_height;
+    let revert_count = next_height.saturating_sub(rollback_to + 1) as usize;
+    eprintln!(
+        "[reorg] detected reorg: rolling back {} blocks from {} to {}",
+        revert_count, next_height, rollback_to
+    );
+
+    if let Some(aof) = get_aof_manager() {
+        if let Err(e) = aof.revert_last_blocks(revert_count) {
+            eprintln!("[aof] rollback failed: {e:?}");
+            return None;
+        }
+    }
+
+    if let Err(e) = block_meta.delete_hashes_from(rollback_to + 1) {
+        eprintln!("[block_metadata] failed to delete hashes: {e:?}");
+    }
+
+    if let Err(e) = block_meta.set_indexed_height(rollback_to) {
+        eprintln!("[block_metadata] failed to update indexed height: {e:?}");
+    }
+
+    if let Err(e) = reset_mempool_store() {
+        eprintln!("[mempool] failed to reset store after reorg: {e:?}");
+    }
+
+    Some(rollback_to + 1)
 }
 
 async fn run_indexer_loop(
@@ -198,11 +284,19 @@ async fn run_indexer_loop(
                         .map(|t| t.transaction.compute_txid())
                         .collect();
 
+                    let block_hash = espo_block.block_header.block_hash();
+
+                    // Store block hash for reorg detection
+                    if let Some(block_meta) = get_block_metadata() {
+                        if let Err(e) = block_meta.store_block_hash(next_height, &block_hash.to_string()) {
+                            eprintln!("[block_metadata] failed to store block hash for height {}: {e:?}", next_height);
+                        }
+                    }
+
                     // Only capture AOF changes when we're near the safe tip; skip during deep catch-up.
                     let aof_for_block =
                         get_aof_manager().filter(|_| should_watch_for_reorg(next_height, tip));
                     if let Some(aof) = &aof_for_block {
-                        let block_hash = espo_block.block_header.block_hash();
                         aof.start_block(next_height, &block_hash);
                     }
 
@@ -258,7 +352,7 @@ async fn run_indexer_loop(
                 }
             }
         } else {
-            if let Some(new_next) = check_and_handle_reorg(next_height, tip) {
+            if let Some(new_next) = check_and_handle_reorg_v2(next_height, tip) {
                 if new_next < next_height {
                     next_height = new_next;
                     if let Some(h) = ESPO_HEIGHT.get() {
@@ -291,6 +385,7 @@ async fn run_indexer_loop(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> Result<()> {
     init_config()?;
@@ -298,6 +393,15 @@ async fn main() -> Result<()> {
     let network = get_network();
     let view_only = cfg.view_only;
     init_block_source()?;
+
+    // Initialize block metadata for reorg detection
+    if cfg.enable_height_indexed {
+        let block_meta = BlockMetadata::new(get_espo_db());
+        BLOCK_METADATA
+            .set(Arc::new(block_meta))
+            .map_err(|_| anyhow::anyhow!("block metadata already initialized"))?;
+        eprintln!("[block_metadata] initialized for reorg detection");
+    }
 
     if view_only {
         eprintln!(
@@ -448,4 +552,10 @@ async fn main() -> Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
+}
+
+// Dummy main for WASM builds (should never be called)
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    panic!("ESPO binary cannot be compiled for WASM");
 }

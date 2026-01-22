@@ -369,43 +369,52 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("network already initialized"))?;
 
     // --- init Electrum-like client once ---
-    let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
-        let electrum_url = format!("tcp://{}", url);
-        let client: Arc<Client> = Arc::new(Client::new(&electrum_url)?);
-        ELECTRUM_CLIENT
-            .set(client.clone())
-            .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
-        Arc::new(ElectrumRpcClient::new(client))
-    } else {
-        let base =
-            esplora_url.expect("validation ensures esplora url exists when electrum is None");
-        Arc::new(EsploraElectrumLike::new(base)?)
-    };
-    ELECTRUM_LIKE
-        .set(electrum_like)
-        .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        let electrum_like: Arc<dyn ElectrumLike> = if let Some(url) = electrum_url {
+            let electrum_url = format!("tcp://{}", url);
+            let client: Arc<Client> = Arc::new(Client::new(&electrum_url)?);
+            ELECTRUM_CLIENT
+                .set(client.clone())
+                .map_err(|_| anyhow::anyhow!("electrum client already initialized"))?;
+            Arc::new(ElectrumRpcClient::new(client))
+        } else {
+            let base =
+                esplora_url.expect("validation ensures esplora url exists when electrum is None");
+            Arc::new(EsploraElectrumLike::new(base)?)
+        };
+        ELECTRUM_LIKE
+            .set(electrum_like)
+            .map_err(|_| anyhow::anyhow!("electrum-like client already initialized"))?;
+    }
 
     // --- init Bitcoin Core RPC client once ---
-    let auth = if !cfg.bitcoind_rpc_user.is_empty() && !cfg.bitcoind_rpc_pass.is_empty() {
-        Some((cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()))
-    } else {
-        None
-    };
-    let core = CoreClient::new(&cfg.bitcoind_rpc_url, auth)?;
-    BITCOIND_CLIENT
-        .set(core)
-        .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        let auth = if !cfg.bitcoind_rpc_user.is_empty() && !cfg.bitcoind_rpc_pass.is_empty() {
+            Some((cfg.bitcoind_rpc_user.clone(), cfg.bitcoind_rpc_pass.clone()))
+        } else {
+            None
+        };
+        let core = CoreClient::new(&cfg.bitcoind_rpc_url, auth)?;
+        BITCOIND_CLIENT
+            .set(core)
+            .map_err(|_| anyhow::anyhow!("bitcoind rpc client already initialized"))?;
+    }
 
     // --- init Secondary RocksDB (SDB) once ---
-    let secondary_path = get_sdb_path_for_metashrew()?;
-    let sdb = SDB::open(
-        cfg.readonly_metashrew_db_dir.clone(),
-        secondary_path,
-        Duration::from_millis(cfg.sdb_poll_ms as u64),
-    )?;
-    METASHREW_SDB
-        .set(std::sync::Arc::new(sdb))
-        .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        let secondary_path = get_sdb_path_for_metashrew()?;
+        let sdb = SDB::open(
+            cfg.readonly_metashrew_db_dir.clone(),
+            secondary_path,
+            Duration::from_millis(cfg.sdb_poll_ms as u64),
+        )?;
+        METASHREW_SDB
+            .set(std::sync::Arc::new(sdb))
+            .map_err(|_| anyhow::anyhow!("metashrew SDB already initialized"))?;
+    }
 
     // --- init ESPO RocksDB once ---
     let mut espo_opts = Options::default();
@@ -424,7 +433,10 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("AOF manager already initialized"))?;
     }
 
-    init_block_source()?;
+    // SKIP if ESPO_SKIP_EXTERNAL_SERVICES env var is set (for testing)
+    if std::env::var("ESPO_SKIP_EXTERNAL_SERVICES").is_err() {
+        init_block_source()?;
+    }
 
     Ok(())
 }

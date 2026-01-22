@@ -67,6 +67,7 @@ fn host_function_values_decode_block_909402() {
 }
 
 #[test]
+#[ignore] // Requires external metashrew database at /data/.metashrew/v9/.metashrew-v9
 fn credits_outflows_for_block_912568_trace() {
     init_test_config_from_run_sh();
     let height = 912568u64;

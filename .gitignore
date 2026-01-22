@@ -1,10 +1,23 @@
+reference
 # Rust build artifacts
 /target/
 **/*.rs.bk
 *.pdb
 
-# Cargo lock file (for libraries, typically ignored; for binaries, committed)
-# Cargo.lock
+# Cargo
+Cargo.lock
+
+# Database directories
+/db/
+*.db
+*.rdb
+
+# Configuration files (keep sample.config.json but ignore config.json)
+config.json
+
+# Logs
+*.log
+logs/
 
 # IDE and editor files
 .vscode/
@@ -14,6 +27,37 @@
 *~
 .DS_Store
 
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+
+# Testing
+/test-results/
+/coverage/
+
+# Documentation build artifacts
+/book/
+
+# AOF files (append-only file logs)
+*.aof
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+
 # Generated files
 *.orig
 
@@ -22,8 +66,6 @@
 config.local.json
 
 # Build outputs
-*.so
-*.dylib
 *.dll
 *.exe
 
@@ -35,6 +77,5 @@ config.local.json
 *.profdata
 
 # Test coverage
-*.profraw
 tarpaulin-report.html
 cobertura.xml
