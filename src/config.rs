@@ -106,10 +106,6 @@ fn default_block_source_mode() -> String {
     "rpc".to_string()
 }
 
-fn default_max_reorg_depth() -> u32 {
-    100
-}
-
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
@@ -195,10 +191,6 @@ pub struct ConfigFile {
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
-    pub enable_height_indexed: bool,
-    #[serde(default = "default_max_reorg_depth")]
-    pub max_reorg_depth: u32,
-    #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -227,8 +219,6 @@ pub struct AppConfig {
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
-    pub enable_height_indexed: bool,
-    pub max_reorg_depth: u32,
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -282,8 +272,6 @@ impl AppConfig {
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
             explorer_networks,
-            enable_height_indexed: file.enable_height_indexed,
-            max_reorg_depth: file.max_reorg_depth,
             modules: file.modules,
         })
     }

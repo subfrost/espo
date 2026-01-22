@@ -7,7 +7,7 @@ use tarpc::context;
 use tokio::sync::RwLock;
 
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{get_config, get_module_config};
+use crate::config::get_module_config;
 use crate::runtime::aof::AofManager;
 use crate::runtime::mdb::Mdb;
 use rocksdb::{DB, Options};
@@ -198,13 +198,11 @@ impl ModuleRegistry {
         prefix_kv.extend_from_slice(name.as_bytes());
         prefix_kv.push(b':');
 
-        let cfg = get_config();
-        let mdb = Arc::new(Mdb::from_db_with_height_indexed(
+        let mdb = Arc::new(Mdb::from_db_with_aof(
             self.module_db.clone(),
             prefix_kv,
             self.aof.clone(),
             Some(name.to_string()),
-            cfg.enable_height_indexed,
         ));
         module.set_mdb(mdb);
 

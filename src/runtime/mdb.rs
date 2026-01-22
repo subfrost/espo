@@ -6,9 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::{path::Path, sync::Arc};
 
 use crate::runtime::aof::AofManager;
-use crate::runtime::height_indexed_storage::{HeightIndexedStorage, RocksHeightIndexedStorage};
-use anyhow::Result as AnyhowResult;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// ===== Cache / open-time tuning =====
 /// How big you want the LRU block cache (data + index/filter when enabled).
@@ -26,8 +23,6 @@ pub struct Mdb {
     prefix: Vec<u8>,
     namespace_label: String,
     aof: Option<Arc<AofManager>>,
-    height_indexed: Option<Arc<RocksHeightIndexedStorage>>,
-    current_height: Arc<AtomicU32>,
 }
 
 impl Mdb {
@@ -36,16 +31,6 @@ impl Mdb {
         prefix: impl AsRef<[u8]>,
         aof: Option<Arc<AofManager>>,
         label: Option<String>,
-    ) -> Self {
-        Self::from_parts_with_height_indexed(db, prefix, aof, label, None)
-    }
-
-    fn from_parts_with_height_indexed(
-        db: Arc<DB>,
-        prefix: impl AsRef<[u8]>,
-        aof: Option<Arc<AofManager>>,
-        label: Option<String>,
-        height_indexed: Option<Arc<RocksHeightIndexedStorage>>,
     ) -> Self {
         let prefix_vec = prefix.as_ref().to_vec();
         let namespace_label = label.unwrap_or_else(|| {
@@ -56,8 +41,6 @@ impl Mdb {
             prefix: prefix_vec,
             namespace_label,
             aof,
-            height_indexed,
-            current_height: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -73,24 +56,6 @@ impl Mdb {
         label: Option<String>,
     ) -> Self {
         Self::from_parts(db, prefix, aof, label)
-    }
-
-    pub fn from_db_with_height_indexed(
-        db: Arc<DB>,
-        prefix: impl AsRef<[u8]>,
-        aof: Option<Arc<AofManager>>,
-        label: Option<String>,
-        enable_height_indexed: bool,
-    ) -> Self {
-        let height_indexed = if enable_height_indexed {
-            let hi_prefix = format!("__HI/{}",
-                String::from_utf8(prefix.as_ref().to_vec())
-                    .unwrap_or_else(|_| hex::encode(prefix.as_ref())));
-            Some(Arc::new(RocksHeightIndexedStorage::new(db.clone(), hi_prefix)))
-        } else {
-            None
-        };
-        Self::from_parts_with_height_indexed(db, prefix, aof, label, height_indexed)
     }
 
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
@@ -333,106 +298,6 @@ impl Mdb {
         &self.prefix
     }
 
-    /// Set the current height for versioned storage operations
-    pub fn set_current_height(&self, height: u32) {
-        self.current_height.store(height, Ordering::SeqCst);
-    }
-
-    /// Get the current height
-    pub fn get_current_height(&self) -> u32 {
-        self.current_height.load(Ordering::SeqCst)
-    }
-
-    /// Put a value with versioning at the current height
-    pub fn put_versioned(&self, k: &[u8], v: &[u8]) -> AnyhowResult<()> {
-        if let Some(hi_storage) = &self.height_indexed {
-            let height = self.current_height.load(Ordering::SeqCst);
-            hi_storage.put(k, v, height)?;
-        }
-        self.put(k, v)?;
-        Ok(())
-    }
-
-    /// Get a value at a specific height
-    pub fn get_at_height(&self, k: &[u8], height: u32) -> AnyhowResult<Option<Vec<u8>>> {
-        self.height_indexed
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("height-indexed storage not enabled"))?
-            .get_at_height(k, height)
-    }
-
-    /// Get the current value (from height-indexed storage if available, otherwise regular storage)
-    pub fn get_current_versioned(&self, k: &[u8]) -> AnyhowResult<Option<Vec<u8>>> {
-        if let Some(hi_storage) = &self.height_indexed {
-            return hi_storage.get_current(k);
-        }
-        Ok(self.get(k)?)
-    }
-
-    /// Bulk write with versioning at the current height
-    pub fn bulk_write_versioned<F>(&self, build: F) -> AnyhowResult<()>
-    where
-        F: FnOnce(&mut MdbBatchVersioned<'_>),
-    {
-        let height = self.current_height.load(Ordering::SeqCst);
-        let mut wb = WriteBatch::default();
-        let mut pending_ops: Vec<PendingChange> = Vec::new();
-        let mut versioned_ops: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        {
-            let mut mb = MdbBatchVersioned {
-                mdb: self,
-                wb: &mut wb,
-                pending_ops: self.aof.as_ref().map(|_| &mut pending_ops),
-                versioned_ops: if self.height_indexed.is_some() {
-                    Some(&mut versioned_ops)
-                } else {
-                    None
-                },
-            };
-            build(&mut mb);
-        }
-
-        let prev_map = if self.aof.is_some() && !pending_ops.is_empty() {
-            self.load_previous_values(&pending_ops)?
-        } else {
-            HashMap::new()
-        };
-
-        self.db.write(wb)?;
-
-        if let Some(hi_storage) = &self.height_indexed {
-            for (key, value) in versioned_ops {
-                hi_storage.put(&key, &value, height)?;
-            }
-        }
-
-        if let Some(aof) = &self.aof {
-            for op in pending_ops {
-                let prev = prev_map.get(&op.key).cloned().unwrap_or(None);
-                match op.value {
-                    Some(v) => aof.record_put(&self.namespace_label, op.key, prev, v),
-                    None => aof.record_delete(&self.namespace_label, op.key, prev),
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Rollback height-indexed storage to a specific height
-    pub fn rollback_to_height(&self, height: u32) -> AnyhowResult<()> {
-        if let Some(hi_storage) = &self.height_indexed {
-            hi_storage.rollback_to_height(height)?;
-        }
-        Ok(())
-    }
-
-    /// Check if height-indexed storage is enabled
-    pub fn has_height_indexed(&self) -> bool {
-        self.height_indexed.is_some()
-    }
-
     fn load_previous_values(
         &self,
         pending_ops: &[PendingChange],
@@ -487,36 +352,6 @@ impl<'a> MdbBatch<'a> {
         }
         self.wb.put(key, v);
     }
-    #[inline]
-    pub fn delete(&mut self, k: &[u8]) {
-        let key = self.mdb.prefixed(k);
-        if let Some(buf) = self.pending_ops.as_mut() {
-            buf.push(PendingChange { key: key.clone(), value: None });
-        }
-        self.wb.delete(key);
-    }
-}
-
-pub struct MdbBatchVersioned<'a> {
-    mdb: &'a Mdb,
-    wb: &'a mut WriteBatch,
-    pending_ops: Option<&'a mut Vec<PendingChange>>,
-    versioned_ops: Option<&'a mut Vec<(Vec<u8>, Vec<u8>)>>,
-}
-
-impl<'a> MdbBatchVersioned<'a> {
-    #[inline]
-    pub fn put(&mut self, k: &[u8], v: &[u8]) {
-        let key = self.mdb.prefixed(k);
-        if let Some(buf) = self.pending_ops.as_mut() {
-            buf.push(PendingChange { key: key.clone(), value: Some(v.to_vec()) });
-        }
-        if let Some(versioned) = self.versioned_ops.as_mut() {
-            versioned.push((k.to_vec(), v.to_vec()));
-        }
-        self.wb.put(key, v);
-    }
-
     #[inline]
     pub fn delete(&mut self, k: &[u8]) {
         let key = self.mdb.prefixed(k);

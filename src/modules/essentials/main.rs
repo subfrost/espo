@@ -104,11 +104,6 @@ impl EspoModule for Essentials {
         let provider = self.provider();
         let table = provider.table();
 
-        // Set current height for versioned storage
-        if provider.mdb().has_height_indexed() {
-            provider.mdb().set_current_height(block.height);
-        }
-
         // -------- Phase A: coalesce per-block writes in memory --------
         // last-write-wins for values:
         //   kv_row_key(alk,skey) -> [ txid(32) | value(...) ]

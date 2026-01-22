@@ -15,12 +15,11 @@ use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
     decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, decode_u128_value,
     encode_u128_value, encode_vec,
-    mk_outpoint, spk_to_address_str, build_alkane_balances_key,
+    mk_outpoint, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, GetScanPrefixParams, SetBatchParams,
 };
-use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result, anyhow};
 use bitcoin::block::Header;
@@ -2223,78 +2222,6 @@ pub fn get_alkane_balances(
     }
 
     Ok(agg)
-}
-
-/// Get balance at a specific height (for strict mode validation)
-pub fn get_alkane_balance_at_height(
-    mdb: &Mdb,
-    owner: &SchemaAlkaneId,
-    token: &SchemaAlkaneId,
-    height: u32,
-) -> Result<u128> {
-    if !mdb.has_height_indexed() {
-        return Err(anyhow!("height-indexed storage not enabled"));
-    }
-
-    let key = build_alkane_balances_key(owner);
-    if let Some(bytes) = mdb.get_at_height(&key, height)? {
-        if let Ok(bals) = decode_balances_vec(&bytes) {
-            for be in bals {
-                if be.alkane == *token {
-                    return Ok(be.amount);
-                }
-            }
-        }
-    }
-
-    if owner == token {
-        if let Some(self_balance) = lookup_self_balance(owner) {
-            return Ok(self_balance);
-        }
-    }
-
-    Ok(0)
-}
-
-/// Validate balance history in strict mode with historical lookups
-///
-/// This function validates that an owner's balance for a specific token at a given height
-/// matches the expected balance. This is useful for strict mode validation where we want
-/// to ensure consistency with historical data.
-pub fn validate_balance_history_strict(
-    mdb: &Mdb,
-    owner: &SchemaAlkaneId,
-    token: &SchemaAlkaneId,
-    expected_balance: u128,
-    height: u32,
-) -> Result<()> {
-    if !is_strict_mode() {
-        return Ok(());
-    }
-
-    if !mdb.has_height_indexed() {
-        eprintln!(
-            "[balances][strict] height-indexed storage not enabled; skipping historical validation"
-        );
-        return Ok(());
-    }
-
-    let stored_balance = get_alkane_balance_at_height(mdb, owner, token, height)?;
-
-    if stored_balance != expected_balance {
-        return Err(anyhow!(
-            "strict mode: balance mismatch at height {} for owner {}:{} token {}:{} - expected {} but found {}",
-            height,
-            owner.block,
-            owner.tx,
-            token.block,
-            token.tx,
-            expected_balance,
-            stored_balance
-        ));
-    }
-
-    Ok(())
 }
 
 #[derive(Default, Clone, Debug)]
