@@ -71,4 +71,5 @@ alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326b
 metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f", features = ["test-utils"] }
 protorune = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f", features = ["test-utils"] }
 alkanes-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
+tower = { version = "0.5", features = ["util"] }
 wasm-bindgen-test = "0.3.49"

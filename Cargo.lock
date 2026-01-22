@@ -1908,6 +1908,7 @@ dependencies = [
  "tokio",
  "tokio-serde",
  "tokio-stream",
+ "tower",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "wasmtime",
