@@ -7,4 +7,5 @@ mod test_harness;
 pub use espo::test_utils::{ChainBuilder, MockBitcoinNode, TestConfigBuilder};
 
 // Re-export the full test harness
+#[allow(unused_imports)]
 pub use test_harness::EspoTestHarness;

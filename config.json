@@ -16,7 +16,7 @@
   "explorer_host": "0.0.0.0:5081",
   "network": "mainnet",
   "metashrew_db_label": null,
-  "strict_mode": true,
+  "strict_mode": false,
   "block_source_mode": "rpc",
   "simulate_reorg": false,
   "explorer_networks": {

@@ -9,7 +9,6 @@
 ///
 /// Note: AMM-specific functionality is available via test_utils::amm_helpers
 /// directly when the test-utils feature is enabled.
-
 use anyhow::Result;
 use bitcoin::Block;
 use espo::config::AppConfig;
@@ -24,6 +23,7 @@ use tempfile::TempDir;
 /// - Simulated Bitcoin blockchain with ChainBuilder
 /// - MockBitcoinNode for block storage and retrieval
 /// - Reorg simulation capabilities
+#[allow(dead_code)]
 pub struct EspoTestHarness {
     // Bitcoin simulation
     pub mock_node: MockBitcoinNode,
@@ -40,15 +40,15 @@ pub struct EspoTestHarness {
     _temp_dirs: Vec<TempDir>,
 }
 
+#[allow(dead_code)]
 impl EspoTestHarness {
     /// Create a new test harness
     ///
     /// Initializes all components with temporary directories that are
     /// automatically cleaned up when the harness is dropped.
     pub fn new() -> Result<Self> {
-        let (config, temp_dirs) = TestConfigBuilder::new()
-            .with_network(bitcoin::Network::Regtest)
-            .build();
+        let (config, temp_dirs) =
+            TestConfigBuilder::new().with_network(bitcoin::Network::Regtest).build();
 
         // Open the DB
         let mut opts = Options::default();
@@ -60,14 +60,7 @@ impl EspoTestHarness {
         // Build initial chain (just genesis)
         let blocks = ChainBuilder::new().build();
 
-        Ok(Self {
-            mock_node,
-            config,
-            db,
-            current_height: 0,
-            blocks,
-            _temp_dirs: temp_dirs,
-        })
+        Ok(Self { mock_node, config, db, current_height: 0, blocks, _temp_dirs: temp_dirs })
     }
 
     /// Mine a specified number of empty blocks
@@ -81,11 +74,7 @@ impl EspoTestHarness {
         let new_chain = ChainBuilder::new().add_blocks(total_blocks).build();
 
         // Extract only the newly mined blocks
-        let new_blocks: Vec<Block> = new_chain
-            .iter()
-            .skip(self.blocks.len())
-            .cloned()
-            .collect();
+        let new_blocks: Vec<Block> = new_chain.iter().skip(self.blocks.len()).cloned().collect();
 
         // Update internal state
         self.blocks = new_chain;
