@@ -358,6 +358,9 @@ impl EspoModule for AmmData {
         let mut address_pool_creations_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut address_pool_mints_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut address_pool_burns_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut address_amm_history_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut amm_history_all_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_pools_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_cache: HashMap<SchemaAlkaneId, SchemaTokenMetricsV1> = HashMap::new();
         let mut alkane_label_cache: HashMap<SchemaAlkaneId, String> = HashMap::new();
         let get_alkane_label = |essentials: &EssentialsProvider,
@@ -453,6 +456,14 @@ impl EspoModule for AmmData {
                     if let Ok(encoded_defs) = borsh::to_vec(&defs) {
                         pool_defs_writes.push((table.pools_key(&pool_id), encoded_defs));
                     }
+                    token_pools_writes.push((
+                        table.token_pools_key(&defs.base_alkane_id, &pool_id),
+                        Vec::new(),
+                    ));
+                    token_pools_writes.push((
+                        table.token_pools_key(&defs.quote_alkane_id, &pool_id),
+                        Vec::new(),
+                    ));
                     reserves_snapshot.entry(pool_id).or_insert(SchemaPoolSnapshot {
                         base_reserve: 0,
                         quote_reserve: 0,
@@ -595,7 +606,26 @@ impl EspoModule for AmmData {
                                 ),
                                 Vec::new(),
                             ));
+                            address_amm_history_writes.push((
+                                table.address_amm_history_key(
+                                    &activity.address_spk,
+                                    block_ts,
+                                    seq,
+                                    activity.kind,
+                                    &pool_id,
+                                ),
+                                Vec::new(),
+                            ));
                         }
+                        amm_history_all_writes.push((
+                            table.amm_history_all_key(
+                                block_ts,
+                                seq,
+                                activity.kind,
+                                &pool_id,
+                            ),
+                            Vec::new(),
+                        ));
                     }
 
                     println!(
@@ -737,6 +767,16 @@ impl EspoModule for AmmData {
                             }
                             _ => {}
                         }
+                    }
+                    amm_history_all_writes.push((
+                        table.amm_history_all_key(block_ts, seq, kind, &owner),
+                        Vec::new(),
+                    ));
+                    if !address_spk.is_empty() {
+                        address_amm_history_writes.push((
+                            table.address_amm_history_key(&address_spk, block_ts, seq, kind, &owner),
+                            Vec::new(),
+                        ));
                     }
                 }
 
@@ -1330,6 +1370,9 @@ impl EspoModule for AmmData {
         let apc_cnt = address_pool_creations_writes.len();
         let apm_cnt = address_pool_mints_writes.len();
         let apb_cnt = address_pool_burns_writes.len();
+        let aah_cnt = address_amm_history_writes.len();
+        let ah_cnt = amm_history_all_writes.len();
+        let tp_cnt = token_pools_writes.len();
         let pd_cnt = pool_defs_writes.len();
         let pm_cnt = pool_metrics_writes.len();
         let pls_cnt = pool_lp_supply_writes.len();
@@ -1339,7 +1382,7 @@ impl EspoModule for AmmData {
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
@@ -1359,6 +1402,9 @@ impl EspoModule for AmmData {
             apc_cnt = apc_cnt,
             apm_cnt = apm_cnt,
             apb_cnt = apb_cnt,
+            aah_cnt = aah_cnt,
+            ah_cnt = ah_cnt,
+            tp_cnt = tp_cnt,
             a_cnt = a_cnt,
             i_cnt = i_cnt,
         );
@@ -1374,6 +1420,7 @@ impl EspoModule for AmmData {
             || !pool_creation_info_writes.is_empty()
             || !pool_creations_writes.is_empty()
             || !pool_defs_writes.is_empty()
+            || !token_pools_writes.is_empty()
             || !pool_metrics_writes.is_empty()
             || !pool_lp_supply_writes.is_empty()
             || !tvl_versioned_writes.is_empty()
@@ -1383,6 +1430,8 @@ impl EspoModule for AmmData {
             || !address_pool_creations_writes.is_empty()
             || !address_pool_mints_writes.is_empty()
             || !address_pool_burns_writes.is_empty()
+            || !address_amm_history_writes.is_empty()
+            || !amm_history_all_writes.is_empty()
             || !activity_writes.is_empty()
             || !index_writes.is_empty()
             || !reserves_blob.is_empty()
@@ -1399,6 +1448,7 @@ impl EspoModule for AmmData {
             puts.extend(pool_creation_info_writes);
             puts.extend(pool_creations_writes);
             puts.extend(pool_defs_writes);
+            puts.extend(token_pools_writes);
             puts.extend(pool_metrics_writes);
             puts.extend(pool_lp_supply_writes);
             puts.extend(tvl_versioned_writes);
@@ -1408,6 +1458,8 @@ impl EspoModule for AmmData {
             puts.extend(address_pool_creations_writes);
             puts.extend(address_pool_mints_writes);
             puts.extend(address_pool_burns_writes);
+            puts.extend(address_amm_history_writes);
+            puts.extend(amm_history_all_writes);
             puts.extend(activity_writes);
             puts.extend(index_writes);
             puts.push((reserves_key_rel, reserves_blob));

@@ -120,6 +120,9 @@ pub struct AmmDataTable<'a> {
     pub ADDRESS_POOL_CREATIONS: MdbPointer<'a>,
     pub ADDRESS_POOL_MINTS: MdbPointer<'a>,
     pub ADDRESS_POOL_BURNS: MdbPointer<'a>,
+    pub ADDRESS_AMM_HISTORY: MdbPointer<'a>,
+    pub AMM_HISTORY_ALL: MdbPointer<'a>,
+    pub TOKEN_POOLS: MdbPointer<'a>,
 }
 
 impl<'a> AmmDataTable<'a> {
@@ -151,6 +154,9 @@ impl<'a> AmmDataTable<'a> {
             ADDRESS_POOL_CREATIONS: root.keyword("/address_pool_creations/v1/"),
             ADDRESS_POOL_MINTS: root.keyword("/address_pool_mints/v1/"),
             ADDRESS_POOL_BURNS: root.keyword("/address_pool_burns/v1/"),
+            ADDRESS_AMM_HISTORY: root.keyword("/address_amm_history/v1/"),
+            AMM_HISTORY_ALL: root.keyword("/amm_history_all/v1/"),
+            TOKEN_POOLS: root.keyword("/token_pools/v1/"),
         }
     }
 }
@@ -484,6 +490,63 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn address_amm_history_prefix(&self, address_spk: &[u8]) -> Vec<u8> {
+        let mut k = self.ADDRESS_AMM_HISTORY.key().to_vec();
+        push_spk(&mut k, address_spk);
+        k
+    }
+
+    pub fn address_amm_history_key(
+        &self,
+        address_spk: &[u8],
+        ts: u64,
+        seq: u32,
+        kind: ActivityKind,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.address_amm_history_prefix(address_spk);
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.push(activity_kind_code(kind));
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn amm_history_all_prefix(&self) -> Vec<u8> {
+        self.AMM_HISTORY_ALL.key().to_vec()
+    }
+
+    pub fn amm_history_all_key(
+        &self,
+        ts: u64,
+        seq: u32,
+        kind: ActivityKind,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.amm_history_all_prefix();
+        k.extend_from_slice(&ts.to_be_bytes());
+        k.extend_from_slice(&seq.to_be_bytes());
+        k.push(activity_kind_code(kind));
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_pools_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.TOKEN_POOLS.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_pools_key(&self, token: &SchemaAlkaneId, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.token_pools_prefix(token);
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
     pub fn pools_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12);
         suffix.extend_from_slice(&pool.block.to_be_bytes());
@@ -522,6 +585,27 @@ fn push_spk(dst: &mut Vec<u8>, spk: &[u8]) {
     let len = spk.len().min(u16::MAX as usize) as u16;
     dst.extend_from_slice(&len.to_be_bytes());
     dst.extend_from_slice(&spk[..len as usize]);
+}
+
+fn activity_kind_code(kind: ActivityKind) -> u8 {
+    match kind {
+        ActivityKind::TradeBuy => 0,
+        ActivityKind::TradeSell => 1,
+        ActivityKind::LiquidityAdd => 2,
+        ActivityKind::LiquidityRemove => 3,
+        ActivityKind::PoolCreate => 4,
+    }
+}
+
+fn activity_kind_from_code(code: u8) -> Option<ActivityKind> {
+    match code {
+        0 => Some(ActivityKind::TradeBuy),
+        1 => Some(ActivityKind::TradeSell),
+        2 => Some(ActivityKind::LiquidityAdd),
+        3 => Some(ActivityKind::LiquidityRemove),
+        4 => Some(ActivityKind::PoolCreate),
+        _ => None,
+    }
 }
 
 fn read_address_pool_events(
@@ -563,6 +647,65 @@ fn read_address_pool_events(
     let page = if offset >= total { &[] } else { &parsed[offset..end] };
 
     Ok(GetAddressPoolEventsPageResult { entries: page.to_vec(), total })
+}
+
+fn read_amm_history(
+    provider: &AmmDataProvider,
+    prefix: Vec<u8>,
+    offset: usize,
+    limit: usize,
+    kind_filter: Option<ActivityKind>,
+) -> Result<GetAmmHistoryPageResult> {
+    let entries = match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+    {
+        Ok(v) => v.entries,
+        Err(_) => Vec::new(),
+    };
+
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    for (k, _v) in entries {
+        if !k.starts_with(&prefix) {
+            continue;
+        }
+        let rest = &k[prefix.len()..];
+        if rest.len() < 25 {
+            continue;
+        }
+        let mut ts_arr = [0u8; 8];
+        let mut seq_arr = [0u8; 4];
+        ts_arr.copy_from_slice(&rest[0..8]);
+        seq_arr.copy_from_slice(&rest[8..12]);
+        let kind = match activity_kind_from_code(rest[12]) {
+            Some(v) => v,
+            None => continue,
+        };
+        if let Some(want) = kind_filter {
+            if want != kind {
+                continue;
+            }
+        }
+        let pool = match decode_alkane_id_be(&rest[13..25]) {
+            Some(p) => p,
+            None => continue,
+        };
+        total += 1;
+        if seen < offset {
+            seen += 1;
+            continue;
+        }
+        if out.len() < limit {
+            out.push(AmmHistoryEntry {
+                ts: u64::from_be_bytes(ts_arr),
+                seq: u32::from_be_bytes(seq_arr),
+                pool,
+                kind,
+            });
+        }
+    }
+
+    Ok(GetAmmHistoryPageResult { entries: out, total })
 }
 
 #[derive(Clone)]
@@ -1095,6 +1238,44 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.address_pool_burns_prefix(&params.address_spk);
         read_address_pool_events(self, prefix, params.offset, params.limit)
+    }
+
+    pub fn get_address_amm_history_page(
+        &self,
+        params: GetAddressAmmHistoryPageParams,
+    ) -> Result<GetAmmHistoryPageResult> {
+        let table = self.table();
+        let prefix = table.address_amm_history_prefix(&params.address_spk);
+        read_amm_history(self, prefix, params.offset, params.limit, params.kind)
+    }
+
+    pub fn get_amm_history_all_page(
+        &self,
+        params: GetAmmHistoryAllPageParams,
+    ) -> Result<GetAmmHistoryPageResult> {
+        let table = self.table();
+        let prefix = table.amm_history_all_prefix();
+        read_amm_history(self, prefix, params.offset, params.limit, params.kind)
+    }
+
+    pub fn get_token_pools(&self, params: GetTokenPoolsParams) -> Result<GetTokenPoolsResult> {
+        let table = self.table();
+        let prefix = table.token_pools_prefix(&params.token);
+        let keys = match self.get_scan_prefix(GetScanPrefixParams { prefix: prefix.clone() }) {
+            Ok(v) => v.keys,
+            Err(_) => Vec::new(),
+        };
+        let mut pools = Vec::new();
+        for key in keys {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &key[prefix.len()..];
+            if let Some(pool) = decode_alkane_id_be(rest) {
+                pools.push(pool);
+            }
+        }
+        Ok(GetTokenPoolsResult { pools })
     }
 
     pub fn get_tvl_versioned_at_or_before(
@@ -1993,6 +2174,40 @@ pub struct GetAddressPoolBurnsPageParams {
 pub struct GetAddressPoolEventsPageResult {
     pub entries: Vec<AddressPoolEventEntry>,
     pub total: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AmmHistoryEntry {
+    pub ts: u64,
+    pub seq: u32,
+    pub pool: SchemaAlkaneId,
+    pub kind: ActivityKind,
+}
+
+pub struct GetAddressAmmHistoryPageParams {
+    pub address_spk: Vec<u8>,
+    pub offset: usize,
+    pub limit: usize,
+    pub kind: Option<ActivityKind>,
+}
+
+pub struct GetAmmHistoryAllPageParams {
+    pub offset: usize,
+    pub limit: usize,
+    pub kind: Option<ActivityKind>,
+}
+
+pub struct GetAmmHistoryPageResult {
+    pub entries: Vec<AmmHistoryEntry>,
+    pub total: usize,
+}
+
+pub struct GetTokenPoolsParams {
+    pub token: SchemaAlkaneId,
+}
+
+pub struct GetTokenPoolsResult {
+    pub pools: Vec<SchemaAlkaneId>,
 }
 
 pub struct GetTvlVersionedAtOrBeforeParams {

@@ -1,22 +1,26 @@
 use crate::config::{get_config, get_electrum_like, get_network};
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::schemas::{
-    ActivityKind, SchemaMarketDefs, SchemaTokenMetricsV1, Timeframe,
+    ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
+    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetActivityEntryParams, GetAddressPoolSwapsPageParams,
-    GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams, GetFactoryPoolsParams,
-    GetLatestTokenUsdCloseParams, GetPoolActivityEntriesParams, GetPoolCreationInfoParams,
-    GetPoolCreationsPageParams, GetPoolDefsParams, GetPoolFactoryParams,
-    GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
-    GetReservesSnapshotParams, GetTokenMetricsParams, GetTokenSwapsPageParams,
-    GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams, GetAddressPoolBurnsPageParams,
+    AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
+    GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams,
+    GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams,
+    GetFactoryPoolsParams, GetIterPrefixRevParams, GetLatestTokenUsdCloseParams,
+    GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
+    GetPoolDefsParams, GetPoolFactoryParams, GetPoolIdsByNamePrefixParams,
+    GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetReservesSnapshotParams,
+    GetTokenMetricsParams, GetTokenPoolsParams, GetTokenSwapsPageParams,
 };
+use crate::modules::ammdata::utils::pathfinder::plan_exact_in_default_fee;
 use crate::modules::subfrost::storage::{
     GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetUnwrapTotalAtOrBeforeParams,
     GetUnwrapTotalLatestParams, GetWrapEventsAllParams, GetWrapEventsByAddressParams,
     SubfrostProvider,
 };
+use crate::modules::subfrost::schemas::SchemaWrapEventV1;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetAlkaneIdsByNamePrefixParams, GetAlkaneIdsBySymbolPrefixParams,
     GetCreationRecordParams, GetCreationRecordsByIdParams, GetCreationRecordsOrderedParams,
@@ -1868,6 +1872,502 @@ pub async fn get_total_unwrap_amount(
     })
 }
 
+pub async fn get_all_address_amm_tx_history(
+    state: &OylApiState,
+    address: &str,
+    transaction_type: Option<String>,
+    count: Option<u64>,
+    offset: Option<u64>,
+    successful: Option<bool>,
+    include_total: Option<bool>,
+) -> Value {
+    let Some(address_spk) = address_spk_bytes(address) else {
+        return error_response(400, "invalid_address");
+    };
+    let limit = clamp_count(count);
+    let offset = clamp_offset(offset);
+    let include_total = include_total.unwrap_or(true);
+    let successful_only = successful.unwrap_or(false);
+    let tx_type = match parse_amm_tx_type(transaction_type.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => return error_response(400, msg),
+    };
+
+    if let Some(AmmTxType::Wrap) = tx_type {
+        let resp = state
+            .subfrost
+            .get_wrap_events_by_address(GetWrapEventsByAddressParams {
+                address_spk: address_spk.clone(),
+                offset,
+                limit,
+                successful: if successful_only { Some(true) } else { None },
+            })
+            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+                entries: Vec::new(),
+                total: 0,
+            });
+        let mut items = Vec::new();
+        for entry in resp.entries {
+            items.push(wrap_event_to_value(&entry, "wrap"));
+        }
+        let total = if include_total { resp.total } else { 0 };
+        return json!({
+            "statusCode": 200,
+            "data": {
+                "items": items,
+                "total": total,
+                "count": items.len(),
+                "offset": offset,
+            }
+        });
+    }
+    if let Some(AmmTxType::Unwrap) = tx_type {
+        let resp = state
+            .subfrost
+            .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+                address_spk: address_spk.clone(),
+                offset,
+                limit,
+                successful: if successful_only { Some(true) } else { None },
+            })
+            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+                entries: Vec::new(),
+                total: 0,
+            });
+        let mut items = Vec::new();
+        for entry in resp.entries {
+            items.push(wrap_event_to_value(&entry, "unwrap"));
+        }
+        let total = if include_total { resp.total } else { 0 };
+        return json!({
+            "statusCode": 200,
+            "data": {
+                "items": items,
+                "total": total,
+                "count": items.len(),
+                "offset": offset,
+            }
+        });
+    }
+
+    if let Some(kind) = tx_type {
+        let kinds = amm_kinds_for_type(kind);
+        let (entries, total) = collect_amm_history_items(
+            state,
+            AmmHistoryScope::Address(&address_spk),
+            kinds.as_deref(),
+            offset,
+            limit,
+            successful_only,
+            include_total,
+        );
+        let items = amm_history_items_to_values(state, entries)
+            .into_iter()
+            .map(|item| item.item)
+            .collect::<Vec<_>>();
+        let total = if include_total { total } else { 0 };
+        return json!({
+            "statusCode": 200,
+            "data": {
+                "items": items,
+                "total": total,
+                "count": items.len(),
+                "offset": offset,
+            }
+        });
+    }
+
+    let combined_limit = offset.saturating_add(limit);
+    let (amm_entries, amm_total) = collect_amm_history_items(
+        state,
+        AmmHistoryScope::Address(&address_spk),
+        None,
+        0,
+        combined_limit,
+        successful_only,
+        include_total,
+    );
+    let mut combined = amm_history_items_to_values(state, amm_entries);
+
+    let wrap_resp = state
+        .subfrost
+        .get_wrap_events_by_address(GetWrapEventsByAddressParams {
+            address_spk: address_spk.clone(),
+            offset: 0,
+            limit: combined_limit,
+            successful: if successful_only { Some(true) } else { None },
+        })
+        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+            entries: Vec::new(),
+            total: 0,
+        });
+    let unwrap_resp = state
+        .subfrost
+        .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+            address_spk: address_spk.clone(),
+            offset: 0,
+            limit: combined_limit,
+            successful: if successful_only { Some(true) } else { None },
+        })
+        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+            entries: Vec::new(),
+            total: 0,
+        });
+
+    for entry in wrap_resp.entries {
+        combined.push(wrap_event_to_history_item(&entry, "wrap"));
+    }
+    for entry in unwrap_resp.entries {
+        combined.push(wrap_event_to_history_item(&entry, "unwrap"));
+    }
+
+    combined.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.seq.cmp(&a.seq)));
+    let items = combined
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|item| item.item)
+        .collect::<Vec<_>>();
+    let total = if include_total {
+        amm_total
+            .saturating_add(wrap_resp.total)
+            .saturating_add(unwrap_resp.total)
+    } else {
+        0
+    };
+
+    json!({
+        "statusCode": 200,
+        "data": {
+            "items": items,
+            "total": total,
+            "count": items.len(),
+            "offset": offset,
+        }
+    })
+}
+
+pub async fn get_all_amm_tx_history(
+    state: &OylApiState,
+    transaction_type: Option<String>,
+    count: Option<u64>,
+    offset: Option<u64>,
+    successful: Option<bool>,
+    include_total: Option<bool>,
+) -> Value {
+    let limit = clamp_count(count);
+    let offset = clamp_offset(offset);
+    let include_total = include_total.unwrap_or(true);
+    let successful_only = successful.unwrap_or(false);
+    let tx_type = match parse_amm_tx_type(transaction_type.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => return error_response(400, msg),
+    };
+
+    if let Some(AmmTxType::Wrap) = tx_type {
+        let resp = state
+            .subfrost
+            .get_wrap_events_all(GetWrapEventsAllParams {
+                offset,
+                limit,
+                successful: if successful_only { Some(true) } else { None },
+            })
+            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+                entries: Vec::new(),
+                total: 0,
+            });
+        let mut items = Vec::new();
+        for entry in resp.entries {
+            items.push(wrap_event_to_value(&entry, "wrap"));
+        }
+        let total = if include_total { resp.total } else { 0 };
+        return json!({
+            "statusCode": 200,
+            "data": {
+                "items": items,
+                "total": total,
+                "count": items.len(),
+                "offset": offset,
+            }
+        });
+    }
+    if let Some(AmmTxType::Unwrap) = tx_type {
+        let resp = state
+            .subfrost
+            .get_unwrap_events_all(GetUnwrapEventsAllParams {
+                offset,
+                limit,
+                successful: if successful_only { Some(true) } else { None },
+            })
+            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+                entries: Vec::new(),
+                total: 0,
+            });
+        let mut items = Vec::new();
+        for entry in resp.entries {
+            items.push(wrap_event_to_value(&entry, "unwrap"));
+        }
+        let total = if include_total { resp.total } else { 0 };
+        return json!({
+            "statusCode": 200,
+            "data": {
+                "items": items,
+                "total": total,
+                "count": items.len(),
+                "offset": offset,
+            }
+        });
+    }
+
+    if let Some(kind) = tx_type {
+        let kinds = amm_kinds_for_type(kind);
+        let (entries, total) = collect_amm_history_items(
+            state,
+            AmmHistoryScope::All,
+            kinds.as_deref(),
+            offset,
+            limit,
+            successful_only,
+            include_total,
+        );
+        let items = amm_history_items_to_values(state, entries)
+            .into_iter()
+            .map(|item| item.item)
+            .collect::<Vec<_>>();
+        let total = if include_total { total } else { 0 };
+        return json!({
+            "statusCode": 200,
+            "data": {
+                "items": items,
+                "total": total,
+                "count": items.len(),
+                "offset": offset,
+            }
+        });
+    }
+
+    let combined_limit = offset.saturating_add(limit);
+    let (amm_entries, amm_total) = collect_amm_history_items(
+        state,
+        AmmHistoryScope::All,
+        None,
+        0,
+        combined_limit,
+        successful_only,
+        include_total,
+    );
+    let mut combined = amm_history_items_to_values(state, amm_entries);
+
+    let wrap_resp = state
+        .subfrost
+        .get_wrap_events_all(GetWrapEventsAllParams {
+            offset: 0,
+            limit: combined_limit,
+            successful: if successful_only { Some(true) } else { None },
+        })
+        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+            entries: Vec::new(),
+            total: 0,
+        });
+    let unwrap_resp = state
+        .subfrost
+        .get_unwrap_events_all(GetUnwrapEventsAllParams {
+            offset: 0,
+            limit: combined_limit,
+            successful: if successful_only { Some(true) } else { None },
+        })
+        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
+            entries: Vec::new(),
+            total: 0,
+        });
+
+    for entry in wrap_resp.entries {
+        combined.push(wrap_event_to_history_item(&entry, "wrap"));
+    }
+    for entry in unwrap_resp.entries {
+        combined.push(wrap_event_to_history_item(&entry, "unwrap"));
+    }
+
+    combined.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.seq.cmp(&a.seq)));
+    let items = combined
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|item| item.item)
+        .collect::<Vec<_>>();
+    let total = if include_total {
+        amm_total
+            .saturating_add(wrap_resp.total)
+            .saturating_add(unwrap_resp.total)
+    } else {
+        0
+    };
+
+    json!({
+        "statusCode": 200,
+        "data": {
+            "items": items,
+            "total": total,
+            "count": items.len(),
+            "offset": offset,
+        }
+    })
+}
+
+pub async fn get_all_token_pairs(
+    state: &OylApiState,
+    factory_block: &str,
+    factory_tx: &str,
+) -> Value {
+    let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
+        return error_response(400, "invalid_factory_id");
+    };
+
+    let pools = state
+        .ammdata
+        .get_factory_pools(GetFactoryPoolsParams { factory })
+        .map(|res| res.pools)
+        .unwrap_or_default();
+
+    let mut meta_cache: HashMap<SchemaAlkaneId, TokenMeta> = HashMap::new();
+    let mut out = Vec::new();
+    for pool in pools {
+        if let Some(pair) = build_token_pair(state, pool, &mut meta_cache) {
+            out.push(pair.value);
+        }
+    }
+
+    json!({ "statusCode": 200, "data": out })
+}
+
+pub async fn get_token_pairs(
+    state: &OylApiState,
+    factory_block: &str,
+    factory_tx: &str,
+    token_block: &str,
+    token_tx: &str,
+    sort_by: Option<String>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    search_query: Option<String>,
+) -> Value {
+    let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
+        return error_response(400, "invalid_factory_id");
+    };
+    let Some(token) = parse_alkane_id_fields(token_block, token_tx) else {
+        return error_response(400, "invalid_token_id");
+    };
+
+    let pools = state
+        .ammdata
+        .get_token_pools(GetTokenPoolsParams { token })
+        .map(|res| res.pools)
+        .unwrap_or_default();
+    let factory_pools = state
+        .ammdata
+        .get_factory_pools(GetFactoryPoolsParams { factory })
+        .map(|res| res.pools)
+        .unwrap_or_default();
+    let factory_set: HashSet<SchemaAlkaneId> = factory_pools.into_iter().collect();
+
+    let mut meta_cache: HashMap<SchemaAlkaneId, TokenMeta> = HashMap::new();
+    let mut pairs: Vec<TokenPairComputed> = Vec::new();
+    for pool in pools {
+        if !factory_set.contains(&pool) {
+            continue;
+        }
+        if let Some(pair) = build_token_pair(state, pool, &mut meta_cache) {
+            pairs.push(pair);
+        }
+    }
+
+    if let Some(query) = search_query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        if let Some(id) = parse_alkane_id_str(query) {
+            pairs.retain(|pair| pair.pool_id == id || pair.token0_id == id || pair.token1_id == id);
+        } else {
+            let norm = normalize_query(query);
+            pairs.retain(|pair| pair.search.contains(&norm));
+        }
+    }
+
+    let sort_by = sort_by.unwrap_or_else(|| "tvl".to_string());
+    if sort_by.eq_ignore_ascii_case("tvl") {
+        pairs.sort_by(|a, b| b.tvl_usd.cmp(&a.tvl_usd));
+    }
+
+    let offset = offset.unwrap_or(0) as usize;
+    let limit = limit.map(|v| v as usize);
+    let total = pairs.len();
+    let out = pairs
+        .into_iter()
+        .skip(offset)
+        .take(limit.unwrap_or(total))
+        .map(|pair| pair.value)
+        .collect::<Vec<_>>();
+
+    json!({ "statusCode": 200, "data": out })
+}
+
+pub async fn get_alkane_swap_pair_details(
+    state: &OylApiState,
+    factory_block: &str,
+    factory_tx: &str,
+    token_a_block: &str,
+    token_a_tx: &str,
+    token_b_block: &str,
+    token_b_tx: &str,
+) -> Value {
+    let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
+        return error_response(400, "invalid_factory_id");
+    };
+    let Some(token_a) = parse_alkane_id_fields(token_a_block, token_a_tx) else {
+        return error_response(400, "invalid_token_a_id");
+    };
+    let Some(token_b) = parse_alkane_id_fields(token_b_block, token_b_tx) else {
+        return error_response(400, "invalid_token_b_id");
+    };
+
+    let snapshot = state
+        .ammdata
+        .get_reserves_snapshot(GetReservesSnapshotParams)
+        .ok()
+        .and_then(|res| res.snapshot)
+        .unwrap_or_default();
+
+    let factory_pools = state
+        .ammdata
+        .get_factory_pools(GetFactoryPoolsParams { factory })
+        .map(|res| res.pools)
+        .unwrap_or_default();
+    let factory_set: HashSet<SchemaAlkaneId> = factory_pools.into_iter().collect();
+
+    let mut filtered: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
+    for (pool, snap) in snapshot {
+        if factory_set.contains(&pool) {
+            filtered.insert(pool, snap);
+        }
+    }
+
+    let mut meta_cache: HashMap<SchemaAlkaneId, TokenMeta> = HashMap::new();
+    let mut paths = Vec::new();
+    if let Some(quote) = plan_exact_in_default_fee(&filtered, token_a, token_b, 1, 0, 3) {
+        let mut path_ids = Vec::new();
+        path_ids.push(alkane_id_json(&token_a));
+        for hop in &quote.hops {
+            path_ids.push(alkane_id_json(&hop.token_out));
+        }
+        let mut pools = Vec::new();
+        for hop in &quote.hops {
+            if let Some(pair) = build_token_pair(state, hop.pool, &mut meta_cache) {
+                pools.push(pair.value);
+            }
+        }
+        paths.push(json!({ "path": path_ids, "pools": pools }));
+    }
+
+    json!({ "statusCode": 200, "data": paths })
+}
+
 pub async fn get_address_utxos(
     essentials: &EssentialsProvider,
     client: &Client,
@@ -2162,6 +2662,509 @@ fn latest_total_minted(state: &OylApiState, token: &SchemaAlkaneId) -> u128 {
         .ok()
         .map(|res| res.total_minted)
         .unwrap_or(0)
+}
+
+#[derive(Clone, Copy)]
+enum AmmTxType {
+    Swap,
+    Mint,
+    Burn,
+    Creation,
+    Wrap,
+    Unwrap,
+}
+
+enum AmmHistoryScope<'a> {
+    Address(&'a [u8]),
+    All,
+}
+
+#[derive(Clone)]
+struct AmmHistoryItem {
+    entry: AmmHistoryEntry,
+    activity: SchemaActivityV1,
+}
+
+#[derive(Clone)]
+struct HistoryItemWithTs {
+    ts: u64,
+    seq: u32,
+    item: Value,
+}
+
+#[derive(Clone)]
+struct TokenMeta {
+    name: String,
+    symbol: String,
+    label: String,
+    image: String,
+    decimals: u8,
+}
+
+#[derive(Clone)]
+struct TokenPairComputed {
+    value: Value,
+    pool_id: SchemaAlkaneId,
+    token0_id: SchemaAlkaneId,
+    token1_id: SchemaAlkaneId,
+    search: String,
+    tvl_usd: u128,
+}
+
+fn parse_amm_tx_type(raw: Option<&str>) -> Result<Option<AmmTxType>, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let norm = raw.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return Ok(None);
+    }
+    match norm.as_str() {
+        "swap" => Ok(Some(AmmTxType::Swap)),
+        "mint" => Ok(Some(AmmTxType::Mint)),
+        "burn" => Ok(Some(AmmTxType::Burn)),
+        "creation" => Ok(Some(AmmTxType::Creation)),
+        "wrap" => Ok(Some(AmmTxType::Wrap)),
+        "unwrap" => Ok(Some(AmmTxType::Unwrap)),
+        _ => Err("invalid_transaction_type"),
+    }
+}
+
+fn amm_kinds_for_type(tx_type: AmmTxType) -> Option<Vec<ActivityKind>> {
+    match tx_type {
+        AmmTxType::Swap => Some(vec![ActivityKind::TradeBuy, ActivityKind::TradeSell]),
+        AmmTxType::Mint => Some(vec![ActivityKind::LiquidityAdd]),
+        AmmTxType::Burn => Some(vec![ActivityKind::LiquidityRemove]),
+        AmmTxType::Creation => Some(vec![ActivityKind::PoolCreate]),
+        AmmTxType::Wrap | AmmTxType::Unwrap => None,
+    }
+}
+
+fn collect_amm_history_items(
+    state: &OylApiState,
+    scope: AmmHistoryScope<'_>,
+    kinds: Option<&[ActivityKind]>,
+    offset: usize,
+    limit: usize,
+    successful_only: bool,
+    include_total: bool,
+) -> (Vec<AmmHistoryItem>, usize) {
+    let table = state.ammdata.table();
+    let prefix = match scope {
+        AmmHistoryScope::Address(spk) => table.address_amm_history_prefix(spk),
+        AmmHistoryScope::All => table.amm_history_all_prefix(),
+    };
+    let entries = match state
+        .ammdata
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
+    {
+        Ok(v) => v.entries,
+        Err(_) => Vec::new(),
+    };
+
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    let mut seen = 0usize;
+    for (k, _v) in entries {
+        let Some(entry) = parse_amm_history_key(&prefix, &k) else {
+            continue;
+        };
+        if let Some(kinds) = kinds {
+            if !kinds.contains(&entry.kind) {
+                continue;
+            }
+        }
+        let activity = match state
+            .ammdata
+            .get_activity_entry(GetActivityEntryParams {
+                pool: entry.pool,
+                ts: entry.ts,
+                seq: entry.seq,
+            })
+            .ok()
+            .and_then(|res| res.entry)
+        {
+            Some(activity) => activity,
+            None => continue,
+        };
+        if successful_only && !activity.success {
+            continue;
+        }
+        total += 1;
+        if seen < offset {
+            seen += 1;
+            continue;
+        }
+        if out.len() < limit {
+            out.push(AmmHistoryItem { entry, activity });
+        }
+        if !include_total && out.len() >= limit {
+            break;
+        }
+    }
+
+    let total = if include_total { total } else { 0 };
+    (out, total)
+}
+
+fn amm_history_items_to_values(
+    state: &OylApiState,
+    items: Vec<AmmHistoryItem>,
+) -> Vec<HistoryItemWithTs> {
+    let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
+    let mut lp_supply_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+    let mut creation_cache: HashMap<SchemaAlkaneId, Option<SchemaPoolCreationInfoV1>> =
+        HashMap::new();
+    let mut out = Vec::new();
+
+    for item in items {
+        let pool = item.entry.pool;
+        let defs = if let Some(defs) = defs_cache.get(&pool) {
+            *defs
+        } else {
+            let Some(defs) = state
+                .ammdata
+                .get_pool_defs(GetPoolDefsParams { pool })
+                .ok()
+                .and_then(|res| res.defs)
+            else {
+                continue;
+            };
+            defs_cache.insert(pool, defs);
+            defs
+        };
+
+        match item.entry.kind {
+            ActivityKind::TradeBuy | ActivityKind::TradeSell => {
+                let Some((sold_id, bought_id, sold_amt, bought_amt)) =
+                    trade_from_activity(&defs, &item.activity)
+                else {
+                    continue;
+                };
+                let address = address_from_spk_bytes(&item.activity.address_spk);
+                let value = json!({
+                    "transactionId": txid_hex(item.activity.txid),
+                    "poolBlockId": pool.block.to_string(),
+                    "poolTxId": pool.tx.to_string(),
+                    "soldTokenBlockId": sold_id.block.to_string(),
+                    "soldTokenTxId": sold_id.tx.to_string(),
+                    "boughtTokenBlockId": bought_id.block.to_string(),
+                    "boughtTokenTxId": bought_id.tx.to_string(),
+                    "soldAmount": sold_amt.to_string(),
+                    "boughtAmount": bought_amt.to_string(),
+                    "sellerAddress": address,
+                    "address": address,
+                    "timestamp": iso_timestamp(item.activity.timestamp),
+                    "type": "swap",
+                });
+                out.push(HistoryItemWithTs {
+                    ts: item.activity.timestamp,
+                    seq: item.entry.seq,
+                    item: value,
+                });
+            }
+            ActivityKind::LiquidityAdd => {
+                let lp_supply = if let Some(supply) = lp_supply_cache.get(&pool) {
+                    *supply
+                } else {
+                    let supply = state
+                        .ammdata
+                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
+                        .map(|res| res.supply)
+                        .unwrap_or(0);
+                    lp_supply_cache.insert(pool, supply);
+                    supply
+                };
+                let token0_amt = abs_i128(item.activity.base_delta);
+                let token1_amt = abs_i128(item.activity.quote_delta);
+                let address = address_from_spk_bytes(&item.activity.address_spk);
+                let value = json!({
+                    "transactionId": txid_hex(item.activity.txid),
+                    "poolBlockId": pool.block.to_string(),
+                    "poolTxId": pool.tx.to_string(),
+                    "token0BlockId": defs.base_alkane_id.block.to_string(),
+                    "token0TxId": defs.base_alkane_id.tx.to_string(),
+                    "token1BlockId": defs.quote_alkane_id.block.to_string(),
+                    "token1TxId": defs.quote_alkane_id.tx.to_string(),
+                    "token0Amount": token0_amt.to_string(),
+                    "token1Amount": token1_amt.to_string(),
+                    "lpTokenAmount": lp_supply.to_string(),
+                    "minterAddress": address,
+                    "address": address,
+                    "timestamp": iso_timestamp(item.activity.timestamp),
+                    "type": "mint",
+                });
+                out.push(HistoryItemWithTs {
+                    ts: item.activity.timestamp,
+                    seq: item.entry.seq,
+                    item: value,
+                });
+            }
+            ActivityKind::LiquidityRemove => {
+                let lp_supply = if let Some(supply) = lp_supply_cache.get(&pool) {
+                    *supply
+                } else {
+                    let supply = state
+                        .ammdata
+                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
+                        .map(|res| res.supply)
+                        .unwrap_or(0);
+                    lp_supply_cache.insert(pool, supply);
+                    supply
+                };
+                let token0_amt = abs_i128(item.activity.base_delta);
+                let token1_amt = abs_i128(item.activity.quote_delta);
+                let address = address_from_spk_bytes(&item.activity.address_spk);
+                let value = json!({
+                    "transactionId": txid_hex(item.activity.txid),
+                    "poolBlockId": pool.block.to_string(),
+                    "poolTxId": pool.tx.to_string(),
+                    "token0BlockId": defs.base_alkane_id.block.to_string(),
+                    "token0TxId": defs.base_alkane_id.tx.to_string(),
+                    "token1BlockId": defs.quote_alkane_id.block.to_string(),
+                    "token1TxId": defs.quote_alkane_id.tx.to_string(),
+                    "token0Amount": token0_amt.to_string(),
+                    "token1Amount": token1_amt.to_string(),
+                    "lpTokenAmount": lp_supply.to_string(),
+                    "burnerAddress": address,
+                    "address": address,
+                    "timestamp": iso_timestamp(item.activity.timestamp),
+                    "type": "burn",
+                });
+                out.push(HistoryItemWithTs {
+                    ts: item.activity.timestamp,
+                    seq: item.entry.seq,
+                    item: value,
+                });
+            }
+            ActivityKind::PoolCreate => {
+                let creation = if let Some(info) = creation_cache.get(&pool) {
+                    info.clone()
+                } else {
+                    let info = state
+                        .ammdata
+                        .get_pool_creation_info(GetPoolCreationInfoParams { pool })
+                        .ok()
+                        .and_then(|res| res.info);
+                    creation_cache.insert(pool, info.clone());
+                    info
+                };
+                let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) =
+                    creation
+                {
+                    (
+                        info.initial_token0_amount,
+                        info.initial_token1_amount,
+                        info.initial_lp_supply,
+                        info.creator_spk,
+                    )
+                } else {
+                    (0, 0, 0, Vec::new())
+                };
+                let creator = if creator_spk.is_empty() {
+                    address_from_spk_bytes(&item.activity.address_spk)
+                } else {
+                    address_from_spk_bytes(&creator_spk)
+                };
+                let value = json!({
+                    "transactionId": txid_hex(item.activity.txid),
+                    "poolBlockId": pool.block.to_string(),
+                    "poolTxId": pool.tx.to_string(),
+                    "token0BlockId": defs.base_alkane_id.block.to_string(),
+                    "token0TxId": defs.base_alkane_id.tx.to_string(),
+                    "token1BlockId": defs.quote_alkane_id.block.to_string(),
+                    "token1TxId": defs.quote_alkane_id.tx.to_string(),
+                    "token0Amount": token0_amt.to_string(),
+                    "token1Amount": token1_amt.to_string(),
+                    "tokenSupply": token_supply.to_string(),
+                    "creatorAddress": creator,
+                    "address": creator,
+                    "timestamp": iso_timestamp(item.activity.timestamp),
+                    "type": "creation",
+                });
+                out.push(HistoryItemWithTs {
+                    ts: item.activity.timestamp,
+                    seq: item.entry.seq,
+                    item: value,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+fn wrap_event_to_value(entry: &SchemaWrapEventV1, kind: &str) -> Value {
+    let address = address_from_spk_bytes(&entry.address_spk);
+    json!({
+        "transactionId": txid_hex(entry.txid),
+        "address": address,
+        "amount": entry.amount.to_string(),
+        "timestamp": iso_timestamp(entry.timestamp),
+        "type": kind,
+    })
+}
+
+fn wrap_event_to_history_item(entry: &SchemaWrapEventV1, kind: &str) -> HistoryItemWithTs {
+    HistoryItemWithTs {
+        ts: entry.timestamp,
+        seq: 0,
+        item: wrap_event_to_value(entry, kind),
+    }
+}
+
+fn build_token_pair(
+    state: &OylApiState,
+    pool: SchemaAlkaneId,
+    meta_cache: &mut HashMap<SchemaAlkaneId, TokenMeta>,
+) -> Option<TokenPairComputed> {
+    let defs = state
+        .ammdata
+        .get_pool_defs(GetPoolDefsParams { pool })
+        .ok()
+        .and_then(|res| res.defs)?;
+
+    let mut balances = get_alkane_balances(&state.essentials, &pool).unwrap_or_default();
+    let reserve0 = balances.remove(&defs.base_alkane_id).unwrap_or(0);
+    let reserve1 = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
+
+    let metrics = state
+        .ammdata
+        .get_pool_metrics(GetPoolMetricsParams { pool })
+        .ok()
+        .map(|res| res.metrics)
+        .unwrap_or_default();
+
+    let token0_meta = get_token_meta(state, meta_cache, &defs.base_alkane_id);
+    let token1_meta = get_token_meta(state, meta_cache, &defs.quote_alkane_id);
+    let pool_name = format!("{} / {}", token0_meta.label.as_str(), token1_meta.label.as_str());
+    let pool_name_norm = normalize_query(&pool_name);
+
+    let value = json!({
+        "poolId": alkane_id_json(&pool),
+        "poolVolume1dInUsd": metrics.pool_volume_1d_usd.to_string(),
+        "poolTvlInUsd": metrics.pool_tvl_usd.to_string(),
+        "poolName": pool_name,
+        "reserve0": reserve0.to_string(),
+        "reserve1": reserve1.to_string(),
+        "token0": {
+            "symbol": token0_meta.symbol.clone(),
+            "alkaneId": alkane_id_json(&defs.base_alkane_id),
+            "name": token0_meta.name.clone(),
+            "decimals": token0_meta.decimals,
+            "image": token0_meta.image.clone(),
+        },
+        "token1": {
+            "symbol": token1_meta.symbol.clone(),
+            "alkaneId": alkane_id_json(&defs.quote_alkane_id),
+            "name": token1_meta.name.clone(),
+            "decimals": token1_meta.decimals,
+            "image": token1_meta.image.clone(),
+        }
+    });
+
+    let search = format!(
+        "{} {} {} {} {}",
+        pool_name_norm,
+        normalize_query(&token0_meta.symbol),
+        normalize_query(&token0_meta.name),
+        normalize_query(&token1_meta.symbol),
+        normalize_query(&token1_meta.name),
+    );
+
+    Some(TokenPairComputed {
+        value,
+        pool_id: pool,
+        token0_id: defs.base_alkane_id,
+        token1_id: defs.quote_alkane_id,
+        search,
+        tvl_usd: metrics.pool_tvl_usd,
+    })
+}
+
+fn get_token_meta(
+    state: &OylApiState,
+    cache: &mut HashMap<SchemaAlkaneId, TokenMeta>,
+    id: &SchemaAlkaneId,
+) -> TokenMeta {
+    if let Some(meta) = cache.get(id) {
+        return meta.clone();
+    }
+
+    let rec = state
+        .essentials
+        .get_creation_record(GetCreationRecordParams { alkane: *id })
+        .ok()
+        .and_then(|resp| resp.record);
+    let name = rec
+        .as_ref()
+        .and_then(|r| r.names.first().cloned())
+        .unwrap_or_default();
+    let symbol = rec
+        .as_ref()
+        .and_then(|r| r.symbols.first().cloned())
+        .unwrap_or_default();
+    let label = if !symbol.is_empty() {
+        symbol.clone()
+    } else if !name.is_empty() {
+        name.clone()
+    } else {
+        format!("{}:{}", id.block, id.tx)
+    };
+    let display_symbol = if symbol.is_empty() { label.clone() } else { symbol };
+    let meta = TokenMeta {
+        name,
+        symbol: display_symbol,
+        label,
+        image: format!("{}/{}:{}.png", state.config.alkane_icon_cdn, id.block, id.tx),
+        decimals: 8,
+    };
+    cache.insert(*id, meta.clone());
+    meta
+}
+
+fn parse_amm_history_key(prefix: &[u8], key: &[u8]) -> Option<AmmHistoryEntry> {
+    if !key.starts_with(prefix) {
+        return None;
+    }
+    let rest = &key[prefix.len()..];
+    if rest.len() < 25 {
+        return None;
+    }
+    let mut ts_arr = [0u8; 8];
+    ts_arr.copy_from_slice(&rest[0..8]);
+    let mut seq_arr = [0u8; 4];
+    seq_arr.copy_from_slice(&rest[8..12]);
+    let kind = activity_kind_from_code(rest[12])?;
+    let pool = decode_alkane_id_be(&rest[13..25])?;
+    Some(AmmHistoryEntry {
+        ts: u64::from_be_bytes(ts_arr),
+        seq: u32::from_be_bytes(seq_arr),
+        pool,
+        kind,
+    })
+}
+
+fn activity_kind_from_code(code: u8) -> Option<ActivityKind> {
+    match code {
+        0 => Some(ActivityKind::TradeBuy),
+        1 => Some(ActivityKind::TradeSell),
+        2 => Some(ActivityKind::LiquidityAdd),
+        3 => Some(ActivityKind::LiquidityRemove),
+        4 => Some(ActivityKind::PoolCreate),
+        _ => None,
+    }
+}
+
+fn decode_alkane_id_be(bytes: &[u8]) -> Option<SchemaAlkaneId> {
+    if bytes.len() != 12 {
+        return None;
+    }
+    let mut block_arr = [0u8; 4];
+    block_arr.copy_from_slice(&bytes[..4]);
+    let mut tx_arr = [0u8; 8];
+    tx_arr.copy_from_slice(&bytes[4..12]);
+    Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
 }
 
 fn fetch_records_for_query(
