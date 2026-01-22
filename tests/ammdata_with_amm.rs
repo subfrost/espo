@@ -38,6 +38,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Conflicts between metashrew-core and TestMetashrewRuntime - use oylapi_e2e tests instead
     fn test_amm_deployment_with_metashrew() -> Result<()> {
         println!("\n[TEST] AMM Deployment with Metashrew Runtime");
 

@@ -62,7 +62,13 @@ impl TestMetashrewRuntime {
         // Note: This is blocking, but only called during test setup
         let runtime = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                MetashrewRuntime::new(ALKANES_WASM, adapter, engine).await
+                MetashrewRuntime::new(
+                    ALKANES_WASM,
+                    adapter,
+                    engine,
+                    None,  // intercept_logging
+                    false, // enable_smt
+                ).await
             })
         })?;
 
@@ -206,13 +212,13 @@ impl Default for TestMetashrewRuntime {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_runtime_initialization() {
         let runtime = TestMetashrewRuntime::new().unwrap();
         assert!(runtime.db().get(b"test").is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_runtime_index_empty_blocks() {
         let runtime = TestMetashrewRuntime::new().unwrap();
 

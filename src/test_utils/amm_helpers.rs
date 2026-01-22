@@ -29,6 +29,8 @@ pub struct AmmDeployment {
     pub pool_upgradeable_beacon_id: AlkaneId,
     pub auth_token_factory_id: AlkaneId,
     pub factory_auth_token_id: AlkaneId,
+    /// All blocks created during AMM deployment, indexed by height
+    pub blocks: std::collections::HashMap<u32, Block>,
 }
 
 /// A binary and its cellpack for deployment
@@ -67,6 +69,7 @@ pub fn deploy_amm_infrastructure(
     println!("[AMM] Deploying AMM infrastructure contracts");
 
     let mut height = start_height;
+    let mut blocks = std::collections::HashMap::new();
 
     // 1. Deploy pool template to factory space
     let pool_cellpack = vec![BinaryAndCellpack {
@@ -81,6 +84,7 @@ pub fn deploy_amm_infrastructure(
     }];
     let pool_block = init_with_cellpack_pairs(pool_cellpack);
     runtime.index_block(&pool_block, height)?;
+    blocks.insert(height, pool_block);
     println!("[AMM] Pool template deployed at height {}", height);
     height += 1;
 
@@ -98,6 +102,7 @@ pub fn deploy_amm_infrastructure(
     }];
     let auth_block = init_with_cellpack_pairs(auth_cellpack);
     runtime.index_block(&auth_block, height)?;
+    blocks.insert(height, auth_block);
     println!("[AMM] Auth token factory deployed at height {}", height);
     height += 1;
 
@@ -114,6 +119,7 @@ pub fn deploy_amm_infrastructure(
     }];
     let factory_block = init_with_cellpack_pairs(factory_cellpack);
     runtime.index_block(&factory_block, height)?;
+    blocks.insert(height, factory_block);
     println!("[AMM] Factory logic deployed at height {}", height);
     height += 1;
 
@@ -131,6 +137,7 @@ pub fn deploy_amm_infrastructure(
     }];
     let beacon_proxy_block = init_with_cellpack_pairs(beacon_proxy_cellpack);
     runtime.index_block(&beacon_proxy_block, height)?;
+    blocks.insert(height, beacon_proxy_block);
     println!("[AMM] Beacon proxy deployed at height {}", height);
     height += 1;
 
@@ -153,6 +160,7 @@ pub fn deploy_amm_infrastructure(
     }];
     let upgradeable_beacon_block = init_with_cellpack_pairs(upgradeable_beacon_cellpack);
     runtime.index_block(&upgradeable_beacon_block, height)?;
+    blocks.insert(height, upgradeable_beacon_block);
     println!("[AMM] Upgradeable beacon deployed at height {}", height);
 
     println!("[AMM] Infrastructure contracts deployed successfully");
@@ -180,6 +188,7 @@ pub fn deploy_amm_infrastructure(
             tx: AUTH_TOKEN_FACTORY_ID,
         },
         factory_auth_token_id: AlkaneId { block: 0, tx: 0 }, // Will be determined after initialization
+        blocks,
     };
 
     Ok(deployment)
@@ -266,11 +275,12 @@ pub fn deploy_factory_proxy(
 pub fn setup_amm(runtime: &TestMetashrewRuntime, start_height: u32) -> Result<AmmDeployment> {
     let mut deployment = deploy_amm_infrastructure(runtime, start_height)?;
 
-    let (_, factory_proxy_id, factory_auth_token_id) =
+    let (proxy_block, factory_proxy_id, factory_auth_token_id) =
         deploy_factory_proxy(runtime, start_height + 5, &deployment)?;
 
     deployment.factory_proxy_id = factory_proxy_id;
     deployment.factory_auth_token_id = factory_auth_token_id;
+    deployment.blocks.insert(start_height + 5, proxy_block);
 
     println!("[AMM] AMM setup complete");
     Ok(deployment)
