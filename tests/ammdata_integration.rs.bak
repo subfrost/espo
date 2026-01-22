@@ -77,8 +77,7 @@ fn init_global_config() {
             block_source_mode: BlockFetchMode::Auto,
             simulate_reorg: false,
             explorer_networks: None,
-            enable_height_indexed: false,
-            max_reorg_depth: 100,
+            modules: std::collections::HashMap::new(),
         };
 
         // Leak temp_dir so it persists for the entire test session

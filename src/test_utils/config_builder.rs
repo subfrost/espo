@@ -45,8 +45,6 @@ impl TestConfigBuilder {
             block_source_mode: BlockFetchMode::RpcOnly,
             simulate_reorg: false,
             explorer_networks: None,
-            enable_height_indexed: false,
-            max_reorg_depth: 100,
             modules: HashMap::new(),
         };
 
@@ -59,18 +57,6 @@ impl TestConfigBuilder {
     /// Set the network (mainnet, testnet, regtest, etc.)
     pub fn with_network(mut self, network: Network) -> Self {
         self.config.network = network;
-        self
-    }
-
-    /// Enable height-indexed storage
-    pub fn with_height_indexed(mut self, enabled: bool) -> Self {
-        self.config.enable_height_indexed = enabled;
-        self
-    }
-
-    /// Set the max reorg depth
-    pub fn with_max_reorg_depth(mut self, depth: u32) -> Self {
-        self.config.max_reorg_depth = depth;
         self
     }
 
@@ -154,23 +140,17 @@ mod tests {
         assert_eq!(config.view_only, true);
         assert_eq!(config.enable_aof, false);
         assert_eq!(config.strict_mode, false);
-        assert_eq!(config.enable_height_indexed, false);
-        assert_eq!(config.max_reorg_depth, 100);
     }
 
     #[test]
     fn test_config_builder_customization() {
         let (config, _temp_dirs) = TestConfigBuilder::new()
             .with_network(Network::Testnet)
-            .with_height_indexed(true)
-            .with_max_reorg_depth(200)
             .with_strict_mode(true)
             .with_aof_enabled(true)
             .build();
 
         assert_eq!(config.network, Network::Testnet);
-        assert_eq!(config.enable_height_indexed, true);
-        assert_eq!(config.max_reorg_depth, 200);
         assert_eq!(config.strict_mode, true);
         assert_eq!(config.enable_aof, true);
     }

@@ -92,8 +92,7 @@ impl AmmdataTestHarness {
                 block_source_mode: BlockFetchMode::RpcOnly, // Use RpcOnly to skip blocks dir validation
                 simulate_reorg: false,
                 explorer_networks: None,
-                enable_height_indexed: false,
-                max_reorg_depth: 100,
+                modules: std::collections::HashMap::new(),
             };
 
             // This will panic if called twice, but Once ensures it's only called once

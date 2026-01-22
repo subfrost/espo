@@ -19,9 +19,9 @@ pub mod modules;
 pub mod runtime;
 
 // Test utilities available for testing
-// Always compiled to support both unit tests and integration tests
-// Only enable when alkanes is available (test builds have dev-dependencies)
-#[cfg(any(test, feature = "test-utils"))]
+// Always compiled for non-wasm to support both unit tests and integration tests
+// Heavy dependencies (metashrew-runtime, wasmtime) are gated behind test-utils feature internally
+#[cfg(not(target_arch = "wasm32"))]
 pub mod test_utils;
 
 // WASM tests module

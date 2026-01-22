@@ -17,7 +17,7 @@ required-features = ["binary"]
 [features]
 # Feature that's only available for non-WASM builds
 binary = []
-test-utils = ["alkanes", "metashrew-core", "protorune", "metashrew-runtime", "rockshrew-runtime", "wasmtime"]
+test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime"]
 
 [dependencies]
 anyhow = "1.0.99"
@@ -56,10 +56,12 @@ lru = "0.16.1"
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"}
 alkanes-trace-transform = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f"}
 
+# Required dependencies for alkanes support
+metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
+protorune = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f" }
+
 # Optional dependencies for test utilities
 alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f", optional = true }
-metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f", optional = true }
-protorune = { git = "https://github.com/kungfuflex/alkanes-rs", rev = "297da14326ba1f3bec8f45c918df7fa9c3bf866f", optional = true }
 metashrew-runtime = { path = "reference/metashrew/crates/metashrew-runtime", optional = true }
 rockshrew-runtime = { path = "reference/metashrew/crates/rockshrew-runtime", optional = true }
 wasmtime = { version = "18.0", features = ["async"], optional = true }

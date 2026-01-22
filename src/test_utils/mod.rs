@@ -13,10 +13,12 @@ pub mod config_builder;
 
 pub mod fixtures;
 
-// WASM-compatible test utilities
-// Always available since test_utils module is explicitly for testing
+// Test utilities that require the test-utils feature (metashrew-runtime, rockshrew-runtime, wasmtime)
+#[cfg(feature = "test-utils")]
 pub mod metashrew_runtime;
+#[cfg(feature = "test-utils")]
 pub mod amm_helpers;
+#[cfg(feature = "test-utils")]
 pub mod trace_helpers;
 
 // Re-export commonly used items
@@ -27,9 +29,11 @@ pub use mock_node::MockBitcoinNode;
 #[cfg(not(target_arch = "wasm32"))]
 pub use config_builder::TestConfigBuilder;
 
+#[cfg(feature = "test-utils")]
 pub use metashrew_runtime::TestMetashrewRuntime;
 
 // Re-export AMM helpers
+#[cfg(feature = "test-utils")]
 pub use amm_helpers::{
     deploy_amm_infrastructure, deploy_factory_proxy, setup_amm, init_with_cellpack_pairs,
     AmmDeployment, BinaryAndCellpack,
@@ -38,4 +42,5 @@ pub use amm_helpers::{
 };
 
 // Re-export trace helpers
+#[cfg(feature = "test-utils")]
 pub use trace_helpers::build_espo_block;

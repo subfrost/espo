@@ -13,7 +13,6 @@
 use anyhow::Result;
 use bitcoin::Block;
 use espo::config::AppConfig;
-use espo::runtime::block_metadata::BlockMetadata;
 use espo::test_utils::{ChainBuilder, MockBitcoinNode, TestConfigBuilder};
 use rocksdb::{DB, Options};
 use std::sync::Arc;
@@ -24,7 +23,6 @@ use tempfile::TempDir;
 /// This harness provides:
 /// - Simulated Bitcoin blockchain with ChainBuilder
 /// - MockBitcoinNode for block storage and retrieval
-/// - BlockMetadata for tracking indexed blocks
 /// - Reorg simulation capabilities
 pub struct EspoTestHarness {
     // Bitcoin simulation
@@ -32,7 +30,7 @@ pub struct EspoTestHarness {
 
     // ESPO components
     pub config: AppConfig,
-    pub metadata: BlockMetadata,
+    pub db: Arc<DB>,
 
     // State tracking
     pub current_height: u32,
@@ -50,7 +48,6 @@ impl EspoTestHarness {
     pub fn new() -> Result<Self> {
         let (config, temp_dirs) = TestConfigBuilder::new()
             .with_network(bitcoin::Network::Regtest)
-            .with_height_indexed(true)
             .build();
 
         // Open the DB
@@ -58,7 +55,6 @@ impl EspoTestHarness {
         opts.create_if_missing(true);
         let db = Arc::new(DB::open(&opts, &config.db_path)?);
 
-        let metadata = BlockMetadata::new(db);
         let mock_node = MockBitcoinNode::new();
 
         // Build initial chain (just genesis)
@@ -67,7 +63,7 @@ impl EspoTestHarness {
         Ok(Self {
             mock_node,
             config,
-            metadata,
+            db,
             current_height: 0,
             blocks,
             _temp_dirs: temp_dirs,
@@ -144,11 +140,6 @@ impl EspoTestHarness {
     /// Get a mutable reference to the mock node
     pub fn mock_node_mut(&mut self) -> &mut MockBitcoinNode {
         &mut self.mock_node
-    }
-
-    /// Get a reference to block metadata
-    pub fn metadata(&self) -> &BlockMetadata {
-        &self.metadata
     }
 }
 
