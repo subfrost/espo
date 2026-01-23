@@ -1,4 +1,5 @@
-use crate::config::{get_config, get_espo_db};
+use crate::config::{debug_enabled, get_config, get_espo_db};
+use crate::debug;
 use crate::modules::ammdata::storage::AmmDataProvider;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::EssentialsProvider;
@@ -54,6 +55,28 @@ impl EspoModule for OylApi {
 
     fn index_block(&self, block: crate::alkanes::trace::EspoBlock) -> Result<()> {
         let t0 = std::time::Instant::now();
+        let debug = debug_enabled();
+        let module = self.get_name();
+
+        let timer = debug::start_if(debug);
+        let has_config = self.config.is_some();
+        debug::log_elapsed(module, "check_config", timer);
+
+        let timer = debug::start_if(debug);
+        let has_essentials = self.essentials.is_some();
+        debug::log_elapsed(module, "check_essentials", timer);
+
+        let timer = debug::start_if(debug);
+        let has_ammdata = self.ammdata.is_some();
+        debug::log_elapsed(module, "check_ammdata", timer);
+
+        let timer = debug::start_if(debug);
+        let has_subfrost = self.subfrost.is_some();
+        debug::log_elapsed(module, "check_subfrost", timer);
+
+        let timer = debug::start_if(debug);
+        let _state = (has_config, has_essentials, has_ammdata, has_subfrost);
+        debug::log_elapsed(module, "finalize", timer);
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),

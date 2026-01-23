@@ -1,6 +1,6 @@
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetBestMevSwapParams,
-    RpcGetCandlesParams, RpcGetPoolsParams, RpcPingParams,
+    AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
+    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetPoolsParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -84,6 +84,26 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                     };
                     mdb_for_handler
                         .rpc_get_pools(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_factories = reg.clone();
+    let mdb_for_factories = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_factories
+            .register("get_amm_factories", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_for_factories);
+                async move {
+                    let params = RpcGetAmmFactoriesParams {
+                        page: payload.get("page").and_then(|v| v.as_u64()),
+                        limit: payload.get("limit").and_then(|v| v.as_u64()),
+                    };
+                    mdb_for_handler
+                        .rpc_get_amm_factories(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

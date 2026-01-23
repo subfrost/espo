@@ -13,8 +13,8 @@
 #[cfg(feature = "test-utils")]
 mod tests {
     use anyhow::Result;
-    use axum::http::StatusCode;
     use axum::Router;
+    use axum::http::StatusCode;
     use espo::alkanes::trace::EspoBlock;
     use espo::modules::ammdata::main::AmmData;
     use espo::modules::ammdata::storage::AmmDataProvider;
@@ -55,9 +55,7 @@ mod tests {
                 .unwrap();
 
             let status = response.status();
-            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
+            let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let body_json: Value = serde_json::from_slice(&body_bytes)?;
 
             Ok((status, body_json))
@@ -84,7 +82,7 @@ mod tests {
 
         let config = espo::config::AppConfig {
             readonly_metashrew_db_dir: metashrew_db.to_str().unwrap().to_string(),
-            electrum_rpc_url: Some(String::from("127.0.0.1:50001")),
+            electrum_rpc_url: None,
             metashrew_rpc_url: String::from("http://127.0.0.1:9999"),
             electrs_esplora_url: Some(String::from("http://127.0.0.1:3000")),
             bitcoind_rpc_url: String::from("http://127.0.0.1:8332"),
@@ -103,6 +101,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
             strict_mode: false,
+            debug: false,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             simulate_reorg: false,
             explorer_networks: None,
@@ -211,7 +210,8 @@ mod tests {
 
         // Create providers for querying (oylapi uses these)
         let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb));
-        let ammdata_provider = Arc::new(AmmDataProvider::new(ammdata_mdb, essentials_provider.clone()));
+        let ammdata_provider =
+            Arc::new(AmmDataProvider::new(ammdata_mdb, essentials_provider.clone()));
         let subfrost_provider = Arc::new(SubfrostProvider::new(subfrost_mdb));
 
         let modules = EspoModules {
@@ -326,12 +326,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new()?;
 
         // Test endpoints
-        let (status, response) = post_request_sync(
-            &rt,
-            &router,
-            "/get-alkanes",
-            json!({"limit": 10}),
-        )?;
+        let (status, response) =
+            post_request_sync(&rt, &router, "/get-alkanes", json!({"limit": 10}))?;
 
         assert_eq!(status, StatusCode::OK);
         println!("[E2E] /get-alkanes response: {:?}", response);
@@ -437,19 +433,24 @@ mod tests {
         let end_height = start_height + 5;
         for h in start_height..=end_height {
             // Use the actual block from the deployment
-            let block = deployment.blocks.get(&h)
+            let block = deployment
+                .blocks
+                .get(&h)
                 .ok_or_else(|| anyhow::anyhow!("Missing deployment block at height {}", h))?;
 
             let traces = metashrew_runtime.get_traces_for_block(h)?;
             let espo_block = build_espo_block(h, block, traces.clone())?;
 
-            let traces_with_data = espo_block.transactions.iter()
-                .filter(|t| t.traces.is_some())
-                .count();
+            let traces_with_data =
+                espo_block.transactions.iter().filter(|t| t.traces.is_some()).count();
 
             index_espo_block(&modules, espo_block)?;
-            println!("[E2E] Indexed block {} through ESPO ({} traces, {} txs with trace data)",
-                h, traces.len(), traces_with_data);
+            println!(
+                "[E2E] Indexed block {} through ESPO ({} traces, {} txs with trace data)",
+                h,
+                traces.len(),
+                traces_with_data
+            );
         }
 
         // Create router with the indexed providers
@@ -494,12 +495,8 @@ mod tests {
         println!("[E2E] /get-all-pools-details: {:?}", response);
 
         // Query alkanes to see deployed contracts
-        let (status, response) = post_request_sync(
-            &rt,
-            &router,
-            "/get-alkanes",
-            json!({"limit": 20}),
-        )?;
+        let (status, response) =
+            post_request_sync(&rt, &router, "/get-alkanes", json!({"limit": 20}))?;
 
         assert_eq!(status, StatusCode::OK);
         println!("[E2E] /get-alkanes response: {:?}", response);

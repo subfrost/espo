@@ -1,8 +1,9 @@
 use crate::config::{get_config, get_electrum_like, get_network};
+use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::schemas::{
-    ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
-    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
+    ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolSnapshot,
+    SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
@@ -12,31 +13,35 @@ use crate::modules::ammdata::storage::{
     GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
     GetPoolDefsParams, GetPoolFactoryParams, GetPoolIdsByNamePrefixParams,
     GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetReservesSnapshotParams,
-    GetTokenMetricsParams, GetTokenPoolsParams, GetTokenSwapsPageParams,
+    GetTokenMetricsByIdParams, GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams,
+    GetTokenMetricsParams, GetTokenPoolsParams, GetTokenSearchIndexPageParams,
+    GetTokenSwapsPageParams, SearchIndexField, TokenMetricsIndexField,
 };
 use crate::modules::ammdata::utils::pathfinder::plan_exact_in_default_fee;
-use crate::modules::subfrost::storage::{
-    GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetUnwrapTotalAtOrBeforeParams,
-    GetUnwrapTotalLatestParams, GetWrapEventsAllParams, GetWrapEventsByAddressParams,
-    SubfrostProvider,
-};
-use crate::modules::subfrost::schemas::SchemaWrapEventV1;
+use crate::modules::ammdata::utils::search::normalize_search_text;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetAlkaneIdsByNamePrefixParams, GetAlkaneIdsBySymbolPrefixParams,
-    GetCreationRecordParams, GetCreationRecordsByIdParams, GetCreationRecordsOrderedParams,
-    GetHoldersCountParams, GetLatestCirculatingSupplyParams, GetLatestTotalMintedParams,
-    spk_to_address_str,
+    GetCreationCountParams, GetCreationRecordParams, GetCreationRecordsByIdParams,
+    GetCreationRecordsOrderedPageParams, GetCreationRecordsOrderedParams, GetHoldersCountParams,
+    GetHoldersCountsByIdParams, GetHoldersOrderedPageParams, GetLatestCirculatingSupplyParams,
+    GetLatestTotalMintedParams, spk_to_address_str,
 };
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_balance_for_address, get_outpoint_balances_with_spent_batch,
 };
 use crate::modules::oylapi::config::OylApiConfig;
 use crate::modules::oylapi::ordinals::{OrdOutput, fetch_ord_outputs};
+use crate::modules::subfrost::schemas::SchemaWrapEventV1;
+use crate::modules::subfrost::storage::{
+    GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetUnwrapTotalAtOrBeforeParams,
+    GetUnwrapTotalLatestParams, GetWrapEventsAllParams, GetWrapEventsByAddressParams,
+    SubfrostProvider,
+};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
-use bitcoin::{Address, Txid, hashes::Hash as _};
 use bitcoin::hashes::sha256;
 use bitcoin::script::ScriptBuf;
+use bitcoin::{Address, Txid, hashes::Hash as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -100,6 +105,7 @@ pub struct GetAlkanesParams {
 }
 
 pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value {
+    crate::debug_timer_log!("get_alkanes_by_address");
     let Some(address) = normalize_address(address) else {
         return error_response(400, "invalid_address");
     };
@@ -139,10 +145,7 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
 
         let (frbtc_price, busd_price) = canonical_pool_prices(state, &alkane, now_ts);
         let price_usd = latest_token_usd_close(state, &alkane).unwrap_or(0);
-        let image = format!(
-            "{}/{}-{}.png",
-            state.config.alkane_icon_cdn, alkane.block, alkane.tx
-        );
+        let image = format!("{}/{}-{}.png", state.config.alkane_icon_cdn, alkane.block, alkane.tx);
 
         out.push(json!({
             "name": name,
@@ -163,6 +166,7 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
 }
 
 pub async fn get_alkanes_utxo(state: &OylApiState, address: &str) -> Value {
+    crate::debug_timer_log!("get_alkanes_utxo");
     let Some(address) = normalize_address(address) else {
         return error_response(400, "invalid_address");
     };
@@ -185,6 +189,7 @@ pub async fn get_amm_utxos(
     address: &str,
     spend_strategy: Option<Value>,
 ) -> Value {
+    crate::debug_timer_log!("get_amm_utxos");
     let Some(address) = normalize_address(address) else {
         return error_response(400, "invalid_address");
     };
@@ -211,41 +216,146 @@ pub async fn get_amm_utxos(
 }
 
 pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value {
+    crate::debug_timer_log!("get_alkanes");
     if params.limit == 0 {
         return error_response(400, "limit_required");
     }
-    let limit = params.limit as usize;
+    let mut limit = params.limit as usize;
     let offset = params.offset.unwrap_or(0) as usize;
     let sort_by = params.sort_by.unwrap_or_else(|| "volumeAllTime".to_string());
     let order = params.order.unwrap_or_else(|| "desc".to_string());
-
-    let records = match fetch_records_for_query(state, params.search_query.as_deref()) {
-        Ok(v) => v,
-        Err(_) => Vec::new(),
-    };
-    let total = records.len();
-
-    let mut items = records
-        .into_iter()
-        .map(|rec| {
-            let metrics = token_metrics(state, &rec.alkane);
-            let holders = holders_count(state, &rec.alkane);
-            (rec, metrics, holders)
-        })
-        .collect::<Vec<_>>();
-
-    sort_records(&mut items, &sort_by, &order);
-
-    let slice = items
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect::<Vec<_>>();
-
+    let search_cfg = AmmDataConfig::load_from_global_config().ok();
+    let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
+    let mut search_prefix_min =
+        search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
+    let mut search_prefix_max =
+        search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+    let search_scan_cap = search_cfg.as_ref().map(|c| c.search_fallback_scan_cap).unwrap_or(5000);
+    let search_limit_cap = search_cfg.as_ref().map(|c| c.search_limit_cap).unwrap_or(20) as usize;
+    if search_prefix_min == 0 {
+        search_prefix_min = 2;
+    }
+    if search_prefix_max < search_prefix_min {
+        search_prefix_max = search_prefix_min;
+    }
     let mut tokens = Vec::new();
-    for (rec, metrics, holders) in slice {
-        if let Ok(token) = build_alkane_token(state, rec, metrics, holders) {
-            tokens.push(token);
+    let mut total: usize = 0;
+
+    if let Some(raw_query) = params.search_query.as_deref() {
+        let Some(query_norm) = normalize_search_text(raw_query) else {
+            return json!({
+                "statusCode": 200,
+                "data": {
+                    "tokens": tokens,
+                    "total": total,
+                    "count": tokens.len(),
+                    "offset": offset,
+                    "limit": limit,
+                }
+            });
+        };
+        let query_len = query_norm.chars().count();
+        if query_len < search_prefix_min {
+            return json!({
+                "statusCode": 200,
+                "data": {
+                    "tokens": tokens,
+                    "total": total,
+                    "count": tokens.len(),
+                    "offset": offset,
+                    "limit": limit,
+                }
+            });
+        }
+
+        limit = std::cmp::min(limit, search_limit_cap);
+        let desc = order.eq_ignore_ascii_case("desc");
+        let mut ids: Vec<SchemaAlkaneId> = Vec::new();
+
+        if search_index_enabled && query_len <= search_prefix_max {
+            let field = search_index_field_for_sort(&sort_by);
+            ids = state
+                .ammdata
+                .get_token_search_index_page(GetTokenSearchIndexPageParams {
+                    field,
+                    prefix: query_norm.clone(),
+                    offset: offset as u64,
+                    limit: limit as u64,
+                    desc,
+                })
+                .map(|res| res.ids)
+                .unwrap_or_default();
+        }
+
+        if ids.is_empty() {
+            ids = search_by_holders_scan(
+                state,
+                &query_norm,
+                offset as u64,
+                limit as u64,
+                search_scan_cap,
+            );
+        }
+
+        total = offset + ids.len();
+
+        if !ids.is_empty() {
+            let records = state
+                .essentials
+                .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })
+                .map(|res| res.records)
+                .unwrap_or_default();
+            let metrics = token_metrics_multi(state, &ids);
+            let holders = holders_counts_multi(state, &ids);
+
+            for ((rec_opt, metrics), holders) in
+                records.into_iter().zip(metrics.into_iter()).zip(holders.into_iter())
+            {
+                let Some(rec) = rec_opt else { continue };
+                if let Ok(token) = build_alkane_token(state, rec, metrics, holders) {
+                    tokens.push(token);
+                }
+            }
+        }
+    } else {
+        total = state
+            .essentials
+            .get_creation_count(GetCreationCountParams)
+            .map(|res| res.count as usize)
+            .unwrap_or(0);
+
+        if total > 0 && limit > 0 {
+            let desc = order.eq_ignore_ascii_case("desc");
+            let sort_index = alkane_sort_index(&sort_by);
+            let ids = fetch_sorted_alkane_ids_no_query(
+                state,
+                sort_index,
+                desc,
+                offset as u64,
+                limit as u64,
+                total as u64,
+            );
+
+            if !ids.is_empty() {
+                let records = state
+                    .essentials
+                    .get_creation_records_by_id(GetCreationRecordsByIdParams {
+                        alkanes: ids.clone(),
+                    })
+                    .map(|res| res.records)
+                    .unwrap_or_default();
+                let metrics = token_metrics_multi(state, &ids);
+                let holders = holders_counts_multi(state, &ids);
+
+                for ((rec_opt, metrics), holders) in
+                    records.into_iter().zip(metrics.into_iter()).zip(holders.into_iter())
+                {
+                    let Some(rec) = rec_opt else { continue };
+                    if let Ok(token) = build_alkane_token(state, rec, metrics, holders) {
+                        tokens.push(token);
+                    }
+                }
+            }
         }
     }
 
@@ -262,15 +372,23 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
 }
 
 pub async fn get_global_alkanes_search(state: &OylApiState, query: &str) -> Value {
-    let tokens = fetch_records_for_query(state, Some(query))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|rec| {
-            let metrics = token_metrics(state, &rec.alkane);
-            let holders = holders_count(state, &rec.alkane);
-            build_alkane_token(state, rec, metrics, holders).ok()
-        })
-        .collect::<Vec<_>>();
+    crate::debug_timer_log!("get_global_alkanes_search");
+    let records = fetch_records_for_query(state, Some(query)).unwrap_or_default();
+    let tokens = if records.is_empty() {
+        Vec::new()
+    } else {
+        let ids: Vec<SchemaAlkaneId> = records.iter().map(|rec| rec.alkane).collect();
+        let metrics = token_metrics_multi(state, &ids);
+        let holders = holders_counts_multi(state, &ids);
+        records
+            .into_iter()
+            .zip(metrics.into_iter())
+            .zip(holders.into_iter())
+            .filter_map(|((rec, metrics), holders)| {
+                build_alkane_token(state, rec, metrics, holders).ok()
+            })
+            .collect::<Vec<_>>()
+    };
 
     let pools = search_pools(state, query).unwrap_or_default();
 
@@ -278,6 +396,7 @@ pub async fn get_global_alkanes_search(state: &OylApiState, query: &str) -> Valu
 }
 
 pub async fn get_alkane_details(state: &OylApiState, block: &str, tx: &str) -> Value {
+    crate::debug_timer_log!("get_alkane_details");
     let Some(alkane) = parse_alkane_id_fields(block, tx) else {
         return error_response(400, "invalid_alkane_id");
     };
@@ -301,10 +420,8 @@ pub async fn get_alkane_details(state: &OylApiState, block: &str, tx: &str) -> V
     let supply = latest_circulating_supply(state, &alkane);
     let now_ts = now_ts();
     let (frbtc_price, _busd_price) = canonical_pool_prices(state, &alkane, now_ts);
-    let token_image = format!(
-        "{}/{}-{}.png",
-        state.config.alkane_icon_cdn, alkane.block, alkane.tx
-    );
+    let token_image =
+        format!("{}/{}-{}.png", state.config.alkane_icon_cdn, alkane.block, alkane.tx);
 
     if let Value::Object(ref mut map) = token {
         map.insert("decimals".to_string(), json!(8));
@@ -323,6 +440,7 @@ pub async fn get_pools(
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> Value {
+    crate::debug_timer_log!("get_pools");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -359,6 +477,7 @@ pub async fn get_pool_details(
     pool_block: &str,
     pool_tx: &str,
 ) -> Value {
+    crate::debug_timer_log!("get_pool_details");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -381,6 +500,7 @@ pub async fn get_address_positions(
     factory_block: &str,
     factory_tx: &str,
 ) -> Value {
+    crate::debug_timer_log!("get_address_positions");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -414,43 +534,27 @@ pub async fn get_address_positions(
         };
 
         let lp_supply = details.lp_supply;
-        let share_value = if lp_supply == 0 {
-            0
-        } else {
-            balance
-        };
+        let share_value = if lp_supply == 0 { 0 } else { balance };
 
         let token0_value_usd = if lp_supply == 0 {
             0
         } else {
-            details
-                .token0_tvl_usd
-                .saturating_mul(share_value)
-                .saturating_div(lp_supply)
+            details.token0_tvl_usd.saturating_mul(share_value).saturating_div(lp_supply)
         };
         let token1_value_usd = if lp_supply == 0 {
             0
         } else {
-            details
-                .token1_tvl_usd
-                .saturating_mul(share_value)
-                .saturating_div(lp_supply)
+            details.token1_tvl_usd.saturating_mul(share_value).saturating_div(lp_supply)
         };
         let token0_value_sats = if lp_supply == 0 {
             0
         } else {
-            details
-                .token0_tvl_sats
-                .saturating_mul(share_value)
-                .saturating_div(lp_supply)
+            details.token0_tvl_sats.saturating_mul(share_value).saturating_div(lp_supply)
         };
         let token1_value_sats = if lp_supply == 0 {
             0
         } else {
-            details
-                .token1_tvl_sats
-                .saturating_mul(share_value)
-                .saturating_div(lp_supply)
+            details.token1_tvl_sats.saturating_mul(share_value).saturating_div(lp_supply)
         };
 
         let total_value_usd = token0_value_usd.saturating_add(token1_value_usd);
@@ -459,30 +563,12 @@ pub async fn get_address_positions(
         let mut value = details.value;
         if let Value::Object(ref mut map) = value {
             map.insert("balance".to_string(), json!(balance.to_string()));
-            map.insert(
-                "token0ValueInSats".to_string(),
-                json!(token0_value_sats.to_string()),
-            );
-            map.insert(
-                "token1ValueInSats".to_string(),
-                json!(token1_value_sats.to_string()),
-            );
-            map.insert(
-                "token0ValueInUsd".to_string(),
-                json!(token0_value_usd.to_string()),
-            );
-            map.insert(
-                "token1ValueInUsd".to_string(),
-                json!(token1_value_usd.to_string()),
-            );
-            map.insert(
-                "totalValueInSats".to_string(),
-                json!(total_value_sats.to_string()),
-            );
-            map.insert(
-                "totalValueInUsd".to_string(),
-                json!(total_value_usd.to_string()),
-            );
+            map.insert("token0ValueInSats".to_string(), json!(token0_value_sats.to_string()));
+            map.insert("token1ValueInSats".to_string(), json!(token1_value_sats.to_string()));
+            map.insert("token0ValueInUsd".to_string(), json!(token0_value_usd.to_string()));
+            map.insert("token1ValueInUsd".to_string(), json!(token1_value_usd.to_string()));
+            map.insert("totalValueInSats".to_string(), json!(total_value_sats.to_string()));
+            map.insert("totalValueInUsd".to_string(), json!(total_value_usd.to_string()));
         }
 
         positions.push((value, total_value_usd));
@@ -505,6 +591,7 @@ pub async fn get_all_pools_details(
     address: Option<String>,
     search_query: Option<String>,
 ) -> Value {
+    crate::debug_timer_log!("get_all_pools_details");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -592,11 +679,7 @@ pub async fn get_all_pools_details(
         total_tvl = total_tvl.saturating_add(details.pool_tvl_usd);
         total_volume_1d = total_volume_1d.saturating_add(details.pool_volume_1d_usd);
 
-        if largest
-            .as_ref()
-            .map(|d| details.pool_tvl_usd > d.pool_tvl_usd)
-            .unwrap_or(true)
-        {
+        if largest.as_ref().map(|d| details.pool_tvl_usd > d.pool_tvl_usd).unwrap_or(true) {
             largest = Some(details.clone());
         }
         if trending
@@ -648,10 +731,7 @@ pub async fn get_all_pools_details(
     let trending_pool = trending.map(|d| {
         let mut val = d.value.clone();
         if let Value::Object(ref mut map) = val {
-            map.insert(
-                "trend".to_string(),
-                json!(d.tvl_change_24h),
-            );
+            map.insert("trend".to_string(), json!(d.tvl_change_24h));
         }
         json!({ "1d": val })
     });
@@ -682,6 +762,7 @@ pub async fn get_pool_swap_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_pool_swap_history");
     let Some(pool) = parse_alkane_id_fields(pool_block, pool_tx) else {
         return error_response(400, "invalid_pool_id");
     };
@@ -736,8 +817,7 @@ pub async fn get_pool_swap_history(
     let pool_name = pool_name_from_defs(state, &defs);
     let mut swaps = Vec::new();
     for entry in resp.entries {
-        let Some((sold_id, bought_id, sold_amt, bought_amt)) =
-            trade_from_activity(&defs, &entry)
+        let Some((sold_id, bought_id, sold_amt, bought_amt)) = trade_from_activity(&defs, &entry)
         else {
             continue;
         };
@@ -788,6 +868,7 @@ pub async fn get_token_swap_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_token_swap_history");
     let Some(token) = parse_alkane_id_fields(token_block, token_tx) else {
         return error_response(400, "invalid_token_id");
     };
@@ -879,6 +960,7 @@ pub async fn get_pool_mint_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_pool_mint_history");
     let Some(pool) = parse_alkane_id_fields(pool_block, pool_tx) else {
         return error_response(400, "invalid_pool_id");
     };
@@ -965,6 +1047,7 @@ pub async fn get_pool_burn_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_pool_burn_history");
     let Some(pool) = parse_alkane_id_fields(pool_block, pool_tx) else {
         return error_response(400, "invalid_pool_id");
     };
@@ -1049,6 +1132,7 @@ pub async fn get_pool_creation_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_pool_creation_history");
     let limit = clamp_count(count);
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
@@ -1100,8 +1184,7 @@ pub async fn get_pool_creation_history(
             .get_pool_creation_info(GetPoolCreationInfoParams { pool: entry.pool })
             .ok()
             .and_then(|res| res.info);
-        let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) =
-            creation_info
+        let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) = creation_info
         {
             (
                 info.initial_token0_amount,
@@ -1157,6 +1240,7 @@ pub async fn get_address_swap_history_for_pool(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_swap_history_for_pool");
     let Some(pool) = parse_alkane_id_fields(pool_block, pool_tx) else {
         return error_response(400, "invalid_pool_id");
     };
@@ -1199,11 +1283,7 @@ pub async fn get_address_swap_history_for_pool(
     for entry in resp.entries {
         let activity = match state
             .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
+            .get_activity_entry(GetActivityEntryParams { pool, ts: entry.ts, seq: entry.seq })
             .ok()
             .and_then(|res| res.entry)
         {
@@ -1257,6 +1337,7 @@ pub async fn get_address_swap_history_for_token(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_swap_history_for_token");
     let Some(token) = parse_alkane_id_fields(token_block, token_tx) else {
         return error_response(400, "invalid_token_id");
     };
@@ -1355,6 +1436,7 @@ pub async fn get_address_pool_creation_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_pool_creation_history");
     let Some(address_spk) = address_spk_bytes(address) else {
         return error_response(400, "invalid_address");
     };
@@ -1413,8 +1495,7 @@ pub async fn get_address_pool_creation_history(
             .get_pool_creation_info(GetPoolCreationInfoParams { pool: entry.pool })
             .ok()
             .and_then(|res| res.info);
-        let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) =
-            creation_info
+        let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) = creation_info
         {
             (
                 info.initial_token0_amount,
@@ -1468,6 +1549,7 @@ pub async fn get_address_pool_mint_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_pool_mint_history");
     let Some(address_spk) = address_spk_bytes(address) else {
         return error_response(400, "invalid_address");
     };
@@ -1477,11 +1559,7 @@ pub async fn get_address_pool_mint_history(
 
     let resp = state
         .ammdata
-        .get_address_pool_mints_page(GetAddressPoolMintsPageParams {
-            address_spk,
-            offset,
-            limit,
-        })
+        .get_address_pool_mints_page(GetAddressPoolMintsPageParams { address_spk, offset, limit })
         .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressPoolEventsPageResult {
             entries: Vec::new(),
             total: 0,
@@ -1564,6 +1642,7 @@ pub async fn get_address_pool_burn_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_pool_burn_history");
     let Some(address_spk) = address_spk_bytes(address) else {
         return error_response(400, "invalid_address");
     };
@@ -1573,11 +1652,7 @@ pub async fn get_address_pool_burn_history(
 
     let resp = state
         .ammdata
-        .get_address_pool_burns_page(GetAddressPoolBurnsPageParams {
-            address_spk,
-            offset,
-            limit,
-        })
+        .get_address_pool_burns_page(GetAddressPoolBurnsPageParams { address_spk, offset, limit })
         .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressPoolEventsPageResult {
             entries: Vec::new(),
             total: 0,
@@ -1660,6 +1735,7 @@ pub async fn get_address_wrap_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_wrap_history");
     let Some(address_spk) = address_spk_bytes(address) else {
         return error_response(400, "invalid_address");
     };
@@ -1711,6 +1787,7 @@ pub async fn get_address_unwrap_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_address_unwrap_history");
     let Some(address_spk) = address_spk_bytes(address) else {
         return error_response(400, "invalid_address");
     };
@@ -1761,17 +1838,14 @@ pub async fn get_all_wrap_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_all_wrap_history");
     let limit = clamp_count(count);
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
     let resp = state
         .subfrost
-        .get_wrap_events_all(GetWrapEventsAllParams {
-            offset,
-            limit,
-            successful,
-        })
+        .get_wrap_events_all(GetWrapEventsAllParams { offset, limit, successful })
         .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
             entries: Vec::new(),
             total: 0,
@@ -1807,17 +1881,14 @@ pub async fn get_all_unwrap_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_all_unwrap_history");
     let limit = clamp_count(count);
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
     let resp = state
         .subfrost
-        .get_unwrap_events_all(GetUnwrapEventsAllParams {
-            offset,
-            limit,
-            successful,
-        })
+        .get_unwrap_events_all(GetUnwrapEventsAllParams { offset, limit, successful })
         .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
             entries: Vec::new(),
             total: 0,
@@ -1851,14 +1922,12 @@ pub async fn get_total_unwrap_amount(
     block_height: Option<u32>,
     successful: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_total_unwrap_amount");
     let successful = successful.unwrap_or(false);
     let total = if let Some(height) = block_height {
         state
             .subfrost
-            .get_unwrap_total_at_or_before(GetUnwrapTotalAtOrBeforeParams {
-                height,
-                successful,
-            })
+            .get_unwrap_total_at_or_before(GetUnwrapTotalAtOrBeforeParams { height, successful })
             .ok()
             .and_then(|res| res.total)
             .unwrap_or(0)
@@ -1885,6 +1954,7 @@ pub async fn get_all_address_amm_tx_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_all_address_amm_tx_history");
     let Some(address_spk) = address_spk_bytes(address) else {
         return error_response(400, "invalid_address");
     };
@@ -2033,9 +2103,7 @@ pub async fn get_all_address_amm_tx_history(
         .map(|item| item.item)
         .collect::<Vec<_>>();
     let total = if include_total {
-        amm_total
-            .saturating_add(wrap_resp.total)
-            .saturating_add(unwrap_resp.total)
+        amm_total.saturating_add(wrap_resp.total).saturating_add(unwrap_resp.total)
     } else {
         0
     };
@@ -2059,6 +2127,7 @@ pub async fn get_all_amm_tx_history(
     successful: Option<bool>,
     include_total: Option<bool>,
 ) -> Value {
+    crate::debug_timer_log!("get_all_amm_tx_history");
     let limit = clamp_count(count);
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
@@ -2200,9 +2269,7 @@ pub async fn get_all_amm_tx_history(
         .map(|item| item.item)
         .collect::<Vec<_>>();
     let total = if include_total {
-        amm_total
-            .saturating_add(wrap_resp.total)
-            .saturating_add(unwrap_resp.total)
+        amm_total.saturating_add(wrap_resp.total).saturating_add(unwrap_resp.total)
     } else {
         0
     };
@@ -2223,6 +2290,7 @@ pub async fn get_all_token_pairs(
     factory_block: &str,
     factory_tx: &str,
 ) -> Value {
+    crate::debug_timer_log!("get_all_token_pairs");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -2255,6 +2323,7 @@ pub async fn get_token_pairs(
     offset: Option<u64>,
     search_query: Option<String>,
 ) -> Value {
+    crate::debug_timer_log!("get_token_pairs");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -2321,6 +2390,7 @@ pub async fn get_alkane_swap_pair_details(
     token_b_block: &str,
     token_b_tx: &str,
 ) -> Value {
+    crate::debug_timer_log!("get_alkane_swap_pair_details");
     let Some(factory) = parse_alkane_id_fields(factory_block, factory_tx) else {
         return error_response(400, "invalid_factory_id");
     };
@@ -2378,6 +2448,7 @@ pub async fn get_address_utxos(
     address: &str,
     ord_endpoint: Option<&str>,
 ) -> Result<Vec<FormattedUtxo>> {
+    crate::debug_timer_log!("get_address_utxos");
     let network = get_network();
     let addr = Address::from_str(address)
         .ok()
@@ -2408,7 +2479,8 @@ pub async fn get_address_utxos(
         outpoint_strs.push(format!("{}:{}", utxo.txid, utxo.vout));
     }
 
-    let balances_by_outpoint = match get_outpoint_balances_with_spent_batch(essentials, &outpoints) {
+    let balances_by_outpoint = match get_outpoint_balances_with_spent_batch(essentials, &outpoints)
+    {
         Ok(map) => map,
         Err(_) => HashMap::new(),
     };
@@ -2428,12 +2500,7 @@ pub async fn get_address_utxos(
             .records;
         for rec in records.into_iter().flatten() {
             let name = rec.names.first().cloned().unwrap_or_default();
-            let symbol = rec
-                .symbols
-                .first()
-                .cloned()
-                .unwrap_or_default()
-                .to_ascii_uppercase();
+            let symbol = rec.symbols.first().cloned().unwrap_or_default().to_ascii_uppercase();
             names.insert(rec.alkane, (name, symbol));
         }
     }
@@ -2455,16 +2522,11 @@ pub async fn get_address_utxos(
         for be in balances {
             let id_str = format!("{}:{}", be.alkane.block, be.alkane.tx);
             let (name, symbol) = names.get(&be.alkane).cloned().unwrap_or_default();
-            alkanes_map.insert(
-                id_str,
-                AlkanesUtxoEntry { value: be.amount.to_string(), name, symbol },
-            );
+            alkanes_map
+                .insert(id_str, AlkanesUtxoEntry { value: be.amount.to_string(), name, symbol });
         }
 
-        let ord = ord_outputs
-            .get(&outpoint_strs[idx])
-            .cloned()
-            .unwrap_or_else(OrdOutput::default);
+        let ord = ord_outputs.get(&outpoint_strs[idx]).cloned().unwrap_or_else(OrdOutput::default);
 
         let confirmations = if utxo.status.confirmed {
             utxo.status
@@ -2542,10 +2604,7 @@ fn error_response(code: u16, msg: &str) -> Value {
 }
 
 fn now_ts() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn alkane_id_json(alkane: &SchemaAlkaneId) -> Value {
@@ -2573,11 +2632,7 @@ fn is_clean_btc(utxo: &FormattedUtxo) -> bool {
     if !utxo.inscriptions.is_empty() {
         return false;
     }
-    if let Value::Object(map) = &utxo.runes {
-        map.is_empty()
-    } else {
-        utxo.runes.is_null()
-    }
+    if let Value::Object(map) = &utxo.runes { map.is_empty() } else { utxo.runes.is_null() }
 }
 
 fn should_sort_greatest_to_least(spend_strategy: Option<Value>) -> bool {
@@ -2590,25 +2645,16 @@ fn should_sort_greatest_to_least(spend_strategy: Option<Value>) -> bool {
         }
     }
     if let Value::Object(map) = value {
-        map.get("utxoSortGreatestToLeast")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+        map.get("utxoSortGreatestToLeast").and_then(|v| v.as_bool()).unwrap_or(false)
     } else {
         false
     }
 }
 
-fn canonical_pool_prices(
-    state: &OylApiState,
-    token: &SchemaAlkaneId,
-    now_ts: u64,
-) -> (u128, u128) {
+fn canonical_pool_prices(state: &OylApiState, token: &SchemaAlkaneId, now_ts: u64) -> (u128, u128) {
     state
         .ammdata
-        .get_canonical_pool_prices(GetCanonicalPoolPricesParams {
-            token: *token,
-            now_ts,
-        })
+        .get_canonical_pool_prices(GetCanonicalPoolPricesParams { token: *token, now_ts })
         .map(|res| (res.frbtc_price, res.busd_price))
         .unwrap_or((0, 0))
 }
@@ -2958,18 +3004,17 @@ fn amm_history_items_to_values(
                     creation_cache.insert(pool, info.clone());
                     info
                 };
-                let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) =
-                    creation
-                {
-                    (
-                        info.initial_token0_amount,
-                        info.initial_token1_amount,
-                        info.initial_lp_supply,
-                        info.creator_spk,
-                    )
-                } else {
-                    (0, 0, 0, Vec::new())
-                };
+                let (token0_amt, token1_amt, token_supply, creator_spk) =
+                    if let Some(info) = creation {
+                        (
+                            info.initial_token0_amount,
+                            info.initial_token1_amount,
+                            info.initial_lp_supply,
+                            info.creator_spk,
+                        )
+                    } else {
+                        (0, 0, 0, Vec::new())
+                    };
                 let creator = if creator_spk.is_empty() {
                     address_from_spk_bytes(&item.activity.address_spk)
                 } else {
@@ -3015,11 +3060,7 @@ fn wrap_event_to_value(entry: &SchemaWrapEventV1, kind: &str) -> Value {
 }
 
 fn wrap_event_to_history_item(entry: &SchemaWrapEventV1, kind: &str) -> HistoryItemWithTs {
-    HistoryItemWithTs {
-        ts: entry.timestamp,
-        seq: 0,
-        item: wrap_event_to_value(entry, kind),
-    }
+    HistoryItemWithTs { ts: entry.timestamp, seq: 0, item: wrap_event_to_value(entry, kind) }
 }
 
 fn build_token_pair(
@@ -3096,6 +3137,7 @@ fn get_token_meta(
     cache: &mut HashMap<SchemaAlkaneId, TokenMeta>,
     id: &SchemaAlkaneId,
 ) -> TokenMeta {
+    crate::debug_timer_log!("get_token_meta");
     if let Some(meta) = cache.get(id) {
         return meta.clone();
     }
@@ -3105,14 +3147,8 @@ fn get_token_meta(
         .get_creation_record(GetCreationRecordParams { alkane: *id })
         .ok()
         .and_then(|resp| resp.record);
-    let name = rec
-        .as_ref()
-        .and_then(|r| r.names.first().cloned())
-        .unwrap_or_default();
-    let symbol_raw = rec
-        .as_ref()
-        .and_then(|r| r.symbols.first().cloned())
-        .unwrap_or_default();
+    let name = rec.as_ref().and_then(|r| r.names.first().cloned()).unwrap_or_default();
+    let symbol_raw = rec.as_ref().and_then(|r| r.symbols.first().cloned()).unwrap_or_default();
     let label = if !symbol_raw.is_empty() {
         symbol_raw.clone()
     } else if !name.is_empty() {
@@ -3120,12 +3156,8 @@ fn get_token_meta(
     } else {
         format!("{}:{}", id.block, id.tx)
     };
-    let display_symbol = if symbol_raw.is_empty() {
-        label.clone()
-    } else {
-        symbol_raw
-    }
-    .to_ascii_uppercase();
+    let display_symbol =
+        if symbol_raw.is_empty() { label.clone() } else { symbol_raw }.to_ascii_uppercase();
     let meta = TokenMeta {
         name,
         symbol: display_symbol,
@@ -3204,21 +3236,17 @@ fn fetch_records_for_query(
                 .ids;
             let by_symbol = state
                 .essentials
-                .get_alkane_ids_by_symbol_prefix(GetAlkaneIdsBySymbolPrefixParams {
-                    prefix: norm,
-                })?
+                .get_alkane_ids_by_symbol_prefix(GetAlkaneIdsBySymbolPrefixParams { prefix: norm })?
                 .ids;
             for id in by_name.into_iter().chain(by_symbol.into_iter()) {
                 ids.insert(id);
             }
         }
     } else {
-        return Ok(
-            state
-                .essentials
-                .get_creation_records_ordered(GetCreationRecordsOrderedParams)?
-                .records,
-        );
+        return Ok(state
+            .essentials
+            .get_creation_records_ordered(GetCreationRecordsOrderedParams)?
+            .records);
     }
 
     if ids.is_empty() {
@@ -3234,6 +3262,292 @@ fn fetch_records_for_query(
     Ok(recs.into_iter().flatten().collect())
 }
 
+fn search_index_field_for_sort(sort_by: &str) -> SearchIndexField {
+    let key = sort_by.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "marketcap" => SearchIndexField::Marketcap,
+        "holders" => SearchIndexField::Holders,
+        "volume7d" => SearchIndexField::Volume7d,
+        "change7d" => SearchIndexField::Change7d,
+        "volumealltime" => SearchIndexField::VolumeAllTime,
+        _ => SearchIndexField::Holders,
+    }
+}
+
+fn record_matches_query(
+    rec: &crate::modules::essentials::utils::inspections::AlkaneCreationRecord,
+    query_norm: &str,
+) -> bool {
+    for name in rec.names.iter().chain(rec.symbols.iter()) {
+        if let Some(norm) = normalize_search_text(name) {
+            if norm.starts_with(query_norm) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn search_by_holders_scan(
+    state: &OylApiState,
+    query_norm: &str,
+    offset: u64,
+    limit: u64,
+    scan_cap: u64,
+) -> Vec<SchemaAlkaneId> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let scan_limit = if scan_cap == 0 { 5000 } else { scan_cap };
+    let ids = state
+        .essentials
+        .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            offset: 0,
+            limit: scan_limit,
+            desc: true,
+        })
+        .map(|res| res.ids)
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let records = state
+        .essentials
+        .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })
+        .map(|res| res.records)
+        .unwrap_or_default();
+
+    let mut out: Vec<SchemaAlkaneId> = Vec::new();
+    let mut seen = HashSet::new();
+    let mut matched: u64 = 0;
+
+    for (idx, rec_opt) in records.into_iter().enumerate() {
+        let Some(rec) = rec_opt else { continue };
+        if !record_matches_query(&rec, query_norm) {
+            continue;
+        }
+        let id = ids[idx];
+        if !seen.insert(id) {
+            continue;
+        }
+        if matched < offset {
+            matched += 1;
+            continue;
+        }
+        out.push(id);
+        matched += 1;
+        if out.len() >= limit as usize {
+            break;
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum AlkaneSortIndex {
+    Holders,
+    Metrics(TokenMetricsIndexField),
+}
+
+fn alkane_sort_index(sort_by: &str) -> AlkaneSortIndex {
+    let key = sort_by.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "holders" => AlkaneSortIndex::Holders,
+        "price" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::PriceUsd),
+        "marketcap" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::MarketcapUsd),
+        "volume1d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Volume1d),
+        "volume7d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Volume7d),
+        "volume30d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Volume30d),
+        "volumealltime" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::VolumeAllTime),
+        "change1d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Change1d),
+        "change7d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Change7d),
+        "change30d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Change30d),
+        "changealltime" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::ChangeAllTime),
+        _ => AlkaneSortIndex::Metrics(TokenMetricsIndexField::VolumeAllTime),
+    }
+}
+
+fn token_metrics_multi(state: &OylApiState, ids: &[SchemaAlkaneId]) -> Vec<SchemaTokenMetricsV1> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    state
+        .ammdata
+        .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.to_vec() })
+        .map(|res| res.metrics.into_iter().map(|m| m.unwrap_or_default()).collect::<Vec<_>>())
+        .unwrap_or_else(|_| vec![SchemaTokenMetricsV1::default(); ids.len()])
+}
+
+fn holders_counts_multi(state: &OylApiState, ids: &[SchemaAlkaneId]) -> Vec<u64> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    state
+        .essentials
+        .get_holders_counts_by_id(GetHoldersCountsByIdParams { alkanes: ids.to_vec() })
+        .map(|res| res.counts)
+        .unwrap_or_else(|_| vec![0u64; ids.len()])
+}
+
+fn collect_missing_tokens(
+    state: &OylApiState,
+    offset: u64,
+    limit: u64,
+    desc: bool,
+) -> Vec<SchemaAlkaneId> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<SchemaAlkaneId> = Vec::new();
+    let mut missing_seen: u64 = 0;
+    let mut creation_offset: u64 = 0;
+    let chunk = std::cmp::max(200usize, limit as usize);
+
+    loop {
+        let page = state
+            .essentials
+            .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+                offset: creation_offset,
+                limit: chunk as u64,
+                desc,
+            })
+            .ok()
+            .map(|res| res.records)
+            .unwrap_or_default();
+        if page.is_empty() {
+            break;
+        }
+
+        let ids: Vec<SchemaAlkaneId> = page.iter().map(|rec| rec.alkane).collect();
+        let metrics = state
+            .ammdata
+            .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.clone() })
+            .ok()
+            .map(|res| res.metrics)
+            .unwrap_or_default();
+        if metrics.len() != ids.len() {
+            break;
+        }
+
+        for (idx, id) in ids.into_iter().enumerate() {
+            let has_metrics = metrics.get(idx).and_then(|m| m.as_ref()).is_some();
+            if has_metrics {
+                continue;
+            }
+            if missing_seen < offset {
+                missing_seen += 1;
+                continue;
+            }
+            out.push(id);
+            missing_seen += 1;
+            if out.len() >= limit as usize {
+                return out;
+            }
+        }
+
+        creation_offset = creation_offset.saturating_add(page.len() as u64);
+    }
+
+    out
+}
+
+fn fetch_sorted_alkane_ids_no_query(
+    state: &OylApiState,
+    sort_index: AlkaneSortIndex,
+    desc: bool,
+    offset: u64,
+    limit: u64,
+    total: u64,
+) -> Vec<SchemaAlkaneId> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    match sort_index {
+        AlkaneSortIndex::Holders => state
+            .essentials
+            .get_holders_ordered_page(GetHoldersOrderedPageParams { offset, limit, desc })
+            .map(|res| res.ids)
+            .unwrap_or_default(),
+        AlkaneSortIndex::Metrics(field) => {
+            let metrics_count = state
+                .ammdata
+                .get_token_metrics_index_count(GetTokenMetricsIndexCountParams)
+                .map(|res| res.count)
+                .unwrap_or(0);
+            let missing_count = total.saturating_sub(metrics_count);
+
+            let metrics_page = |off: u64, lim: u64| -> Vec<SchemaAlkaneId> {
+                if lim == 0 {
+                    return Vec::new();
+                }
+                state
+                    .ammdata
+                    .get_token_metrics_index_page(GetTokenMetricsIndexPageParams {
+                        field,
+                        offset: off,
+                        limit: lim,
+                        desc,
+                    })
+                    .map(|res| res.ids)
+                    .unwrap_or_default()
+            };
+
+            if metrics_count == 0 && total > 0 {
+                let probe = metrics_page(offset, limit);
+                if !probe.is_empty() {
+                    return probe;
+                }
+                let fallback: Vec<SchemaAlkaneId> = state
+                    .essentials
+                    .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+                        offset,
+                        limit,
+                        desc,
+                    })
+                    .ok()
+                    .map(|res| res.records.into_iter().map(|rec| rec.alkane).collect())
+                    .unwrap_or_default();
+                if !fallback.is_empty() {
+                    return fallback;
+                }
+            }
+
+            let mut ids: Vec<SchemaAlkaneId> = Vec::new();
+
+            if desc {
+                if offset < metrics_count {
+                    let take = std::cmp::min(limit, metrics_count - offset);
+                    ids.extend(metrics_page(offset, take));
+                    let remaining = limit.saturating_sub(ids.len() as u64);
+                    if remaining > 0 && missing_count > 0 {
+                        ids.extend(collect_missing_tokens(state, 0, remaining, true));
+                    }
+                } else if missing_count > 0 {
+                    let miss_off = offset.saturating_sub(metrics_count);
+                    ids.extend(collect_missing_tokens(state, miss_off, limit, true));
+                }
+            } else {
+                if missing_count > 0 && offset < missing_count {
+                    let take = std::cmp::min(limit, missing_count - offset);
+                    ids.extend(collect_missing_tokens(state, offset, take, false));
+                    let remaining = limit.saturating_sub(ids.len() as u64);
+                    if remaining > 0 {
+                        ids.extend(metrics_page(0, remaining));
+                    }
+                } else {
+                    let metrics_offset = offset.saturating_sub(missing_count);
+                    ids.extend(metrics_page(metrics_offset, limit));
+                }
+            }
+
+            ids
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn sort_records(
     items: &mut Vec<(
         crate::modules::essentials::utils::inspections::AlkaneCreationRecord,
@@ -3262,10 +3576,22 @@ fn sort_records(
         "volume7d" => cmp_u128(a.1.volume_7d, b.1.volume_7d),
         "volume30d" => cmp_u128(a.1.volume_30d, b.1.volume_30d),
         "volumeAllTime" => cmp_u128(a.1.volume_all_time, b.1.volume_all_time),
-        "change1d" => cmp_f64(a.1.change_1d.parse::<f64>().unwrap_or(0.0), b.1.change_1d.parse::<f64>().unwrap_or(0.0)),
-        "change7d" => cmp_f64(a.1.change_7d.parse::<f64>().unwrap_or(0.0), b.1.change_7d.parse::<f64>().unwrap_or(0.0)),
-        "change30d" => cmp_f64(a.1.change_30d.parse::<f64>().unwrap_or(0.0), b.1.change_30d.parse::<f64>().unwrap_or(0.0)),
-        "changeAllTime" => cmp_f64(a.1.change_all_time.parse::<f64>().unwrap_or(0.0), b.1.change_all_time.parse::<f64>().unwrap_or(0.0)),
+        "change1d" => cmp_f64(
+            a.1.change_1d.parse::<f64>().unwrap_or(0.0),
+            b.1.change_1d.parse::<f64>().unwrap_or(0.0),
+        ),
+        "change7d" => cmp_f64(
+            a.1.change_7d.parse::<f64>().unwrap_or(0.0),
+            b.1.change_7d.parse::<f64>().unwrap_or(0.0),
+        ),
+        "change30d" => cmp_f64(
+            a.1.change_30d.parse::<f64>().unwrap_or(0.0),
+            b.1.change_30d.parse::<f64>().unwrap_or(0.0),
+        ),
+        "changeAllTime" => cmp_f64(
+            a.1.change_all_time.parse::<f64>().unwrap_or(0.0),
+            b.1.change_all_time.parse::<f64>().unwrap_or(0.0),
+        ),
         _ => cmp_u128(a.1.volume_all_time, b.1.volume_all_time),
     });
 }
@@ -3283,7 +3609,8 @@ fn build_alkane_token(
     let percentage_minted = if max_supply == 0 {
         0
     } else {
-        minted.saturating_mul(100) / max_supply
+        let numerator = minted.saturating_mul(100);
+        numerator.saturating_add(max_supply.saturating_sub(1)) / max_supply
     };
 
     let now_ts = now_ts();
@@ -3292,17 +3619,9 @@ fn build_alkane_token(
 
     let has_busd = busd_price > 0;
     let has_frbtc = frbtc_price > 0;
-    let frbtc_fdv = if has_frbtc {
-        frbtc_price.saturating_mul(supply) / PRICE_SCALE
-    } else {
-        0
-    };
+    let frbtc_fdv = if has_frbtc { frbtc_price.saturating_mul(supply) / PRICE_SCALE } else { 0 };
     let busd_fdv = if has_busd { metrics.fdv_usd } else { 0 };
-    let frbtc_mcap = if has_frbtc {
-        frbtc_price.saturating_mul(supply) / PRICE_SCALE
-    } else {
-        0
-    };
+    let frbtc_mcap = if has_frbtc { frbtc_price.saturating_mul(supply) / PRICE_SCALE } else { 0 };
     let busd_mcap = if has_busd { metrics.marketcap_usd } else { 0 };
 
     let id_str = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
@@ -3315,6 +3634,11 @@ fn build_alkane_token(
         symbol = id_str;
     }
     let symbol = symbol.to_ascii_uppercase();
+    let change_1d = if metrics.change_1d.trim().is_empty() { "0" } else { metrics.change_1d.as_str() };
+    let change_7d = if metrics.change_7d.trim().is_empty() { "0" } else { metrics.change_7d.as_str() };
+    let change_30d = if metrics.change_30d.trim().is_empty() { "0" } else { metrics.change_30d.as_str() };
+    let change_all_time =
+        if metrics.change_all_time.trim().is_empty() { "0" } else { metrics.change_all_time.as_str() };
 
     Ok(json!({
         "id": alkane_id_json(&rec.alkane),
@@ -3350,10 +3674,10 @@ fn build_alkane_token(
         "tokenVolume30d": metrics.volume_30d.to_string(),
         "tokenVolume7d": metrics.volume_7d.to_string(),
         "tokenVolumeAllTime": metrics.volume_all_time.to_string(),
-        "priceChange24h": metrics.change_1d,
-        "priceChange7d": metrics.change_7d,
-        "priceChange30d": metrics.change_30d,
-        "priceChangeAllTime": metrics.change_all_time,
+        "priceChange24h": change_1d,
+        "priceChange7d": change_7d,
+        "priceChange30d": change_30d,
+        "priceChangeAllTime": change_all_time,
     }))
 }
 
@@ -3459,16 +3783,8 @@ fn build_pool_details(
         lp_supply = latest_circulating_supply(state, &pool);
     }
 
-    let lp_value_sats = if lp_supply == 0 {
-        0
-    } else {
-        pool_tvl_sats.saturating_div(lp_supply)
-    };
-    let lp_value_usd = if lp_supply == 0 {
-        0
-    } else {
-        pool_tvl_usd.saturating_div(lp_supply)
-    };
+    let lp_value_sats = if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
+    let lp_value_usd = if lp_supply == 0 { 0 } else { pool_tvl_usd.saturating_div(lp_supply) };
 
     let creation = state
         .ammdata

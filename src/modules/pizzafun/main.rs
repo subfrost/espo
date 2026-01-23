@@ -1,5 +1,6 @@
 use crate::alkanes::trace::EspoBlock;
-use crate::config::{get_espo_db, get_last_safe_tip};
+use crate::config::{debug_enabled, get_espo_db, get_last_safe_tip};
+use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
     decode_creation_record, EssentialsProvider, GetIndexHeightParams, GetIterFromParams,
@@ -216,18 +217,35 @@ impl EspoModule for Pizzafun {
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let t0 = std::time::Instant::now();
-        if let Some(tip) = get_last_safe_tip() {
-            if block.height >= tip {
-                self.reload_series_index("safe_tip");
-            }
+        let debug = debug_enabled();
+        let module = self.get_name();
+
+        let timer = debug::start_if(debug);
+        let tip = get_last_safe_tip();
+        debug::log_elapsed(module, "read_safe_tip", timer);
+
+        let timer = debug::start_if(debug);
+        let should_reload = tip.map_or(false, |tip| block.height >= tip);
+        debug::log_elapsed(module, "evaluate_reload", timer);
+
+        let timer = debug::start_if(debug);
+        if should_reload {
+            self.reload_series_index("safe_tip");
         }
+        debug::log_elapsed(module, "reload_series", timer);
+
+        let timer = debug::start_if(debug);
         *self.index_height.write().unwrap() = Some(block.height);
+        debug::log_elapsed(module, "store_height", timer);
+
+        let timer = debug::start_if(debug);
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),
             block.height,
             t0.elapsed()
         );
+        debug::log_elapsed(module, "finalize", timer);
         Ok(())
     }
 

@@ -218,6 +218,7 @@ impl SubfrostProvider {
     }
 
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        crate::debug_timer_log!("get_index_height");
         let table = self.table();
         let Some(bytes) = table.INDEX_HEIGHT.get()? else {
             return Ok(GetIndexHeightResult { height: None });
@@ -231,6 +232,7 @@ impl SubfrostProvider {
     }
 
     pub fn set_index_height(&self, params: SetIndexHeightParams) -> Result<()> {
+        crate::debug_timer_log!("set_index_height");
         let table = self.table();
         table.INDEX_HEIGHT.put(&params.height.to_le_bytes())
     }
@@ -239,6 +241,7 @@ impl SubfrostProvider {
         &self,
         params: GetWrapEventsByAddressParams,
     ) -> Result<GetWrapEventsResult> {
+        crate::debug_timer_log!("get_wrap_events_by_address");
         let table = self.table();
         let prefix = table.wrap_events_by_address_prefix(&params.address_spk);
         read_events(self, prefix, params.offset, params.limit, params.successful)
@@ -248,6 +251,7 @@ impl SubfrostProvider {
         &self,
         params: GetUnwrapEventsByAddressParams,
     ) -> Result<GetWrapEventsResult> {
+        crate::debug_timer_log!("get_unwrap_events_by_address");
         let table = self.table();
         let prefix = table.unwrap_events_by_address_prefix(&params.address_spk);
         read_events(self, prefix, params.offset, params.limit, params.successful)
@@ -257,6 +261,7 @@ impl SubfrostProvider {
         &self,
         params: GetWrapEventsAllParams,
     ) -> Result<GetWrapEventsResult> {
+        crate::debug_timer_log!("get_wrap_events_all");
         let table = self.table();
         let prefix = table.WRAP_EVENTS_ALL.key().to_vec();
         read_events(self, prefix, params.offset, params.limit, params.successful)
@@ -266,6 +271,7 @@ impl SubfrostProvider {
         &self,
         params: GetUnwrapEventsAllParams,
     ) -> Result<GetWrapEventsResult> {
+        crate::debug_timer_log!("get_unwrap_events_all");
         let table = self.table();
         let prefix = table.UNWRAP_EVENTS_ALL.key().to_vec();
         read_events(self, prefix, params.offset, params.limit, params.successful)
@@ -275,6 +281,7 @@ impl SubfrostProvider {
         &self,
         params: GetUnwrapTotalLatestParams,
     ) -> Result<GetUnwrapTotalLatestResult> {
+        crate::debug_timer_log!("get_unwrap_total_latest");
         let table = self.table();
         let key = table.unwrap_total_latest_key(params.successful);
         let total = self
@@ -289,6 +296,7 @@ impl SubfrostProvider {
         &self,
         params: GetUnwrapTotalAtOrBeforeParams,
     ) -> Result<GetUnwrapTotalAtOrBeforeResult> {
+        crate::debug_timer_log!("get_unwrap_total_at_or_before");
         let table = self.table();
         let prefix = table.unwrap_total_by_height_prefix(params.successful);
         let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
@@ -437,6 +445,7 @@ pub struct SetWrapEventParams {
 
 impl SubfrostProvider {
     pub fn set_wrap_event(&self, params: SetWrapEventParams) -> Result<()> {
+        crate::debug_timer_log!("set_wrap_event");
         let bytes = encode_wrap_event(&params.event)?;
         self.mdb.put(&params.key, &bytes).map_err(|e| anyhow!("mdb.put failed: {e}"))
     }

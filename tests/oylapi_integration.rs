@@ -75,6 +75,7 @@ fn init_global_config() {
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
             strict_mode: false,
+            debug: false,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             simulate_reorg: false,
             explorer_networks: None,

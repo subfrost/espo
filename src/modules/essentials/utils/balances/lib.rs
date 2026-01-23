@@ -8,8 +8,10 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
 use crate::config::{
-    get_electrum_like, get_metashrew, get_metashrew_sdb, get_network, is_strict_mode,
+    debug_enabled, get_electrum_like, get_metashrew, get_metashrew_sdb, get_network, is_strict_mode,
+    get_espo_db,
 };
+use crate::debug;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
@@ -20,6 +22,10 @@ use crate::modules::essentials::storage::{
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, GetScanPrefixParams, SetBatchParams,
 };
+use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
+use crate::modules::ammdata::utils::search::collect_search_prefixes;
+use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{Context, Result, anyhow};
 use bitcoin::block::Header;
@@ -28,9 +34,18 @@ use bitcoin::{ScriptBuf, Transaction, Txid, hashes::Hash};
 use borsh::BorshDeserialize;
 use protorune_support::protostone::{Protostone, ProtostoneEdict};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-fn clean_espo_sandshrew_like_trace(
+static AMMDATA_MDB: OnceLock<Arc<Mdb>> = OnceLock::new();
+
+fn ammdata_mdb() -> Arc<Mdb> {
+    AMMDATA_MDB
+        .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
+        .clone()
+}
+
+pub(crate) fn clean_espo_sandshrew_like_trace(
     trace: &EspoSandshrewLikeTrace,
     host_function_values: &EspoHostFunctionValues,
 ) -> Option<EspoSandshrewLikeTrace> {
@@ -168,11 +183,140 @@ fn clean_espo_sandshrew_like_trace(
     attempt_clean(false).or_else(|| attempt_clean(true))
 }
 
+fn parse_u128_from_str(input: &str) -> Option<u128> {
+    if let Some(hex) = input.strip_prefix("0x") {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        input.parse::<u128>().ok()
+    }
+}
+
+fn mint_deltas_from_trace(
+    trace: &EspoSandshrewLikeTrace,
+    host_function_values: &EspoHostFunctionValues,
+) -> Option<BTreeMap<SchemaAlkaneId, u128>> {
+    let trace = clean_espo_sandshrew_like_trace(trace, host_function_values)?;
+
+    #[derive(Clone)]
+    struct Frame {
+        owner: Option<SchemaAlkaneId>,
+        mint_candidate: bool,
+        incoming: Vec<(SchemaAlkaneId, u128)>,
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+
+    for ev in &trace.events {
+        match ev {
+            EspoSandshrewLikeTraceEvent::Invoke(inv) => {
+                let typ = inv.typ.to_ascii_lowercase();
+                let is_static = typ == "staticcall";
+                let mut mint_candidate = false;
+                if !is_static {
+                    let opcode_match = inv
+                        .context
+                        .inputs
+                        .get(2)
+                        .and_then(|s| parse_u128_from_str(s))
+                        .filter(|op| *op == 77)
+                        .is_some()
+                        || inv
+                            .context
+                            .inputs
+                            .get(0)
+                            .and_then(|s| parse_u128_from_str(s))
+                            .filter(|op| *op == 77)
+                            .is_some();
+                    if opcode_match {
+                        mint_candidate = true;
+                    }
+                }
+                let incoming = if mint_candidate {
+                    inv.context
+                        .incoming_alkanes
+                        .iter()
+                        .filter_map(|t| {
+                            let id = parse_short_id(&t.id)?;
+                            let value = parse_u128_from_str(&t.value)?;
+                            if value == 0 {
+                                return None;
+                            }
+                            Some((id, value))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                stack.push(Frame {
+                    owner: parse_short_id(&inv.context.myself),
+                    mint_candidate,
+                    incoming,
+                });
+            }
+            EspoSandshrewLikeTraceEvent::Return(ret) => {
+                let Some(frame) = stack.pop() else {
+                    return None;
+                };
+                if !frame.mint_candidate {
+                    continue;
+                }
+                if ret.status != EspoSandshrewLikeTraceStatus::Success {
+                    continue;
+                }
+                let Some(owner) = frame.owner else {
+                    continue;
+                };
+                let mut returned: Vec<(SchemaAlkaneId, u128)> = ret
+                    .response
+                    .alkanes
+                    .iter()
+                    .filter_map(|t| {
+                        let id = parse_short_id(&t.id)?;
+                        let value = parse_u128_from_str(&t.value)?;
+                        if value == 0 {
+                            return None;
+                        }
+                        Some((id, value))
+                    })
+                    .collect();
+                if !frame.incoming.is_empty() && !returned.is_empty() {
+                    for (inc_id, inc_value) in &frame.incoming {
+                        if let Some(pos) = returned
+                            .iter()
+                            .position(|(id, value)| id == inc_id && value == inc_value)
+                        {
+                            returned.remove(pos);
+                        }
+                    }
+                }
+                if let Some((_, value)) = returned.iter().find(|(id, _)| *id == owner) {
+                    *deltas.entry(owner).or_default() = deltas
+                        .get(&owner)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*value);
+                }
+            }
+            EspoSandshrewLikeTraceEvent::Create(_) => {}
+        }
+    }
+
+    if !stack.is_empty() {
+        return None;
+    }
+
+    Some(deltas)
+}
+
 pub(crate) fn accumulate_alkane_balance_deltas(
     trace: &EspoSandshrewLikeTrace,
     _txid: &Txid,
     host_function_values: &EspoHostFunctionValues,
 ) -> (bool, HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>) {
+    let debug = debug_enabled();
+    let module = "essentials.balances";
+    let timer = debug::start_if(debug);
     let Some(trace) = clean_espo_sandshrew_like_trace(trace, host_function_values) else {
         if is_strict_mode() {
             eprintln!(
@@ -182,6 +326,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
         }
         return (false, HashMap::new());
     };
+    debug::log_elapsed(module, "accumulate.clean_trace", timer);
     if std::env::var_os("ESPO_LOG_HOST_FUNCTION_VALUES").is_some() {
         let (header, coinbase, diesel, fee) = host_function_values;
         eprintln!(
@@ -841,8 +986,22 @@ pub fn bulk_update_balances_for_block(
     provider: &EssentialsProvider,
     block: &EspoBlock,
 ) -> Result<()> {
+    let debug = debug_enabled();
+    let module = "essentials.balances";
     let network = get_network();
     let table = provider.table();
+    let search_cfg = AmmDataConfig::load_from_global_config().ok();
+    let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
+    let mut search_prefix_min = search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
+    let mut search_prefix_max = search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+    if search_prefix_min == 0 {
+        search_prefix_min = 2;
+    }
+    if search_prefix_max < search_prefix_min {
+        search_prefix_max = search_prefix_min;
+    }
+    let mut ammdata_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut ammdata_deletes: Vec<Vec<u8>> = Vec::new();
 
     eprintln!("[balances] >>> begin block #{} (txs={})", block.height, block.transactions.len());
 
@@ -924,6 +1083,7 @@ pub fn bulk_update_balances_for_block(
     let mut consumed_ephem_outpoints: HashMap<String, Vec<u8>> = HashMap::new(); // outpoint_str -> spender txid
 
     // ---------- Pass A: collect block-created outpoints & external inputs ----------
+    let timer = debug::start_if(debug);
     let mut block_created_outs: HashSet<String> = HashSet::new();
     for atx in &block.transactions {
         let tx = &atx.transaction;
@@ -958,7 +1118,9 @@ pub fn bulk_update_balances_for_block(
         }
     }
 
+    debug::log_elapsed(module, "pass_a_collect_outpoints", timer);
     // ---------- Pass B: fetch external inputs (batch read) ----------
+    let timer = debug::start_if(debug);
     let mut balances_by_outpoint: HashMap<(Vec<u8>, u32), Vec<BalanceEntry>> = HashMap::new();
     let mut addr_by_outpoint: HashMap<(Vec<u8>, u32), String> = HashMap::new();
     let mut spk_by_outpoint: HashMap<(Vec<u8>, u32), ScriptBuf> = HashMap::new();
@@ -1004,7 +1166,9 @@ pub fn bulk_update_balances_for_block(
             }
         }
     }
+    debug::log_elapsed(module, "pass_b_fetch_inputs", timer);
 
+    let timer = debug::start_if(debug);
     let mut block_tx_index: HashMap<Txid, usize> = HashMap::new();
     for (idx, atx) in block.transactions.iter().enumerate() {
         block_tx_index.insert(atx.transaction.compute_txid(), idx);
@@ -1032,6 +1196,8 @@ pub fn bulk_update_balances_for_block(
     }
 
     // TODO: extend prevout fallback to all alkane txs (not just traced) for full address coverage.
+    debug::log_elapsed(module, "trace_prevout_scan", timer);
+    let timer = debug::start_if(debug);
     let mut trace_prev_tx_map: HashMap<Txid, Transaction> = HashMap::new();
     if !trace_prevout_txids.is_empty() {
         let electrum_like = get_electrum_like();
@@ -1054,8 +1220,10 @@ pub fn bulk_update_balances_for_block(
             }
         }
     }
+    debug::log_elapsed(module, "trace_prevout_fetch", timer);
 
     // ---------- Main per-tx loop ----------
+    let timer = debug::start_if(debug);
     for atx in &block.transactions {
         let tx = &atx.transaction;
         let txid = tx.compute_txid();
@@ -1066,6 +1234,8 @@ pub fn bulk_update_balances_for_block(
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
         let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
             HashMap::new();
+        let mut tx_mint_deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
+        let mut trace_failed = false;
 
         let mut add_holder_delta =
             |alk: SchemaAlkaneId,
@@ -1216,6 +1386,17 @@ pub fn bulk_update_balances_for_block(
         let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
         if !traces_for_tx.is_empty() {
             for t in &traces_for_tx {
+                if let Some(mints) =
+                    mint_deltas_from_trace(&t.sandshrew_trace, &block.host_function_values)
+                {
+                    for (alkane, delta) in mints {
+                        if delta == 0 {
+                            continue;
+                        }
+                        *tx_mint_deltas.entry(alkane).or_default() =
+                            tx_mint_deltas.get(&alkane).copied().unwrap_or(0).saturating_add(delta);
+                    }
+                }
                 let (ok, deltas) = accumulate_alkane_balance_deltas(
                     &t.sandshrew_trace,
                     &txid,
@@ -1224,6 +1405,8 @@ pub fn bulk_update_balances_for_block(
                 if !ok {
                     local_alkane_delta.clear();
                     holder_alkanes_changed.clear();
+                    tx_mint_deltas.clear();
+                    trace_failed = true;
                     break;
                 }
                 for (owner, per_token) in deltas {
@@ -1236,6 +1419,12 @@ pub fn bulk_update_balances_for_block(
                         }
                     }
                 }
+            }
+        }
+        if !trace_failed && !tx_mint_deltas.is_empty() {
+            for (alkane, delta) in tx_mint_deltas {
+                *minted_delta_by_alk.entry(alkane).or_default() =
+                    minted_delta_by_alk.get(&alkane).copied().unwrap_or(0).saturating_add(delta);
             }
         }
 
@@ -1320,11 +1509,6 @@ pub fn bulk_update_balances_for_block(
                 );
                 if *token == *holder_alk {
                     // Keep self-token outflows for summaries/ammdata, but don't persist balances.
-                    let (is_negative, mag) = delta.as_parts();
-                    if is_negative && mag > 0 {
-                        *minted_delta_by_alk.entry(*token).or_default() =
-                            minted_delta_by_alk.get(token).copied().unwrap_or(0).saturating_add(mag);
-                    }
                     continue;
                 }
                 add_holder_delta(
@@ -1630,10 +1814,13 @@ pub fn bulk_update_balances_for_block(
         }
     }
 
+    debug::log_elapsed(module, "process_transactions", timer);
+
     // logging metric
     stat_outpoints_marked_spent = spent_outpoints.len();
 
     // Build unified rows (new outputs + spent inputs)
+    let timer = debug::start_if(debug);
     struct NewRow {
         outpoint: EspoOutpoint,
         addr: String,
@@ -1840,6 +2027,45 @@ pub fn bulk_update_balances_for_block(
             vec_holders = apply_holders_delta(vec_holders, holder, *delta);
         }
         let new_count = vec_holders.len() as u64;
+        if search_index_enabled {
+            let rec = provider
+                .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+                    alkane: *alkane,
+                })
+                .ok()
+                .and_then(|resp| resp.record);
+            if let Some(rec) = rec {
+                let prefixes = collect_search_prefixes(
+                    &rec.names,
+                    &rec.symbols,
+                    search_prefix_min,
+                    search_prefix_max,
+                );
+                if !prefixes.is_empty() {
+                    let mdb = ammdata_mdb();
+                    let table_amm = AmmDataTable::new(mdb.as_ref());
+                    for prefix in prefixes {
+                        ammdata_puts.push((
+                            table_amm.token_search_index_key_u64(
+                                SearchIndexField::Holders,
+                                &prefix,
+                                new_count,
+                                alkane,
+                            ),
+                            Vec::new(),
+                        ));
+                        if prev_count != new_count {
+                            ammdata_deletes.push(table_amm.token_search_index_key_u64(
+                                SearchIndexField::Holders,
+                                &prefix,
+                                prev_count,
+                                alkane,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let new_index_key = table.alkane_holders_ordered_key(new_count, alkane);
         if prev_count != new_count {
             let prev_index_key = table.alkane_holders_ordered_key(prev_count, alkane);
@@ -1886,6 +2112,8 @@ pub fn bulk_update_balances_for_block(
         puts.push((latest_key, encoded));
     }
 
+    debug::log_elapsed(module, "build_writes", timer);
+    let timer = debug::start_if(debug);
     if is_strict_mode() {
         let metashrew = get_metashrew();
         let height_u64 = block.height as u64;
@@ -2121,8 +2349,26 @@ pub fn bulk_update_balances_for_block(
             );
         }
     }
+    debug::log_elapsed(module, "strict_mode_checks", timer);
 
+    let timer = debug::start_if(debug);
     provider.set_batch(SetBatchParams { puts, deletes })?;
+    debug::log_elapsed(module, "write_batch", timer);
+
+    if search_index_enabled && (!ammdata_puts.is_empty() || !ammdata_deletes.is_empty()) {
+        let mdb = ammdata_mdb();
+        let res = mdb.bulk_write(|wb| {
+            for key in &ammdata_deletes {
+                wb.delete(key);
+            }
+            for (key, value) in &ammdata_puts {
+                wb.put(key, value);
+            }
+        });
+        if let Err(e) = res {
+            eprintln!("[balances] ammdata search index write failed at height {}: {e}", block.height);
+        }
+    }
 
     let minus_total: u128 = stat_minus_by_alk.values().copied().sum();
     let plus_total: u128 = stat_plus_by_alk.values().copied().sum();

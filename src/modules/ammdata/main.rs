@@ -5,15 +5,17 @@ use super::schemas::{
 };
 use super::storage::{
     AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetRawValueParams,
-    GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, SetBatchParams, decode_candle_v1,
-    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot, encode_candle_v1,
-    encode_canonical_pools, encode_pool_creation_info, encode_pool_metrics,
-    encode_reserves_snapshot, encode_token_metrics, encode_u128_value,
+    GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, SearchIndexField, SetBatchParams,
+    TokenMetricsIndexField, decode_candle_v1, decode_canonical_pools, decode_full_candle_v1,
+    decode_reserves_snapshot, decode_token_metrics, encode_candle_v1, encode_canonical_pools,
+    encode_pool_creation_info, encode_pool_metrics, encode_reserves_snapshot, encode_token_metrics,
+    encode_u128_value, parse_change_basis_points,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::alkanes::trace::EspoSandshrewLikeTraceStatus;
 use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
-use crate::config::{get_electrum_like, get_espo_db, get_network};
+use crate::config::{debug_enabled, get_electrum_like, get_espo_db, get_network};
+use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
@@ -22,13 +24,15 @@ use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::utils::candles::{
     CandleCache, bucket_start_for, price_base_per_quote, price_quote_per_base,
 };
+use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::ammdata::utils::reserves::{
     NewPoolInfo, extract_new_pools_from_espo_transaction,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, EssentialsProvider, GetAlkaneStorageValueParams, GetCreationRecordParams,
-    GetLatestCirculatingSupplyParams, GetRawValueParams as EssentialsGetRawValueParams,
+    AlkaneBalanceTxEntry, EssentialsProvider, GetAlkaneStorageValueParams,
+    GetCreationRecordParams, GetCreationRecordsOrderedParams, GetLatestCirculatingSupplyParams,
+    GetRawValueParams as EssentialsGetRawValueParams,
 };
 use crate::modules::essentials::utils::balances::{SignedU128, get_alkane_balances};
 use crate::modules::essentials::utils::inspections::{
@@ -46,6 +50,7 @@ use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::rpc::register_rpc;
 
@@ -53,11 +58,16 @@ use super::rpc::register_rpc;
 
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
 const AMM_FACTORY_OPCODES: [u128; 14] = [0, 1, 2, 3, 4, 7, 10, 11, 12, 13, 14, 21, 29, 50];
+const KV_KEY_BEACON: &[u8] = b"/beacon";
 
 fn is_amm_factory_metadata(meta: &StoredInspectionMetadata) -> bool {
-    AMM_FACTORY_OPCODES
+    let has_opcodes = AMM_FACTORY_OPCODES
         .iter()
-        .all(|opcode| meta.methods.iter().any(|m| m.opcode == *opcode))
+        .all(|opcode| meta.methods.iter().any(|m| m.opcode == *opcode));
+    if has_opcodes {
+        return true;
+    }
+    meta.name.eq_ignore_ascii_case("ammfactory")
 }
 
 fn inspection_is_amm_factory(inspection: &StoredInspectionResult) -> bool {
@@ -77,6 +87,20 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
         return None;
     }
     Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
+}
+
+fn lookup_proxy_target(essentials: &EssentialsProvider, alkane: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
+    let lookup = |key: &[u8]| {
+        essentials
+            .get_alkane_storage_value(GetAlkaneStorageValueParams {
+                alkane,
+                key: key.to_vec(),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_kv_implementation(&raw))
+    };
+    lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON))
 }
 
 fn parse_hex_u32(s: &str) -> Option<u32> {
@@ -161,11 +185,16 @@ fn load_balance_txs_by_height(
 pub struct AmmData {
     provider: Option<Arc<AmmDataProvider>>,
     index_height: Arc<std::sync::RwLock<Option<u32>>>,
+    factories_bootstrapped: AtomicBool,
 }
 
 impl AmmData {
     pub fn new() -> Self {
-        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
+        Self {
+            provider: None,
+            index_height: Arc::new(std::sync::RwLock::new(None)),
+            factories_bootstrapped: AtomicBool::new(false),
+        }
     }
 
     #[inline]
@@ -226,6 +255,8 @@ impl EspoModule for AmmData {
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let t0 = std::time::Instant::now();
+        let debug = debug_enabled();
+        let module = self.get_name();
         let block_ts = block.block_header.time as u64;
         let height = block.height;
         println!("[AMMDATA] Indexing block #{height} for candles and activity...");
@@ -233,7 +264,18 @@ impl EspoModule for AmmData {
         let provider = self.provider();
         let essentials = provider.essentials();
         let table = provider.table();
+        let search_cfg = AmmDataConfig::load_from_global_config().ok();
+        let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
+        let mut search_prefix_min = search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
+        let mut search_prefix_max = search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+        if search_prefix_min == 0 {
+            search_prefix_min = 2;
+        }
+        if search_prefix_max < search_prefix_min {
+            search_prefix_max = search_prefix_min;
+        }
 
+        let timer = debug::start_if(debug);
         // ---- Load existing snapshot (single read) ----
         let mut reserves_snapshot: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> =
             if let Some(bytes) = provider
@@ -276,6 +318,51 @@ impl EspoModule for AmmData {
             .unwrap_or_default();
         let mut amm_factory_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
+        if amm_factories.is_empty()
+            && !self.factories_bootstrapped.swap(true, Ordering::Relaxed)
+        {
+            if let Ok(resp) = essentials.get_creation_records_ordered(GetCreationRecordsOrderedParams)
+            {
+                let records_len = resp.records.len();
+                let mut discovered = 0usize;
+                for rec in resp.records {
+                    if amm_factories.contains(&rec.alkane) {
+                        continue;
+                    }
+                    let mut is_factory = rec
+                        .inspection
+                        .as_ref()
+                        .map(inspection_is_amm_factory)
+                        .unwrap_or(false);
+                    if !is_factory {
+                        if let Some(proxy_target) = lookup_proxy_target(essentials, rec.alkane) {
+                            if let Ok(resp) = essentials
+                                .get_creation_record(GetCreationRecordParams { alkane: proxy_target })
+                            {
+                                if let Some(rec) = resp.record {
+                                    if let Some(inspection) = rec.inspection.as_ref() {
+                                        if inspection_is_amm_factory(inspection) {
+                                            is_factory = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if is_factory {
+                        amm_factories.insert(rec.alkane);
+                        amm_factory_writes.push((table.amm_factory_key(&rec.alkane), Vec::new()));
+                        discovered += 1;
+                    }
+                }
+                eprintln!(
+                    "[AMMDATA] factory bootstrap scanned {} creation records, discovered {} factories",
+                    records_len,
+                    discovered
+                );
+            }
+        }
+
         let mut created_alkanes: Vec<SchemaAlkaneId> = Vec::new();
         for tx in &block.transactions {
             if let Some(traces) = &tx.traces {
@@ -310,15 +397,7 @@ impl EspoModule for AmmData {
                 }
             }
             if !is_factory {
-                let impl_val = essentials
-                    .get_alkane_storage_value(GetAlkaneStorageValueParams {
-                        alkane: alk,
-                        key: KV_KEY_IMPLEMENTATION.to_vec(),
-                    })
-                    .ok()
-                    .and_then(|resp| resp.value)
-                    .and_then(|raw| decode_kv_implementation(&raw));
-                if let Some(proxy_target) = impl_val {
+                if let Some(proxy_target) = lookup_proxy_target(essentials, alk) {
                     if let Ok(resp) = essentials
                         .get_creation_record(GetCreationRecordParams { alkane: proxy_target })
                     {
@@ -338,6 +417,8 @@ impl EspoModule for AmmData {
             }
         }
 
+        debug::log_elapsed(module, "load_snapshot_and_factories", timer);
+        let timer = debug::start_if(debug);
         let mut candle_cache = CandleCache::new();
         let frames = active_timeframes();
         let mut activity_acc = ActivityWriteAcc::new();
@@ -406,6 +487,8 @@ impl EspoModule for AmmData {
             tx_meta.insert(txid, (spk_bytes, success));
         }
 
+        debug::log_elapsed(module, "init_accumulators", timer);
+        let timer = debug::start_if(debug);
         // Discover new pools (per-tx) and record pool creation activity.
         let mut seen_new_pools: HashSet<(u32, u64)> = HashSet::new();
         for transaction in block.transactions.iter() {
@@ -442,7 +525,9 @@ impl EspoModule for AmmData {
                 }
             }
 
-            if let Ok(new_pools) = extract_new_pools_from_espo_transaction(transaction) {
+            if let Ok(new_pools) =
+                extract_new_pools_from_espo_transaction(transaction, &block.host_function_values)
+            {
                 for NewPoolInfo { pool_id, defs, factory_id } in new_pools {
                     if !seen_new_pools.insert((pool_id.block, pool_id.tx)) {
                         continue;
@@ -802,7 +887,9 @@ impl EspoModule for AmmData {
             }
         }
 
+        debug::log_elapsed(module, "process_traces_activity", timer);
         // ---------- derived data (canonical pools + token USD candles + metrics) ----------
+        let timer = debug::start_if(debug);
         let btc_usd_price = if has_trades {
             match UniswapPriceFeed::from_global_config() {
                 Ok(feed) => Some(feed.get_bitcoin_price_usd_at_block_height(height as u64)),
@@ -834,6 +921,8 @@ impl EspoModule for AmmData {
             pool_candle_overrides.insert((pool, tf, bucket_ts), candle);
         }
 
+        debug::log_elapsed(module, "derive_pool_candles", timer);
+        let timer = debug::start_if(debug);
         let load_pool_candle = |pool: &SchemaAlkaneId,
                                 tf: Timeframe,
                                 bucket_ts: u64|
@@ -871,12 +960,19 @@ impl EspoModule for AmmData {
             }
         }
 
+        debug::log_elapsed(module, "derive_canonical_pools", timer);
+        let timer = debug::start_if(debug);
         let mut token_usd_candle_overrides: HashMap<
             (SchemaAlkaneId, Timeframe, u64),
             SchemaCandleV1,
         > = HashMap::new();
         let mut token_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_metrics_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_metrics_index_deletes: Vec<Vec<u8>> = Vec::new();
+        let mut token_metrics_index_new: u64 = 0;
+        let mut token_search_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_search_index_deletes: Vec<Vec<u8>> = Vec::new();
 
         if !canonical_trade_buckets.is_empty() {
             for (token, buckets) in canonical_trade_buckets.iter() {
@@ -1102,13 +1198,242 @@ impl EspoModule for AmmData {
                     change_all_time: percent_change(first_close, latest_close),
                 };
 
+                let metrics_key = table.token_metrics_key(token);
+                let prev_raw = provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
+                let prev_metrics = prev_raw
+                    .value
+                    .as_ref()
+                    .and_then(|raw| decode_token_metrics(raw).ok());
+                if prev_raw.value.is_none() {
+                    token_metrics_index_new = token_metrics_index_new.saturating_add(1);
+                }
+
+                let build_index_keys = |m: &SchemaTokenMetricsV1| -> Vec<(TokenMetricsIndexField, Vec<u8>)> {
+                    vec![
+                        (
+                            TokenMetricsIndexField::PriceUsd,
+                            table.token_metrics_index_key_u128(
+                                TokenMetricsIndexField::PriceUsd,
+                                m.price_usd,
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::MarketcapUsd,
+                            table.token_metrics_index_key_u128(
+                                TokenMetricsIndexField::MarketcapUsd,
+                                m.marketcap_usd,
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::Volume1d,
+                            table.token_metrics_index_key_u128(
+                                TokenMetricsIndexField::Volume1d,
+                                m.volume_1d,
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::Volume7d,
+                            table.token_metrics_index_key_u128(
+                                TokenMetricsIndexField::Volume7d,
+                                m.volume_7d,
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::Volume30d,
+                            table.token_metrics_index_key_u128(
+                                TokenMetricsIndexField::Volume30d,
+                                m.volume_30d,
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::VolumeAllTime,
+                            table.token_metrics_index_key_u128(
+                                TokenMetricsIndexField::VolumeAllTime,
+                                m.volume_all_time,
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::Change1d,
+                            table.token_metrics_index_key_i64(
+                                TokenMetricsIndexField::Change1d,
+                                parse_change_basis_points(&m.change_1d),
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::Change7d,
+                            table.token_metrics_index_key_i64(
+                                TokenMetricsIndexField::Change7d,
+                                parse_change_basis_points(&m.change_7d),
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::Change30d,
+                            table.token_metrics_index_key_i64(
+                                TokenMetricsIndexField::Change30d,
+                                parse_change_basis_points(&m.change_30d),
+                                token,
+                            ),
+                        ),
+                        (
+                            TokenMetricsIndexField::ChangeAllTime,
+                            table.token_metrics_index_key_i64(
+                                TokenMetricsIndexField::ChangeAllTime,
+                                parse_change_basis_points(&m.change_all_time),
+                                token,
+                            ),
+                        ),
+                    ]
+                };
+
+                let new_keys = build_index_keys(&metrics);
+                if let Some(prev) = prev_metrics.as_ref() {
+                    let prev_keys = build_index_keys(prev);
+                    for (idx, (_field, new_key)) in new_keys.iter().enumerate() {
+                        if let Some((_pf, prev_key)) = prev_keys.get(idx) {
+                            if prev_key != new_key {
+                                token_metrics_index_deletes.push(prev_key.clone());
+                                token_metrics_index_writes.push((new_key.clone(), Vec::new()));
+                            }
+                        }
+                    }
+                } else {
+                    for (_field, new_key) in new_keys.into_iter() {
+                        token_metrics_index_writes.push((new_key, Vec::new()));
+                    }
+                }
+
+                if search_index_enabled {
+                    let rec = essentials
+                        .get_creation_record(GetCreationRecordParams { alkane: *token })
+                        .ok()
+                        .and_then(|resp| resp.record);
+                    if let Some(rec) = rec {
+                        let prefixes = collect_search_prefixes(
+                            &rec.names,
+                            &rec.symbols,
+                            search_prefix_min,
+                            search_prefix_max,
+                        );
+                        if !prefixes.is_empty() {
+                            let new_marketcap = metrics.marketcap_usd;
+                            let new_volume_7d = metrics.volume_7d;
+                            let new_change_7d = parse_change_basis_points(&metrics.change_7d);
+                            let new_volume_all = metrics.volume_all_time;
+
+                            let prev_marketcap = prev_metrics.as_ref().map(|m| m.marketcap_usd);
+                            let prev_volume_7d = prev_metrics.as_ref().map(|m| m.volume_7d);
+                            let prev_change_7d =
+                                prev_metrics.as_ref().map(|m| parse_change_basis_points(&m.change_7d));
+                            let prev_volume_all = prev_metrics.as_ref().map(|m| m.volume_all_time);
+
+                            for prefix in prefixes {
+                                token_search_index_writes.push((
+                                    table.token_search_index_key_u128(
+                                        SearchIndexField::Marketcap,
+                                        &prefix,
+                                        new_marketcap,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+                                token_search_index_writes.push((
+                                    table.token_search_index_key_u128(
+                                        SearchIndexField::Volume7d,
+                                        &prefix,
+                                        new_volume_7d,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+                                token_search_index_writes.push((
+                                    table.token_search_index_key_i64(
+                                        SearchIndexField::Change7d,
+                                        &prefix,
+                                        new_change_7d,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+                                token_search_index_writes.push((
+                                    table.token_search_index_key_u128(
+                                        SearchIndexField::VolumeAllTime,
+                                        &prefix,
+                                        new_volume_all,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+
+                                if let Some(prev) = prev_marketcap {
+                                    if prev != new_marketcap {
+                                        token_search_index_deletes.push(
+                                            table.token_search_index_key_u128(
+                                                SearchIndexField::Marketcap,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if let Some(prev) = prev_volume_7d {
+                                    if prev != new_volume_7d {
+                                        token_search_index_deletes.push(
+                                            table.token_search_index_key_u128(
+                                                SearchIndexField::Volume7d,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if let Some(prev) = prev_change_7d {
+                                    if prev != new_change_7d {
+                                        token_search_index_deletes.push(
+                                            table.token_search_index_key_i64(
+                                                SearchIndexField::Change7d,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if let Some(prev) = prev_volume_all {
+                                    if prev != new_volume_all {
+                                        token_search_index_deletes.push(
+                                            table.token_search_index_key_u128(
+                                                SearchIndexField::VolumeAllTime,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 token_metrics_cache.insert(*token, metrics.clone());
                 let encoded = encode_token_metrics(&metrics)?;
-                token_metrics_writes.push((table.token_metrics_key(token), encoded));
+                token_metrics_writes.push((metrics_key, encoded));
             }
         }
 
+        debug::log_elapsed(module, "derive_token_metrics", timer);
         // ---------- pool metrics + TVL versioned + LP supply ----------
+        let timer = debug::start_if(debug);
         if !pools_touched.is_empty() {
             let mut token_price_usd_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
             let mut token_price_sats_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
@@ -1308,7 +1633,9 @@ impl EspoModule for AmmData {
             }
         }
 
+        debug::log_elapsed(module, "pool_metrics_tvl", timer);
         // ---------- one atomic DB write (candles + activity + indexes + reserves snapshot) ----------
+        let timer = debug::start_if(debug);
         let activity_writes = activity_acc.into_writes();
         let idx_delta = index_acc.clone().per_pool_delta();
         let idx_group_delta = index_acc.clone().per_pool_group_delta();
@@ -1353,12 +1680,33 @@ impl EspoModule for AmmData {
             ));
         }
 
+        if token_metrics_index_new > 0 {
+            let count_key = table.token_metrics_index_count_key();
+            let current = provider
+                .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+                .value
+                .and_then(|raw| {
+                    if raw.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&raw);
+                        Some(u64::from_le_bytes(arr))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            let updated = current.saturating_add(token_metrics_index_new);
+            token_metrics_index_writes.push((count_key, updated.to_le_bytes().to_vec()));
+        }
+
         let reserves_blob = encode_reserves_snapshot(&reserves_snapshot)?;
         let reserves_key_rel = table.reserves_snapshot_key();
 
         let c_cnt = candle_writes.len();
         let tc_cnt = token_usd_candle_writes.len();
         let tm_cnt = token_metrics_writes.len();
+        let tmi_cnt = token_metrics_index_writes.len();
+        let tsi_cnt = token_search_index_writes.len();
         let cp_cnt = canonical_pool_writes.len();
         let pn_cnt = pool_name_index_writes.len();
         let af_cnt = amm_factory_writes.len();
@@ -1383,11 +1731,13 @@ impl EspoModule for AmmData {
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
             tm_cnt = tm_cnt,
+            tmi_cnt = tmi_cnt,
+            tsi_cnt = tsi_cnt,
             cp_cnt = cp_cnt,
             pn_cnt = pn_cnt,
             af_cnt = af_cnt,
@@ -1410,9 +1760,15 @@ impl EspoModule for AmmData {
             i_cnt = i_cnt,
         );
 
+        debug::log_elapsed(module, "prepare_writes", timer);
+        let timer = debug::start_if(debug);
         if !candle_writes.is_empty()
             || !token_usd_candle_writes.is_empty()
             || !token_metrics_writes.is_empty()
+            || !token_metrics_index_writes.is_empty()
+            || !token_metrics_index_deletes.is_empty()
+            || !token_search_index_writes.is_empty()
+            || !token_search_index_deletes.is_empty()
             || !canonical_pool_writes.is_empty()
             || !pool_name_index_writes.is_empty()
             || !amm_factory_writes.is_empty()
@@ -1441,6 +1797,8 @@ impl EspoModule for AmmData {
             puts.extend(candle_writes);
             puts.extend(token_usd_candle_writes);
             puts.extend(token_metrics_writes);
+            puts.extend(token_metrics_index_writes);
+            puts.extend(token_search_index_writes);
             puts.extend(canonical_pool_writes);
             puts.extend(pool_name_index_writes);
             puts.extend(amm_factory_writes);
@@ -1465,9 +1823,13 @@ impl EspoModule for AmmData {
             puts.extend(index_writes);
             puts.push((reserves_key_rel, reserves_blob));
 
-            let _ = provider.set_batch(SetBatchParams { puts, deletes: Vec::new() });
+            let mut deletes: Vec<Vec<u8>> = Vec::new();
+            deletes.extend(token_metrics_index_deletes);
+            deletes.extend(token_search_index_deletes);
+            let _ = provider.set_batch(SetBatchParams { puts, deletes });
         }
 
+        debug::log_elapsed(module, "write_batch", timer);
         println!(
             "[AMMDATA] Finished processing block #{} with {} traces",
             block.height,

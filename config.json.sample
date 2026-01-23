@@ -18,8 +18,10 @@
   "network": "mainnet",
   "metashrew_db_label": null,
   "strict_mode": false,
+  "debug": false,
   "block_source_mode": "rpc",
   "simulate_reorg": false,
+  "debug_backup": null,
   "explorer_networks": {
     "mainnet": "https://explorer.example.com",
     "signet": "https://signet.example.com",

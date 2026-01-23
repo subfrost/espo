@@ -147,6 +147,50 @@ impl ExplorerNetworks {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DebugBackupConfig {
+    pub blocks: Vec<u32>,
+    pub dir: String,
+}
+
+impl<'de> Deserialize<'de> for DebugBackupConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawDebugBackupConfig {
+            pub dir: String,
+            #[serde(default)]
+            pub block: Option<u32>,
+            #[serde(default)]
+            pub blocks: Option<Vec<u32>>,
+        }
+
+        let raw = RawDebugBackupConfig::deserialize(deserializer)?;
+        let dir = raw.dir.trim().to_string();
+        if dir.is_empty() {
+            return Err(serde::de::Error::custom(
+                "debug_backup.dir must be a non-empty string when provided",
+            ));
+        }
+
+        let mut blocks = raw.blocks.unwrap_or_default();
+        if let Some(block) = raw.block {
+            blocks.push(block);
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        if blocks.is_empty() {
+            return Err(serde::de::Error::custom(
+                "debug_backup requires 'blocks' (array) or 'block' (number)",
+            ));
+        }
+
+        Ok(DebugBackupConfig { blocks, dir })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigFile {
     pub readonly_metashrew_db_dir: String,
@@ -184,6 +228,12 @@ pub struct ConfigFile {
     pub metashrew_db_label: Option<String>,
     #[serde(default)]
     pub strict_mode: bool,
+    #[serde(default)]
+    pub debug: bool,
+    #[serde(default)]
+    pub debug_ignore_ms: u64,
+    #[serde(default)]
+    pub debug_backup: Option<DebugBackupConfig>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
     #[serde(default)]
@@ -216,6 +266,9 @@ pub struct AppConfig {
     pub network: Network,
     pub metashrew_db_label: Option<String>,
     pub strict_mode: bool,
+    pub debug: bool,
+    pub debug_ignore_ms: u64,
+    pub debug_backup: Option<DebugBackupConfig>,
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
@@ -247,6 +300,7 @@ impl AppConfig {
             .map_err(|e| anyhow::anyhow!(e))?;
         let explorer_base_path = normalize_explorer_base_path(&file.explorer_base_path)?;
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
+        let debug_backup = file.debug_backup;
 
         Ok(Self {
             readonly_metashrew_db_dir: file.readonly_metashrew_db_dir,
@@ -269,6 +323,9 @@ impl AppConfig {
             network,
             metashrew_db_label: normalize_optional_string(file.metashrew_db_label),
             strict_mode: file.strict_mode,
+            debug: file.debug,
+            debug_ignore_ms: file.debug_ignore_ms,
+            debug_backup,
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
             explorer_networks,
@@ -532,6 +589,14 @@ pub fn get_network() -> Network {
 
 pub fn is_strict_mode() -> bool {
     get_config().strict_mode
+}
+
+pub fn debug_enabled() -> bool {
+    CONFIG.get().map(|cfg| cfg.debug).unwrap_or(false)
+}
+
+pub fn debug_ignore_ms() -> u64 {
+    CONFIG.get().map(|cfg| cfg.debug_ignore_ms).unwrap_or(0)
 }
 
 pub fn get_metashrew() -> MetashrewAdapter {

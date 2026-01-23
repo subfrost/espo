@@ -599,6 +599,7 @@ impl EssentialsProvider {
     }
 
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+        crate::debug_timer_log!("get_index_height");
         let table = self.table();
         let Some(bytes) = table.INDEX_HEIGHT.get()? else {
             return Ok(GetIndexHeightResult { height: None });
@@ -612,6 +613,7 @@ impl EssentialsProvider {
     }
 
     pub fn set_index_height(&self, params: SetIndexHeightParams) -> Result<()> {
+        crate::debug_timer_log!("set_index_height");
         let table = self.table();
         table
             .INDEX_HEIGHT
@@ -623,6 +625,7 @@ impl EssentialsProvider {
         &self,
         params: GetCreationRecordParams,
     ) -> Result<GetCreationRecordResult> {
+        crate::debug_timer_log!("get_creation_record");
         let table = self.table();
         let key = table.alkane_creation_by_id_key(&params.alkane);
         let Some(bytes) = self.mdb.get(&key).map_err(|e| anyhow!("mdb.get failed: {e}"))? else {
@@ -636,6 +639,7 @@ impl EssentialsProvider {
         &self,
         params: GetCreationRecordsByIdParams,
     ) -> Result<GetCreationRecordsByIdResult> {
+        crate::debug_timer_log!("get_creation_records_by_id");
         let table = self.table();
         let keys: Vec<Vec<u8>> =
             params.alkanes.iter().map(|alk| table.alkane_creation_by_id_key(alk)).collect();
@@ -656,6 +660,7 @@ impl EssentialsProvider {
         &self,
         _params: GetCreationRecordsOrderedParams,
     ) -> Result<GetCreationRecordsOrderedResult> {
+        crate::debug_timer_log!("get_creation_records_ordered");
         let table = self.table();
         let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams {
             prefix: table.alkane_creation_ordered_prefix(),
@@ -672,10 +677,59 @@ impl EssentialsProvider {
         Ok(GetCreationRecordsOrderedResult { records })
     }
 
+    pub fn get_creation_records_ordered_page(
+        &self,
+        params: GetCreationRecordsOrderedPageParams,
+    ) -> Result<GetCreationRecordsOrderedPageResult> {
+        crate::debug_timer_log!("get_creation_records_ordered_page");
+        let table = self.table();
+        let prefix = table.alkane_creation_ordered_prefix();
+        let mut records = Vec::new();
+        let mut skipped: u64 = 0;
+
+        if params.desc {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_prefix_rev(&full_prefix) {
+                let (_k_full, v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                if let Ok(rec) = decode_creation_record(&v) {
+                    records.push(rec);
+                    if records.len() >= params.limit as usize {
+                        break;
+                    }
+                }
+            }
+        } else {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_from(&prefix) {
+                let (k_full, v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
+                if !k_full.starts_with(&full_prefix) {
+                    break;
+                }
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                if let Ok(rec) = decode_creation_record(&v) {
+                    records.push(rec);
+                    if records.len() >= params.limit as usize {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(GetCreationRecordsOrderedPageResult { records })
+    }
+
     pub fn get_alkane_ids_by_name_prefix(
         &self,
         params: GetAlkaneIdsByNamePrefixParams,
     ) -> Result<GetAlkaneIdsByNamePrefixResult> {
+        crate::debug_timer_log!("get_alkane_ids_by_name_prefix");
         let table = self.table();
         let keys = match self.get_scan_prefix(GetScanPrefixParams {
             prefix: table.alkane_name_index_prefix(&params.prefix),
@@ -695,10 +749,46 @@ impl EssentialsProvider {
         Ok(GetAlkaneIdsByNamePrefixResult { ids })
     }
 
+    pub fn get_alkane_ids_by_name_prefix_page(
+        &self,
+        params: GetAlkaneIdsByNamePrefixPageParams,
+    ) -> Result<GetAlkaneIdsByNamePrefixResult> {
+        crate::debug_timer_log!("get_alkane_ids_by_name_prefix_page");
+        let table = self.table();
+        let prefix = table.alkane_name_index_prefix(&params.prefix);
+        let full_prefix = self.mdb.prefixed(&prefix);
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unique_skipped: u64 = 0;
+
+        for res in self.mdb.iter_from(&prefix) {
+            let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
+            if !k_full.starts_with(&full_prefix) {
+                break;
+            }
+            let rel = &k_full[self.mdb.prefix().len()..];
+            if let Some((_name, id)) = table.parse_alkane_name_index_key(rel) {
+                if seen.insert(id) {
+                    if unique_skipped < params.offset {
+                        unique_skipped += 1;
+                        continue;
+                    }
+                    ids.push(id);
+                    if ids.len() >= params.limit as usize {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(GetAlkaneIdsByNamePrefixResult { ids })
+    }
+
     pub fn get_alkane_ids_by_symbol_prefix(
         &self,
         params: GetAlkaneIdsBySymbolPrefixParams,
     ) -> Result<GetAlkaneIdsBySymbolPrefixResult> {
+        crate::debug_timer_log!("get_alkane_ids_by_symbol_prefix");
         let table = self.table();
         let keys = match self.get_scan_prefix(GetScanPrefixParams {
             prefix: table.alkane_symbol_index_prefix(&params.prefix),
@@ -718,10 +808,46 @@ impl EssentialsProvider {
         Ok(GetAlkaneIdsBySymbolPrefixResult { ids })
     }
 
+    pub fn get_alkane_ids_by_symbol_prefix_page(
+        &self,
+        params: GetAlkaneIdsBySymbolPrefixPageParams,
+    ) -> Result<GetAlkaneIdsBySymbolPrefixResult> {
+        crate::debug_timer_log!("get_alkane_ids_by_symbol_prefix_page");
+        let table = self.table();
+        let prefix = table.alkane_symbol_index_prefix(&params.prefix);
+        let full_prefix = self.mdb.prefixed(&prefix);
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        let mut unique_skipped: u64 = 0;
+
+        for res in self.mdb.iter_from(&prefix) {
+            let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
+            if !k_full.starts_with(&full_prefix) {
+                break;
+            }
+            let rel = &k_full[self.mdb.prefix().len()..];
+            if let Some((_symbol, id)) = table.parse_alkane_symbol_index_key(rel) {
+                if seen.insert(id) {
+                    if unique_skipped < params.offset {
+                        unique_skipped += 1;
+                        continue;
+                    }
+                    ids.push(id);
+                    if ids.len() >= params.limit as usize {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(GetAlkaneIdsBySymbolPrefixResult { ids })
+    }
+
     pub fn get_creation_count(
         &self,
         _params: GetCreationCountParams,
     ) -> Result<GetCreationCountResult> {
+        crate::debug_timer_log!("get_creation_count");
         let table = self.table();
         let count = table
             .ALKANE_CREATION_COUNT
@@ -743,6 +869,7 @@ impl EssentialsProvider {
         &self,
         params: GetHoldersCountParams,
     ) -> Result<GetHoldersCountResult> {
+        crate::debug_timer_log!("get_holders_count");
         let table = self.table();
         let count = self
             .get_raw_value(GetRawValueParams {
@@ -756,10 +883,84 @@ impl EssentialsProvider {
         Ok(GetHoldersCountResult { count })
     }
 
+    pub fn get_holders_counts_by_id(
+        &self,
+        params: GetHoldersCountsByIdParams,
+    ) -> Result<GetHoldersCountsByIdResult> {
+        crate::debug_timer_log!("get_holders_counts_by_id");
+        let table = self.table();
+        let keys: Vec<Vec<u8>> =
+            params.alkanes.iter().map(|alk| table.holders_count_key(alk)).collect();
+        let values =
+            self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let mut counts = Vec::with_capacity(values.len());
+        for val in values {
+            let count = val
+                .and_then(|raw| HoldersCountEntry::try_from_slice(&raw).ok())
+                .map(|entry| entry.count)
+                .unwrap_or(0);
+            counts.push(count);
+        }
+        Ok(GetHoldersCountsByIdResult { counts })
+    }
+
+    pub fn get_holders_ordered_page(
+        &self,
+        params: GetHoldersOrderedPageParams,
+    ) -> Result<GetHoldersOrderedPageResult> {
+        crate::debug_timer_log!("get_holders_ordered_page");
+        let table = self.table();
+        let prefix = table.alkane_holders_ordered_prefix();
+        let mut ids = Vec::new();
+        let mut skipped: u64 = 0;
+
+        if params.desc {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_prefix_rev(&full_prefix) {
+                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
+                let rel = &k_full[self.mdb.prefix().len()..];
+                let Some((_count, id)) = table.parse_alkane_holders_ordered_key(rel) else {
+                    continue;
+                };
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                ids.push(id);
+                if ids.len() >= params.limit as usize {
+                    break;
+                }
+            }
+        } else {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_from(&prefix) {
+                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
+                if !k_full.starts_with(&full_prefix) {
+                    break;
+                }
+                let rel = &k_full[self.mdb.prefix().len()..];
+                let Some((_count, id)) = table.parse_alkane_holders_ordered_key(rel) else {
+                    continue;
+                };
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                ids.push(id);
+                if ids.len() >= params.limit as usize {
+                    break;
+                }
+            }
+        }
+
+        Ok(GetHoldersOrderedPageResult { ids })
+    }
+
     pub fn get_latest_circulating_supply(
         &self,
         params: GetLatestCirculatingSupplyParams,
     ) -> Result<GetLatestCirculatingSupplyResult> {
+        crate::debug_timer_log!("get_latest_circulating_supply");
         let table = self.table();
         let supply = self
             .get_raw_value(GetRawValueParams {
@@ -776,6 +977,7 @@ impl EssentialsProvider {
         &self,
         params: GetLatestTotalMintedParams,
     ) -> Result<GetLatestTotalMintedResult> {
+        crate::debug_timer_log!("get_latest_total_minted");
         let table = self.table();
         let total_minted = self
             .get_raw_value(GetRawValueParams {
@@ -792,6 +994,7 @@ impl EssentialsProvider {
         &self,
         params: GetAlkaneStorageValueParams,
     ) -> Result<GetAlkaneStorageValueResult> {
+        crate::debug_timer_log!("get_alkane_storage_value");
         let table = self.table();
         let key = table.kv_row_key(&params.alkane, &params.key);
         let value = self
@@ -805,6 +1008,7 @@ impl EssentialsProvider {
         &self,
         params: GetBlockSummaryParams,
     ) -> Result<GetBlockSummaryResult> {
+        crate::debug_timer_log!("get_block_summary");
         let table = self.table();
         let key = table.block_summary_key(params.height);
         let summary = self
@@ -819,6 +1023,7 @@ impl EssentialsProvider {
         &self,
         params: GetMempoolSeenPageParams,
     ) -> Result<GetMempoolSeenPageResult> {
+        crate::debug_timer_log!("get_mempool_seen_page");
         let mdb = get_mempool_mdb();
         let pref = mdb.prefixed(b"seen/");
         let it = mdb.iter_prefix_rev(&pref);
@@ -855,6 +1060,7 @@ impl EssentialsProvider {
         &self,
         params: GetMempoolEntryParams,
     ) -> Result<GetMempoolEntryResult> {
+        crate::debug_timer_log!("get_mempool_entry");
         Ok(GetMempoolEntryResult { entry: get_tx_from_mempool(&params.txid) })
     }
 
@@ -862,6 +1068,7 @@ impl EssentialsProvider {
         &self,
         params: GetMempoolPendingForAddressParams,
     ) -> Result<GetMempoolPendingForAddressResult> {
+        crate::debug_timer_log!("get_mempool_pending_for_address");
         Ok(GetMempoolPendingForAddressResult {
             entries: pending_for_address(&params.address),
         })
@@ -2237,6 +2444,16 @@ pub struct GetCreationRecordsOrderedResult {
     pub records: Vec<AlkaneCreationRecord>,
 }
 
+pub struct GetCreationRecordsOrderedPageParams {
+    pub offset: u64,
+    pub limit: u64,
+    pub desc: bool,
+}
+
+pub struct GetCreationRecordsOrderedPageResult {
+    pub records: Vec<AlkaneCreationRecord>,
+}
+
 pub struct GetAlkaneIdsByNamePrefixParams {
     pub prefix: String,
 }
@@ -2245,12 +2462,24 @@ pub struct GetAlkaneIdsByNamePrefixResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
 
+pub struct GetAlkaneIdsByNamePrefixPageParams {
+    pub prefix: String,
+    pub offset: u64,
+    pub limit: u64,
+}
+
 pub struct GetAlkaneIdsBySymbolPrefixParams {
     pub prefix: String,
 }
 
 pub struct GetAlkaneIdsBySymbolPrefixResult {
     pub ids: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetAlkaneIdsBySymbolPrefixPageParams {
+    pub prefix: String,
+    pub offset: u64,
+    pub limit: u64,
 }
 
 pub struct GetCreationCountParams;
@@ -2265,6 +2494,24 @@ pub struct GetHoldersCountParams {
 
 pub struct GetHoldersCountResult {
     pub count: u64,
+}
+
+pub struct GetHoldersCountsByIdParams {
+    pub alkanes: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetHoldersCountsByIdResult {
+    pub counts: Vec<u64>,
+}
+
+pub struct GetHoldersOrderedPageParams {
+    pub offset: u64,
+    pub limit: u64,
+    pub desc: bool,
+}
+
+pub struct GetHoldersOrderedPageResult {
+    pub ids: Vec<SchemaAlkaneId>,
 }
 
 pub struct GetLatestCirculatingSupplyParams {
@@ -2595,6 +2842,7 @@ pub fn cache_block_summary(height: u32, summary: BlockSummary) {
 }
 
 pub fn get_cached_block_summary(height: u32) -> Option<BlockSummary> {
+    crate::debug_timer_log!("get_cached_block_summary");
     block_summary_cache()
         .read()
         .ok()
@@ -2816,12 +3064,14 @@ pub fn load_creation_record(
 }
 
 pub fn get_holders_count_encoded(count: u64) -> Result<Vec<u8>> {
+    crate::debug_timer_log!("get_holders_count_encoded");
     let count_value = HoldersCountEntry { count };
 
     Ok(borsh::to_vec(&count_value)?)
 }
 
 pub fn get_holders_values_encoded(holders: Vec<HolderEntry>) -> Result<(Vec<u8>, Vec<u8>)> {
+    crate::debug_timer_log!("get_holders_values_encoded");
     Ok((encode_vec(&holders)?, get_holders_count_encoded(holders.len().try_into()?)?))
 }
 

@@ -1,5 +1,6 @@
-use crate::alkanes::trace::EspoBlock;
-use crate::config::{get_metashrew, get_network};
+use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
+use crate::config::{debug_enabled, get_metashrew, get_network};
+use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::consts::{
     ESSENTIALS_GENESIS_INSPECTIONS, essentials_genesis_block,
@@ -25,6 +26,40 @@ use std::sync::Arc;
 
 // ✅ bring in balances bulk updater
 use crate::modules::essentials::utils::balances::bulk_update_balances_for_block;
+
+fn parse_short_id(
+    id: &crate::alkanes::trace::EspoSandshrewLikeTraceShortId,
+) -> Option<SchemaAlkaneId> {
+    fn parse_u32_or_hex(s: &str) -> Option<u32> {
+        if let Some(hex) = s.strip_prefix("0x") {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        s.parse::<u32>().ok()
+    }
+    fn parse_u64_or_hex(s: &str) -> Option<u64> {
+        if let Some(hex) = s.strip_prefix("0x") {
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        s.parse::<u64>().ok()
+    }
+
+    let block = parse_u32_or_hex(&id.block)?;
+    let tx = parse_u64_or_hex(&id.tx)?;
+    Some(SchemaAlkaneId { block, tx })
+}
+
+fn decode_u128_le_bytes(bytes: &[u8]) -> Option<u128> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    if bytes.len() >= 16 {
+        buf.copy_from_slice(&bytes[..16]);
+    } else {
+        buf[..bytes.len()].copy_from_slice(bytes);
+    }
+    Some(u128::from_le_bytes(buf))
+}
 
 pub struct Essentials {
     provider: Option<Arc<EssentialsProvider>>,
@@ -102,6 +137,8 @@ impl EspoModule for Essentials {
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let t0 = std::time::Instant::now();
+        let debug = debug_enabled();
+        let module = self.get_name();
         let provider = self.provider();
         let table = provider.table();
 
@@ -110,6 +147,7 @@ impl EspoModule for Essentials {
         //   kv_row_key(alk,skey) -> [ txid(32) | value(...) ]
         use std::collections::{HashMap, HashSet};
 
+        let timer = debug::start_if(debug);
         let mut kv_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         // dedup directory markers:
         //   dir_row_key(alk,skey) -> ()
@@ -120,6 +158,8 @@ impl EspoModule for Essentials {
         let mut holders_index_rows: HashSet<Vec<u8>> = HashSet::new();
         // in-block name/symbol updates detected from storage writes
         let mut meta_updates: HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)> = HashMap::new();
+        let mut cap_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+        let mut mint_updates: HashMap<SchemaAlkaneId, u128> = HashMap::new();
         let mut name_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let mut symbol_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let add_name_index =
@@ -148,65 +188,82 @@ impl EspoModule for Essentials {
         let mut total_pairs_dedup = 0usize;
 
         for tx in block.transactions.iter() {
-            // Access traces without cloning big structures if possible
-            let storage_changes_iter = tx
-                .traces
-                .as_ref()
-                .map(|traces| traces.iter())
-                .into_iter()
-                .flatten()
-                .flat_map(|trace| trace.storage_changes.iter());
-
-            for (alk, kvs) in storage_changes_iter {
-                for (skey, (txid, value)) in kvs.iter() {
-                    // Key for value row
-                    let k_v = table.kv_row_key(alk, skey);
-
-                    // Value layout: [ txid(32) | value(...) ]
-                    let mut buf = Vec::with_capacity(32 + value.len());
-                    buf.extend_from_slice(&txid.to_byte_array());
-                    buf.extend_from_slice(value);
-
-                    // last-write-wins for this key within the block
-                    kv_rows.insert(k_v, buf);
-
-                    // Dir entry is idempotent; one per (alk, skey) is enough
-                    let k_dir = table.dir_row_key(alk, skey);
-                    dir_rows.insert(k_dir);
-
-                    // Track name/symbol updates for the alkane (append if new)
-                    let push_if_new =
-                        |map: &mut HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)>,
-                         alk: SchemaAlkaneId,
-                         name: Option<String>,
-                         symbol: Option<String>| {
-                            let entry = map.entry(alk).or_default();
-                            if let Some(n) = name {
-                                if !entry.0.iter().any(|v| v == &n) {
-                                    entry.0.push(n);
-                                }
-                            }
-                            if let Some(s) = symbol {
-                                if !entry.1.iter().any(|v| v == &s) {
-                                    entry.1.push(s);
-                                }
-                            }
-                        };
-                    if skey.as_slice() == b"/name" {
-                        if let Ok(name) = String::from_utf8(value.clone()) {
-                            push_if_new(&mut meta_updates, *alk, Some(name), None);
-                        }
-                    } else if skey.as_slice() == b"/symbol" {
-                        if let Ok(symbol) = String::from_utf8(value.clone()) {
-                            push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+            let Some(traces) = tx.traces.as_ref() else { continue };
+            for trace in traces.iter() {
+                let mut created_in_trace: HashSet<SchemaAlkaneId> = HashSet::new();
+                for ev in trace.sandshrew_trace.events.iter() {
+                    if let EspoSandshrewLikeTraceEvent::Create(create) = ev {
+                        if let Some(id) = parse_short_id(create) {
+                            created_in_trace.insert(id);
                         }
                     }
+                }
 
-                    total_pairs_dedup += 1;
+                for (alk, kvs) in trace.storage_changes.iter() {
+                    for (skey, (txid, value)) in kvs.iter() {
+                        // Key for value row
+                        let k_v = table.kv_row_key(alk, skey);
+
+                        // Value layout: [ txid(32) | value(...) ]
+                        let mut buf = Vec::with_capacity(32 + value.len());
+                        buf.extend_from_slice(&txid.to_byte_array());
+                        buf.extend_from_slice(value);
+
+                        // last-write-wins for this key within the block
+                        kv_rows.insert(k_v, buf);
+
+                        // Dir entry is idempotent; one per (alk, skey) is enough
+                        let k_dir = table.dir_row_key(alk, skey);
+                        dir_rows.insert(k_dir);
+
+                        // Track name/symbol updates for the alkane (append if new)
+                        let push_if_new =
+                            |map: &mut HashMap<SchemaAlkaneId, (Vec<String>, Vec<String>)>,
+                             alk: SchemaAlkaneId,
+                             name: Option<String>,
+                             symbol: Option<String>| {
+                                let entry = map.entry(alk).or_default();
+                                if let Some(n) = name {
+                                    if !entry.0.iter().any(|v| v == &n) {
+                                        entry.0.push(n);
+                                    }
+                                }
+                                if let Some(s) = symbol {
+                                    if !entry.1.iter().any(|v| v == &s) {
+                                        entry.1.push(s);
+                                    }
+                                }
+                            };
+                        if skey.as_slice() == b"/name" {
+                            if let Ok(name) = String::from_utf8(value.clone()) {
+                                push_if_new(&mut meta_updates, *alk, Some(name), None);
+                            }
+                        } else if skey.as_slice() == b"/symbol" {
+                            if let Ok(symbol) = String::from_utf8(value.clone()) {
+                                push_if_new(&mut meta_updates, *alk, None, Some(symbol));
+                            }
+                        } else if created_in_trace.contains(alk) {
+                            if skey.as_slice() == b"/cap" {
+                                if let Some(cap) = decode_u128_le_bytes(value) {
+                                    cap_updates.insert(*alk, cap);
+                                }
+                            } else if skey.as_slice() == b"/value-per-mint"
+                                || skey.as_slice() == b"/value_per_mint"
+                            {
+                                if let Some(mint_amount) = decode_u128_le_bytes(value) {
+                                    mint_updates.insert(*alk, mint_amount);
+                                }
+                            }
+                        }
+
+                        total_pairs_dedup += 1;
+                    }
                 }
             }
         }
 
+        debug::log_elapsed(module, "collect_storage_changes", timer);
+        let timer = debug::start_if(debug);
         let mut created_records = created_alkane_records_from_block(&block);
         // Special case: ensure genesis alkanes are inspected on the genesis block even if no trace emits a create.
         let genesis_height = essentials_genesis_block(get_network());
@@ -265,6 +322,17 @@ impl EspoModule for Essentials {
             }
         }
 
+        for rec in created_records.iter_mut() {
+            if let Some(cap) = cap_updates.get(&rec.alkane) {
+                rec.cap = *cap;
+            }
+            if let Some(mint_amount) = mint_updates.get(&rec.alkane) {
+                rec.mint_amount = *mint_amount;
+            }
+        }
+
+        debug::log_elapsed(module, "build_creation_records", timer);
+        let timer = debug::start_if(debug);
         let metashrew = get_metashrew();
         for rec in created_records.iter_mut() {
             match metashrew.get_alkane_wasm_bytes(&rec.alkane) {
@@ -305,12 +373,12 @@ impl EspoModule for Essentials {
         }
 
         for rec in created_records.iter_mut() {
-            if rec.cap == 0 {
+            if rec.cap == 0 && !cap_updates.contains_key(&rec.alkane) {
                 if let Some(cap) = get_cap(block.height, &rec.alkane, rec.inspection.as_ref()) {
                     rec.cap = cap;
                 }
             }
-            if rec.mint_amount == 0 {
+            if rec.mint_amount == 0 && !mint_updates.contains_key(&rec.alkane) {
                 if let Some(mint_amount) =
                     get_value_per_mint(block.height, &rec.alkane, rec.inspection.as_ref())
                 {
@@ -319,6 +387,8 @@ impl EspoModule for Essentials {
             }
         }
 
+        debug::log_elapsed(module, "inspect_and_enrich", timer);
+        let timer = debug::start_if(debug);
         for rec in created_records.iter() {
             for name in rec.names.iter() {
                 add_name_index(&mut name_index_rows, &rec.alkane, name);
@@ -328,7 +398,9 @@ impl EspoModule for Essentials {
             }
         }
 
+        debug::log_elapsed(module, "build_creation_indexes", timer);
         // Dedup against existing records to avoid double-counting if re-run.
+        let timer = debug::start_if(debug);
         let mut new_creations_added: u64 = 0;
         if !created_records.is_empty() {
             let alkanes: Vec<SchemaAlkaneId> = created_records.iter().map(|r| r.alkane).collect();
@@ -489,7 +561,9 @@ impl EspoModule for Essentials {
             creation_rows_ordered.insert(key_ord, encoded);
         }
 
+        debug::log_elapsed(module, "dedup_and_update_creations", timer);
         // -------- Phase B: write in sorted key order (better LSM locality) --------
+        let timer = debug::start_if(debug);
         let mut kv_keys: Vec<Vec<u8>> = kv_rows.keys().cloned().collect();
         kv_keys.sort_unstable();
         let mut dir_keys: Vec<Vec<u8>> = dir_rows.into_iter().collect();
@@ -551,6 +625,8 @@ impl EspoModule for Essentials {
             puts.push((table.alkane_creation_count_key(), count_bytes.to_vec()));
         }
 
+        debug::log_elapsed(module, "prepare_batch", timer);
+        let timer = debug::start_if(debug);
         if let Err(e) = provider.set_batch(crate::modules::essentials::storage::SetBatchParams {
             puts,
             deletes: Vec::new(),
@@ -560,7 +636,9 @@ impl EspoModule for Essentials {
         }
         cache_block_summary(block.height, block_summary);
 
+        debug::log_elapsed(module, "write_batch", timer);
         // ✅ also update alkane balances/holders for this block
+        let timer = debug::start_if(debug);
         if let Err(e) = bulk_update_balances_for_block(provider, &block) {
             eprintln!(
                 "[ESSENTIALS] bulk_update_balances_for_block failed at block #{}: {e}",
@@ -568,6 +646,7 @@ impl EspoModule for Essentials {
             );
             return Err(e);
         }
+        debug::log_elapsed(module, "update_balances", timer);
 
         let new_alkanes_saved = creation_rows_by_id.len();
         eprintln!(

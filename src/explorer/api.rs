@@ -7,8 +7,10 @@ use crate::config::{get_espo_next_height, get_metashrew_rpc_url, get_network};
 use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::paths::explorer_path;
+use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::storage::{AmmDataProvider, GetTokenSearchIndexPageParams, SearchIndexField};
 use crate::modules::essentials::storage::{
-    EssentialsTable, HoldersCountEntry, get_cached_block_summary, load_creation_record,
+    EssentialsProvider, EssentialsTable, HoldersCountEntry, get_cached_block_summary, load_creation_record,
     BlockSummary,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
@@ -37,6 +39,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct CarouselQuery {
@@ -94,8 +97,8 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
     let start = center.saturating_sub(radius);
     let end = (center + radius).min(espo_tip);
 
-    let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
-    let table = EssentialsTable::new(&essentials_mdb);
+    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut blocks: Vec<CarouselBlock> = Vec::with_capacity((end - start + 1) as usize);
 
     for h in start..=end {
@@ -128,8 +131,8 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         return Json(SearchGuessResponse { query, groups: Vec::new() });
     }
 
-    let essentials_mdb = Mdb::from_db(crate::config::get_espo_db(), b"essentials:");
-    let table = EssentialsTable::new(&essentials_mdb);
+    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
     let mut seen_alkanes: HashSet<SchemaAlkaneId> = HashSet::new();
     let mut blocks: Vec<SearchGuessItem> = Vec::new();
@@ -141,6 +144,18 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     let mut alkanes: Vec<RankedAlkaneItem> = Vec::new();
     let mut txid: Vec<SearchGuessItem> = Vec::new();
     let mut addresses: Vec<SearchGuessItem> = Vec::new();
+    let search_cfg = AmmDataConfig::load_from_global_config().ok();
+    let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
+    let mut search_prefix_min =
+        search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
+    let mut search_prefix_max =
+        search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+    if search_prefix_min == 0 {
+        search_prefix_min = 2;
+    }
+    if search_prefix_max < search_prefix_min {
+        search_prefix_max = search_prefix_min;
+    }
 
     fn holders_for(table: &EssentialsTable<'_>, essentials_mdb: &Mdb, alk: &SchemaAlkaneId) -> u64 {
         essentials_mdb
@@ -225,38 +240,80 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
 
     if let Some(query_norm) = normalize_alkane_name(&query) {
         let mut matches = 0usize;
-        let prefix_full = essentials_mdb.prefixed(&table.alkane_holders_ordered_prefix());
-        let it = essentials_mdb.iter_prefix_rev(&prefix_full);
-        for res in it {
-            let Ok((k, _)) = res else { continue };
-            let rel = &k[essentials_mdb.prefix().len()..];
-            let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
-            let Some(rec) = load_creation_record(&essentials_mdb, &alk).ok().flatten() else {
-                continue;
-            };
-            let matches_name = rec
-                .names
-                .iter()
-                .filter_map(|name| normalize_alkane_name(name))
-                .any(|name| name.starts_with(&query_norm));
-            if !matches_name {
-                continue;
+        let query_len = query_norm.chars().count();
+        let mut used_search_index = false;
+
+        if search_index_enabled
+            && query_len >= search_prefix_min
+            && query_len <= search_prefix_max
+        {
+            let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+            let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb.clone()));
+            let ammdata_provider = AmmDataProvider::new(ammdata_mdb, essentials_provider);
+            let ids = ammdata_provider
+                .get_token_search_index_page(GetTokenSearchIndexPageParams {
+                    field: SearchIndexField::Holders,
+                    prefix: query_norm.clone(),
+                    offset: 0,
+                    limit: 5,
+                    desc: true,
+                })
+                .map(|res| res.ids)
+                .unwrap_or_default();
+            for alk in ids {
+                if push_alkane_item(
+                    &table,
+                    &mut seen_alkanes,
+                    &mut alkanes,
+                    &mut meta_cache,
+                    &essentials_mdb,
+                    &alk,
+                    None,
+                ) {
+                    matches += 1;
+                    if matches >= 5 {
+                        break;
+                    }
+                }
             }
-            if push_alkane_item(
-                &table,
-                &mut seen_alkanes,
-                &mut alkanes,
-                &mut meta_cache,
-                &essentials_mdb,
-                &alk,
-                Some(holders),
-            ) {
-                matches += 1;
-                if matches >= 5 {
-                    break;
+            used_search_index = true;
+        }
+
+        if !used_search_index {
+            let prefix_full = essentials_mdb.prefixed(&table.alkane_holders_ordered_prefix());
+            let it = essentials_mdb.iter_prefix_rev(&prefix_full);
+            for res in it {
+                let Ok((k, _)) = res else { continue };
+                let rel = &k[essentials_mdb.prefix().len()..];
+                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
+                let Some(rec) = load_creation_record(&essentials_mdb, &alk).ok().flatten() else {
+                    continue;
+                };
+                let matches_name = rec
+                    .names
+                    .iter()
+                    .filter_map(|name| normalize_alkane_name(name))
+                    .any(|name| name.starts_with(&query_norm));
+                if !matches_name {
+                    continue;
+                }
+                if push_alkane_item(
+                    &table,
+                    &mut seen_alkanes,
+                    &mut alkanes,
+                    &mut meta_cache,
+                    &essentials_mdb,
+                    &alk,
+                    Some(holders),
+                ) {
+                    matches += 1;
+                    if matches >= 5 {
+                        break;
+                    }
                 }
             }
         }
+
         if matches < 5 {
             let prefix = table.alkane_name_index_prefix(&query_norm);
             for res in essentials_mdb.iter_from(&prefix) {

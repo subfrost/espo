@@ -8,8 +8,10 @@ use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeData,
     EspoSandshrewLikeTraceStatus, EspoSandshrewLikeTraceTransfer,
 };
-use crate::config::{get_electrum_like, get_network};
+use crate::config::{debug_enabled, get_electrum_like, get_network};
+use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use crate::modules::essentials::utils::balances::clean_espo_sandshrew_like_trace;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
@@ -93,9 +95,12 @@ impl EspoModule for Subfrost {
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
         let t0 = std::time::Instant::now();
+        let debug = debug_enabled();
+        let module = self.get_name();
         let provider = self.provider();
         let table = provider.table();
 
+        let timer = debug::start_if(debug);
         let block_ts = block.block_header.time as u64;
         let frbtc = get_frbtc_alkane(get_network());
 
@@ -110,14 +115,21 @@ impl EspoModule for Subfrost {
         let mut unwrap_delta_all: u128 = 0;
         let mut unwrap_delta_success: u128 = 0;
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        debug::log_elapsed(module, "init_context", timer);
 
+        let timer = debug::start_if(debug);
         for tx in &block.transactions {
             let txid = tx.transaction.compute_txid();
             let Some(traces) = &tx.traces else { continue };
             let mut address_spk_bytes: Option<Vec<u8>> = None;
             for trace in traces {
+                let Some(cleaned) =
+                    clean_espo_sandshrew_like_trace(&trace.sandshrew_trace, &block.host_function_values)
+                else {
+                    continue;
+                };
                 let mut stack: Vec<Option<PendingWrap>> = Vec::new();
-                for ev in &trace.sandshrew_trace.events {
+                for ev in &cleaned.events {
                     match ev {
                         EspoSandshrewLikeTraceEvent::Invoke(inv) => {
                             let Some((kind, amount)) = parse_wrap_invoke(inv, frbtc) else {
@@ -193,8 +205,10 @@ impl EspoModule for Subfrost {
                 }
             }
         }
+        debug::log_elapsed(module, "process_traces", timer);
 
         if !puts.is_empty() {
+            let timer = debug::start_if(debug);
             if unwrap_delta_all > 0 || unwrap_delta_success > 0 {
                 let prev_all = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
@@ -227,17 +241,22 @@ impl EspoModule for Subfrost {
                     encode_u128_value(total_success),
                 ));
             }
+            debug::log_elapsed(module, "update_totals", timer);
+            let timer = debug::start_if(debug);
             let _ = provider.set_batch(SetBatchParams {
                 puts,
                 deletes: Vec::new(),
             });
+            debug::log_elapsed(module, "write_batch", timer);
         }
 
         println!(
             "[SUBFROST] finished block #{} (wraps={}, unwraps={})",
             block.height, wrap_seq, unwrap_seq
         );
+        let timer = debug::start_if(debug);
         self.set_index_height(block.height)?;
+        debug::log_elapsed(module, "finalize", timer);
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),
