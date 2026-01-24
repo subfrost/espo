@@ -8,8 +8,8 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
 use crate::config::{
-    debug_enabled, get_electrum_like, get_metashrew, get_metashrew_sdb, get_network, is_strict_mode,
-    get_espo_db,
+    debug_enabled, get_electrum_like, get_metashrew, get_metashrew_sdb, get_network,
+    strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos, get_espo_db,
 };
 use crate::debug;
 use crate::modules::essentials::storage::get_holders_values_encoded;
@@ -318,7 +318,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     let module = "essentials.balances";
     let timer = debug::start_if(debug);
     let Some(trace) = clean_espo_sandshrew_like_trace(trace, host_function_values) else {
-        if is_strict_mode() {
+        if strict_check_trace_mismatches() {
             eprintln!(
                 "[balances][strict] dropped trace: failed to clean sandshrew-like events (txid={})",
                 _txid
@@ -2114,7 +2114,9 @@ pub fn bulk_update_balances_for_block(
 
     debug::log_elapsed(module, "build_writes", timer);
     let timer = debug::start_if(debug);
-    if is_strict_mode() {
+    let check_balances = strict_check_alkane_balances();
+    let check_utxos = strict_check_utxos();
+    if check_balances || check_utxos {
         let metashrew = get_metashrew();
         let height_u64 = block.height as u64;
         let metashrew_sdb = get_metashrew_sdb();
@@ -2123,110 +2125,79 @@ pub fn bulk_update_balances_for_block(
             .context("metashrew catch_up before strict checks")?;
         let sdb = metashrew_sdb.as_ref();
 
-        let balances_from_rows = |owner: &SchemaAlkaneId| -> HashMap<SchemaAlkaneId, u128> {
-            let entries = alkane_balances_rows.get(owner).unwrap_or_else(|| {
-                panic!(
-                    "[balances][strict] missing prewrite balances (owner={}:{})",
-                    owner.block, owner.tx
-                )
-            });
-            let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
-            for entry in entries {
-                if entry.amount == 0 {
-                    continue;
-                }
-                *agg.entry(entry.alkane).or_default() =
-                    agg.get(&entry.alkane).copied().unwrap_or(0).saturating_add(entry.amount);
-            }
-            if let Some(self_balance) = lookup_self_balance(owner) {
-                if self_balance == 0 {
-                    agg.remove(owner);
-                } else {
-                    agg.insert(*owner, self_balance);
-                }
-            }
-            agg
-        };
-
-        let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
-            HashMap::new();
         let mut balance_mismatches: Vec<(SchemaAlkaneId, SchemaAlkaneId, u128, u128)> = Vec::new();
-
-        let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();
-        for (owner, per_token) in &alkane_balance_delta {
-            for (token, delta) in per_token {
-                if delta.is_zero() {
-                    continue;
-                }
-                changed_pairs.push((*owner, *token));
-            }
-        }
-        changed_pairs.sort();
-        changed_pairs.dedup();
-
-        for (owner, token) in changed_pairs {
-            if !local_cache.contains_key(&owner) {
-                let balances = balances_from_rows(&owner);
-                local_cache.insert(owner, balances);
-            }
-            let local_balance = local_cache
-                .get(&owner)
-                .and_then(|m| m.get(&token).copied())
-                .unwrap_or(0);
-
-            let metashrew_balance = match metashrew.get_reserves_for_alkane_with_db(
-                sdb,
-                &owner,
-                &token,
-                Some(height_u64),
-            ) {
-                Ok(Some(bal)) => bal,
-                Ok(None) => 0,
-                Err(e) => {
+        if check_balances {
+            let balances_from_rows = |owner: &SchemaAlkaneId| -> HashMap<SchemaAlkaneId, u128> {
+                let entries = alkane_balances_rows.get(owner).unwrap_or_else(|| {
                     panic!(
-                        "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
-                        owner.block, owner.tx, token.block, token.tx, height_u64
-                    );
+                        "[balances][strict] missing prewrite balances (owner={}:{})",
+                        owner.block, owner.tx
+                    )
+                });
+                let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+                for entry in entries {
+                    if entry.amount == 0 {
+                        continue;
+                    }
+                    *agg.entry(entry.alkane).or_default() =
+                        agg.get(&entry.alkane).copied().unwrap_or(0).saturating_add(entry.amount);
                 }
+                if let Some(self_balance) = lookup_self_balance(owner) {
+                    if self_balance == 0 {
+                        agg.remove(owner);
+                    } else {
+                        agg.insert(*owner, self_balance);
+                    }
+                }
+                agg
             };
 
-            if local_balance != metashrew_balance {
-                balance_mismatches.push((owner, token, local_balance, metashrew_balance));
+            let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
+                HashMap::new();
+
+            let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();
+            for (owner, per_token) in &alkane_balance_delta {
+                for (token, delta) in per_token {
+                    if delta.is_zero() {
+                        continue;
+                    }
+                    changed_pairs.push((*owner, *token));
+                }
+            }
+            changed_pairs.sort();
+            changed_pairs.dedup();
+
+            for (owner, token) in changed_pairs {
+                if !local_cache.contains_key(&owner) {
+                    let balances = balances_from_rows(&owner);
+                    local_cache.insert(owner, balances);
+                }
+                let local_balance = local_cache
+                    .get(&owner)
+                    .and_then(|m| m.get(&token).copied())
+                    .unwrap_or(0);
+
+                let metashrew_balance = match metashrew.get_reserves_for_alkane_with_db(
+                    sdb,
+                    &owner,
+                    &token,
+                    Some(height_u64),
+                ) {
+                    Ok(Some(bal)) => bal,
+                    Ok(None) => 0,
+                    Err(e) => {
+                        panic!(
+                            "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
+                            owner.block, owner.tx, token.block, token.tx, height_u64
+                        );
+                    }
+                };
+
+                if local_balance != metashrew_balance {
+                    balance_mismatches.push((owner, token, local_balance, metashrew_balance));
+                }
             }
         }
-
-        let to_balance_map = |entries: &[BalanceEntry]| -> BTreeMap<SchemaAlkaneId, u128> {
-            let mut out = BTreeMap::new();
-            for entry in entries {
-                if entry.amount == 0 {
-                    continue;
-                }
-                *out.entry(entry.alkane).or_default() = out
-                    .get(&entry.alkane)
-                    .copied()
-                    .unwrap_or(0u128)
-                    .saturating_add(entry.amount);
-            }
-            out
-        };
-        let fmt_sheet = |sheet: &BTreeMap<SchemaAlkaneId, u128>| -> String {
-            if sheet.is_empty() {
-                return "empty".to_string();
-            }
-            sheet
-                .iter()
-                .map(|(id, amt)| format!("{}:{}={}", id.block, id.tx, amt))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        let parse_txid = |txid_bytes: &[u8]| -> Result<Txid> {
-            if txid_bytes.len() != 32 {
-                return Err(anyhow!("invalid txid length {}", txid_bytes.len()));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(txid_bytes);
-            Ok(Txid::from_byte_array(arr))
-        };
 
         struct UtxoMismatch {
             outpoint: EspoOutpoint,
@@ -2235,110 +2206,148 @@ pub fn bulk_update_balances_for_block(
             metashrew: BTreeMap<SchemaAlkaneId, u128>,
         }
         let mut utxo_mismatches: Vec<UtxoMismatch> = Vec::new();
+        if check_utxos {
+            let to_balance_map = |entries: &[BalanceEntry]| -> BTreeMap<SchemaAlkaneId, u128> {
+                let mut out = BTreeMap::new();
+                for entry in entries {
+                    if entry.amount == 0 {
+                        continue;
+                    }
+                    *out.entry(entry.alkane).or_default() = out
+                        .get(&entry.alkane)
+                        .copied()
+                        .unwrap_or(0u128)
+                        .saturating_add(entry.amount);
+                }
+                out
+            };
+            let parse_txid = |txid_bytes: &[u8]| -> Result<Txid> {
+                if txid_bytes.len() != 32 {
+                    return Err(anyhow!("invalid txid length {}", txid_bytes.len()));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(txid_bytes);
+                Ok(Txid::from_byte_array(arr))
+            };
 
-        for row in &new_rows {
-            if row.outpoint.tx_spent.is_some() {
-                continue;
-            }
-            let txid = parse_txid(&row.outpoint.txid).unwrap_or_else(|e| {
-                panic!(
-                    "[balances][strict] invalid outpoint txid bytes ({}:{}): {e}",
-                    row.outpoint.as_outpoint_string(),
-                    row.outpoint.vout
-                )
-            });
-            let local_entries = decode_balances_vec(&row.enc_balances).unwrap_or_else(|e| {
-                panic!(
-                    "[balances][strict] decode outpoint balances failed ({}:{}): {e:?}",
-                    row.outpoint.as_outpoint_string(),
-                    row.outpoint.vout
-                )
-            });
-            let local_map = to_balance_map(&local_entries);
-
-            let meta_entries = metashrew
-                .get_outpoint_alkane_balances_with_db(sdb, &txid, row.outpoint.vout)
-                .unwrap_or_else(|e| {
+            for row in &new_rows {
+                if row.outpoint.tx_spent.is_some() {
+                    continue;
+                }
+                let txid = parse_txid(&row.outpoint.txid).unwrap_or_else(|e| {
                     panic!(
-                        "[balances][strict] metashrew outpoint lookup failed ({}:{}): {e:?}",
+                        "[balances][strict] invalid outpoint txid bytes ({}:{}): {e}",
                         row.outpoint.as_outpoint_string(),
                         row.outpoint.vout
                     )
                 });
-            let mut meta_map = BTreeMap::new();
-            for (id, amount) in meta_entries {
-                if amount == 0 {
-                    continue;
-                }
-                let schema = schema_id_from_parts(id.block, id.tx).unwrap_or_else(|e| {
+                let local_entries = decode_balances_vec(&row.enc_balances).unwrap_or_else(|e| {
                     panic!(
-                        "[balances][strict] invalid metashrew alkane id ({}:{}): {e:?}",
-                        id.block, id.tx
+                        "[balances][strict] decode outpoint balances failed ({}:{}): {e:?}",
+                        row.outpoint.as_outpoint_string(),
+                        row.outpoint.vout
                     )
                 });
-                *meta_map.entry(schema).or_default() = meta_map
-                    .get(&schema)
-                    .copied()
-                    .unwrap_or(0u128)
-                    .saturating_add(amount);
-            }
+                let local_map = to_balance_map(&local_entries);
 
-            if local_map != meta_map {
-                utxo_mismatches.push(UtxoMismatch {
-                    outpoint: row.outpoint.clone(),
-                    addr: row.addr.clone(),
-                    local: local_map,
-                    metashrew: meta_map,
-                });
+                let meta_entries = metashrew
+                    .get_outpoint_alkane_balances_with_db(sdb, &txid, row.outpoint.vout)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "[balances][strict] metashrew outpoint lookup failed ({}:{}): {e:?}",
+                            row.outpoint.as_outpoint_string(),
+                            row.outpoint.vout
+                        )
+                    });
+                let mut meta_map = BTreeMap::new();
+                for (id, amount) in meta_entries {
+                    if amount == 0 {
+                        continue;
+                    }
+                    let schema = schema_id_from_parts(id.block, id.tx).unwrap_or_else(|e| {
+                        panic!(
+                            "[balances][strict] invalid metashrew alkane id ({}:{}): {e:?}",
+                            id.block, id.tx
+                        )
+                    });
+                    *meta_map.entry(schema).or_default() = meta_map
+                        .get(&schema)
+                        .copied()
+                        .unwrap_or(0u128)
+                        .saturating_add(amount);
+                }
+
+                if local_map != meta_map {
+                    utxo_mismatches.push(UtxoMismatch {
+                        outpoint: row.outpoint.clone(),
+                        addr: row.addr.clone(),
+                        local: local_map,
+                        metashrew: meta_map,
+                    });
+                }
             }
         }
 
         if !balance_mismatches.is_empty() || !utxo_mismatches.is_empty() {
-            for (owner, token, local_balance, metashrew_balance) in &balance_mismatches {
-                eprintln!(
-                    "[balances][strict] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
-                    height_u64,
-                    owner.block,
-                    owner.tx,
-                    token.block,
-                    token.tx,
-                    local_balance,
-                    metashrew_balance
-                );
-
-                let mut txids: Vec<String> = alkane_balance_tx_entries_by_token
-                    .get(&(*owner, *token))
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .map(|entry| Txid::from_byte_array(entry.txid).to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                txids.sort();
-                txids.dedup();
-
-                if txids.is_empty() {
+            if check_balances {
+                for (owner, token, local_balance, metashrew_balance) in &balance_mismatches {
                     eprintln!(
-                        "[balances][strict] balance-change txids: none (owner={}:{}, token={}:{})",
-                        owner.block, owner.tx, token.block, token.tx
+                        "[balances][strict] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
+                        height_u64,
+                        owner.block,
+                        owner.tx,
+                        token.block,
+                        token.tx,
+                        local_balance,
+                        metashrew_balance
                     );
-                } else {
-                    eprintln!(
-                        "[balances][strict] balance-change txids: {}",
-                        txids.join(",")
-                    );
+
+                    let mut txids: Vec<String> = alkane_balance_tx_entries_by_token
+                        .get(&(*owner, *token))
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .map(|entry| Txid::from_byte_array(entry.txid).to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    txids.sort();
+                    txids.dedup();
+
+                    if txids.is_empty() {
+                        eprintln!(
+                            "[balances][strict] balance-change txids: none (owner={}:{}, token={}:{})",
+                            owner.block, owner.tx, token.block, token.tx
+                        );
+                    } else {
+                        eprintln!(
+                            "[balances][strict] balance-change txids: {}",
+                            txids.join(",")
+                        );
+                    }
                 }
             }
 
-            for mismatch in &utxo_mismatches {
-                eprintln!(
-                    "[balances][strict] utxo mismatch outpoint={} addr={} local=[{}] metashrew=[{}]",
-                    mismatch.outpoint.as_outpoint_string(),
-                    mismatch.addr,
-                    fmt_sheet(&mismatch.local),
-                    fmt_sheet(&mismatch.metashrew)
-                );
+            if check_utxos {
+                let fmt_sheet = |sheet: &BTreeMap<SchemaAlkaneId, u128>| -> String {
+                    if sheet.is_empty() {
+                        return "empty".to_string();
+                    }
+                    sheet
+                        .iter()
+                        .map(|(id, amt)| format!("{}:{}={}", id.block, id.tx, amt))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                for mismatch in &utxo_mismatches {
+                    eprintln!(
+                        "[balances][strict] utxo mismatch outpoint={} addr={} local=[{}] metashrew=[{}]",
+                        mismatch.outpoint.as_outpoint_string(),
+                        mismatch.addr,
+                        fmt_sheet(&mismatch.local),
+                        fmt_sheet(&mismatch.metashrew)
+                    );
+                }
             }
 
             panic!(

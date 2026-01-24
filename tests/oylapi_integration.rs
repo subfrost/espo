@@ -9,12 +9,11 @@
 /// - Serves wrap/unwrap endpoints
 /// - Serves AMM transaction history endpoints
 /// - Serves token pair endpoints
-
 mod common;
 
 use anyhow::Result;
-use axum::http::StatusCode;
 use axum::Router;
+use axum::http::StatusCode;
 use espo::modules::ammdata::storage::AmmDataProvider;
 use espo::modules::essentials::storage::EssentialsProvider;
 use espo::modules::oylapi::config::OylApiConfig;
@@ -55,6 +54,8 @@ fn init_global_config() {
         DB::open(&opts, &metashrew_db).expect("Failed to open metashrew DB");
 
         let config = espo::config::AppConfig {
+            debug_backup: None,
+            debug_ignore_ms: 0,
             readonly_metashrew_db_dir: metashrew_db.to_str().unwrap().to_string(),
             electrum_rpc_url: Some(String::from("127.0.0.1:50001")),
             metashrew_rpc_url: String::from("http://127.0.0.1:9999"),
@@ -74,7 +75,7 @@ fn init_global_config() {
             explorer_base_path: String::from("/"),
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
-            strict_mode: false,
+            strict_mode: None,
             debug: false,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             simulate_reorg: false,
@@ -113,13 +114,7 @@ fn create_test_state() -> Result<OylApiState> {
 
     std::mem::forget(temp_dir);
 
-    Ok(OylApiState {
-        config,
-        essentials,
-        ammdata,
-        subfrost,
-        http_client: reqwest::Client::new(),
-    })
+    Ok(OylApiState { config, essentials, ammdata, subfrost, http_client: reqwest::Client::new() })
 }
 
 /// Helper to make POST request to router
@@ -138,9 +133,7 @@ async fn post_request(app: &Router, path: &str, body: Value) -> Result<(StatusCo
         .unwrap();
 
     let status = response.status();
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body_json: Value = serde_json::from_slice(&body_bytes)?;
 
     Ok((status, body_json))
@@ -454,7 +447,8 @@ async fn test_get_address_swap_history_for_pool_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-address-swap-history-for-pool", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-address-swap-history-for-pool", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -478,7 +472,8 @@ async fn test_get_address_swap_history_for_token_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-address-swap-history-for-token", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-address-swap-history-for-token", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -548,7 +543,8 @@ async fn test_get_pool_creation_history_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-pool-creation-history", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-pool-creation-history", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -569,7 +565,8 @@ async fn test_get_address_pool_creation_history_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-address-pool-creation-history", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-address-pool-creation-history", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -589,7 +586,8 @@ async fn test_get_address_pool_mint_history_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-address-pool-mint-history", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-address-pool-mint-history", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -609,7 +607,8 @@ async fn test_get_address_pool_burn_history_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-address-pool-burn-history", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-address-pool-burn-history", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -653,7 +652,8 @@ async fn test_get_address_unwrap_history_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-address-unwrap-history", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-address-unwrap-history", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -736,7 +736,8 @@ async fn test_get_all_address_amm_tx_history_endpoint() -> Result<()> {
         "offset": 0
     });
 
-    let (status, _response) = post_request(&app, "/get-all-address-amm-tx-history", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-all-address-amm-tx-history", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 
@@ -839,7 +840,8 @@ async fn test_get_alkane_swap_pair_details_endpoint() -> Result<()> {
         }
     });
 
-    let (status, _response) = post_request(&app, "/get-alkane-swap-pair-details", request_body).await?;
+    let (status, _response) =
+        post_request(&app, "/get-alkane-swap-pair-details", request_body).await?;
 
     assert_eq!(status, StatusCode::OK);
 

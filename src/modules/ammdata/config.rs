@@ -1,5 +1,24 @@
 use anyhow::{Result, anyhow};
+use crate::schemas::SchemaAlkaneId;
 use serde_json::Value;
+
+#[derive(Clone, Debug)]
+pub enum DerivedMergeStrategy {
+    Neutral,
+    Optimistic,
+    Pessimistic,
+}
+
+#[derive(Clone, Debug)]
+pub struct DerivedQuoteConfig {
+    pub alkane: SchemaAlkaneId,
+    pub strategy: DerivedMergeStrategy,
+}
+
+#[derive(Clone, Debug)]
+pub struct DerivedLiquidityConfig {
+    pub derived_quotes: Vec<DerivedQuoteConfig>,
+}
 
 #[derive(Clone, Debug)]
 pub struct AmmDataConfig {
@@ -10,11 +29,12 @@ pub struct AmmDataConfig {
     pub search_prefix_max_len: u8,
     pub search_fallback_scan_cap: u64,
     pub search_limit_cap: u64,
+    pub derived_liquidity: Option<DerivedLiquidityConfig>,
 }
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num> }"
+        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -64,6 +84,81 @@ impl AmmDataConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(20);
 
+        let derived_liquidity = match obj.get("derived_liquidity") {
+            None => None,
+            Some(Value::Null) => None,
+            Some(val) => {
+                let derived_quotes_arr = if let Some(arr) = val.as_array() {
+                    arr
+                } else if let Some(dl_obj) = val.as_object() {
+                    let derived_quotes_val = dl_obj.get("derived_quotes").ok_or_else(|| {
+                        anyhow!(
+                            "ammdata.derived_liquidity.derived_quotes missing; expected: {}",
+                            Self::spec()
+                        )
+                    })?;
+                    derived_quotes_val.as_array().ok_or_else(|| {
+                        anyhow!(
+                            "ammdata.derived_liquidity.derived_quotes must be an array; expected: {}",
+                            Self::spec()
+                        )
+                    })?
+                } else {
+                    return Err(anyhow!(
+                        "ammdata.derived_liquidity must be an array; expected: {}",
+                        Self::spec()
+                    ));
+                };
+
+                let mut derived_quotes = Vec::new();
+                for entry in derived_quotes_arr {
+                    let entry_obj = entry.as_object().ok_or_else(|| {
+                        anyhow!(
+                            "ammdata.derived_liquidity entries must be objects; expected: {}",
+                            Self::spec()
+                        )
+                    })?;
+                    let alkane_str = entry_obj
+                        .get("alkane")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "ammdata.derived_liquidity[].alkane must be a string; expected: {}",
+                                Self::spec()
+                            )
+                        })?;
+                    let alkane = parse_alkane_id_str(alkane_str).ok_or_else(|| {
+                        anyhow!(
+                            "ammdata.derived_liquidity[].alkane must be like \"2:0\"; got {}",
+                            alkane_str
+                        )
+                    })?;
+                    let strategy_str = entry_obj
+                        .get("strategy")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "ammdata.derived_liquidity[].strategy missing; expected: {}",
+                                Self::spec()
+                            )
+                        })?;
+                    let strategy = match strategy_str.trim().to_ascii_lowercase().as_str() {
+                        "neutral" => DerivedMergeStrategy::Neutral,
+                        "optimistic" => DerivedMergeStrategy::Optimistic,
+                        "pessimistic" => DerivedMergeStrategy::Pessimistic,
+                        _ => {
+                            return Err(anyhow!(
+                                "ammdata.derived_liquidity[].strategy must be neutral|optimistic|pessimistic; got {}",
+                                strategy_str
+                            ));
+                        }
+                    };
+                    derived_quotes.push(DerivedQuoteConfig { alkane, strategy });
+                }
+                Some(DerivedLiquidityConfig { derived_quotes })
+            }
+        };
+
         let parsed = reqwest::Url::parse(&eth_rpc)
             .map_err(|e| anyhow!("ammdata.eth_rpc must be an absolute URL (http/https): {e}"))?;
         if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -81,6 +176,7 @@ impl AmmDataConfig {
             search_prefix_max_len,
             search_fallback_scan_cap,
             search_limit_cap,
+            derived_liquidity,
         })
     }
 
@@ -94,4 +190,11 @@ impl AmmDataConfig {
             })?;
         Self::from_value(value)
     }
+}
+
+fn parse_alkane_id_str(raw: &str) -> Option<SchemaAlkaneId> {
+    let mut parts = raw.split(':');
+    let block = parts.next()?.parse::<u32>().ok()?;
+    let tx = parts.next()?.parse::<u64>().ok()?;
+    Some(SchemaAlkaneId { block, tx })
 }

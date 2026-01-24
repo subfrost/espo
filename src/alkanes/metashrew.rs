@@ -1,6 +1,6 @@
 use crate::alkanes::defs::AlkaneMessageContext;
 use crate::alkanes::trace::PartialEspoTrace;
-use crate::config::{get_metashrew_sdb, is_strict_mode};
+use crate::config::{get_metashrew_sdb, strict_check_trace_mismatches};
 use crate::runtime::sdb::SDB;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_cli_common::alkanes_pb::{AlkanesTrace, AlkanesTraceEvent};
@@ -822,7 +822,7 @@ impl MetashrewAdapter {
             let warning =
                 format!("[metashrew] warn: block {block}: trace index looks incomplete ({reason})");
             eprintln!("{warning}");
-            if is_strict_mode() {
+            if strict_check_trace_mismatches() {
                 panic!("{warning}");
             }
         }

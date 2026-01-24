@@ -1,22 +1,24 @@
 use super::schemas::{
     ActivityDirection, ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry,
     SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolMetricsV1,
-    SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe, active_timeframes,
+    SchemaPoolMetricsV2, SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe, active_timeframes,
 };
 use super::storage::{
     AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetRawValueParams,
     GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, SearchIndexField, SetBatchParams,
     TokenMetricsIndexField, decode_candle_v1, decode_canonical_pools, decode_full_candle_v1,
     decode_reserves_snapshot, decode_token_metrics, encode_candle_v1, encode_canonical_pools,
-    encode_pool_creation_info, encode_pool_metrics, encode_reserves_snapshot, encode_token_metrics,
-    encode_u128_value, parse_change_basis_points,
+    encode_pool_creation_info, encode_pool_metrics, encode_pool_metrics_v2, encode_reserves_snapshot,
+    encode_token_metrics, encode_u128_value, parse_change_basis_points,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::alkanes::trace::EspoSandshrewLikeTraceStatus;
-use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
+use crate::alkanes::trace::{
+    EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceInvokeData,
+};
 use crate::config::{debug_enabled, get_electrum_like, get_espo_db, get_network};
 use crate::debug;
-use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
 };
@@ -34,7 +36,9 @@ use crate::modules::essentials::storage::{
     GetCreationRecordParams, GetCreationRecordsOrderedParams, GetLatestCirculatingSupplyParams,
     GetRawValueParams as EssentialsGetRawValueParams,
 };
-use crate::modules::essentials::utils::balances::{SignedU128, get_alkane_balances};
+use crate::modules::essentials::utils::balances::{
+    SignedU128, clean_espo_sandshrew_like_trace, get_alkane_balances,
+};
 use crate::modules::essentials::utils::inspections::{
     StoredInspectionMetadata, StoredInspectionResult,
 };
@@ -117,21 +121,72 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
         .and_then(|v| if v > u64::MAX as u128 { None } else { Some(v as u64) })
 }
 
+fn parse_hex_u128(s: &str) -> Option<u128> {
+    u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+}
+
+fn merge_candles(
+    base: SchemaCandleV1,
+    other: SchemaCandleV1,
+    strategy: &DerivedMergeStrategy,
+) -> SchemaCandleV1 {
+    let merge = |a: u128, b: u128| -> u128 {
+        match strategy {
+            DerivedMergeStrategy::Optimistic => a.max(b),
+            DerivedMergeStrategy::Pessimistic => a.min(b),
+            DerivedMergeStrategy::Neutral => (a.saturating_add(b)) / 2,
+        }
+    };
+    let volume = if base.volume == 0 { other.volume } else { base.volume };
+    SchemaCandleV1 {
+        open: merge(base.open, other.open),
+        high: merge(base.high, other.high),
+        low: merge(base.low, other.low),
+        close: merge(base.close, other.close),
+        volume,
+    }
+}
+
+fn invert_price_value(p: u128) -> Option<u128> {
+    if p == 0 {
+        None
+    } else {
+        Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p)
+    }
+}
+
 fn parse_factory_create_call(
-    inputs: &[String],
+    inv: &EspoSandshrewLikeTraceInvokeData,
     factories: &HashSet<SchemaAlkaneId>,
 ) -> Option<SchemaAlkaneId> {
-    if inputs.len() < 3 {
+    let inputs = &inv.context.inputs;
+    let opcode0 = inputs.get(0).and_then(|s| parse_hex_u128(s));
+    let opcode2 = inputs.get(2).and_then(|s| parse_hex_u128(s));
+    if opcode0 != Some(1) && opcode2 != Some(1) {
         return None;
     }
-    let block = parse_hex_u32(&inputs[0])?;
-    let tx = parse_hex_u64(&inputs[1])?;
-    let opcode = u128::from_str_radix(inputs[2].trim_start_matches("0x"), 16).ok()?;
-    if opcode != 1 {
-        return None;
+
+    // Legacy layout: [factory_block, factory_tx, opcode, ...]
+    if opcode2 == Some(1) {
+        if let (Some(block), Some(tx)) = (parse_hex_u32(&inputs[0]), parse_hex_u64(&inputs[1])) {
+            let id = SchemaAlkaneId { block, tx };
+            if factories.contains(&id) {
+                return Some(id);
+            }
+        }
     }
-    let id = SchemaAlkaneId { block, tx };
-    if factories.contains(&id) { Some(id) } else { None }
+
+    // Current layout: [opcode, ...], invoked contract is the factory.
+    if let (Some(block), Some(tx)) =
+        (parse_hex_u32(&inv.context.myself.block), parse_hex_u64(&inv.context.myself.tx))
+    {
+        let id = SchemaAlkaneId { block, tx };
+        if factories.contains(&id) {
+            return Some(id);
+        }
+    }
+
+    None
 }
 
 fn pool_creator_spk_from_protostone(tx: &Transaction) -> Option<ScriptBuf> {
@@ -260,6 +315,12 @@ impl EspoModule for AmmData {
         let block_ts = block.block_header.time as u64;
         let height = block.height;
         println!("[AMMDATA] Indexing block #{height} for candles and activity...");
+        if let Some(prev) = *self.index_height.read().unwrap() {
+            if height <= prev {
+                eprintln!("[AMMDATA] skipping already indexed block #{height} (last={prev})");
+                return Ok(());
+            }
+        }
 
         let provider = self.provider();
         let essentials = provider.essentials();
@@ -268,6 +329,11 @@ impl EspoModule for AmmData {
         let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
         let mut search_prefix_min = search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
         let mut search_prefix_max = search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+        let derived_quotes: Vec<DerivedQuoteConfig> = search_cfg
+            .as_ref()
+            .and_then(|c| c.derived_liquidity.as_ref())
+            .map(|c| c.derived_quotes.clone())
+            .unwrap_or_default();
         if search_prefix_min == 0 {
             search_prefix_min = 2;
         }
@@ -499,12 +565,17 @@ impl EspoModule for AmmData {
             let mut pool_factory_by_id: HashMap<SchemaAlkaneId, SchemaAlkaneId> = HashMap::new();
             if let Some(traces) = &transaction.traces {
                 for trace in traces {
+                    let Some(cleaned) = clean_espo_sandshrew_like_trace(
+                        &trace.sandshrew_trace,
+                        &block.host_function_values,
+                    ) else {
+                        continue;
+                    };
                     let mut pending_factory: Option<SchemaAlkaneId> = None;
-                    for ev in &trace.sandshrew_trace.events {
+                    for ev in &cleaned.events {
                         match ev {
                             EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                                if let Some(factory) =
-                                    parse_factory_create_call(&inv.context.inputs, &amm_factories)
+                                if let Some(factory) = parse_factory_create_call(inv, &amm_factories)
                                 {
                                     pending_factory = Some(factory);
                                 }
@@ -533,10 +604,13 @@ impl EspoModule for AmmData {
                         continue;
                     }
                     let factory_from_call = pool_factory_by_id.get(&pool_id).copied();
-                    if factory_from_call.is_none() {
+                    let factory_id = factory_from_call.or(factory_id);
+                    let factory_ok = factory_id
+                        .map(|id| amm_factories.contains(&id))
+                        .unwrap_or(false);
+                    if !factory_ok {
                         continue;
                     }
-                    let factory_id = factory_id.or(factory_from_call);
 
                     pools_map.insert(pool_id, defs);
                     if let Ok(encoded_defs) = borsh::to_vec(&defs) {
@@ -967,14 +1041,31 @@ impl EspoModule for AmmData {
             SchemaCandleV1,
         > = HashMap::new();
         let mut token_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_mcusd_candle_overrides: HashMap<
+            (SchemaAlkaneId, Timeframe, u64),
+            SchemaCandleV1,
+        > = HashMap::new();
+        let mut token_mcusd_candle_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut token_derived_usd_candle_overrides: HashMap<
+            (SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64),
+            SchemaCandleV1,
+        > = HashMap::new();
+        let mut token_derived_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_index_deletes: Vec<Vec<u8>> = Vec::new();
         let mut token_metrics_index_new: u64 = 0;
         let mut token_search_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_search_index_deletes: Vec<Vec<u8>> = Vec::new();
+        let mut derived_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut derived_metrics_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut derived_metrics_index_deletes: Vec<Vec<u8>> = Vec::new();
+        let mut derived_metrics_index_new: HashMap<SchemaAlkaneId, u64> = HashMap::new();
+        let mut derived_search_index_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut derived_search_index_deletes: Vec<Vec<u8>> = Vec::new();
+        let mut supply_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
 
-        if !canonical_trade_buckets.is_empty() {
+        if !canonical_trade_buckets.is_empty() || !derived_quotes.is_empty() {
             for (token, buckets) in canonical_trade_buckets.iter() {
                 let Some(pools) = canonical_pools_by_token.get(token) else { continue };
                 for (tf, bucket_ts) in buckets {
@@ -1087,13 +1178,398 @@ impl EspoModule for AmmData {
                 }
             }
 
+            if !derived_quotes.is_empty() {
+                #[derive(Clone, Copy)]
+                struct DerivedPoolInfo {
+                    pool_id: SchemaAlkaneId,
+                    token_is_base: bool,
+                }
+
+                let mut derived_quote_strategies: HashMap<SchemaAlkaneId, DerivedMergeStrategy> =
+                    HashMap::new();
+                for dq in &derived_quotes {
+                    derived_quote_strategies.insert(dq.alkane, dq.strategy.clone());
+                }
+
+                let derived_quote_set: HashSet<SchemaAlkaneId> =
+                    derived_quotes.iter().map(|dq| dq.alkane).collect();
+
+                let mut derived_pool_by_token_quote: HashMap<
+                    (SchemaAlkaneId, SchemaAlkaneId),
+                    DerivedPoolInfo,
+                > = HashMap::new();
+
+                let mut maybe_insert_pool = |token: SchemaAlkaneId,
+                                             quote: SchemaAlkaneId,
+                                             pool: SchemaAlkaneId,
+                                             token_is_base: bool| {
+                    let key = (token, quote);
+                    match derived_pool_by_token_quote.get(&key) {
+                        None => {
+                            derived_pool_by_token_quote.insert(
+                                key,
+                                DerivedPoolInfo { pool_id: pool, token_is_base },
+                            );
+                        }
+                        Some(existing) => {
+                            let prefer = token_is_base && !existing.token_is_base;
+                            let smaller = pool.block < existing.pool_id.block
+                                || (pool.block == existing.pool_id.block
+                                    && pool.tx < existing.pool_id.tx);
+                            if prefer || (existing.token_is_base == token_is_base && smaller) {
+                                derived_pool_by_token_quote.insert(
+                                    key,
+                                    DerivedPoolInfo { pool_id: pool, token_is_base },
+                                );
+                            }
+                        }
+                    }
+                };
+
+                for (pool, defs) in pools_map.iter() {
+                    if derived_quote_set.contains(&defs.quote_alkane_id) {
+                        maybe_insert_pool(
+                            defs.base_alkane_id,
+                            defs.quote_alkane_id,
+                            *pool,
+                            true,
+                        );
+                    }
+                    if derived_quote_set.contains(&defs.base_alkane_id) {
+                        maybe_insert_pool(
+                            defs.quote_alkane_id,
+                            defs.base_alkane_id,
+                            *pool,
+                            false,
+                        );
+                    }
+                }
+
+                let mut pool_to_edges: HashMap<
+                    SchemaAlkaneId,
+                    Vec<(SchemaAlkaneId, SchemaAlkaneId, bool)>,
+                > = HashMap::new();
+                let mut quote_to_tokens: HashMap<SchemaAlkaneId, Vec<SchemaAlkaneId>> =
+                    HashMap::new();
+                for ((token, quote), info) in derived_pool_by_token_quote.iter() {
+                    pool_to_edges
+                        .entry(info.pool_id)
+                        .or_default()
+                        .push((*token, *quote, info.token_is_base));
+                    quote_to_tokens.entry(*quote).or_default().push(*token);
+                }
+
+                let mut pool_overrides_by_pool_tf: HashMap<
+                    (SchemaAlkaneId, Timeframe),
+                    BTreeMap<u64, SchemaFullCandleV1>,
+                > = HashMap::new();
+                for ((pool, tf, bucket), candle) in pool_candle_overrides.iter() {
+                    pool_overrides_by_pool_tf
+                        .entry((*pool, *tf))
+                        .or_default()
+                        .insert(*bucket, *candle);
+                }
+
+                let mut token_usd_overrides_by_token_tf: HashMap<
+                    (SchemaAlkaneId, Timeframe),
+                    BTreeMap<u64, SchemaCandleV1>,
+                > = HashMap::new();
+                for ((token, tf, bucket), candle) in token_usd_candle_overrides.iter() {
+                    token_usd_overrides_by_token_tf
+                        .entry((*token, *tf))
+                        .or_default()
+                        .insert(*bucket, *candle);
+                }
+
+                let mut derived_overrides_by_token_quote_tf: HashMap<
+                    (SchemaAlkaneId, SchemaAlkaneId, Timeframe),
+                    BTreeMap<u64, SchemaCandleV1>,
+                > = HashMap::new();
+
+                let parse_ts = |key: &[u8]| -> Option<u64> {
+                    key.rsplit(|&b| b == b':')
+                        .next()
+                        .and_then(|ts_bytes| std::str::from_utf8(ts_bytes).ok())
+                        .and_then(|ts_str| ts_str.parse::<u64>().ok())
+                };
+
+                let latest_pool_candle = |pool: &SchemaAlkaneId,
+                                          tf: Timeframe,
+                                          target: u64|
+                 -> Option<(u64, SchemaFullCandleV1)> {
+                    let mut best: Option<(u64, SchemaFullCandleV1)> = None;
+                    if let Some(map) = pool_overrides_by_pool_tf.get(&(*pool, tf)) {
+                        if let Some((&ts, candle)) = map.range(..=target).next_back() {
+                            best = Some((ts, *candle));
+                        }
+                    }
+                    let prefix = table.candle_ns_prefix(pool, tf);
+                    if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                        for (k, v) in resp.entries {
+                            let Some(ts) = parse_ts(&k) else { continue };
+                            if ts > target {
+                                continue;
+                            }
+                            if let Ok(c) = decode_full_candle_v1(&v) {
+                                match best {
+                                    Some((best_ts, _)) if best_ts >= ts => {}
+                                    _ => best = Some((ts, c)),
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    best
+                };
+
+                let latest_token_usd_candle = |token: &SchemaAlkaneId,
+                                               tf: Timeframe,
+                                               target: u64|
+                 -> Option<(u64, SchemaCandleV1)> {
+                    let mut best: Option<(u64, SchemaCandleV1)> = None;
+                    if let Some(map) = token_usd_overrides_by_token_tf.get(&(*token, tf)) {
+                        if let Some((&ts, candle)) = map.range(..=target).next_back() {
+                            best = Some((ts, *candle));
+                        }
+                    }
+                    let prefix = table.token_usd_candle_ns_prefix(token, tf);
+                    if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                        for (k, v) in resp.entries {
+                            let Some(ts) = parse_ts(&k) else { continue };
+                            if ts > target {
+                                continue;
+                            }
+                            if let Ok(c) = decode_candle_v1(&v) {
+                                match best {
+                                    Some((best_ts, _)) if best_ts >= ts => {}
+                                    _ => best = Some((ts, c)),
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    best
+                };
+
+                let latest_derived_candle = |map: &HashMap<
+                    (SchemaAlkaneId, SchemaAlkaneId, Timeframe),
+                    BTreeMap<u64, SchemaCandleV1>,
+                >,
+                                             token: &SchemaAlkaneId,
+                                             quote: &SchemaAlkaneId,
+                                             tf: Timeframe,
+                                             target: u64|
+                 -> Option<(u64, SchemaCandleV1)> {
+                    let mut best: Option<(u64, SchemaCandleV1)> = None;
+                    if let Some(bucket_map) = map.get(&(*token, *quote, tf)) {
+                        if let Some((&ts, candle)) = bucket_map.range(..=target).next_back() {
+                            best = Some((ts, *candle));
+                        }
+                    }
+                    let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, tf);
+                    if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                        for (k, v) in resp.entries {
+                            let Some(ts) = parse_ts(&k) else { continue };
+                            if ts > target {
+                                continue;
+                            }
+                            if let Ok(c) = decode_candle_v1(&v) {
+                                match best {
+                                    Some((best_ts, _)) if best_ts >= ts => {}
+                                    _ => best = Some((ts, c)),
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    best
+                };
+
+                let mut derived_buckets: HashSet<(SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64)> =
+                    HashSet::new();
+                for ((pool, tf, bucket), _candle) in pool_candle_overrides.iter() {
+                    if let Some(edges) = pool_to_edges.get(pool) {
+                        for (token, quote, _token_is_base) in edges {
+                            derived_buckets.insert((*token, *quote, *tf, *bucket));
+                        }
+                    }
+                }
+                for ((quote, tf, bucket), _candle) in token_usd_candle_overrides.iter() {
+                    if let Some(tokens) = quote_to_tokens.get(quote) {
+                        for token in tokens {
+                            derived_buckets.insert((*token, *quote, *tf, *bucket));
+                        }
+                    }
+                }
+
+                for (token, quote, tf, bucket_ts) in derived_buckets.into_iter() {
+                    let Some(info) = derived_pool_by_token_quote.get(&(token, quote)) else {
+                        continue;
+                    };
+                    let Some((_pool_ts, pool_candle)) =
+                        latest_pool_candle(&info.pool_id, tf, bucket_ts)
+                    else {
+                        continue;
+                    };
+                    let Some((_usd_ts, q_usd_candle)) =
+                        latest_token_usd_candle(&quote, tf, bucket_ts)
+                    else {
+                        continue;
+                    };
+
+                    let (q_per_t_open, q_per_t_high, q_per_t_low, q_per_t_close) = if info
+                        .token_is_base
+                    {
+                        (
+                            pool_candle.base_candle.open,
+                            pool_candle.base_candle.high,
+                            pool_candle.base_candle.low,
+                            pool_candle.base_candle.close,
+                        )
+                    } else {
+                        let inv_open = match invert_price_value(pool_candle.base_candle.open) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let inv_close = match invert_price_value(pool_candle.base_candle.close) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let inv_high = match invert_price_value(pool_candle.base_candle.low) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let inv_low = match invert_price_value(pool_candle.base_candle.high) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        (inv_open, inv_high, inv_low, inv_close)
+                    };
+
+                    let conv = |q_usd: u128, q_per_t: u128| -> Option<u128> {
+                        if q_per_t == 0 {
+                            None
+                        } else {
+                            Some(q_usd.saturating_mul(q_per_t) / PRICE_SCALE)
+                        }
+                    };
+
+                    let Some(open_conv) = conv(q_usd_candle.open, q_per_t_open) else { continue };
+                    let Some(high_conv) = conv(q_usd_candle.high, q_per_t_high) else { continue };
+                    let Some(low_conv) = conv(q_usd_candle.low, q_per_t_low) else { continue };
+                    let Some(close_conv) = conv(q_usd_candle.close, q_per_t_close) else { continue };
+
+                    let token_volume = if info.token_is_base {
+                        pool_candle.base_candle.volume
+                    } else {
+                        pool_candle.quote_candle.volume
+                    };
+                    let volume_usd = token_volume.saturating_mul(close_conv) / PRICE_SCALE;
+
+                    let mut derived = SchemaCandleV1 {
+                        open: open_conv,
+                        high: high_conv,
+                        low: low_conv,
+                        close: close_conv,
+                        volume: volume_usd,
+                    };
+
+                    if let Some((_ts, canonical)) =
+                        latest_token_usd_candle(&token, tf, bucket_ts)
+                    {
+                        let strategy = derived_quote_strategies
+                            .get(&quote)
+                            .unwrap_or(&DerivedMergeStrategy::Neutral);
+                        let mut merged = merge_candles(derived, canonical, strategy);
+                        merged.volume = derived.volume;
+                        derived = merged;
+                    }
+
+                    let prev_bucket = bucket_ts.saturating_sub(tf.duration_secs());
+                    if let Some((_ts, prev)) = latest_derived_candle(
+                        &derived_overrides_by_token_quote_tf,
+                        &token,
+                        &quote,
+                        tf,
+                        prev_bucket,
+                    ) {
+                        derived.open = prev.close;
+                        if derived.open > derived.high {
+                            derived.high = derived.open;
+                        }
+                        if derived.open < derived.low {
+                            derived.low = derived.open;
+                        }
+                    }
+
+                    token_derived_usd_candle_overrides
+                        .insert((token, quote, tf, bucket_ts), derived);
+                    derived_overrides_by_token_quote_tf
+                        .entry((token, quote, tf))
+                        .or_default()
+                        .insert(bucket_ts, derived);
+                }
+
+                for ((token, quote, tf, bucket_ts), candle) in
+                    token_derived_usd_candle_overrides.iter()
+                {
+                    let key = table.token_derived_usd_candle_key(token, quote, *tf, *bucket_ts);
+                    let encoded = encode_candle_v1(candle)?;
+                    token_derived_usd_candle_writes.push((key, encoded));
+                }
+            }
+
+            for ((token, tf, bucket_ts), candle) in token_usd_candle_overrides.iter() {
+                let supply = if let Some(v) = supply_cache.get(token) {
+                    *v
+                } else {
+                    let table_e = essentials.table();
+                    let key = table_e.circulating_supply_latest_key(token);
+                    let v = essentials
+                        .get_raw_value(EssentialsGetRawValueParams { key })?
+                        .value
+                        .and_then(|raw| {
+                            crate::modules::essentials::storage::decode_u128_value(&raw).ok()
+                        })
+                        .unwrap_or(0);
+                    supply_cache.insert(*token, v);
+                    v
+                };
+                if supply == 0 {
+                    continue;
+                }
+                let scale = |p: u128| -> u128 { p.saturating_mul(supply) / PRICE_SCALE };
+                let mc_candle = SchemaCandleV1 {
+                    open: scale(candle.open),
+                    high: scale(candle.high),
+                    low: scale(candle.low),
+                    close: scale(candle.close),
+                    volume: candle.volume,
+                };
+                token_mcusd_candle_overrides.insert((*token, *tf, *bucket_ts), mc_candle);
+            }
+
             for ((token, tf, bucket_ts), candle) in token_usd_candle_overrides.iter() {
                 let key = table.token_usd_candle_key(token, *tf, *bucket_ts);
                 let encoded = encode_candle_v1(candle)?;
                 token_usd_candle_writes.push((key, encoded));
             }
 
+            for ((token, tf, bucket_ts), candle) in token_mcusd_candle_overrides.iter() {
+                let key = table.token_mcusd_candle_key(token, *tf, *bucket_ts);
+                let encoded = encode_candle_v1(candle)?;
+                token_mcusd_candle_writes.push((key, encoded));
+            }
+
+            let mut tokens_for_metrics: HashSet<SchemaAlkaneId> = HashSet::new();
             for token in canonical_trade_buckets.keys() {
+                tokens_for_metrics.insert(*token);
+            }
+            for ((token, _tf, _bucket), _candle) in token_usd_candle_overrides.iter() {
+                tokens_for_metrics.insert(*token);
+            }
+
+            for token in tokens_for_metrics.iter() {
                 let prefix = table.token_usd_candle_ns_prefix(token, Timeframe::M10);
                 let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
                 for (k, v) in provider
@@ -1429,6 +1905,380 @@ impl EspoModule for AmmData {
                 let encoded = encode_token_metrics(&metrics)?;
                 token_metrics_writes.push((metrics_key, encoded));
             }
+
+            let mut derived_tokens_for_metrics: HashSet<(SchemaAlkaneId, SchemaAlkaneId)> =
+                HashSet::new();
+            for ((token, quote, _tf, _bucket), _candle) in token_derived_usd_candle_overrides.iter()
+            {
+                derived_tokens_for_metrics.insert((*token, *quote));
+            }
+
+            for (token, quote) in derived_tokens_for_metrics.iter() {
+                let prefix =
+                    table.token_derived_usd_candle_ns_prefix(token, quote, Timeframe::M10);
+                let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+                for (k, v) in provider
+                    .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+                    .entries
+                {
+                    if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+                        if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                            if let Ok(ts) = ts_str.parse::<u64>() {
+                                if !per_bucket.contains_key(&ts) {
+                                    if let Ok(c) = decode_candle_v1(&v) {
+                                        per_bucket.insert(ts, c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for ((tok, q, tf, bucket), candle) in token_derived_usd_candle_overrides.iter() {
+                    if tok == token && q == quote && *tf == Timeframe::M10 {
+                        per_bucket.insert(*bucket, *candle);
+                    }
+                }
+
+                if per_bucket.is_empty() {
+                    continue;
+                }
+
+                let now_bucket = bucket_start_for(block_ts, Timeframe::M10);
+                let earliest_bucket = per_bucket.keys().next().copied().unwrap_or(now_bucket);
+
+                let close_at = |target_bucket: u64| -> u128 {
+                    if per_bucket.is_empty() {
+                        return 0;
+                    }
+                    if target_bucket <= earliest_bucket {
+                        return per_bucket.get(&earliest_bucket).map(|c| c.close).unwrap_or(0);
+                    }
+                    let mut bts = earliest_bucket;
+                    let mut last_close = 0u128;
+                    while bts <= target_bucket {
+                        if let Some(c) = per_bucket.get(&bts) {
+                            last_close = c.close;
+                        }
+                        bts = match bts.checked_add(Timeframe::M10.duration_secs()) {
+                            Some(n) => n,
+                            None => break,
+                        };
+                    }
+                    last_close
+                };
+
+                let latest_close = close_at(now_bucket);
+                let first_close = per_bucket.get(&earliest_bucket).map(|c| c.close).unwrap_or(0);
+
+                let window_close = |secs: u64| -> u128 {
+                    let target = now_bucket.saturating_sub(secs);
+                    close_at(target)
+                };
+
+                let percent_change = |prev: u128, now: u128| -> String {
+                    if prev == 0 {
+                        return "0".to_string();
+                    }
+                    let prev_f = prev as f64;
+                    let now_f = now as f64;
+                    let pct = (now_f - prev_f) / prev_f * 100.0;
+                    format!("{:.4}", pct)
+                };
+
+                let volume_window = |secs: u64| -> u128 {
+                    let start = now_bucket.saturating_sub(secs);
+                    per_bucket.range(start..=now_bucket).map(|(_, c)| c.volume).sum()
+                };
+
+                let volume_all_time: u128 = per_bucket.values().map(|c| c.volume).sum();
+
+                let supply = if let Some(v) = supply_cache.get(token) {
+                    *v
+                } else {
+                    let table_e = essentials.table();
+                    let key = table_e.circulating_supply_latest_key(token);
+                    let v = essentials
+                        .get_raw_value(EssentialsGetRawValueParams { key })?
+                        .value
+                        .and_then(|raw| {
+                            crate::modules::essentials::storage::decode_u128_value(&raw).ok()
+                        })
+                        .unwrap_or(0);
+                    supply_cache.insert(*token, v);
+                    v
+                };
+
+                let price_usd = latest_close;
+                let fdv_usd = price_usd.saturating_mul(supply) / PRICE_SCALE;
+                let marketcap_usd = fdv_usd;
+
+                let metrics = SchemaTokenMetricsV1 {
+                    price_usd,
+                    fdv_usd,
+                    marketcap_usd,
+                    volume_all_time,
+                    volume_1d: volume_window(24 * 60 * 60),
+                    volume_7d: volume_window(7 * 24 * 60 * 60),
+                    volume_30d: volume_window(30 * 24 * 60 * 60),
+                    change_1d: percent_change(window_close(24 * 60 * 60), latest_close),
+                    change_7d: percent_change(window_close(7 * 24 * 60 * 60), latest_close),
+                    change_30d: percent_change(window_close(30 * 24 * 60 * 60), latest_close),
+                    change_all_time: percent_change(first_close, latest_close),
+                };
+
+                let metrics_key = table.token_derived_metrics_key(token, quote);
+                let prev_raw =
+                    provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
+                let prev_metrics = prev_raw
+                    .value
+                    .as_ref()
+                    .and_then(|raw| decode_token_metrics(raw).ok());
+                if prev_raw.value.is_none() {
+                    let entry = derived_metrics_index_new.entry(*quote).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                }
+
+                let build_index_keys =
+                    |m: &SchemaTokenMetricsV1| -> Vec<(TokenMetricsIndexField, Vec<u8>)> {
+                        vec![
+                            (
+                                TokenMetricsIndexField::PriceUsd,
+                                table.token_derived_metrics_index_key_u128(
+                                    quote,
+                                    TokenMetricsIndexField::PriceUsd,
+                                    m.price_usd,
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::MarketcapUsd,
+                                table.token_derived_metrics_index_key_u128(
+                                    quote,
+                                    TokenMetricsIndexField::MarketcapUsd,
+                                    m.marketcap_usd,
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::Volume1d,
+                                table.token_derived_metrics_index_key_u128(
+                                    quote,
+                                    TokenMetricsIndexField::Volume1d,
+                                    m.volume_1d,
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::Volume7d,
+                                table.token_derived_metrics_index_key_u128(
+                                    quote,
+                                    TokenMetricsIndexField::Volume7d,
+                                    m.volume_7d,
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::Volume30d,
+                                table.token_derived_metrics_index_key_u128(
+                                    quote,
+                                    TokenMetricsIndexField::Volume30d,
+                                    m.volume_30d,
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::VolumeAllTime,
+                                table.token_derived_metrics_index_key_u128(
+                                    quote,
+                                    TokenMetricsIndexField::VolumeAllTime,
+                                    m.volume_all_time,
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::Change1d,
+                                table.token_derived_metrics_index_key_i64(
+                                    quote,
+                                    TokenMetricsIndexField::Change1d,
+                                    parse_change_basis_points(&m.change_1d),
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::Change7d,
+                                table.token_derived_metrics_index_key_i64(
+                                    quote,
+                                    TokenMetricsIndexField::Change7d,
+                                    parse_change_basis_points(&m.change_7d),
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::Change30d,
+                                table.token_derived_metrics_index_key_i64(
+                                    quote,
+                                    TokenMetricsIndexField::Change30d,
+                                    parse_change_basis_points(&m.change_30d),
+                                    token,
+                                ),
+                            ),
+                            (
+                                TokenMetricsIndexField::ChangeAllTime,
+                                table.token_derived_metrics_index_key_i64(
+                                    quote,
+                                    TokenMetricsIndexField::ChangeAllTime,
+                                    parse_change_basis_points(&m.change_all_time),
+                                    token,
+                                ),
+                            ),
+                        ]
+                    };
+
+                let new_keys = build_index_keys(&metrics);
+                if let Some(prev) = prev_metrics.as_ref() {
+                    let prev_keys = build_index_keys(prev);
+                    for (idx, (_field, new_key)) in new_keys.iter().enumerate() {
+                        if let Some((_pf, prev_key)) = prev_keys.get(idx) {
+                            if prev_key != new_key {
+                                derived_metrics_index_deletes.push(prev_key.clone());
+                                derived_metrics_index_writes.push((new_key.clone(), Vec::new()));
+                            }
+                        }
+                    }
+                } else {
+                    for (_field, new_key) in new_keys.into_iter() {
+                        derived_metrics_index_writes.push((new_key, Vec::new()));
+                    }
+                }
+
+                if search_index_enabled {
+                    let rec = essentials
+                        .get_creation_record(GetCreationRecordParams { alkane: *token })
+                        .ok()
+                        .and_then(|resp| resp.record);
+                    if let Some(rec) = rec {
+                        let prefixes = collect_search_prefixes(
+                            &rec.names,
+                            &rec.symbols,
+                            search_prefix_min,
+                            search_prefix_max,
+                        );
+                        if !prefixes.is_empty() {
+                            let new_marketcap = metrics.marketcap_usd;
+                            let new_volume_7d = metrics.volume_7d;
+                            let new_change_7d = parse_change_basis_points(&metrics.change_7d);
+                            let new_volume_all = metrics.volume_all_time;
+
+                            let prev_marketcap = prev_metrics.as_ref().map(|m| m.marketcap_usd);
+                            let prev_volume_7d = prev_metrics.as_ref().map(|m| m.volume_7d);
+                            let prev_change_7d = prev_metrics
+                                .as_ref()
+                                .map(|m| parse_change_basis_points(&m.change_7d));
+                            let prev_volume_all = prev_metrics.as_ref().map(|m| m.volume_all_time);
+
+                            for prefix in prefixes {
+                                derived_search_index_writes.push((
+                                    table.token_derived_search_index_key_u128(
+                                        quote,
+                                        SearchIndexField::Marketcap,
+                                        &prefix,
+                                        new_marketcap,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+                                derived_search_index_writes.push((
+                                    table.token_derived_search_index_key_u128(
+                                        quote,
+                                        SearchIndexField::Volume7d,
+                                        &prefix,
+                                        new_volume_7d,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+                                derived_search_index_writes.push((
+                                    table.token_derived_search_index_key_i64(
+                                        quote,
+                                        SearchIndexField::Change7d,
+                                        &prefix,
+                                        new_change_7d,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+                                derived_search_index_writes.push((
+                                    table.token_derived_search_index_key_u128(
+                                        quote,
+                                        SearchIndexField::VolumeAllTime,
+                                        &prefix,
+                                        new_volume_all,
+                                        token,
+                                    ),
+                                    Vec::new(),
+                                ));
+
+                                if let Some(prev) = prev_marketcap {
+                                    if prev != new_marketcap {
+                                        derived_search_index_deletes.push(
+                                            table.token_derived_search_index_key_u128(
+                                                quote,
+                                                SearchIndexField::Marketcap,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if let Some(prev) = prev_volume_7d {
+                                    if prev != new_volume_7d {
+                                        derived_search_index_deletes.push(
+                                            table.token_derived_search_index_key_u128(
+                                                quote,
+                                                SearchIndexField::Volume7d,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if let Some(prev) = prev_change_7d {
+                                    if prev != new_change_7d {
+                                        derived_search_index_deletes.push(
+                                            table.token_derived_search_index_key_i64(
+                                                quote,
+                                                SearchIndexField::Change7d,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                                if let Some(prev) = prev_volume_all {
+                                    if prev != new_volume_all {
+                                        derived_search_index_deletes.push(
+                                            table.token_derived_search_index_key_u128(
+                                                quote,
+                                                SearchIndexField::VolumeAllTime,
+                                                &prefix,
+                                                prev,
+                                                token,
+                                            ),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let encoded = encode_token_metrics(&metrics)?;
+                derived_metrics_writes.push((metrics_key, encoded));
+            }
         }
 
         debug::log_elapsed(module, "derive_token_metrics", timer);
@@ -1495,6 +2345,70 @@ impl EspoModule for AmmData {
                 price
             };
 
+            let bucket_1d_now = bucket_start_for(block_ts, Timeframe::D1);
+            let window_7d_start =
+                bucket_1d_now.saturating_sub(6 * Timeframe::D1.duration_secs());
+            let mut pool_volume_cache: HashMap<SchemaAlkaneId, (u128, u128, u128, u128)> =
+                HashMap::new();
+            let parse_bucket_ts = |key: &[u8]| -> Option<u64> {
+                key.rsplit(|&b| b == b':')
+                    .next()
+                    .and_then(|ts_bytes| std::str::from_utf8(ts_bytes).ok())
+                    .and_then(|ts_str| ts_str.parse::<u64>().ok())
+            };
+            let mut pool_volume_from_candles = |pool: &SchemaAlkaneId| -> Result<(u128, u128, u128, u128)> {
+                if let Some(cached) = pool_volume_cache.get(pool) {
+                    return Ok(*cached);
+                }
+                let mut overrides: HashMap<u64, SchemaFullCandleV1> = HashMap::new();
+                for ((pid, tf, bucket), candle) in pool_candle_overrides.iter() {
+                    if *pid == *pool && *tf == Timeframe::D1 {
+                        overrides.insert(*bucket, *candle);
+                    }
+                }
+
+                let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
+                let mut token0_volume_7d = 0u128;
+                let mut token1_volume_7d = 0u128;
+                let mut token0_volume_all = 0u128;
+                let mut token1_volume_all = 0u128;
+
+                for (k, v) in provider
+                    .get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?
+                    .entries
+                {
+                    let Some(ts) = parse_bucket_ts(&k) else { continue };
+                    let candle = if let Some(override_candle) = overrides.remove(&ts) {
+                        override_candle
+                    } else {
+                        decode_full_candle_v1(&v)?
+                    };
+                    let base_vol = candle.base_candle.volume;
+                    let quote_vol = candle.quote_candle.volume;
+                    token0_volume_all = token0_volume_all.saturating_add(base_vol);
+                    token1_volume_all = token1_volume_all.saturating_add(quote_vol);
+                    if ts >= window_7d_start {
+                        token0_volume_7d = token0_volume_7d.saturating_add(base_vol);
+                        token1_volume_7d = token1_volume_7d.saturating_add(quote_vol);
+                    }
+                }
+
+                for (ts, candle) in overrides {
+                    let base_vol = candle.base_candle.volume;
+                    let quote_vol = candle.quote_candle.volume;
+                    token0_volume_all = token0_volume_all.saturating_add(base_vol);
+                    token1_volume_all = token1_volume_all.saturating_add(quote_vol);
+                    if ts >= window_7d_start {
+                        token0_volume_7d = token0_volume_7d.saturating_add(base_vol);
+                        token1_volume_7d = token1_volume_7d.saturating_add(quote_vol);
+                    }
+                }
+
+                let out = (token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all);
+                pool_volume_cache.insert(*pool, out);
+                Ok(out)
+            };
+
             let percent_change = |prev: u128, now: u128| -> String {
                 if prev == 0 {
                     return "0".to_string();
@@ -1536,7 +2450,7 @@ impl EspoModule for AmmData {
                 let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
                 let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
 
-                let bucket_1d = bucket_start_for(block_ts, Timeframe::D1);
+                let bucket_1d = bucket_1d_now;
                 let bucket_30d = bucket_start_for(block_ts, Timeframe::M1);
 
                 let (token0_volume_1d, token1_volume_1d) =
@@ -1585,6 +2499,41 @@ impl EspoModule for AmmData {
                             .saturating_div(PRICE_SCALE),
                     );
 
+                let (token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all) =
+                    pool_volume_from_candles(pool)?;
+                let pool_volume_7d_usd = token0_volume_7d
+                    .saturating_mul(token0_price_usd)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_7d
+                            .saturating_mul(token1_price_usd)
+                            .saturating_div(PRICE_SCALE),
+                    );
+                let pool_volume_all_time_usd = token0_volume_all
+                    .saturating_mul(token0_price_usd)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_all
+                            .saturating_mul(token1_price_usd)
+                            .saturating_div(PRICE_SCALE),
+                    );
+                let pool_volume_7d_sats = token0_volume_7d
+                    .saturating_mul(token0_price_sats)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_7d
+                            .saturating_mul(token1_price_sats)
+                            .saturating_div(PRICE_SCALE),
+                    );
+                let pool_volume_all_time_sats = token0_volume_all
+                    .saturating_mul(token0_price_sats)
+                    .saturating_div(PRICE_SCALE)
+                    .saturating_add(
+                        token1_volume_all
+                            .saturating_mul(token1_price_sats)
+                            .saturating_div(PRICE_SCALE),
+                    );
+
                 let prev_1d = tvl_at_height(pool, height.saturating_sub(144));
                 let prev_7d = tvl_at_height(pool, height.saturating_sub(1008));
                 let tvl_change_24h = percent_change(prev_1d, pool_tvl_usd);
@@ -1609,6 +2558,25 @@ impl EspoModule for AmmData {
                     pool_volume_30d_sats,
                     pool_tvl_usd,
                     pool_tvl_sats,
+                    tvl_change_24h: tvl_change_24h.clone(),
+                    tvl_change_7d: tvl_change_7d.clone(),
+                    pool_apr: pool_apr.clone(),
+                };
+                let metrics_v2 = SchemaPoolMetricsV2 {
+                    token0_volume_1d,
+                    token1_volume_1d,
+                    token0_volume_30d,
+                    token1_volume_30d,
+                    pool_volume_1d_usd,
+                    pool_volume_30d_usd,
+                    pool_volume_1d_sats,
+                    pool_volume_30d_sats,
+                    pool_volume_7d_usd,
+                    pool_volume_all_time_usd,
+                    pool_volume_7d_sats,
+                    pool_volume_all_time_sats,
+                    pool_tvl_usd,
+                    pool_tvl_sats,
                     tvl_change_24h,
                     tvl_change_7d,
                     pool_apr,
@@ -1616,6 +2584,8 @@ impl EspoModule for AmmData {
 
                 pool_metrics_writes
                     .push((table.pool_metrics_key(pool), encode_pool_metrics(&metrics)?));
+                pool_metrics_writes
+                    .push((table.pool_metrics_v2_key(pool), encode_pool_metrics_v2(&metrics_v2)?));
 
                 let lp_supply = essentials
                     .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
@@ -1699,14 +2669,43 @@ impl EspoModule for AmmData {
             token_metrics_index_writes.push((count_key, updated.to_le_bytes().to_vec()));
         }
 
+        if !derived_metrics_index_new.is_empty() {
+            for (quote, add) in derived_metrics_index_new.into_iter() {
+                if add == 0 {
+                    continue;
+                }
+                let count_key = table.token_derived_metrics_index_count_key(&quote);
+                let current = provider
+                    .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+                    .value
+                    .and_then(|raw| {
+                        if raw.len() == 8 {
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(&raw);
+                            Some(u64::from_le_bytes(arr))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let updated = current.saturating_add(add);
+                derived_metrics_index_writes.push((count_key, updated.to_le_bytes().to_vec()));
+            }
+        }
+
         let reserves_blob = encode_reserves_snapshot(&reserves_snapshot)?;
         let reserves_key_rel = table.reserves_snapshot_key();
 
         let c_cnt = candle_writes.len();
         let tc_cnt = token_usd_candle_writes.len();
+        let tmc_cnt = token_mcusd_candle_writes.len();
+        let tdc_cnt = token_derived_usd_candle_writes.len();
         let tm_cnt = token_metrics_writes.len();
         let tmi_cnt = token_metrics_index_writes.len();
         let tsi_cnt = token_search_index_writes.len();
+        let tdm_cnt = derived_metrics_writes.len();
+        let tdmi_cnt = derived_metrics_index_writes.len();
+        let tdsi_cnt = derived_search_index_writes.len();
         let cp_cnt = canonical_pool_writes.len();
         let pn_cnt = pool_name_index_writes.len();
         let af_cnt = amm_factory_writes.len();
@@ -1731,13 +2730,18 @@ impl EspoModule for AmmData {
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
+            tmc_cnt = tmc_cnt,
+            tdc_cnt = tdc_cnt,
             tm_cnt = tm_cnt,
             tmi_cnt = tmi_cnt,
             tsi_cnt = tsi_cnt,
+            tdm_cnt = tdm_cnt,
+            tdmi_cnt = tdmi_cnt,
+            tdsi_cnt = tdsi_cnt,
             cp_cnt = cp_cnt,
             pn_cnt = pn_cnt,
             af_cnt = af_cnt,
@@ -1764,11 +2768,18 @@ impl EspoModule for AmmData {
         let timer = debug::start_if(debug);
         if !candle_writes.is_empty()
             || !token_usd_candle_writes.is_empty()
+            || !token_mcusd_candle_writes.is_empty()
+            || !token_derived_usd_candle_writes.is_empty()
             || !token_metrics_writes.is_empty()
             || !token_metrics_index_writes.is_empty()
             || !token_metrics_index_deletes.is_empty()
             || !token_search_index_writes.is_empty()
             || !token_search_index_deletes.is_empty()
+            || !derived_metrics_writes.is_empty()
+            || !derived_metrics_index_writes.is_empty()
+            || !derived_metrics_index_deletes.is_empty()
+            || !derived_search_index_writes.is_empty()
+            || !derived_search_index_deletes.is_empty()
             || !canonical_pool_writes.is_empty()
             || !pool_name_index_writes.is_empty()
             || !amm_factory_writes.is_empty()
@@ -1796,9 +2807,14 @@ impl EspoModule for AmmData {
             let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             puts.extend(candle_writes);
             puts.extend(token_usd_candle_writes);
+            puts.extend(token_mcusd_candle_writes);
+            puts.extend(token_derived_usd_candle_writes);
             puts.extend(token_metrics_writes);
             puts.extend(token_metrics_index_writes);
             puts.extend(token_search_index_writes);
+            puts.extend(derived_metrics_writes);
+            puts.extend(derived_metrics_index_writes);
+            puts.extend(derived_search_index_writes);
             puts.extend(canonical_pool_writes);
             puts.extend(pool_name_index_writes);
             puts.extend(amm_factory_writes);
@@ -1826,6 +2842,8 @@ impl EspoModule for AmmData {
             let mut deletes: Vec<Vec<u8>> = Vec::new();
             deletes.extend(token_metrics_index_deletes);
             deletes.extend(token_search_index_deletes);
+            deletes.extend(derived_metrics_index_deletes);
+            deletes.extend(derived_search_index_deletes);
             let _ = provider.set_batch(SetBatchParams { puts, deletes });
         }
 

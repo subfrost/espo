@@ -1,7 +1,7 @@
 use super::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaMarketDefs,
-    SchemaPoolCreationInfoV1, SchemaPoolMetricsV1, SchemaPoolSnapshot, SchemaReservesSnapshot,
-    SchemaTokenMetricsV1, Timeframe,
+    SchemaPoolCreationInfoV1, SchemaPoolMetricsV1, SchemaPoolMetricsV2, SchemaPoolSnapshot,
+    SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, canonical_quotes,
@@ -98,21 +98,28 @@ pub struct AmmDataTable<'a> {
     // Candle series (fc1:<blk>:<tx>:<tf>:...).
     pub CANDLES: MdbPointer<'a>,
     pub TOKEN_USD_CANDLES: MdbPointer<'a>,
+    pub TOKEN_DERIVED_USD_CANDLES: MdbPointer<'a>,
+    pub TOKEN_MCAP_USD_CANDLES: MdbPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
     pub ACTIVITY: MdbPointer<'a>,
     pub ACTIVITY_INDEX: MdbPointer<'a>,
     // Token-level indices.
     pub CANONICAL_POOL: MdbPointer<'a>,
     pub TOKEN_METRICS: MdbPointer<'a>,
+    pub TOKEN_DERIVED_METRICS: MdbPointer<'a>,
     pub TOKEN_METRICS_INDEX: MdbPointer<'a>,
+    pub TOKEN_DERIVED_METRICS_INDEX: MdbPointer<'a>,
     pub TOKEN_METRICS_INDEX_COUNT: MdbPointer<'a>,
+    pub TOKEN_DERIVED_METRICS_INDEX_COUNT: MdbPointer<'a>,
     pub TOKEN_SEARCH_INDEX: MdbPointer<'a>,
+    pub TOKEN_DERIVED_SEARCH_INDEX: MdbPointer<'a>,
     pub POOL_NAME_INDEX: MdbPointer<'a>,
     // Factory + pool indices.
     pub AMM_FACTORIES: MdbPointer<'a>,
     pub FACTORY_POOLS: MdbPointer<'a>,
     pub POOL_FACTORY: MdbPointer<'a>,
     pub POOL_METRICS: MdbPointer<'a>,
+    pub POOL_METRICS_V2: MdbPointer<'a>,
     pub POOL_CREATION_INFO: MdbPointer<'a>,
     pub POOL_LP_SUPPLY: MdbPointer<'a>,
     pub TVL_VERSIONED: MdbPointer<'a>,
@@ -138,18 +145,25 @@ impl<'a> AmmDataTable<'a> {
             POOLS: root.keyword("/pools/"),
             CANDLES: root.keyword("fc1:"),
             TOKEN_USD_CANDLES: root.keyword("tuc1:"),
+            TOKEN_DERIVED_USD_CANDLES: root.keyword("tud1:"),
+            TOKEN_MCAP_USD_CANDLES: root.keyword("tmc1:"),
             ACTIVITY: root.keyword("activity:v1:"),
             ACTIVITY_INDEX: root.keyword("activity:idx:"),
             CANONICAL_POOL: root.keyword("/canonical_pool/v1/"),
             TOKEN_METRICS: root.keyword("/token_metrics/v1/"),
+            TOKEN_DERIVED_METRICS: root.keyword("/token_metrics/derived/v1/"),
             TOKEN_METRICS_INDEX: root.keyword("/token_metrics/index/"),
+            TOKEN_DERIVED_METRICS_INDEX: root.keyword("/token_metrics/derived/index/"),
             TOKEN_METRICS_INDEX_COUNT: root.keyword("/token_metrics/index_count"),
+            TOKEN_DERIVED_METRICS_INDEX_COUNT: root.keyword("/token_metrics/derived/index_count"),
             TOKEN_SEARCH_INDEX: root.keyword("/token_search_index/v1/"),
+            TOKEN_DERIVED_SEARCH_INDEX: root.keyword("/token_search_index/derived/v1/"),
             POOL_NAME_INDEX: root.keyword("/pool_name_index/"),
             AMM_FACTORIES: root.keyword("/amm_factories/v1/"),
             FACTORY_POOLS: root.keyword("/factory_pools/v1/"),
             POOL_FACTORY: root.keyword("/pool_factory/v1/"),
             POOL_METRICS: root.keyword("/pool_metrics/v1/"),
+            POOL_METRICS_V2: root.keyword("/pool_metrics/v2/"),
             POOL_CREATION_INFO: root.keyword("/pool_creation_info/v1/"),
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
@@ -318,6 +332,60 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn token_derived_usd_candle_ns_prefix(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+        tf: Timeframe,
+    ) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let q_blk_hex = format!("{:x}", quote.block);
+        let q_tx_hex = format!("{:x}", quote.tx);
+        let suffix = format!(
+            "{}:{}:{}:{}:{}:",
+            blk_hex,
+            tx_hex,
+            q_blk_hex,
+            q_tx_hex,
+            tf.code()
+        );
+        self.TOKEN_DERIVED_USD_CANDLES
+            .select(suffix.as_bytes())
+            .key()
+            .to_vec()
+    }
+
+    pub fn token_derived_usd_candle_key(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_derived_usd_candle_ns_prefix(token, quote, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
+    pub fn token_mcusd_candle_ns_prefix(&self, token: &SchemaAlkaneId, tf: Timeframe) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let suffix = format!("{}:{}:{}:", blk_hex, tx_hex, tf.code());
+        self.TOKEN_MCAP_USD_CANDLES.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_mcusd_candle_key(
+        &self,
+        token: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_mcusd_candle_ns_prefix(token, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
     pub fn token_metrics_index_prefix(&self, field: TokenMetricsIndexField) -> Vec<u8> {
         let mut k = self.TOKEN_METRICS_INDEX.select(field.as_str().as_bytes()).key().to_vec();
         k.push(b'/');
@@ -451,6 +519,157 @@ impl<'a> AmmDataTable<'a> {
         self.TOKEN_METRICS.select(&suffix).key().to_vec()
     }
 
+    pub fn token_derived_metrics_key(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(24);
+        suffix.extend_from_slice(&quote.block.to_be_bytes());
+        suffix.extend_from_slice(&quote.tx.to_be_bytes());
+        suffix.extend_from_slice(&token.block.to_be_bytes());
+        suffix.extend_from_slice(&token.tx.to_be_bytes());
+        self.TOKEN_DERIVED_METRICS.select(&suffix).key().to_vec()
+    }
+
+    pub fn token_derived_metrics_index_prefix(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: TokenMetricsIndexField,
+    ) -> Vec<u8> {
+        let mut k = self.TOKEN_DERIVED_METRICS_INDEX.key().to_vec();
+        k.extend_from_slice(&quote.block.to_be_bytes());
+        k.extend_from_slice(&quote.tx.to_be_bytes());
+        k.push(b'/');
+        k.extend_from_slice(field.as_str().as_bytes());
+        k.push(b'/');
+        k
+    }
+
+    pub fn token_derived_metrics_index_key_u128(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: TokenMetricsIndexField,
+        value: u128,
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_derived_metrics_index_prefix(quote, field);
+        k.extend_from_slice(&value.to_be_bytes());
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_derived_metrics_index_key_i64(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: TokenMetricsIndexField,
+        value: i64,
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_derived_metrics_index_prefix(quote, field);
+        k.extend_from_slice(&encode_i64_be_ordered(value));
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn parse_token_derived_metrics_index_key(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: TokenMetricsIndexField,
+        key: &[u8],
+    ) -> Option<SchemaAlkaneId> {
+        let prefix = self.token_derived_metrics_index_prefix(quote, field);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != field.value_len() + 12 {
+            return None;
+        }
+        let id_bytes = &rest[field.value_len()..];
+        let mut block_arr = [0u8; 4];
+        block_arr.copy_from_slice(&id_bytes[..4]);
+        let mut tx_arr = [0u8; 8];
+        tx_arr.copy_from_slice(&id_bytes[4..12]);
+        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+    }
+
+    pub fn token_derived_metrics_index_count_key(&self, quote: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&quote.block.to_be_bytes());
+        suffix.extend_from_slice(&quote.tx.to_be_bytes());
+        self.TOKEN_DERIVED_METRICS_INDEX_COUNT
+            .select(&suffix)
+            .key()
+            .to_vec()
+    }
+
+    pub fn token_derived_search_index_prefix(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: SearchIndexField,
+        prefix: &str,
+    ) -> Vec<u8> {
+        let mut k = self.TOKEN_DERIVED_SEARCH_INDEX.key().to_vec();
+        k.extend_from_slice(&quote.block.to_be_bytes());
+        k.extend_from_slice(&quote.tx.to_be_bytes());
+        k.push(b'/');
+        k.extend_from_slice(field.as_str().as_bytes());
+        k.push(b'/');
+        k.extend_from_slice(prefix.as_bytes());
+        k.push(b'/');
+        k
+    }
+
+    pub fn token_derived_search_index_key_u128(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: SearchIndexField,
+        prefix: &str,
+        value: u128,
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_derived_search_index_prefix(quote, field, prefix);
+        k.extend_from_slice(&value.to_be_bytes());
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn token_derived_search_index_key_i64(
+        &self,
+        quote: &SchemaAlkaneId,
+        field: SearchIndexField,
+        prefix: &str,
+        value: i64,
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.token_derived_search_index_prefix(quote, field, prefix);
+        k.extend_from_slice(&encode_i64_be_ordered(value));
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k
+    }
+
+    pub fn parse_token_derived_search_index_key(
+        &self,
+        _quote: &SchemaAlkaneId,
+        field: SearchIndexField,
+        key: &[u8],
+    ) -> Option<SchemaAlkaneId> {
+        if key.len() < field.score_len() + 12 {
+            return None;
+        }
+        let id_bytes = &key[key.len() - 12..];
+        let mut block_arr = [0u8; 4];
+        block_arr.copy_from_slice(&id_bytes[..4]);
+        let mut tx_arr = [0u8; 8];
+        tx_arr.copy_from_slice(&id_bytes[4..12]);
+        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+    }
+
     pub fn pool_name_index_key(&self, name: &str, pool: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(name.len() + 1 + 12);
         suffix.extend_from_slice(name.as_bytes());
@@ -521,6 +740,13 @@ impl<'a> AmmDataTable<'a> {
         suffix.extend_from_slice(&pool.block.to_be_bytes());
         suffix.extend_from_slice(&pool.tx.to_be_bytes());
         self.POOL_METRICS.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_metrics_v2_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_METRICS_V2.select(&suffix).key().to_vec()
     }
 
     pub fn pool_creation_info_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
@@ -1099,6 +1325,22 @@ impl AmmDataProvider {
         Ok(GetTokenMetricsResult { metrics })
     }
 
+    pub fn get_token_derived_metrics(
+        &self,
+        params: GetTokenDerivedMetricsParams,
+    ) -> Result<GetTokenDerivedMetricsResult> {
+        crate::debug_timer_log!("get_token_derived_metrics");
+        let table = self.table();
+        let metrics = self
+            .get_raw_value(GetRawValueParams {
+                key: table.token_derived_metrics_key(&params.token, &params.quote),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_token_metrics(&raw).ok());
+        Ok(GetTokenDerivedMetricsResult { metrics })
+    }
+
     pub fn get_token_metrics_by_id(
         &self,
         params: GetTokenMetricsByIdParams,
@@ -1121,6 +1363,30 @@ impl AmmDataProvider {
             }
         }
         Ok(GetTokenMetricsByIdResult { metrics })
+    }
+
+    pub fn get_token_derived_metrics_by_id(
+        &self,
+        params: GetTokenDerivedMetricsByIdParams,
+    ) -> Result<GetTokenDerivedMetricsByIdResult> {
+        crate::debug_timer_log!("get_token_derived_metrics_by_id");
+        let table = self.table();
+        let keys: Vec<Vec<u8>> = params
+            .tokens
+            .iter()
+            .map(|token| table.token_derived_metrics_key(token, &params.quote))
+            .collect();
+        let values =
+            self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let mut metrics = Vec::with_capacity(values.len());
+        for val in values {
+            if let Some(bytes) = val {
+                metrics.push(decode_token_metrics(&bytes).ok());
+            } else {
+                metrics.push(None);
+            }
+        }
+        Ok(GetTokenDerivedMetricsByIdResult { metrics })
     }
 
     pub fn get_token_metrics_index_page(
@@ -1175,6 +1441,62 @@ impl AmmDataProvider {
         Ok(GetTokenMetricsIndexPageResult { ids: out })
     }
 
+    pub fn get_token_derived_metrics_index_page(
+        &self,
+        params: GetTokenDerivedMetricsIndexPageParams,
+    ) -> Result<GetTokenDerivedMetricsIndexPageResult> {
+        crate::debug_timer_log!("get_token_derived_metrics_index_page");
+        let table = self.table();
+        let prefix = table.token_derived_metrics_index_prefix(&params.quote, params.field);
+        let mut out: Vec<SchemaAlkaneId> = Vec::new();
+        let mut skipped: u64 = 0;
+
+        if params.desc {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_prefix_rev(&full_prefix) {
+                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
+                let rel = &k_full[self.mdb.prefix().len()..];
+                let Some(id) =
+                    table.parse_token_derived_metrics_index_key(&params.quote, params.field, rel)
+                else {
+                    continue;
+                };
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                out.push(id);
+                if out.len() >= params.limit as usize {
+                    break;
+                }
+            }
+        } else {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_from(&prefix) {
+                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
+                if !k_full.starts_with(&full_prefix) {
+                    break;
+                }
+                let rel = &k_full[self.mdb.prefix().len()..];
+                let Some(id) =
+                    table.parse_token_derived_metrics_index_key(&params.quote, params.field, rel)
+                else {
+                    continue;
+                };
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                out.push(id);
+                if out.len() >= params.limit as usize {
+                    break;
+                }
+            }
+        }
+
+        Ok(GetTokenDerivedMetricsIndexPageResult { ids: out })
+    }
+
     pub fn get_token_metrics_index_count(
         &self,
         _params: GetTokenMetricsIndexCountParams,
@@ -1196,6 +1518,30 @@ impl AmmDataProvider {
             })
             .unwrap_or(0);
         Ok(GetTokenMetricsIndexCountResult { count })
+    }
+
+    pub fn get_token_derived_metrics_index_count(
+        &self,
+        params: GetTokenDerivedMetricsIndexCountParams,
+    ) -> Result<GetTokenDerivedMetricsIndexCountResult> {
+        crate::debug_timer_log!("get_token_derived_metrics_index_count");
+        let table = self.table();
+        let count = self
+            .get_raw_value(GetRawValueParams {
+                key: table.token_derived_metrics_index_count_key(&params.quote),
+            })?
+            .value
+            .and_then(|raw| {
+                if raw.len() == 8 {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&raw);
+                    Some(u64::from_le_bytes(arr))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        Ok(GetTokenDerivedMetricsIndexCountResult { count })
     }
 
     pub fn get_token_search_index_page(
@@ -1248,6 +1594,66 @@ impl AmmDataProvider {
         }
 
         Ok(GetTokenSearchIndexPageResult { ids: out })
+    }
+
+    pub fn get_token_derived_search_index_page(
+        &self,
+        params: GetTokenDerivedSearchIndexPageParams,
+    ) -> Result<GetTokenDerivedSearchIndexPageResult> {
+        crate::debug_timer_log!("get_token_derived_search_index_page");
+        let table = self.table();
+        let prefix = table.token_derived_search_index_prefix(
+            &params.quote,
+            params.field,
+            &params.prefix,
+        );
+        let mut out: Vec<SchemaAlkaneId> = Vec::new();
+        let mut skipped: u64 = 0;
+
+        if params.desc {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_prefix_rev(&full_prefix) {
+                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
+                let rel = &k_full[self.mdb.prefix().len()..];
+                let Some(id) =
+                    table.parse_token_derived_search_index_key(&params.quote, params.field, rel)
+                else {
+                    continue;
+                };
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                out.push(id);
+                if out.len() >= params.limit as usize {
+                    break;
+                }
+            }
+        } else {
+            let full_prefix = self.mdb.prefixed(&prefix);
+            for res in self.mdb.iter_from(&prefix) {
+                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
+                if !k_full.starts_with(&full_prefix) {
+                    break;
+                }
+                let rel = &k_full[self.mdb.prefix().len()..];
+                let Some(id) =
+                    table.parse_token_derived_search_index_key(&params.quote, params.field, rel)
+                else {
+                    continue;
+                };
+                if skipped < params.offset {
+                    skipped += 1;
+                    continue;
+                }
+                out.push(id);
+                if out.len() >= params.limit as usize {
+                    break;
+                }
+            }
+        }
+
+        Ok(GetTokenDerivedSearchIndexPageResult { ids: out })
     }
 
     pub fn get_pool_ids_by_name_prefix(
@@ -1353,6 +1759,20 @@ impl AmmDataProvider {
             .and_then(|raw| decode_pool_metrics(&raw).ok())
             .unwrap_or_default();
         Ok(GetPoolMetricsResult { metrics })
+    }
+
+    pub fn get_pool_metrics_v2(
+        &self,
+        params: GetPoolMetricsV2Params,
+    ) -> Result<GetPoolMetricsV2Result> {
+        crate::debug_timer_log!("get_pool_metrics_v2");
+        let table = self.table();
+        let metrics = self
+            .get_raw_value(GetRawValueParams { key: table.pool_metrics_v2_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_pool_metrics_v2(&raw).ok());
+        Ok(GetPoolMetricsV2Result { metrics })
     }
 
     pub fn get_pool_creation_info(
@@ -1765,36 +2185,74 @@ impl AmmDataProvider {
             }
         };
 
-        let (pool, is_usd) = if let Some(stripped) = pool_raw.strip_suffix("-usd") {
+        let mut derived_quote: Option<SchemaAlkaneId> = None;
+        let (pool, is_usd, is_mcusd) = if let Some(stripped) = pool_raw.strip_suffix("-mcusd") {
             match parse_id_from_str(stripped) {
-                Some(p) => (p, true),
+                Some(p) => (p, false, true),
                 None => {
                     return Ok(RpcGetCandlesResult {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\" or \"2:0-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
             }
+        } else if let Some(stripped) = pool_raw.strip_suffix("-usd") {
+            if let Some((token_part, quote_part)) = stripped.split_once("-derived_") {
+                match (parse_id_from_str(token_part), parse_id_from_str(quote_part)) {
+                    (Some(p), Some(q)) => {
+                        derived_quote = Some(q);
+                        (p, true, false)
+                    }
+                    _ => {
+                        return Ok(RpcGetCandlesResult {
+                            value: json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_pool",
+                                "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
+                            }),
+                        });
+                    }
+                }
+            } else {
+                match parse_id_from_str(stripped) {
+                    Some(p) => (p, true, false),
+                    None => {
+                        return Ok(RpcGetCandlesResult {
+                            value: json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_pool",
+                                "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
+                            }),
+                        });
+                    }
+                }
+            }
         } else {
             match parse_id_from_str(pool_raw) {
-                Some(p) => (p, false),
+                Some(p) => (p, false, false),
                 None => {
                     return Ok(RpcGetCandlesResult {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\" or \"2:0-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
             }
         };
 
-        let slice = if is_usd {
-            read_token_usd_candles_v1(self, pool, tf, now)
+        let slice = if is_mcusd {
+            read_token_mcusd_candles_v1(self, pool, tf, now)
+        } else if is_usd {
+            if let Some(quote) = derived_quote {
+                read_token_derived_usd_candles_v1(self, pool, quote, tf, now)
+            } else {
+                read_token_usd_candles_v1(self, pool, tf, now)
+            }
         } else {
             read_candles_v1(self, pool, tf, /*unused*/ limit, now, side)
         };
@@ -1835,11 +2293,20 @@ impl AmmDataProvider {
                         "ok": true,
                         "pool": if is_usd {
                             format!("{}-usd", id_str(&pool))
+                        } else if is_mcusd {
+                            format!("{}-mcusd", id_str(&pool))
                         } else {
                             id_str(&pool)
                         },
                         "timeframe": tf.code(),
-                        "side": if is_usd { "base" } else { match side { PriceSide::Base => "base", PriceSide::Quote => "quote" } },
+                        "side": if is_usd || is_mcusd {
+                            "base"
+                        } else {
+                            match side {
+                                PriceSide::Base => "base",
+                                PriceSide::Quote => "quote",
+                            }
+                        },
                         "page": page,
                         "limit": limit,
                         "total": total,
@@ -2426,11 +2893,29 @@ pub struct GetTokenMetricsResult {
     pub metrics: SchemaTokenMetricsV1,
 }
 
+pub struct GetTokenDerivedMetricsParams {
+    pub token: SchemaAlkaneId,
+    pub quote: SchemaAlkaneId,
+}
+
+pub struct GetTokenDerivedMetricsResult {
+    pub metrics: Option<SchemaTokenMetricsV1>,
+}
+
 pub struct GetTokenMetricsByIdParams {
     pub tokens: Vec<SchemaAlkaneId>,
 }
 
 pub struct GetTokenMetricsByIdResult {
+    pub metrics: Vec<Option<SchemaTokenMetricsV1>>,
+}
+
+pub struct GetTokenDerivedMetricsByIdParams {
+    pub tokens: Vec<SchemaAlkaneId>,
+    pub quote: SchemaAlkaneId,
+}
+
+pub struct GetTokenDerivedMetricsByIdResult {
     pub metrics: Vec<Option<SchemaTokenMetricsV1>>,
 }
 
@@ -2445,9 +2930,29 @@ pub struct GetTokenMetricsIndexPageResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
 
+pub struct GetTokenDerivedMetricsIndexPageParams {
+    pub quote: SchemaAlkaneId,
+    pub field: TokenMetricsIndexField,
+    pub offset: u64,
+    pub limit: u64,
+    pub desc: bool,
+}
+
+pub struct GetTokenDerivedMetricsIndexPageResult {
+    pub ids: Vec<SchemaAlkaneId>,
+}
+
 pub struct GetTokenMetricsIndexCountParams;
 
 pub struct GetTokenMetricsIndexCountResult {
+    pub count: u64,
+}
+
+pub struct GetTokenDerivedMetricsIndexCountParams {
+    pub quote: SchemaAlkaneId,
+}
+
+pub struct GetTokenDerivedMetricsIndexCountResult {
     pub count: u64,
 }
 
@@ -2460,6 +2965,19 @@ pub struct GetTokenSearchIndexPageParams {
 }
 
 pub struct GetTokenSearchIndexPageResult {
+    pub ids: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetTokenDerivedSearchIndexPageParams {
+    pub quote: SchemaAlkaneId,
+    pub field: SearchIndexField,
+    pub prefix: String,
+    pub offset: u64,
+    pub limit: u64,
+    pub desc: bool,
+}
+
+pub struct GetTokenDerivedSearchIndexPageResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
 
@@ -2507,6 +3025,14 @@ pub struct GetPoolMetricsParams {
 
 pub struct GetPoolMetricsResult {
     pub metrics: SchemaPoolMetricsV1,
+}
+
+pub struct GetPoolMetricsV2Params {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolMetricsV2Result {
+    pub metrics: Option<SchemaPoolMetricsV2>,
 }
 
 pub struct GetPoolCreationInfoParams {
@@ -2847,6 +3373,15 @@ pub fn encode_pool_metrics(v: &SchemaPoolMetricsV1) -> anyhow::Result<Vec<u8>> {
     Ok(borsh::to_vec(v)?)
 }
 
+pub fn decode_pool_metrics_v2(bytes: &[u8]) -> anyhow::Result<SchemaPoolMetricsV2> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaPoolMetricsV2::try_from_slice(bytes)?)
+}
+
+pub fn encode_pool_metrics_v2(v: &SchemaPoolMetricsV2) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
+}
+
 pub fn decode_pool_creation_info(bytes: &[u8]) -> anyhow::Result<SchemaPoolCreationInfoV1> {
     use borsh::BorshDeserialize;
     Ok(SchemaPoolCreationInfoV1::try_from_slice(bytes)?)
@@ -2951,6 +3486,199 @@ fn read_token_usd_candles_v1(
     let dur = tf.duration_secs();
     let table = provider.table();
     let logical = table.token_usd_candle_ns_prefix(&token, tf);
+    let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    for (k, v) in provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .entries
+    {
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                if let Ok(ts) = ts_str.parse::<u64>() {
+                    if !per_bucket.contains_key(&ts) {
+                        if let Ok(c) = decode_candle_v1(&v) {
+                            per_bucket.insert(ts, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut last_close: u128 = 0;
+    let mut have_prev: bool = false;
+    let mut forward: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    let mut bts = start_bucket;
+
+    while bts <= newest_bucket_with_data {
+        if let Some(candle) = per_bucket.get(&bts) {
+            let mut c = *candle;
+            if have_prev {
+                c.open = last_close;
+                if c.open > c.high {
+                    c.high = c.open;
+                }
+                if c.open < c.low {
+                    c.low = c.open;
+                }
+            }
+            last_close = c.close;
+            have_prev = true;
+            forward.insert(bts, c);
+        } else {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            have_prev = true;
+            forward.insert(bts, c);
+        }
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            forward.insert(t, c);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_first: Vec<SchemaCandleV1> =
+        forward.into_iter().rev().map(|(_ts, c)| c).collect();
+
+    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+}
+
+fn read_token_derived_usd_candles_v1(
+    provider: &AmmDataProvider,
+    token: SchemaAlkaneId,
+    quote: SchemaAlkaneId,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<CandleSlice> {
+    let dur = tf.duration_secs();
+    let table = provider.table();
+    let logical = table.token_derived_usd_candle_ns_prefix(&token, &quote, tf);
+    let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    for (k, v) in provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .entries
+    {
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                if let Ok(ts) = ts_str.parse::<u64>() {
+                    if !per_bucket.contains_key(&ts) {
+                        if let Ok(c) = decode_candle_v1(&v) {
+                            per_bucket.insert(ts, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut last_close: u128 = 0;
+    let mut have_prev: bool = false;
+    let mut forward: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    let mut bts = start_bucket;
+
+    while bts <= newest_bucket_with_data {
+        if let Some(candle) = per_bucket.get(&bts) {
+            let mut c = *candle;
+            if have_prev {
+                c.open = last_close;
+                if c.open > c.high {
+                    c.high = c.open;
+                }
+                if c.open < c.low {
+                    c.low = c.open;
+                }
+            }
+            last_close = c.close;
+            have_prev = true;
+            forward.insert(bts, c);
+        } else {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            have_prev = true;
+            forward.insert(bts, c);
+        }
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            forward.insert(t, c);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_first: Vec<SchemaCandleV1> =
+        forward.into_iter().rev().map(|(_ts, c)| c).collect();
+
+    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+}
+
+fn read_token_mcusd_candles_v1(
+    provider: &AmmDataProvider,
+    token: SchemaAlkaneId,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<CandleSlice> {
+    let dur = tf.duration_secs();
+    let table = provider.table();
+    let logical = table.token_mcusd_candle_ns_prefix(&token, tf);
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
         .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?

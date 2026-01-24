@@ -141,6 +141,13 @@ impl EspoModule for Essentials {
         let module = self.get_name();
         let provider = self.provider();
         let table = provider.table();
+        let height = block.height;
+        if let Some(prev) = *self.index_height.read().unwrap() {
+            if height <= prev {
+                eprintln!("[ESSENTIALS] skipping already indexed block #{height} (last={prev})");
+                return Ok(());
+            }
+        }
 
         // -------- Phase A: coalesce per-block writes in memory --------
         // last-write-wins for values:
@@ -333,6 +340,7 @@ impl EspoModule for Essentials {
 
         debug::log_elapsed(module, "build_creation_records", timer);
         let timer = debug::start_if(debug);
+        let inspect_timer = debug::start_if(debug);
         let metashrew = get_metashrew();
         for rec in created_records.iter_mut() {
             match metashrew.get_alkane_wasm_bytes(&rec.alkane) {
@@ -363,7 +371,9 @@ impl EspoModule for Essentials {
                 }
             }
         }
+        debug::log_elapsed(module, "inspect_and_enrich.inspect_wasm_metadata", inspect_timer);
 
+        let names_timer = debug::start_if(debug);
         for rec in created_records.iter_mut() {
             if rec.names.is_empty() {
                 if let Some(name) = get_alkane_name(&block, &rec.alkane, rec.inspection.as_ref()) {
@@ -371,7 +381,9 @@ impl EspoModule for Essentials {
                 }
             }
         }
+        debug::log_elapsed(module, "inspect_and_enrich.names", names_timer);
 
+        let meta_timer = debug::start_if(debug);
         for rec in created_records.iter_mut() {
             if rec.cap == 0 && !cap_updates.contains_key(&rec.alkane) {
                 if let Some(cap) = get_cap(block.height, &rec.alkane, rec.inspection.as_ref()) {
@@ -386,6 +398,7 @@ impl EspoModule for Essentials {
                 }
             }
         }
+        debug::log_elapsed(module, "inspect_and_enrich.cap_mint", meta_timer);
 
         debug::log_elapsed(module, "inspect_and_enrich", timer);
         let timer = debug::start_if(debug);

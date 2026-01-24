@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 fn init_test_config_from_run_sh() {
     let cfg = AppConfig {
+        debug_backup: None,
         readonly_metashrew_db_dir: "/data/.metashrew/v9/.metashrew-v9".to_string(),
         electrum_rpc_url: None,
         metashrew_rpc_url: "http://127.0.0.1:7044".to_string(),
@@ -28,7 +29,7 @@ fn init_test_config_from_run_sh() {
         explorer_base_path: "/".to_string(),
         network: bitcoin::Network::Bitcoin,
         metashrew_db_label: None,
-        strict_mode: false,
+        strict_mode: None,
         debug: false,
         debug_ignore_ms: 0,
         block_source_mode: BlockFetchMode::RpcOnly,

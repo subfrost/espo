@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, StrictModeConfig};
 use crate::core::blockfetcher::BlockFetchMode;
 use bitcoin::Network;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ impl TestConfigBuilder {
             explorer_base_path: "/".to_string(),
             network: Network::Regtest, // Default to regtest
             metashrew_db_label: None,
-            strict_mode: false,
+            strict_mode: None,
             debug: false,
             debug_ignore_ms: 0,
             debug_backup: None,
@@ -71,7 +71,15 @@ impl TestConfigBuilder {
 
     /// Enable strict mode
     pub fn with_strict_mode(mut self, enabled: bool) -> Self {
-        self.config.strict_mode = enabled;
+        self.config.strict_mode = if enabled {
+            Some(StrictModeConfig {
+                check_utxos: true,
+                check_alkane_balances: true,
+                check_trace_mismatches: true,
+            })
+        } else {
+            None
+        };
         self
     }
 
@@ -142,7 +150,7 @@ mod tests {
         assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.view_only, true);
         assert_eq!(config.enable_aof, false);
-        assert_eq!(config.strict_mode, false);
+        assert!(config.strict_mode.is_none());
     }
 
     #[test]
@@ -154,7 +162,7 @@ mod tests {
             .build();
 
         assert_eq!(config.network, Network::Testnet);
-        assert_eq!(config.strict_mode, true);
+        assert!(config.strict_mode.is_some());
         assert_eq!(config.enable_aof, true);
     }
 

@@ -56,6 +56,27 @@ pub struct SchemaPoolMetricsV1 {
 }
 
 #[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Default)]
+pub struct SchemaPoolMetricsV2 {
+    pub token0_volume_1d: u128,
+    pub token1_volume_1d: u128,
+    pub token0_volume_30d: u128,
+    pub token1_volume_30d: u128,
+    pub pool_volume_1d_usd: u128,
+    pub pool_volume_30d_usd: u128,
+    pub pool_volume_1d_sats: u128,
+    pub pool_volume_30d_sats: u128,
+    pub pool_volume_7d_usd: u128,
+    pub pool_volume_all_time_usd: u128,
+    pub pool_volume_7d_sats: u128,
+    pub pool_volume_all_time_sats: u128,
+    pub pool_tvl_usd: u128,
+    pub pool_tvl_sats: u128,
+    pub tvl_change_24h: String,
+    pub tvl_change_7d: String,
+    pub pool_apr: String,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, PartialEq, Debug, Clone, Default)]
 pub struct SchemaPoolCreationInfoV1 {
     pub creator_spk: Vec<u8>,
     pub creation_height: u32,

@@ -153,6 +153,13 @@ pub struct DebugBackupConfig {
     pub dir: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct StrictModeConfig {
+    pub check_utxos: bool,
+    pub check_alkane_balances: bool,
+    pub check_trace_mismatches: bool,
+}
+
 impl<'de> Deserialize<'de> for DebugBackupConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -227,7 +234,7 @@ pub struct ConfigFile {
     #[serde(default)]
     pub metashrew_db_label: Option<String>,
     #[serde(default)]
-    pub strict_mode: bool,
+    pub strict_mode: Option<StrictModeConfig>,
     #[serde(default)]
     pub debug: bool,
     #[serde(default)]
@@ -265,7 +272,7 @@ pub struct AppConfig {
     pub explorer_base_path: String,
     pub network: Network,
     pub metashrew_db_label: Option<String>,
-    pub strict_mode: bool,
+    pub strict_mode: Option<StrictModeConfig>,
     pub debug: bool,
     pub debug_ignore_ms: u64,
     pub debug_backup: Option<DebugBackupConfig>,
@@ -588,7 +595,35 @@ pub fn get_network() -> Network {
 }
 
 pub fn is_strict_mode() -> bool {
-    get_config().strict_mode
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_utxos || cfg.check_alkane_balances || cfg.check_trace_mismatches)
+        .unwrap_or(false)
+}
+
+pub fn strict_check_utxos() -> bool {
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_utxos)
+        .unwrap_or(false)
+}
+
+pub fn strict_check_alkane_balances() -> bool {
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_alkane_balances)
+        .unwrap_or(false)
+}
+
+pub fn strict_check_trace_mismatches() -> bool {
+    get_config()
+        .strict_mode
+        .as_ref()
+        .map(|cfg| cfg.check_trace_mismatches)
+        .unwrap_or(false)
 }
 
 pub fn debug_enabled() -> bool {

@@ -100,7 +100,7 @@ mod tests {
             explorer_base_path: String::from("/"),
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
-            strict_mode: false,
+            strict_mode: None,
             debug: false,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             simulate_reorg: false,

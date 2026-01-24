@@ -4,10 +4,19 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OrdOutput {
     pub inscriptions: Vec<String>,
     pub runes: Value,
+}
+
+impl Default for OrdOutput {
+    fn default() -> Self {
+        Self {
+            inscriptions: Vec::new(),
+            runes: Value::Object(Default::default()),
+        }
+    }
 }
 
 pub async fn fetch_ord_outputs(
@@ -54,9 +63,10 @@ fn parse_ord_output(value: &Value) -> OrdOutput {
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default();
-    let runes = value
-        .get("runes")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
+    let runes = match value.get("runes") {
+        Some(Value::Null) => Value::Object(Default::default()),
+        Some(v) => v.clone(),
+        None => Value::Object(Default::default()),
+    };
     OrdOutput { inscriptions, runes }
 }

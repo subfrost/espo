@@ -17,7 +17,11 @@
   "explorer_base_path": "/",
   "network": "mainnet",
   "metashrew_db_label": null,
-  "strict_mode": false,
+  "strict_mode": {
+    "check_utxos": false,
+    "check_alkane_balances": false,
+    "check_trace_mismatches": false
+  },
   "debug": false,
   "block_source_mode": "rpc",
   "simulate_reorg": false,

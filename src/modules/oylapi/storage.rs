@@ -1,6 +1,7 @@
-use crate::config::{get_config, get_electrum_like, get_network};
+use crate::config::{get_config, get_electrum_like, get_last_safe_tip, get_network};
 use crate::modules::ammdata::config::AmmDataConfig;
-use crate::modules::ammdata::consts::PRICE_SCALE;
+use crate::modules::ammdata::consts::{CanonicalQuoteUnit, PRICE_SCALE, canonical_quotes};
+use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::schemas::{
     ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolSnapshot,
     SchemaTokenMetricsV1, Timeframe,
@@ -12,12 +13,17 @@ use crate::modules::ammdata::storage::{
     GetFactoryPoolsParams, GetIterPrefixRevParams, GetLatestTokenUsdCloseParams,
     GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
     GetPoolDefsParams, GetPoolFactoryParams, GetPoolIdsByNamePrefixParams,
-    GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetReservesSnapshotParams,
-    GetTokenMetricsByIdParams, GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams,
-    GetTokenMetricsParams, GetTokenPoolsParams, GetTokenSearchIndexPageParams,
+    GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetPoolMetricsV2Params,
+    GetReservesSnapshotParams, decode_full_candle_v1,
+    GetTokenDerivedMetricsByIdParams, GetTokenDerivedMetricsIndexCountParams,
+    GetTokenDerivedMetricsIndexPageParams, GetTokenDerivedMetricsParams,
+    GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
+    GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams, GetTokenMetricsParams,
+    GetTokenPoolsParams, GetTokenSearchIndexPageParams,
     GetTokenSwapsPageParams, SearchIndexField, TokenMetricsIndexField,
 };
 use crate::modules::ammdata::utils::pathfinder::plan_exact_in_default_fee;
+use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::search::normalize_search_text;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetAlkaneIdsByNamePrefixParams, GetAlkaneIdsBySymbolPrefixParams,
@@ -46,8 +52,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 
@@ -112,7 +119,7 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
 
     let balances = match get_balance_for_address(&state.essentials, &address) {
         Ok(v) => v,
-        Err(_) => HashMap::new(),
+        Err(err) => return internal_error(err),
     };
     if balances.is_empty() {
         return json!({ "statusCode": 200, "data": [] });
@@ -124,7 +131,7 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
         .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids })
     {
         Ok(r) => r.records,
-        Err(_) => Vec::new(),
+        Err(err) => return internal_error(err),
     };
     let mut rec_map: HashMap<SchemaAlkaneId, _> = HashMap::new();
     for rec in records.into_iter().flatten() {
@@ -143,8 +150,14 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
             .unwrap_or_default()
             .to_ascii_uppercase();
 
-        let (frbtc_price, busd_price) = canonical_pool_prices(state, &alkane, now_ts);
-        let price_usd = latest_token_usd_close(state, &alkane).unwrap_or(0);
+        let (frbtc_price, busd_price) = match canonical_pool_prices(state, &alkane, now_ts) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        let price_usd = match latest_token_usd_close(state, &alkane) {
+            Ok(v) => v.unwrap_or(0),
+            Err(err) => return internal_error(err),
+        };
         let image = format!("{}/{}-{}.png", state.config.alkane_icon_cdn, alkane.block, alkane.tx);
 
         out.push(json!({
@@ -152,10 +165,10 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
             "symbol": symbol,
             "balance": balance.to_string(),
             "alkaneId": alkane_id_json(&alkane),
-            "floorPrice": price_usd.to_string(),
+            "floorPrice": scale_price_u128(price_usd),
             "frbtcPoolPriceInSats": frbtc_price.to_string(),
-            "busdPoolPriceInUsd": busd_price.to_string(),
-            "priceUsd": price_usd.to_string(),
+            "busdPoolPriceInUsd": scale_price_u128(busd_price),
+            "priceUsd": scale_price_u128(price_usd),
             "priceInSatoshi": frbtc_price.to_string(),
             "tokenImage": image,
             "idClubMarketplace": false,
@@ -179,7 +192,7 @@ pub async fn get_alkanes_utxo(state: &OylApiState, address: &str) -> Value {
     .await
     {
         Ok(v) => v,
-        Err(_) => Vec::new(),
+        Err(err) => return internal_error(err),
     };
     json!({ "statusCode": 200, "data": utxos })
 }
@@ -203,7 +216,7 @@ pub async fn get_amm_utxos(
     .await
     {
         Ok(v) => v,
-        Err(_) => Vec::new(),
+        Err(err) => return internal_error(err),
     };
 
     utxos.retain(|u| !u.alkanes.is_empty() || is_clean_btc(u));
@@ -224,8 +237,16 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
     let offset = params.offset.unwrap_or(0) as usize;
     let sort_by = params.sort_by.unwrap_or_else(|| "volumeAllTime".to_string());
     let order = params.order.unwrap_or_else(|| "desc".to_string());
-    let search_cfg = AmmDataConfig::load_from_global_config().ok();
+    let search_cfg = match AmmDataConfig::load_from_global_config() {
+        Ok(cfg) => Some(cfg),
+        Err(err) => return internal_error(err),
+    };
     let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
+    let derived_quotes: Vec<SchemaAlkaneId> = search_cfg
+        .as_ref()
+        .and_then(|c| c.derived_liquidity.as_ref())
+        .map(|c| c.derived_quotes.iter().map(|dq| dq.alkane).collect())
+        .unwrap_or_default();
     let mut search_prefix_min =
         search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
     let mut search_prefix_max =
@@ -273,87 +294,147 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
         let mut ids: Vec<SchemaAlkaneId> = Vec::new();
 
         if search_index_enabled && query_len <= search_prefix_max {
-            let field = search_index_field_for_sort(&sort_by);
-            ids = state
-                .ammdata
-                .get_token_search_index_page(GetTokenSearchIndexPageParams {
-                    field,
-                    prefix: query_norm.clone(),
-                    offset: offset as u64,
-                    limit: limit as u64,
-                    desc,
-                })
-                .map(|res| res.ids)
-                .unwrap_or_default();
+            let (field, derived_quote) = search_index_field_for_sort(&sort_by);
+            if let Some(quote) = derived_quote {
+                if field != SearchIndexField::Holders {
+                    ids = match state.ammdata.get_token_derived_search_index_page(
+                        GetTokenDerivedSearchIndexPageParams {
+                            quote,
+                            field,
+                            prefix: query_norm.clone(),
+                            offset: offset as u64,
+                            limit: limit as u64,
+                            desc,
+                        },
+                    ) {
+                        Ok(res) => res.ids,
+                        Err(err) => return internal_error(err),
+                    };
+                }
+            } else {
+                ids = match state.ammdata.get_token_search_index_page(
+                    GetTokenSearchIndexPageParams {
+                        field,
+                        prefix: query_norm.clone(),
+                        offset: offset as u64,
+                        limit: limit as u64,
+                        desc,
+                    },
+                ) {
+                    Ok(res) => res.ids,
+                    Err(err) => return internal_error(err),
+                };
+            }
         }
 
         if ids.is_empty() {
-            ids = search_by_holders_scan(
+            ids = match search_by_holders_scan(
                 state,
                 &query_norm,
                 offset as u64,
                 limit as u64,
                 search_scan_cap,
-            );
+            ) {
+                Ok(v) => v,
+                Err(err) => return internal_error(err),
+            };
+            let (_field, derived_quote) = search_index_field_for_sort(&sort_by);
+            if let Some(quote) = derived_quote {
+                ids = match filter_ids_with_derived_metrics(state, ids, quote) {
+                    Ok(v) => v,
+                    Err(err) => return internal_error(err),
+                };
+            }
         }
 
         total = offset + ids.len();
 
         if !ids.is_empty() {
-            let records = state
+            let records = match state
                 .essentials
                 .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })
-                .map(|res| res.records)
-                .unwrap_or_default();
-            let metrics = token_metrics_multi(state, &ids);
-            let holders = holders_counts_multi(state, &ids);
+            {
+                Ok(res) => res.records,
+                Err(err) => return internal_error(err),
+            };
+            let metrics = match token_metrics_multi(state, &ids) {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let holders = match holders_counts_multi(state, &ids) {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
 
             for ((rec_opt, metrics), holders) in
                 records.into_iter().zip(metrics.into_iter()).zip(holders.into_iter())
             {
                 let Some(rec) = rec_opt else { continue };
-                if let Ok(token) = build_alkane_token(state, rec, metrics, holders) {
-                    tokens.push(token);
-                }
+                let token = match build_alkane_token(state, rec, metrics, holders, &derived_quotes)
+                {
+                    Ok(v) => v,
+                    Err(err) => return internal_error(err),
+                };
+                tokens.push(token);
             }
         }
     } else {
-        total = state
-            .essentials
-            .get_creation_count(GetCreationCountParams)
-            .map(|res| res.count as usize)
-            .unwrap_or(0);
+        let desc = order.eq_ignore_ascii_case("desc");
+        let sort_index = alkane_sort_index(&sort_by);
+        total = match sort_index {
+            AlkaneSortIndex::Derived { quote, .. } => match state.ammdata.get_token_derived_metrics_index_count(
+                GetTokenDerivedMetricsIndexCountParams { quote },
+            ) {
+                Ok(res) => res.count as usize,
+                Err(err) => return internal_error(err),
+            },
+            _ => match state.essentials.get_creation_count(GetCreationCountParams) {
+                Ok(res) => res.count as usize,
+                Err(err) => return internal_error(err),
+            },
+        };
 
         if total > 0 && limit > 0 {
-            let desc = order.eq_ignore_ascii_case("desc");
-            let sort_index = alkane_sort_index(&sort_by);
-            let ids = fetch_sorted_alkane_ids_no_query(
+            let ids = match fetch_sorted_alkane_ids_no_query(
                 state,
                 sort_index,
                 desc,
                 offset as u64,
                 limit as u64,
                 total as u64,
-            );
+            ) {
+                Ok(v) => v,
+                Err(err) => return internal_error(err),
+            };
 
             if !ids.is_empty() {
-                let records = state
+                let records = match state
                     .essentials
                     .get_creation_records_by_id(GetCreationRecordsByIdParams {
                         alkanes: ids.clone(),
-                    })
-                    .map(|res| res.records)
-                    .unwrap_or_default();
-                let metrics = token_metrics_multi(state, &ids);
-                let holders = holders_counts_multi(state, &ids);
+                    }) {
+                    Ok(res) => res.records,
+                    Err(err) => return internal_error(err),
+                };
+                let metrics = match token_metrics_multi(state, &ids) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
+                let holders = match holders_counts_multi(state, &ids) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
 
                 for ((rec_opt, metrics), holders) in
                     records.into_iter().zip(metrics.into_iter()).zip(holders.into_iter())
                 {
                     let Some(rec) = rec_opt else { continue };
-                    if let Ok(token) = build_alkane_token(state, rec, metrics, holders) {
-                        tokens.push(token);
-                    }
+                    let token =
+                        match build_alkane_token(state, rec, metrics, holders, &derived_quotes) {
+                            Ok(v) => v,
+                            Err(err) => return internal_error(err),
+                        };
+                    tokens.push(token);
                 }
             }
         }
@@ -373,24 +454,49 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
 
 pub async fn get_global_alkanes_search(state: &OylApiState, query: &str) -> Value {
     crate::debug_timer_log!("get_global_alkanes_search");
-    let records = fetch_records_for_query(state, Some(query)).unwrap_or_default();
+    let records = match fetch_records_for_query(state, Some(query)) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    let derived_quotes = match derived_quotes_from_config() {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
     let tokens = if records.is_empty() {
         Vec::new()
     } else {
         let ids: Vec<SchemaAlkaneId> = records.iter().map(|rec| rec.alkane).collect();
-        let metrics = token_metrics_multi(state, &ids);
-        let holders = holders_counts_multi(state, &ids);
-        records
+        let metrics = match token_metrics_multi(state, &ids) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
+        let holders = match holders_counts_multi(state, &ids) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
+        let mut combined = records
             .into_iter()
             .zip(metrics.into_iter())
             .zip(holders.into_iter())
-            .filter_map(|((rec, metrics), holders)| {
-                build_alkane_token(state, rec, metrics, holders).ok()
-            })
-            .collect::<Vec<_>>()
+            .map(|((rec, metrics), holders)| (holders, rec, metrics))
+            .collect::<Vec<_>>();
+        combined.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut out = Vec::new();
+        for (holders, rec, metrics) in combined {
+            let token = match build_alkane_token(state, rec, metrics, holders, &derived_quotes) {
+                Ok(v) => v,
+                Err(err) => return internal_error(err),
+            };
+            out.push(token);
+        }
+        out
     };
 
-    let pools = search_pools(state, query).unwrap_or_default();
+    let pools = match search_pools(state, query) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
 
     json!({ "statusCode": 200, "data": { "tokens": tokens, "pools": pools } })
 }
@@ -401,25 +507,43 @@ pub async fn get_alkane_details(state: &OylApiState, block: &str, tx: &str) -> V
         return error_response(400, "invalid_alkane_id");
     };
 
-    let rec = state
+    let rec = match state
         .essentials
         .get_creation_record(GetCreationRecordParams { alkane })
-        .ok()
-        .and_then(|resp| resp.record);
+    {
+        Ok(resp) => resp.record,
+        Err(err) => return internal_error(err),
+    };
     let Some(rec) = rec else {
         return error_response(404, "alkane_not_found");
     };
 
-    let metrics = token_metrics(state, &alkane);
-    let holders = holders_count(state, &alkane);
-    let mut token = match build_alkane_token(state, rec, metrics, holders) {
+    let metrics = match token_metrics(state, &alkane) {
         Ok(v) => v,
-        Err(_) => return error_response(500, "build_failed"),
+        Err(err) => return internal_error(err),
+    };
+    let holders = match holders_count(state, &alkane) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    let derived_quotes = match derived_quotes_from_config() {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    let mut token = match build_alkane_token(state, rec, metrics, holders, &derived_quotes) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
     };
 
-    let supply = latest_circulating_supply(state, &alkane);
+    let supply = match latest_circulating_supply(state, &alkane) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
     let now_ts = now_ts();
-    let (frbtc_price, _busd_price) = canonical_pool_prices(state, &alkane, now_ts);
+    let (frbtc_price, _busd_price) = match canonical_pool_prices(state, &alkane, now_ts) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
     let token_image =
         format!("{}/{}-{}.png", state.config.alkane_icon_cdn, alkane.block, alkane.tx);
 
@@ -445,11 +569,13 @@ pub async fn get_pools(
         return error_response(400, "invalid_factory_id");
     };
 
-    let pools = state
+    let pools = match state
         .ammdata
         .get_factory_pools(GetFactoryPoolsParams { factory })
-        .map(|res| res.pools)
-        .unwrap_or_default();
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
     let total = pools.len();
     let offset = offset.unwrap_or(0) as usize;
     let limit_usize = limit.map(|l| l as usize);
@@ -488,7 +614,7 @@ pub async fn get_pool_details(
     let details = match build_pool_details(state, Some(factory), pool) {
         Ok(Some(d)) => Some(d.value),
         Ok(None) => None,
-        Err(_) => None,
+        Err(err) => return internal_error(err),
     };
 
     json!({ "statusCode": 200, "data": details })
@@ -510,17 +636,19 @@ pub async fn get_address_positions(
 
     let balances = match get_balance_for_address(&state.essentials, &address) {
         Ok(v) => v,
-        Err(_) => HashMap::new(),
+        Err(err) => return internal_error(err),
     };
     if balances.is_empty() {
         return json!({ "statusCode": 200, "data": [] });
     }
 
-    let pool_ids = state
+    let pool_ids = match state
         .ammdata
         .get_factory_pools(GetFactoryPoolsParams { factory })
-        .map(|res| res.pools)
-        .unwrap_or_default();
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
     let pool_set: HashSet<SchemaAlkaneId> = pool_ids.into_iter().collect();
 
     let mut positions: Vec<(Value, u128)> = Vec::new();
@@ -529,7 +657,10 @@ pub async fn get_address_positions(
         if balance == 0 || !pool_set.contains(&pool_id) {
             continue;
         }
-        let Some(details) = build_pool_details(state, Some(factory), pool_id).ok().flatten() else {
+        let Some(details) = (match build_pool_details(state, Some(factory), pool_id) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        }) else {
             continue;
         };
 
@@ -565,10 +696,10 @@ pub async fn get_address_positions(
             map.insert("balance".to_string(), json!(balance.to_string()));
             map.insert("token0ValueInSats".to_string(), json!(token0_value_sats.to_string()));
             map.insert("token1ValueInSats".to_string(), json!(token1_value_sats.to_string()));
-            map.insert("token0ValueInUsd".to_string(), json!(token0_value_usd.to_string()));
-            map.insert("token1ValueInUsd".to_string(), json!(token1_value_usd.to_string()));
+            map.insert("token0ValueInUsd".to_string(), json!(scale_price_u128(token0_value_usd)));
+            map.insert("token1ValueInUsd".to_string(), json!(scale_price_u128(token1_value_usd)));
             map.insert("totalValueInSats".to_string(), json!(total_value_sats.to_string()));
-            map.insert("totalValueInUsd".to_string(), json!(total_value_usd.to_string()));
+            map.insert("totalValueInUsd".to_string(), json!(scale_price_u128(total_value_usd)));
         }
 
         positions.push((value, total_value_usd));
@@ -596,11 +727,13 @@ pub async fn get_all_pools_details(
         return error_response(400, "invalid_factory_id");
     };
 
-    let mut pools = state
+    let mut pools = match state
         .ammdata
         .get_factory_pools(GetFactoryPoolsParams { factory })
-        .map(|res| res.pools)
-        .unwrap_or_default();
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
 
     if let Some(query) = search_query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         if let Some(id) = parse_alkane_id_str(query) {
@@ -610,22 +743,26 @@ pub async fn get_all_pools_details(
                     filtered.push(pool);
                     continue;
                 }
-                if let Ok(resp) = state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
-                    if let Some(defs) = resp.defs {
-                        if defs.base_alkane_id == id || defs.quote_alkane_id == id {
-                            filtered.push(pool);
-                        }
+                let resp = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+                    Ok(v) => v,
+                    Err(err) => return internal_error(err),
+                };
+                if let Some(defs) = resp.defs {
+                    if defs.base_alkane_id == id || defs.quote_alkane_id == id {
+                        filtered.push(pool);
                     }
                 }
             }
             pools = filtered;
         } else {
             let norm = normalize_query(query);
-            let ids = state
+            let ids = match state
                 .ammdata
                 .get_pool_ids_by_name_prefix(GetPoolIdsByNamePrefixParams { prefix: norm })
-                .map(|res| res.ids)
-                .unwrap_or_default();
+            {
+                Ok(res) => res.ids,
+                Err(err) => return internal_error(err),
+            };
             let id_set: HashSet<SchemaAlkaneId> = ids.into_iter().collect();
             pools = pools.into_iter().filter(|p| id_set.contains(p)).collect();
         }
@@ -637,7 +774,7 @@ pub async fn get_all_pools_details(
         };
         let balances = match get_balance_for_address(&state.essentials, &addr) {
             Ok(v) => v,
-            Err(_) => HashMap::new(),
+            Err(err) => return internal_error(err),
         };
         pools = pools
             .into_iter()
@@ -647,7 +784,11 @@ pub async fn get_all_pools_details(
 
     let mut computed: Vec<PoolDetailsComputed> = Vec::new();
     for pool in pools.into_iter() {
-        if let Ok(Some(details)) = build_pool_details(state, Some(factory), pool) {
+        let details = match build_pool_details(state, Some(factory), pool) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        if let Some(details) = details {
             computed.push(details);
         }
     }
@@ -663,9 +804,9 @@ pub async fn get_all_pools_details(
                 "limit": limit,
                 "largestPool": Value::Null,
                 "trendingPools": Value::Null,
-                "totalTvl": "0",
-                "totalPoolVolume24hChange": "0.00",
-                "totalPoolVolume24h": "0",
+                "totalTvl": 0.0,
+                "totalPoolVolume24hChange": 0.0,
+                "totalPoolVolume24h": 0.0,
             }
         });
     }
@@ -723,7 +864,7 @@ pub async fn get_all_pools_details(
     let largest_pool = largest.map(|d| {
         let mut val = d.value.clone();
         if let Value::Object(ref mut map) = val {
-            map.insert("tvl".to_string(), json!(d.pool_tvl_usd.to_string()));
+            map.insert("tvl".to_string(), json!(scale_price_u128(d.pool_tvl_usd)));
         }
         val
     });
@@ -746,9 +887,9 @@ pub async fn get_all_pools_details(
             "limit": limit,
             "largestPool": largest_pool,
             "trendingPools": trending_pool,
-            "totalTvl": total_tvl.to_string(),
-            "totalPoolVolume24hChange": "0.00",
-            "totalPoolVolume24h": total_volume_1d.to_string(),
+            "totalTvl": scale_price_u128(total_tvl),
+            "totalPoolVolume24hChange": 0.0,
+            "totalPoolVolume24h": scale_price_u128(total_volume_1d),
         }
     })
 }
@@ -770,51 +911,49 @@ pub async fn get_pool_swap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state
-        .ammdata
-        .get_pool_defs(GetPoolDefsParams { pool })
-        .ok()
-        .and_then(|res| res.defs)
-    {
-        Some(defs) => defs,
-        None => {
-            return json!({
-                "statusCode": 200,
-                "data": {
-                    "items": {
-                        "pool": {
-                            "poolId": alkane_id_json(&pool),
-                            "poolName": "",
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+        Ok(res) => match res.defs {
+            Some(defs) => defs,
+            None => {
+                return json!({
+                    "statusCode": 200,
+                    "data": {
+                        "items": {
+                            "pool": {
+                                "poolId": alkane_id_json(&pool),
+                                "poolName": "",
+                            },
+                            "swaps": [],
+                            "count": 0,
+                            "offset": offset,
+                            "total": 0,
                         },
-                        "swaps": [],
+                        "total": 0,
                         "count": 0,
                         "offset": offset,
-                        "total": 0,
-                    },
-                    "total": 0,
-                    "count": 0,
-                    "offset": offset,
-                }
-            });
-        }
+                    }
+                });
+            }
+        },
+        Err(err) => return internal_error(err),
     };
 
-    let resp = state
-        .ammdata
-        .get_pool_activity_entries(GetPoolActivityEntriesParams {
-            pool,
-            offset,
-            limit,
-            kinds: Some(vec![ActivityKind::TradeBuy, ActivityKind::TradeSell]),
-            successful,
-            include_total,
-        })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetPoolActivityEntriesResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    let resp = match state.ammdata.get_pool_activity_entries(GetPoolActivityEntriesParams {
+        pool,
+        offset,
+        limit,
+        kinds: Some(vec![ActivityKind::TradeBuy, ActivityKind::TradeSell]),
+        successful,
+        include_total,
+    }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
-    let pool_name = pool_name_from_defs(state, &defs);
+    let pool_name = match pool_name_from_defs(state, &defs) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
     let mut swaps = Vec::new();
     for entry in resp.entries {
         let Some((sold_id, bought_id, sold_amt, bought_amt)) = trade_from_activity(&defs, &entry)
@@ -876,29 +1015,27 @@ pub async fn get_token_swap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_token_swaps_page(GetTokenSwapsPageParams { token, offset, limit })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetTokenSwapsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut swaps = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
-            Some(v) => v,
-            None => continue,
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -906,12 +1043,14 @@ pub async fn get_token_swap_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let Some(defs) = state
+            let defs_resp = match state
                 .ammdata
                 .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(entry.pool, defs);
@@ -968,41 +1107,38 @@ pub async fn get_pool_mint_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state
-        .ammdata
-        .get_pool_defs(GetPoolDefsParams { pool })
-        .ok()
-        .and_then(|res| res.defs)
-    {
-        Some(defs) => defs,
-        None => {
-            return json!({
-                "statusCode": 200,
-                "data": { "items": [], "total": 0, "count": 0, "offset": offset }
-            });
-        }
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+        Ok(res) => match res.defs {
+            Some(defs) => defs,
+            None => {
+                return json!({
+                    "statusCode": 200,
+                    "data": { "items": [], "total": 0, "count": 0, "offset": offset }
+                });
+            }
+        },
+        Err(err) => return internal_error(err),
     };
 
-    let resp = state
-        .ammdata
-        .get_pool_activity_entries(GetPoolActivityEntriesParams {
-            pool,
-            offset,
-            limit,
-            kinds: Some(vec![ActivityKind::LiquidityAdd]),
-            successful,
-            include_total,
-        })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetPoolActivityEntriesResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    let resp = match state.ammdata.get_pool_activity_entries(GetPoolActivityEntriesParams {
+        pool,
+        offset,
+        limit,
+        kinds: Some(vec![ActivityKind::LiquidityAdd]),
+        successful,
+        include_total,
+    }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
-    let lp_supply = state
+    let lp_supply = match state
         .ammdata
         .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-        .map(|res| res.supply)
-        .unwrap_or(0);
+    {
+        Ok(res) => res.supply,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1055,41 +1191,38 @@ pub async fn get_pool_burn_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state
-        .ammdata
-        .get_pool_defs(GetPoolDefsParams { pool })
-        .ok()
-        .and_then(|res| res.defs)
-    {
-        Some(defs) => defs,
-        None => {
-            return json!({
-                "statusCode": 200,
-                "data": { "items": [], "total": 0, "count": 0, "offset": offset }
-            });
-        }
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+        Ok(res) => match res.defs {
+            Some(defs) => defs,
+            None => {
+                return json!({
+                    "statusCode": 200,
+                    "data": { "items": [], "total": 0, "count": 0, "offset": offset }
+                });
+            }
+        },
+        Err(err) => return internal_error(err),
     };
 
-    let resp = state
-        .ammdata
-        .get_pool_activity_entries(GetPoolActivityEntriesParams {
-            pool,
-            offset,
-            limit,
-            kinds: Some(vec![ActivityKind::LiquidityRemove]),
-            successful,
-            include_total,
-        })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetPoolActivityEntriesResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    let resp = match state.ammdata.get_pool_activity_entries(GetPoolActivityEntriesParams {
+        pool,
+        offset,
+        limit,
+        kinds: Some(vec![ActivityKind::LiquidityRemove]),
+        successful,
+        include_total,
+    }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
-    let lp_supply = state
+    let lp_supply = match state
         .ammdata
         .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-        .map(|res| res.supply)
-        .unwrap_or(0);
+    {
+        Ok(res) => res.supply,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1137,29 +1270,27 @@ pub async fn get_pool_creation_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_pool_creations_page(GetPoolCreationsPageParams { offset, limit })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetPoolCreationsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
-            Some(v) => v,
-            None => continue,
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -1167,23 +1298,27 @@ pub async fn get_pool_creation_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let Some(defs) = state
+            let defs_resp = match state
                 .ammdata
                 .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(entry.pool, defs);
             defs
         };
 
-        let creation_info = state
+        let creation_info = match state
             .ammdata
             .get_pool_creation_info(GetPoolCreationInfoParams { pool: entry.pool })
-            .ok()
-            .and_then(|res| res.info);
+        {
+            Ok(res) => res.info,
+            Err(err) => return internal_error(err),
+        };
         let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) = creation_info
         {
             (
@@ -1251,22 +1386,20 @@ pub async fn get_address_swap_history_for_pool(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state
-        .ammdata
-        .get_pool_defs(GetPoolDefsParams { pool })
-        .ok()
-        .and_then(|res| res.defs)
-    {
-        Some(defs) => defs,
-        None => {
-            return json!({
-                "statusCode": 200,
-                "data": { "items": [], "total": 0, "count": 0, "offset": offset }
-            });
-        }
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+        Ok(res) => match res.defs {
+            Some(defs) => defs,
+            None => {
+                return json!({
+                    "statusCode": 200,
+                    "data": { "items": [], "total": 0, "count": 0, "offset": offset }
+                });
+            }
+        },
+        Err(err) => return internal_error(err),
     };
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_address_pool_swaps_page(GetAddressPoolSwapsPageParams {
             address_spk: address_spk.clone(),
@@ -1274,21 +1407,22 @@ pub async fn get_address_swap_history_for_pool(
             offset,
             limit,
         })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressPoolSwapsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state
             .ammdata
             .get_activity_entry(GetActivityEntryParams { pool, ts: entry.ts, seq: entry.seq })
-            .ok()
-            .and_then(|res| res.entry)
         {
-            Some(v) => v,
-            None => continue,
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -1348,7 +1482,7 @@ pub async fn get_address_swap_history_for_token(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_address_token_swaps_page(GetAddressTokenSwapsPageParams {
             address_spk: address_spk.clone(),
@@ -1356,26 +1490,24 @@ pub async fn get_address_swap_history_for_token(
             offset,
             limit,
         })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressTokenSwapsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
-            Some(v) => v,
-            None => continue,
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -1383,12 +1515,14 @@ pub async fn get_address_swap_history_for_token(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let Some(defs) = state
+            let defs_resp = match state
                 .ammdata
                 .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(entry.pool, defs);
@@ -1444,33 +1578,31 @@ pub async fn get_address_pool_creation_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_address_pool_creations_page(GetAddressPoolCreationsPageParams {
             address_spk,
             offset,
             limit,
         })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressPoolEventsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
-            Some(v) => v,
-            None => continue,
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -1478,23 +1610,27 @@ pub async fn get_address_pool_creation_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let Some(defs) = state
+            let defs_resp = match state
                 .ammdata
                 .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(entry.pool, defs);
             defs
         };
 
-        let creation_info = state
+        let creation_info = match state
             .ammdata
             .get_pool_creation_info(GetPoolCreationInfoParams { pool: entry.pool })
-            .ok()
-            .and_then(|res| res.info);
+        {
+            Ok(res) => res.info,
+            Err(err) => return internal_error(err),
+        };
         let (token0_amt, token1_amt, token_supply, creator_spk) = if let Some(info) = creation_info
         {
             (
@@ -1557,29 +1693,27 @@ pub async fn get_address_pool_mint_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_address_pool_mints_page(GetAddressPoolMintsPageParams { address_spk, offset, limit })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressPoolEventsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
-            Some(v) => v,
-            None => continue,
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -1587,23 +1721,27 @@ pub async fn get_address_pool_mint_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let Some(defs) = state
+            let defs_resp = match state
                 .ammdata
                 .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(entry.pool, defs);
             defs
         };
 
-        let lp_supply = state
+        let lp_supply = match state
             .ammdata
             .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool: entry.pool })
-            .map(|res| res.supply)
-            .unwrap_or(0);
+        {
+            Ok(res) => res.supply,
+            Err(err) => return internal_error(err),
+        };
         let address = address_from_spk_bytes(&activity.address_spk);
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
@@ -1650,29 +1788,27 @@ pub async fn get_address_pool_burn_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .ammdata
         .get_address_pool_burns_page(GetAddressPoolBurnsPageParams { address_spk, offset, limit })
-        .unwrap_or_else(|_| crate::modules::ammdata::storage::GetAddressPoolEventsPageResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+    {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
-            Some(v) => v,
-            None => continue,
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
+            Ok(res) => match res.entry {
+                Some(v) => v,
+                None => continue,
+            },
+            Err(err) => return internal_error(err),
         };
         if successful.unwrap_or(false) && !activity.success {
             continue;
@@ -1680,23 +1816,27 @@ pub async fn get_address_pool_burn_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let Some(defs) = state
+            let defs_resp = match state
                 .ammdata
                 .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            {
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(entry.pool, defs);
             defs
         };
 
-        let lp_supply = state
+        let lp_supply = match state
             .ammdata
             .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool: entry.pool })
-            .map(|res| res.supply)
-            .unwrap_or(0);
+        {
+            Ok(res) => res.supply,
+            Err(err) => return internal_error(err),
+        };
         let address = address_from_spk_bytes(&activity.address_spk);
         items.push(json!({
             "transactionId": txid_hex(activity.txid),
@@ -1743,18 +1883,17 @@ pub async fn get_address_wrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .subfrost
         .get_wrap_events_by_address(GetWrapEventsByAddressParams {
             address_spk: address_spk.clone(),
             offset,
             limit,
             successful,
-        })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+        }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1795,18 +1934,17 @@ pub async fn get_address_unwrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .subfrost
         .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
             address_spk: address_spk.clone(),
             offset,
             limit,
             successful,
-        })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+        }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1843,13 +1981,12 @@ pub async fn get_all_wrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .subfrost
-        .get_wrap_events_all(GetWrapEventsAllParams { offset, limit, successful })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+        .get_wrap_events_all(GetWrapEventsAllParams { offset, limit, successful }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1886,13 +2023,12 @@ pub async fn get_all_unwrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = state
+    let resp = match state
         .subfrost
-        .get_unwrap_events_all(GetUnwrapEventsAllParams { offset, limit, successful })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+        .get_unwrap_events_all(GetUnwrapEventsAllParams { offset, limit, successful }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1925,18 +2061,21 @@ pub async fn get_total_unwrap_amount(
     crate::debug_timer_log!("get_total_unwrap_amount");
     let successful = successful.unwrap_or(false);
     let total = if let Some(height) = block_height {
-        state
+        match state
             .subfrost
             .get_unwrap_total_at_or_before(GetUnwrapTotalAtOrBeforeParams { height, successful })
-            .ok()
-            .and_then(|res| res.total)
-            .unwrap_or(0)
+        {
+            Ok(res) => res.total.unwrap_or(0),
+            Err(err) => return internal_error(err),
+        }
     } else {
-        state
+        match state
             .subfrost
             .get_unwrap_total_latest(GetUnwrapTotalLatestParams { successful })
-            .map(|res| res.total)
-            .unwrap_or(0)
+        {
+            Ok(res) => res.total,
+            Err(err) => return internal_error(err),
+        }
     };
 
     json!({
@@ -1968,18 +2107,17 @@ pub async fn get_all_address_amm_tx_history(
     };
 
     if let Some(AmmTxType::Wrap) = tx_type {
-        let resp = state
+        let resp = match state
             .subfrost
             .get_wrap_events_by_address(GetWrapEventsByAddressParams {
                 address_spk: address_spk.clone(),
                 offset,
                 limit,
                 successful: if successful_only { Some(true) } else { None },
-            })
-            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-                entries: Vec::new(),
-                total: 0,
-            });
+            }) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
         let mut items = Vec::new();
         for entry in resp.entries {
             items.push(wrap_event_to_value(&entry, "wrap"));
@@ -1996,18 +2134,17 @@ pub async fn get_all_address_amm_tx_history(
         });
     }
     if let Some(AmmTxType::Unwrap) = tx_type {
-        let resp = state
+        let resp = match state
             .subfrost
             .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
                 address_spk: address_spk.clone(),
                 offset,
                 limit,
                 successful: if successful_only { Some(true) } else { None },
-            })
-            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-                entries: Vec::new(),
-                total: 0,
-            });
+            }) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
         let mut items = Vec::new();
         for entry in resp.entries {
             items.push(wrap_event_to_value(&entry, "unwrap"));
@@ -2026,7 +2163,7 @@ pub async fn get_all_address_amm_tx_history(
 
     if let Some(kind) = tx_type {
         let kinds = amm_kinds_for_type(kind);
-        let (entries, total) = collect_amm_history_items(
+        let (entries, total) = match collect_amm_history_items(
             state,
             AmmHistoryScope::Address(&address_spk),
             kinds.as_deref(),
@@ -2034,11 +2171,14 @@ pub async fn get_all_address_amm_tx_history(
             limit,
             successful_only,
             include_total,
-        );
-        let items = amm_history_items_to_values(state, entries)
-            .into_iter()
-            .map(|item| item.item)
-            .collect::<Vec<_>>();
+        ) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        let items = match amm_history_items_to_values(state, entries) {
+            Ok(values) => values.into_iter().map(|item| item.item).collect::<Vec<_>>(),
+            Err(err) => return internal_error(err),
+        };
         let total = if include_total { total } else { 0 };
         return json!({
             "statusCode": 200,
@@ -2052,7 +2192,7 @@ pub async fn get_all_address_amm_tx_history(
     }
 
     let combined_limit = offset.saturating_add(limit);
-    let (amm_entries, amm_total) = collect_amm_history_items(
+    let (amm_entries, amm_total) = match collect_amm_history_items(
         state,
         AmmHistoryScope::Address(&address_spk),
         None,
@@ -2060,33 +2200,37 @@ pub async fn get_all_address_amm_tx_history(
         combined_limit,
         successful_only,
         include_total,
-    );
-    let mut combined = amm_history_items_to_values(state, amm_entries);
+    ) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    let mut combined = match amm_history_items_to_values(state, amm_entries) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
 
-    let wrap_resp = state
+    let wrap_resp = match state
         .subfrost
         .get_wrap_events_by_address(GetWrapEventsByAddressParams {
             address_spk: address_spk.clone(),
             offset: 0,
             limit: combined_limit,
             successful: if successful_only { Some(true) } else { None },
-        })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
-    let unwrap_resp = state
+        }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
+    let unwrap_resp = match state
         .subfrost
         .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
             address_spk: address_spk.clone(),
             offset: 0,
             limit: combined_limit,
             successful: if successful_only { Some(true) } else { None },
-        })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+        }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     for entry in wrap_resp.entries {
         combined.push(wrap_event_to_history_item(&entry, "wrap"));
@@ -2138,17 +2282,16 @@ pub async fn get_all_amm_tx_history(
     };
 
     if let Some(AmmTxType::Wrap) = tx_type {
-        let resp = state
+        let resp = match state
             .subfrost
             .get_wrap_events_all(GetWrapEventsAllParams {
                 offset,
                 limit,
                 successful: if successful_only { Some(true) } else { None },
-            })
-            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-                entries: Vec::new(),
-                total: 0,
-            });
+            }) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
         let mut items = Vec::new();
         for entry in resp.entries {
             items.push(wrap_event_to_value(&entry, "wrap"));
@@ -2165,17 +2308,16 @@ pub async fn get_all_amm_tx_history(
         });
     }
     if let Some(AmmTxType::Unwrap) = tx_type {
-        let resp = state
+        let resp = match state
             .subfrost
             .get_unwrap_events_all(GetUnwrapEventsAllParams {
                 offset,
                 limit,
                 successful: if successful_only { Some(true) } else { None },
-            })
-            .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-                entries: Vec::new(),
-                total: 0,
-            });
+            }) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
         let mut items = Vec::new();
         for entry in resp.entries {
             items.push(wrap_event_to_value(&entry, "unwrap"));
@@ -2194,7 +2336,7 @@ pub async fn get_all_amm_tx_history(
 
     if let Some(kind) = tx_type {
         let kinds = amm_kinds_for_type(kind);
-        let (entries, total) = collect_amm_history_items(
+        let (entries, total) = match collect_amm_history_items(
             state,
             AmmHistoryScope::All,
             kinds.as_deref(),
@@ -2202,11 +2344,14 @@ pub async fn get_all_amm_tx_history(
             limit,
             successful_only,
             include_total,
-        );
-        let items = amm_history_items_to_values(state, entries)
-            .into_iter()
-            .map(|item| item.item)
-            .collect::<Vec<_>>();
+        ) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        let items = match amm_history_items_to_values(state, entries) {
+            Ok(values) => values.into_iter().map(|item| item.item).collect::<Vec<_>>(),
+            Err(err) => return internal_error(err),
+        };
         let total = if include_total { total } else { 0 };
         return json!({
             "statusCode": 200,
@@ -2220,7 +2365,7 @@ pub async fn get_all_amm_tx_history(
     }
 
     let combined_limit = offset.saturating_add(limit);
-    let (amm_entries, amm_total) = collect_amm_history_items(
+    let (amm_entries, amm_total) = match collect_amm_history_items(
         state,
         AmmHistoryScope::All,
         None,
@@ -2228,31 +2373,35 @@ pub async fn get_all_amm_tx_history(
         combined_limit,
         successful_only,
         include_total,
-    );
-    let mut combined = amm_history_items_to_values(state, amm_entries);
+    ) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    let mut combined = match amm_history_items_to_values(state, amm_entries) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
 
-    let wrap_resp = state
+    let wrap_resp = match state
         .subfrost
         .get_wrap_events_all(GetWrapEventsAllParams {
             offset: 0,
             limit: combined_limit,
             successful: if successful_only { Some(true) } else { None },
-        })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
-    let unwrap_resp = state
+        }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
+    let unwrap_resp = match state
         .subfrost
         .get_unwrap_events_all(GetUnwrapEventsAllParams {
             offset: 0,
             limit: combined_limit,
             successful: if successful_only { Some(true) } else { None },
-        })
-        .unwrap_or_else(|_| crate::modules::subfrost::storage::GetWrapEventsResult {
-            entries: Vec::new(),
-            total: 0,
-        });
+        }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
 
     for entry in wrap_resp.entries {
         combined.push(wrap_event_to_history_item(&entry, "wrap"));
@@ -2295,16 +2444,22 @@ pub async fn get_all_token_pairs(
         return error_response(400, "invalid_factory_id");
     };
 
-    let pools = state
+    let pools = match state
         .ammdata
         .get_factory_pools(GetFactoryPoolsParams { factory })
-        .map(|res| res.pools)
-        .unwrap_or_default();
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
 
     let mut meta_cache: HashMap<SchemaAlkaneId, TokenMeta> = HashMap::new();
     let mut out = Vec::new();
     for pool in pools {
-        if let Some(pair) = build_token_pair(state, pool, &mut meta_cache) {
+        let pair = match build_token_pair(state, pool, &mut meta_cache) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        if let Some(pair) = pair {
             out.push(pair.value);
         }
     }
@@ -2331,16 +2486,20 @@ pub async fn get_token_pairs(
         return error_response(400, "invalid_token_id");
     };
 
-    let pools = state
+    let pools = match state
         .ammdata
         .get_token_pools(GetTokenPoolsParams { token })
-        .map(|res| res.pools)
-        .unwrap_or_default();
-    let factory_pools = state
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
+    let factory_pools = match state
         .ammdata
         .get_factory_pools(GetFactoryPoolsParams { factory })
-        .map(|res| res.pools)
-        .unwrap_or_default();
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
     let factory_set: HashSet<SchemaAlkaneId> = factory_pools.into_iter().collect();
 
     let mut meta_cache: HashMap<SchemaAlkaneId, TokenMeta> = HashMap::new();
@@ -2349,7 +2508,11 @@ pub async fn get_token_pairs(
         if !factory_set.contains(&pool) {
             continue;
         }
-        if let Some(pair) = build_token_pair(state, pool, &mut meta_cache) {
+        let pair = match build_token_pair(state, pool, &mut meta_cache) {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        if let Some(pair) = pair {
             pairs.push(pair);
         }
     }
@@ -2401,18 +2564,18 @@ pub async fn get_alkane_swap_pair_details(
         return error_response(400, "invalid_token_b_id");
     };
 
-    let snapshot = state
-        .ammdata
-        .get_reserves_snapshot(GetReservesSnapshotParams)
-        .ok()
-        .and_then(|res| res.snapshot)
-        .unwrap_or_default();
+    let snapshot = match state.ammdata.get_reserves_snapshot(GetReservesSnapshotParams) {
+        Ok(res) => res.snapshot.unwrap_or_default(),
+        Err(err) => return internal_error(err),
+    };
 
-    let factory_pools = state
+    let factory_pools = match state
         .ammdata
         .get_factory_pools(GetFactoryPoolsParams { factory })
-        .map(|res| res.pools)
-        .unwrap_or_default();
+    {
+        Ok(res) => res.pools,
+        Err(err) => return internal_error(err),
+    };
     let factory_set: HashSet<SchemaAlkaneId> = factory_pools.into_iter().collect();
 
     let mut filtered: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
@@ -2432,7 +2595,11 @@ pub async fn get_alkane_swap_pair_details(
         }
         let mut pools = Vec::new();
         for hop in &quote.hops {
-            if let Some(pair) = build_token_pair(state, hop.pool, &mut meta_cache) {
+            let pair = match build_token_pair(state, hop.pool, &mut meta_cache) {
+                Ok(v) => v,
+                Err(err) => return internal_error(err),
+            };
+            if let Some(pair) = pair {
                 pools.push(pair.value);
             }
         }
@@ -2469,7 +2636,7 @@ pub async fn get_address_utxos(
         return Ok(Vec::new());
     }
 
-    let tip_height = get_electrum_like().tip_height().unwrap_or(0) as u64;
+    let tip_height = get_electrum_like().tip_height()? as u64;
 
     let mut outpoints: Vec<(Txid, u32)> = Vec::with_capacity(utxos.len());
     let mut outpoint_strs: Vec<String> = Vec::with_capacity(utxos.len());
@@ -2479,11 +2646,7 @@ pub async fn get_address_utxos(
         outpoint_strs.push(format!("{}:{}", utxo.txid, utxo.vout));
     }
 
-    let balances_by_outpoint = match get_outpoint_balances_with_spent_batch(essentials, &outpoints)
-    {
-        Ok(map) => map,
-        Err(_) => HashMap::new(),
-    };
+    let balances_by_outpoint = get_outpoint_balances_with_spent_batch(essentials, &outpoints)?;
 
     let mut alkane_ids: HashSet<SchemaAlkaneId> = HashSet::new();
     for lookup in balances_by_outpoint.values() {
@@ -2506,7 +2669,7 @@ pub async fn get_address_utxos(
     }
 
     let ord_outputs = if let Some(endpoint) = ord_endpoint {
-        fetch_ord_outputs(client, endpoint, &outpoint_strs).await.unwrap_or_default()
+        fetch_ord_outputs(client, endpoint, &outpoint_strs).await?
     } else {
         HashMap::new()
     };
@@ -2556,9 +2719,7 @@ pub async fn get_address_utxos(
 
 fn script_hash_hex(script_pubkey: &ScriptBuf) -> String {
     let hash = sha256::Hash::hash(script_pubkey.as_bytes());
-    let mut bytes = hash.to_byte_array();
-    bytes.reverse();
-    hex::encode(bytes)
+    hex::encode(hash.to_byte_array())
 }
 
 async fn fetch_scripthash_utxos(
@@ -2603,8 +2764,122 @@ fn error_response(code: u16, msg: &str) -> Value {
     json!({ "statusCode": code, "error": msg })
 }
 
+fn internal_error<E: std::fmt::Display>(err: E) -> Value {
+    json!({ "statusCode": 500, "error": err.to_string() })
+}
+
+#[derive(Default, Clone, Copy)]
+struct BtcPriceCache {
+    tip: u32,
+    price_usd: u128,
+}
+
+static BTC_PRICE_CACHE: OnceLock<Mutex<BtcPriceCache>> = OnceLock::new();
+
+fn btc_price_usd_cached() -> Result<u128> {
+    let tip = get_last_safe_tip().ok_or_else(|| anyhow!("safe tip unavailable"))?;
+    let cache = BTC_PRICE_CACHE.get_or_init(|| Mutex::new(BtcPriceCache::default()));
+    let (cached_tip, cached_price) = {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.tip, guard.price_usd)
+    };
+
+    if cached_price > 0 && cached_tip >= tip {
+        return Ok(cached_price);
+    }
+
+    let fetch = || -> Result<u128> {
+        let feed = UniswapPriceFeed::from_global_config()?;
+        let price = catch_unwind(AssertUnwindSafe(|| {
+            feed.get_bitcoin_price_usd_at_block_height(tip as u64)
+        }))
+        .map_err(|_| anyhow!("btc price feed panicked"))?;
+        if price == 0 {
+            Err(anyhow!("btc price unavailable"))
+        } else {
+            Ok(price)
+        }
+    };
+
+    match fetch() {
+        Ok(price) => {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if tip >= guard.tip {
+                guard.tip = tip;
+                guard.price_usd = price;
+            }
+            Ok(price)
+        }
+        Err(err) => {
+            if cached_price > 0 {
+                Ok(cached_price)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 fn now_ts() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+#[inline]
+fn scale_price_u128(value: u128) -> f64 {
+    (value as f64) / (PRICE_SCALE as f64)
+}
+
+#[inline]
+fn base_volume_from_quote(volume_quote: u128, price_quote_per_base: u128) -> u128 {
+    if price_quote_per_base == 0 {
+        0
+    } else {
+        volume_quote
+            .saturating_mul(PRICE_SCALE)
+            / price_quote_per_base
+    }
+}
+
+fn pool_candle_volume_sums(
+    state: &OylApiState,
+    pool: &SchemaAlkaneId,
+    now_ts: u64,
+) -> Result<(u128, u128, u128, u128)> {
+    let bucket_now = bucket_start_for(now_ts, Timeframe::D1);
+    let window_start = bucket_now.saturating_sub(6 * Timeframe::D1.duration_secs());
+    let table = state.ammdata.table();
+    let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
+    let entries = state
+        .ammdata
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?
+        .entries;
+
+    let mut token0_volume_7d = 0u128;
+    let mut token1_volume_7d = 0u128;
+    let mut token0_volume_all = 0u128;
+    let mut token1_volume_all = 0u128;
+
+    for (k, v) in entries {
+        let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() else { continue };
+        let Ok(ts_str) = std::str::from_utf8(ts_bytes) else { continue };
+        let Ok(ts) = ts_str.parse::<u64>() else { continue };
+        let candle = decode_full_candle_v1(&v)?;
+        let base_vol = candle.base_candle.volume;
+        let quote_vol = candle.quote_candle.volume;
+        token0_volume_all = token0_volume_all.saturating_add(base_vol);
+        token1_volume_all = token1_volume_all.saturating_add(quote_vol);
+        if ts >= window_start {
+            token0_volume_7d = token0_volume_7d.saturating_add(base_vol);
+            token1_volume_7d = token1_volume_7d.saturating_add(quote_vol);
+        }
+    }
+
+    Ok((token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all))
+}
+
+#[inline]
+fn parse_change_f64(raw: &str) -> f64 {
+    raw.parse::<f64>().unwrap_or(0.0)
 }
 
 fn alkane_id_json(alkane: &SchemaAlkaneId) -> Value {
@@ -2616,6 +2891,13 @@ fn parse_alkane_id_str(raw: &str) -> Option<SchemaAlkaneId> {
     let block = parts.next()?.parse::<u32>().ok()?;
     let tx = parts.next()?.parse::<u64>().ok()?;
     Some(SchemaAlkaneId { block, tx })
+}
+
+fn derived_quotes_from_config() -> Result<Vec<SchemaAlkaneId>> {
+    Ok(AmmDataConfig::load_from_global_config()?
+        .derived_liquidity
+        .map(|cfg| cfg.derived_quotes.into_iter().map(|dq| dq.alkane).collect())
+        .unwrap_or_default())
 }
 
 fn parse_alkane_id_fields(block: &str, tx: &str) -> Option<SchemaAlkaneId> {
@@ -2651,32 +2933,32 @@ fn should_sort_greatest_to_least(spend_strategy: Option<Value>) -> bool {
     }
 }
 
-fn canonical_pool_prices(state: &OylApiState, token: &SchemaAlkaneId, now_ts: u64) -> (u128, u128) {
+fn canonical_pool_prices(
+    state: &OylApiState,
+    token: &SchemaAlkaneId,
+    now_ts: u64,
+) -> Result<(u128, u128)> {
     state
         .ammdata
         .get_canonical_pool_prices(GetCanonicalPoolPricesParams { token: *token, now_ts })
         .map(|res| (res.frbtc_price, res.busd_price))
-        .unwrap_or((0, 0))
 }
 
-fn latest_token_usd_close(state: &OylApiState, token: &SchemaAlkaneId) -> Option<u128> {
+fn latest_token_usd_close(state: &OylApiState, token: &SchemaAlkaneId) -> Result<Option<u128>> {
     state
         .ammdata
         .get_latest_token_usd_close(GetLatestTokenUsdCloseParams {
             token: *token,
             timeframe: Timeframe::M10,
         })
-        .ok()
-        .and_then(|res| res.close)
+        .map(|res| res.close)
 }
 
-fn token_metrics(state: &OylApiState, token: &SchemaAlkaneId) -> SchemaTokenMetricsV1 {
+fn token_metrics(state: &OylApiState, token: &SchemaAlkaneId) -> Result<SchemaTokenMetricsV1> {
     let mut metrics = state
         .ammdata
-        .get_token_metrics(GetTokenMetricsParams { token: *token })
-        .ok()
-        .map(|res| res.metrics)
-        .unwrap_or_default();
+        .get_token_metrics(GetTokenMetricsParams { token: *token })?
+        .metrics;
     if metrics.change_1d.is_empty() {
         metrics.change_1d = "0".to_string();
     }
@@ -2689,34 +2971,38 @@ fn token_metrics(state: &OylApiState, token: &SchemaAlkaneId) -> SchemaTokenMetr
     if metrics.change_all_time.is_empty() {
         metrics.change_all_time = "0".to_string();
     }
-    metrics
+    Ok(metrics)
 }
 
-fn holders_count(state: &OylApiState, token: &SchemaAlkaneId) -> u64 {
+fn holders_count(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u64> {
     state
         .essentials
         .get_holders_count(GetHoldersCountParams { alkane: *token })
-        .ok()
         .map(|res| res.count)
-        .unwrap_or(0)
 }
 
-fn latest_circulating_supply(state: &OylApiState, token: &SchemaAlkaneId) -> u128 {
+fn latest_circulating_supply(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u128> {
     state
         .essentials
         .get_latest_circulating_supply(GetLatestCirculatingSupplyParams { alkane: *token })
-        .ok()
         .map(|res| res.supply)
-        .unwrap_or(0)
 }
 
-fn latest_total_minted(state: &OylApiState, token: &SchemaAlkaneId) -> u128 {
+fn latest_total_minted(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u128> {
     state
         .essentials
         .get_latest_total_minted(GetLatestTotalMintedParams { alkane: *token })
-        .ok()
         .map(|res| res.total_minted)
-        .unwrap_or(0)
+}
+
+fn canonical_quote_amount_tvl_usd(amount: u128, unit: CanonicalQuoteUnit) -> Result<u128> {
+    match unit {
+        CanonicalQuoteUnit::Usd => Ok(amount),
+        CanonicalQuoteUnit::Btc => {
+            let btc_price = btc_price_usd_cached()?;
+            Ok(amount.saturating_mul(btc_price) / PRICE_SCALE)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2803,19 +3089,16 @@ fn collect_amm_history_items(
     limit: usize,
     successful_only: bool,
     include_total: bool,
-) -> (Vec<AmmHistoryItem>, usize) {
+) -> Result<(Vec<AmmHistoryItem>, usize)> {
     let table = state.ammdata.table();
     let prefix = match scope {
         AmmHistoryScope::Address(spk) => table.address_amm_history_prefix(spk),
         AmmHistoryScope::All => table.amm_history_all_prefix(),
     };
-    let entries = match state
+    let entries = state
         .ammdata
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-    {
-        Ok(v) => v.entries,
-        Err(_) => Vec::new(),
-    };
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+        .entries;
 
     let mut total = 0usize;
     let mut out = Vec::new();
@@ -2829,16 +3112,12 @@ fn collect_amm_history_items(
                 continue;
             }
         }
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams {
-                pool: entry.pool,
-                ts: entry.ts,
-                seq: entry.seq,
-            })
-            .ok()
-            .and_then(|res| res.entry)
-        {
+        let res = state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool: entry.pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        })?;
+        let activity = match res.entry {
             Some(activity) => activity,
             None => continue,
         };
@@ -2859,13 +3138,13 @@ fn collect_amm_history_items(
     }
 
     let total = if include_total { total } else { 0 };
-    (out, total)
+    Ok((out, total))
 }
 
 fn amm_history_items_to_values(
     state: &OylApiState,
     items: Vec<AmmHistoryItem>,
-) -> Vec<HistoryItemWithTs> {
+) -> Result<Vec<HistoryItemWithTs>> {
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut lp_supply_cache: HashMap<SchemaAlkaneId, u128> = HashMap::new();
     let mut creation_cache: HashMap<SchemaAlkaneId, Option<SchemaPoolCreationInfoV1>> =
@@ -2877,12 +3156,8 @@ fn amm_history_items_to_values(
         let defs = if let Some(defs) = defs_cache.get(&pool) {
             *defs
         } else {
-            let Some(defs) = state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool })
-                .ok()
-                .and_then(|res| res.defs)
-            else {
+            let defs_resp = state.ammdata.get_pool_defs(GetPoolDefsParams { pool })?;
+            let Some(defs) = defs_resp.defs else {
                 continue;
             };
             defs_cache.insert(pool, defs);
@@ -2924,9 +3199,8 @@ fn amm_history_items_to_values(
                 } else {
                     let supply = state
                         .ammdata
-                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-                        .map(|res| res.supply)
-                        .unwrap_or(0);
+                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })?
+                        .supply;
                     lp_supply_cache.insert(pool, supply);
                     supply
                 };
@@ -2961,9 +3235,8 @@ fn amm_history_items_to_values(
                 } else {
                     let supply = state
                         .ammdata
-                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-                        .map(|res| res.supply)
-                        .unwrap_or(0);
+                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })?
+                        .supply;
                     lp_supply_cache.insert(pool, supply);
                     supply
                 };
@@ -2998,9 +3271,8 @@ fn amm_history_items_to_values(
                 } else {
                     let info = state
                         .ammdata
-                        .get_pool_creation_info(GetPoolCreationInfoParams { pool })
-                        .ok()
-                        .and_then(|res| res.info);
+                        .get_pool_creation_info(GetPoolCreationInfoParams { pool })?
+                        .info;
                     creation_cache.insert(pool, info.clone());
                     info
                 };
@@ -3045,7 +3317,7 @@ fn amm_history_items_to_values(
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn wrap_event_to_value(entry: &SchemaWrapEventV1, kind: &str) -> Value {
@@ -3067,33 +3339,30 @@ fn build_token_pair(
     state: &OylApiState,
     pool: SchemaAlkaneId,
     meta_cache: &mut HashMap<SchemaAlkaneId, TokenMeta>,
-) -> Option<TokenPairComputed> {
-    let defs = state
-        .ammdata
-        .get_pool_defs(GetPoolDefsParams { pool })
-        .ok()
-        .and_then(|res| res.defs)?;
+) -> Result<Option<TokenPairComputed>> {
+    let defs = state.ammdata.get_pool_defs(GetPoolDefsParams { pool })?;
+    let Some(defs) = defs.defs else {
+        return Ok(None);
+    };
 
-    let mut balances = get_alkane_balances(&state.essentials, &pool).unwrap_or_default();
+    let mut balances = get_alkane_balances(&state.essentials, &pool)?;
     let reserve0 = balances.remove(&defs.base_alkane_id).unwrap_or(0);
     let reserve1 = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
     let metrics = state
         .ammdata
-        .get_pool_metrics(GetPoolMetricsParams { pool })
-        .ok()
-        .map(|res| res.metrics)
-        .unwrap_or_default();
+        .get_pool_metrics(GetPoolMetricsParams { pool })?
+        .metrics;
 
-    let token0_meta = get_token_meta(state, meta_cache, &defs.base_alkane_id);
-    let token1_meta = get_token_meta(state, meta_cache, &defs.quote_alkane_id);
+    let token0_meta = get_token_meta(state, meta_cache, &defs.base_alkane_id)?;
+    let token1_meta = get_token_meta(state, meta_cache, &defs.quote_alkane_id)?;
     let pool_name = format!("{} / {}", token0_meta.label.as_str(), token1_meta.label.as_str());
     let pool_name_norm = normalize_query(&pool_name);
 
     let value = json!({
         "poolId": alkane_id_json(&pool),
-        "poolVolume1dInUsd": metrics.pool_volume_1d_usd.to_string(),
-        "poolTvlInUsd": metrics.pool_tvl_usd.to_string(),
+        "poolVolume1dInUsd": scale_price_u128(metrics.pool_volume_1d_usd),
+        "poolTvlInUsd": scale_price_u128(metrics.pool_tvl_usd),
         "poolName": pool_name,
         "reserve0": reserve0.to_string(),
         "reserve1": reserve1.to_string(),
@@ -3122,31 +3391,30 @@ fn build_token_pair(
         normalize_query(&token1_meta.name),
     );
 
-    Some(TokenPairComputed {
+    Ok(Some(TokenPairComputed {
         value,
         pool_id: pool,
         token0_id: defs.base_alkane_id,
         token1_id: defs.quote_alkane_id,
         search,
         tvl_usd: metrics.pool_tvl_usd,
-    })
+    }))
 }
 
 fn get_token_meta(
     state: &OylApiState,
     cache: &mut HashMap<SchemaAlkaneId, TokenMeta>,
     id: &SchemaAlkaneId,
-) -> TokenMeta {
+) -> Result<TokenMeta> {
     crate::debug_timer_log!("get_token_meta");
     if let Some(meta) = cache.get(id) {
-        return meta.clone();
+        return Ok(meta.clone());
     }
 
     let rec = state
         .essentials
-        .get_creation_record(GetCreationRecordParams { alkane: *id })
-        .ok()
-        .and_then(|resp| resp.record);
+        .get_creation_record(GetCreationRecordParams { alkane: *id })?
+        .record;
     let name = rec.as_ref().and_then(|r| r.names.first().cloned()).unwrap_or_default();
     let symbol_raw = rec.as_ref().and_then(|r| r.symbols.first().cloned()).unwrap_or_default();
     let label = if !symbol_raw.is_empty() {
@@ -3166,7 +3434,7 @@ fn get_token_meta(
         decimals: 8,
     };
     cache.insert(*id, meta.clone());
-    meta
+    Ok(meta)
 }
 
 fn parse_amm_history_key(prefix: &[u8], key: &[u8]) -> Option<AmmHistoryEntry> {
@@ -3262,9 +3530,8 @@ fn fetch_records_for_query(
     Ok(recs.into_iter().flatten().collect())
 }
 
-fn search_index_field_for_sort(sort_by: &str) -> SearchIndexField {
-    let key = sort_by.trim().to_ascii_lowercase();
-    match key.as_str() {
+fn parse_search_index_field(key: &str) -> SearchIndexField {
+    match key {
         "marketcap" => SearchIndexField::Marketcap,
         "holders" => SearchIndexField::Holders,
         "volume7d" => SearchIndexField::Volume7d,
@@ -3272,6 +3539,19 @@ fn search_index_field_for_sort(sort_by: &str) -> SearchIndexField {
         "volumealltime" => SearchIndexField::VolumeAllTime,
         _ => SearchIndexField::Holders,
     }
+}
+
+fn search_index_field_for_sort(sort_by: &str) -> (SearchIndexField, Option<SchemaAlkaneId>) {
+    let raw = sort_by.trim();
+    let key = raw.to_ascii_lowercase();
+    if let Some(idx) = key.find("-derived_") {
+        let field_part = &key[..idx];
+        let quote_part = &raw[idx + "-derived_".len()..];
+        let field = parse_search_index_field(field_part);
+        let quote = parse_alkane_id_str(quote_part);
+        return (field, quote);
+    }
+    (parse_search_index_field(key.as_str()), None)
 }
 
 fn record_matches_query(
@@ -3294,9 +3574,9 @@ fn search_by_holders_scan(
     offset: u64,
     limit: u64,
     scan_cap: u64,
-) -> Vec<SchemaAlkaneId> {
+) -> Result<Vec<SchemaAlkaneId>> {
     if limit == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let scan_limit = if scan_cap == 0 { 5000 } else { scan_cap };
     let ids = state
@@ -3305,18 +3585,16 @@ fn search_by_holders_scan(
             offset: 0,
             limit: scan_limit,
             desc: true,
-        })
-        .map(|res| res.ids)
-        .unwrap_or_default();
+        })?
+        .ids;
     if ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let records = state
         .essentials
-        .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })
-        .map(|res| res.records)
-        .unwrap_or_default();
+        .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })?
+        .records;
 
     let mut out: Vec<SchemaAlkaneId> = Vec::new();
     let mut seen = HashSet::new();
@@ -3341,53 +3619,98 @@ fn search_by_holders_scan(
             break;
         }
     }
-    out
+    Ok(out)
+}
+
+fn filter_ids_with_derived_metrics(
+    state: &OylApiState,
+    ids: Vec<SchemaAlkaneId>,
+    quote: SchemaAlkaneId,
+) -> Result<Vec<SchemaAlkaneId>> {
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+    let metrics = state
+        .ammdata
+        .get_token_derived_metrics_by_id(GetTokenDerivedMetricsByIdParams {
+            tokens: ids.clone(),
+            quote,
+        })
+        ?;
+    let metrics = metrics.metrics;
+    if metrics.len() != ids.len() {
+        return Ok(Vec::new());
+    }
+    Ok(ids
+        .into_iter()
+        .zip(metrics.into_iter())
+        .filter_map(|(id, metric)| if metric.is_some() { Some(id) } else { None })
+        .collect())
 }
 
 #[derive(Clone, Copy)]
 enum AlkaneSortIndex {
     Holders,
     Metrics(TokenMetricsIndexField),
+    Derived { quote: SchemaAlkaneId, field: TokenMetricsIndexField },
+}
+
+fn parse_metrics_field(key: &str) -> Option<TokenMetricsIndexField> {
+    match key {
+        "price" => Some(TokenMetricsIndexField::PriceUsd),
+        "marketcap" => Some(TokenMetricsIndexField::MarketcapUsd),
+        "volume1d" => Some(TokenMetricsIndexField::Volume1d),
+        "volume7d" => Some(TokenMetricsIndexField::Volume7d),
+        "volume30d" => Some(TokenMetricsIndexField::Volume30d),
+        "volumealltime" => Some(TokenMetricsIndexField::VolumeAllTime),
+        "change1d" => Some(TokenMetricsIndexField::Change1d),
+        "change7d" => Some(TokenMetricsIndexField::Change7d),
+        "change30d" => Some(TokenMetricsIndexField::Change30d),
+        "changealltime" => Some(TokenMetricsIndexField::ChangeAllTime),
+        _ => None,
+    }
 }
 
 fn alkane_sort_index(sort_by: &str) -> AlkaneSortIndex {
-    let key = sort_by.trim().to_ascii_lowercase();
+    let raw = sort_by.trim();
+    let key = raw.to_ascii_lowercase();
+    if let Some(idx) = key.find("-derived_") {
+        let field_part = &key[..idx];
+        let quote_part = &raw[idx + "-derived_".len()..];
+        if let (Some(field), Some(quote)) =
+            (parse_metrics_field(field_part), parse_alkane_id_str(quote_part))
+        {
+            return AlkaneSortIndex::Derived { quote, field };
+        }
+    }
     match key.as_str() {
         "holders" => AlkaneSortIndex::Holders,
-        "price" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::PriceUsd),
-        "marketcap" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::MarketcapUsd),
-        "volume1d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Volume1d),
-        "volume7d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Volume7d),
-        "volume30d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Volume30d),
-        "volumealltime" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::VolumeAllTime),
-        "change1d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Change1d),
-        "change7d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Change7d),
-        "change30d" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::Change30d),
-        "changealltime" => AlkaneSortIndex::Metrics(TokenMetricsIndexField::ChangeAllTime),
-        _ => AlkaneSortIndex::Metrics(TokenMetricsIndexField::VolumeAllTime),
+        _ => parse_metrics_field(key.as_str())
+            .map(AlkaneSortIndex::Metrics)
+            .unwrap_or(AlkaneSortIndex::Metrics(TokenMetricsIndexField::VolumeAllTime)),
     }
 }
 
-fn token_metrics_multi(state: &OylApiState, ids: &[SchemaAlkaneId]) -> Vec<SchemaTokenMetricsV1> {
+fn token_metrics_multi(
+    state: &OylApiState,
+    ids: &[SchemaAlkaneId],
+) -> Result<Vec<SchemaTokenMetricsV1>> {
     if ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    state
-        .ammdata
-        .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.to_vec() })
-        .map(|res| res.metrics.into_iter().map(|m| m.unwrap_or_default()).collect::<Vec<_>>())
-        .unwrap_or_else(|_| vec![SchemaTokenMetricsV1::default(); ids.len()])
+    let res =
+        state.ammdata.get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.to_vec() })?;
+    Ok(res.metrics.into_iter().map(|m| m.unwrap_or_default()).collect())
 }
 
-fn holders_counts_multi(state: &OylApiState, ids: &[SchemaAlkaneId]) -> Vec<u64> {
+fn holders_counts_multi(state: &OylApiState, ids: &[SchemaAlkaneId]) -> Result<Vec<u64>> {
     if ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    state
+    let res = state
         .essentials
-        .get_holders_counts_by_id(GetHoldersCountsByIdParams { alkanes: ids.to_vec() })
-        .map(|res| res.counts)
-        .unwrap_or_else(|_| vec![0u64; ids.len()])
+        .get_holders_counts_by_id(GetHoldersCountsByIdParams { alkanes: ids.to_vec() })?;
+    Ok(res.counts)
 }
 
 fn collect_missing_tokens(
@@ -3395,9 +3718,9 @@ fn collect_missing_tokens(
     offset: u64,
     limit: u64,
     desc: bool,
-) -> Vec<SchemaAlkaneId> {
+) -> Result<Vec<SchemaAlkaneId>> {
     if limit == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut out: Vec<SchemaAlkaneId> = Vec::new();
     let mut missing_seen: u64 = 0;
@@ -3411,10 +3734,8 @@ fn collect_missing_tokens(
                 offset: creation_offset,
                 limit: chunk as u64,
                 desc,
-            })
-            .ok()
-            .map(|res| res.records)
-            .unwrap_or_default();
+            })?
+            .records;
         if page.is_empty() {
             break;
         }
@@ -3422,10 +3743,8 @@ fn collect_missing_tokens(
         let ids: Vec<SchemaAlkaneId> = page.iter().map(|rec| rec.alkane).collect();
         let metrics = state
             .ammdata
-            .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.clone() })
-            .ok()
-            .map(|res| res.metrics)
-            .unwrap_or_default();
+            .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.clone() })?
+            .metrics;
         if metrics.len() != ids.len() {
             break;
         }
@@ -3442,14 +3761,14 @@ fn collect_missing_tokens(
             out.push(id);
             missing_seen += 1;
             if out.len() >= limit as usize {
-                return out;
+                return Ok(out);
             }
         }
 
         creation_offset = creation_offset.saturating_add(page.len() as u64);
     }
 
-    out
+    Ok(out)
 }
 
 fn fetch_sorted_alkane_ids_no_query(
@@ -3459,45 +3778,69 @@ fn fetch_sorted_alkane_ids_no_query(
     offset: u64,
     limit: u64,
     total: u64,
-) -> Vec<SchemaAlkaneId> {
+) -> Result<Vec<SchemaAlkaneId>> {
     if limit == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     match sort_index {
-        AlkaneSortIndex::Holders => state
-            .essentials
-            .get_holders_ordered_page(GetHoldersOrderedPageParams { offset, limit, desc })
-            .map(|res| res.ids)
-            .unwrap_or_default(),
+        AlkaneSortIndex::Holders => {
+            let ids = state
+                .essentials
+                .get_holders_ordered_page(GetHoldersOrderedPageParams { offset, limit, desc })?
+                .ids;
+            Ok(ids)
+        }
+        AlkaneSortIndex::Derived { quote, field } => {
+            let metrics_count = state
+                .ammdata
+                .get_token_derived_metrics_index_count(GetTokenDerivedMetricsIndexCountParams {
+                    quote,
+                })?
+                .count;
+            if metrics_count == 0 || offset >= metrics_count {
+                return Ok(Vec::new());
+            }
+            let take = std::cmp::min(limit, metrics_count.saturating_sub(offset));
+            let ids = state
+                .ammdata
+                .get_token_derived_metrics_index_page(GetTokenDerivedMetricsIndexPageParams {
+                    quote,
+                    field,
+                    offset,
+                    limit: take,
+                    desc,
+                })?
+                .ids;
+            Ok(ids)
+        }
         AlkaneSortIndex::Metrics(field) => {
             let metrics_count = state
                 .ammdata
-                .get_token_metrics_index_count(GetTokenMetricsIndexCountParams)
-                .map(|res| res.count)
-                .unwrap_or(0);
+                .get_token_metrics_index_count(GetTokenMetricsIndexCountParams)?
+                .count;
             let missing_count = total.saturating_sub(metrics_count);
 
-            let metrics_page = |off: u64, lim: u64| -> Vec<SchemaAlkaneId> {
+            let metrics_page = |off: u64, lim: u64| -> Result<Vec<SchemaAlkaneId>> {
                 if lim == 0 {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 }
-                state
+                let ids = state
                     .ammdata
                     .get_token_metrics_index_page(GetTokenMetricsIndexPageParams {
                         field,
                         offset: off,
                         limit: lim,
                         desc,
-                    })
-                    .map(|res| res.ids)
-                    .unwrap_or_default()
+                    })?
+                    .ids;
+                Ok(ids)
             };
 
             if metrics_count == 0 && total > 0 {
-                let probe = metrics_page(offset, limit);
+                let probe = metrics_page(offset, limit)?;
                 if !probe.is_empty() {
-                    return probe;
+                    return Ok(probe);
                 }
                 let fallback: Vec<SchemaAlkaneId> = state
                     .essentials
@@ -3505,12 +3848,13 @@ fn fetch_sorted_alkane_ids_no_query(
                         offset,
                         limit,
                         desc,
-                    })
-                    .ok()
-                    .map(|res| res.records.into_iter().map(|rec| rec.alkane).collect())
-                    .unwrap_or_default();
+                    })?
+                    .records
+                    .into_iter()
+                    .map(|rec| rec.alkane)
+                    .collect();
                 if !fallback.is_empty() {
-                    return fallback;
+                    return Ok(fallback);
                 }
             }
 
@@ -3519,30 +3863,30 @@ fn fetch_sorted_alkane_ids_no_query(
             if desc {
                 if offset < metrics_count {
                     let take = std::cmp::min(limit, metrics_count - offset);
-                    ids.extend(metrics_page(offset, take));
+                    ids.extend(metrics_page(offset, take)?);
                     let remaining = limit.saturating_sub(ids.len() as u64);
                     if remaining > 0 && missing_count > 0 {
-                        ids.extend(collect_missing_tokens(state, 0, remaining, true));
+                        ids.extend(collect_missing_tokens(state, 0, remaining, true)?);
                     }
                 } else if missing_count > 0 {
                     let miss_off = offset.saturating_sub(metrics_count);
-                    ids.extend(collect_missing_tokens(state, miss_off, limit, true));
+                    ids.extend(collect_missing_tokens(state, miss_off, limit, true)?);
                 }
             } else {
                 if missing_count > 0 && offset < missing_count {
                     let take = std::cmp::min(limit, missing_count - offset);
-                    ids.extend(collect_missing_tokens(state, offset, take, false));
+                    ids.extend(collect_missing_tokens(state, offset, take, false)?);
                     let remaining = limit.saturating_sub(ids.len() as u64);
                     if remaining > 0 {
-                        ids.extend(metrics_page(0, remaining));
+                        ids.extend(metrics_page(0, remaining)?);
                     }
                 } else {
                     let metrics_offset = offset.saturating_sub(missing_count);
-                    ids.extend(metrics_page(metrics_offset, limit));
+                    ids.extend(metrics_page(metrics_offset, limit)?);
                 }
             }
 
-            ids
+            Ok(ids)
         }
     }
 }
@@ -3601,9 +3945,10 @@ fn build_alkane_token(
     rec: crate::modules::essentials::utils::inspections::AlkaneCreationRecord,
     metrics: SchemaTokenMetricsV1,
     holders: u64,
+    derived_quotes: &[SchemaAlkaneId],
 ) -> Result<Value> {
-    let supply = latest_circulating_supply(state, &rec.alkane);
-    let minted = latest_total_minted(state, &rec.alkane);
+    let supply = latest_circulating_supply(state, &rec.alkane)?;
+    let minted = latest_total_minted(state, &rec.alkane)?;
     let max_supply = rec.cap.saturating_mul(rec.mint_amount);
     let mint_active = max_supply > minted;
     let percentage_minted = if max_supply == 0 {
@@ -3614,8 +3959,8 @@ fn build_alkane_token(
     };
 
     let now_ts = now_ts();
-    let (frbtc_price, busd_price) = canonical_pool_prices(state, &rec.alkane, now_ts);
-    let price_usd = latest_token_usd_close(state, &rec.alkane).unwrap_or(0);
+    let (frbtc_price, busd_price) = canonical_pool_prices(state, &rec.alkane, now_ts)?;
+    let price_usd = latest_token_usd_close(state, &rec.alkane)?.unwrap_or(0);
 
     let has_busd = busd_price > 0;
     let has_frbtc = frbtc_price > 0;
@@ -3634,11 +3979,111 @@ fn build_alkane_token(
         symbol = id_str;
     }
     let symbol = symbol.to_ascii_uppercase();
-    let change_1d = if metrics.change_1d.trim().is_empty() { "0" } else { metrics.change_1d.as_str() };
-    let change_7d = if metrics.change_7d.trim().is_empty() { "0" } else { metrics.change_7d.as_str() };
-    let change_30d = if metrics.change_30d.trim().is_empty() { "0" } else { metrics.change_30d.as_str() };
-    let change_all_time =
-        if metrics.change_all_time.trim().is_empty() { "0" } else { metrics.change_all_time.as_str() };
+    let change_1d_raw =
+        if metrics.change_1d.trim().is_empty() { "0" } else { metrics.change_1d.as_str() };
+    let change_7d_raw =
+        if metrics.change_7d.trim().is_empty() { "0" } else { metrics.change_7d.as_str() };
+    let change_30d_raw =
+        if metrics.change_30d.trim().is_empty() { "0" } else { metrics.change_30d.as_str() };
+    let change_all_time_raw = if metrics.change_all_time.trim().is_empty() {
+        "0"
+    } else {
+        metrics.change_all_time.as_str()
+    };
+    let change_1d = parse_change_f64(change_1d_raw);
+    let change_7d = parse_change_f64(change_7d_raw);
+    let change_30d = parse_change_f64(change_30d_raw);
+    let change_all_time = parse_change_f64(change_all_time_raw);
+    let percentage_minted_num = percentage_minted as u64;
+    let price_for_volume = if price_usd > 0 { price_usd } else { metrics.price_usd };
+    let token_volume_1d = base_volume_from_quote(metrics.volume_1d, price_for_volume);
+    let token_volume_30d = base_volume_from_quote(metrics.volume_30d, price_for_volume);
+    let token_volume_7d = base_volume_from_quote(metrics.volume_7d, price_for_volume);
+    let token_volume_all_time = base_volume_from_quote(metrics.volume_all_time, price_for_volume);
+
+    let mut derived_data = serde_json::Map::new();
+    for quote in derived_quotes.iter() {
+        let derived_metrics = state
+            .ammdata
+            .get_token_derived_metrics(GetTokenDerivedMetricsParams {
+                token: rec.alkane,
+                quote: *quote,
+            })?
+            .metrics;
+        let Some(dm) = derived_metrics else { continue };
+
+        let suffix = format!("derived_{}:{}", quote.block, quote.tx);
+        let price_usd = dm.price_usd;
+        let price_for_volume = if price_usd > 0 { price_usd } else { metrics.price_usd };
+        let token_volume_1d = base_volume_from_quote(dm.volume_1d, price_for_volume);
+        let token_volume_30d = base_volume_from_quote(dm.volume_30d, price_for_volume);
+        let token_volume_7d = base_volume_from_quote(dm.volume_7d, price_for_volume);
+        let token_volume_all_time = base_volume_from_quote(dm.volume_all_time, price_for_volume);
+
+        let change_1d_raw = if dm.change_1d.trim().is_empty() { "0" } else { dm.change_1d.as_str() };
+        let change_7d_raw = if dm.change_7d.trim().is_empty() { "0" } else { dm.change_7d.as_str() };
+        let change_30d_raw = if dm.change_30d.trim().is_empty() { "0" } else { dm.change_30d.as_str() };
+        let change_all_time_raw =
+            if dm.change_all_time.trim().is_empty() { "0" } else { dm.change_all_time.as_str() };
+
+        derived_data.insert(format!("priceUsd-{}", suffix), json!(scale_price_u128(price_usd)));
+        derived_data.insert(
+            format!("fdvUsd-{}", suffix),
+            json!(scale_price_u128(dm.fdv_usd)),
+        );
+        derived_data.insert(
+            format!("marketcap-{}", suffix),
+            json!(scale_price_u128(dm.marketcap_usd)),
+        );
+        derived_data.insert(
+            format!("tokenPoolsVolume1dInUsd-{}", suffix),
+            json!(scale_price_u128(dm.volume_1d)),
+        );
+        derived_data.insert(
+            format!("tokenPoolsVolume7dInUsd-{}", suffix),
+            json!(scale_price_u128(dm.volume_7d)),
+        );
+        derived_data.insert(
+            format!("tokenPoolsVolume30dInUsd-{}", suffix),
+            json!(scale_price_u128(dm.volume_30d)),
+        );
+        derived_data.insert(
+            format!("tokenPoolsVolumeAllTimeInUsd-{}", suffix),
+            json!(scale_price_u128(dm.volume_all_time)),
+        );
+        derived_data.insert(
+            format!("tokenVolume1d-{}", suffix),
+            json!(token_volume_1d.to_string()),
+        );
+        derived_data.insert(
+            format!("tokenVolume7d-{}", suffix),
+            json!(token_volume_7d.to_string()),
+        );
+        derived_data.insert(
+            format!("tokenVolume30d-{}", suffix),
+            json!(token_volume_30d.to_string()),
+        );
+        derived_data.insert(
+            format!("tokenVolumeAllTime-{}", suffix),
+            json!(token_volume_all_time.to_string()),
+        );
+        derived_data.insert(
+            format!("priceChange24h-{}", suffix),
+            json!(parse_change_f64(change_1d_raw)),
+        );
+        derived_data.insert(
+            format!("priceChange7d-{}", suffix),
+            json!(parse_change_f64(change_7d_raw)),
+        );
+        derived_data.insert(
+            format!("priceChange30d-{}", suffix),
+            json!(parse_change_f64(change_30d_raw)),
+        );
+        derived_data.insert(
+            format!("priceChangeAllTime-{}", suffix),
+            json!(parse_change_f64(change_all_time_raw)),
+        );
+    }
 
     Ok(json!({
         "id": alkane_id_json(&rec.alkane),
@@ -3649,35 +4094,36 @@ fn build_alkane_token(
         "cap": rec.cap.to_string(),
         "minted": minted.to_string(),
         "mintActive": mint_active,
-        "percentageMinted": percentage_minted.to_string(),
+        "percentageMinted": percentage_minted_num,
         "mintAmount": rec.mint_amount.to_string(),
         "image": format!("{}/{}-{}.png", state.config.alkane_icon_cdn, rec.alkane.block, rec.alkane.tx),
         "frbtcPoolPriceInSats": frbtc_price.to_string(),
-        "busdPoolPriceInUsd": busd_price.to_string(),
+        "busdPoolPriceInUsd": scale_price_u128(busd_price),
         "maxSupply": max_supply.to_string(),
-        "floorPrice": "0",
-        "fdv": metrics.fdv_usd.to_string(),
+        "floorPrice": 0.0,
+        "fdv": scale_price_u128(metrics.fdv_usd),
         "holders": holders,
-        "marketcap": metrics.marketcap_usd.to_string(),
+        "marketcap": scale_price_u128(metrics.marketcap_usd),
         "idClubMarketplace": false,
-        "busdPoolFdvInUsd": busd_fdv.to_string(),
+        "busdPoolFdvInUsd": scale_price_u128(busd_fdv),
         "frbtcPoolFdvInSats": frbtc_fdv.to_string(),
-        "priceUsd": price_usd.to_string(),
-        "fdvUsd": metrics.fdv_usd.to_string(),
-        "busdPoolMarketcapInUsd": busd_mcap.to_string(),
+        "priceUsd": scale_price_u128(price_usd),
+        "fdvUsd": scale_price_u128(metrics.fdv_usd),
+        "busdPoolMarketcapInUsd": scale_price_u128(busd_mcap),
         "frbtcPoolMarketcapInSats": frbtc_mcap.to_string(),
-        "tokenPoolsVolume1dInUsd": metrics.volume_1d.to_string(),
-        "tokenPoolsVolume30dInUsd": metrics.volume_30d.to_string(),
-        "tokenPoolsVolume7dInUsd": metrics.volume_7d.to_string(),
-        "tokenPoolsVolumeAllTimeInUsd": metrics.volume_all_time.to_string(),
-        "tokenVolume1d": metrics.volume_1d.to_string(),
-        "tokenVolume30d": metrics.volume_30d.to_string(),
-        "tokenVolume7d": metrics.volume_7d.to_string(),
-        "tokenVolumeAllTime": metrics.volume_all_time.to_string(),
+        "tokenPoolsVolume1dInUsd": scale_price_u128(metrics.volume_1d),
+        "tokenPoolsVolume30dInUsd": scale_price_u128(metrics.volume_30d),
+        "tokenPoolsVolume7dInUsd": scale_price_u128(metrics.volume_7d),
+        "tokenPoolsVolumeAllTimeInUsd": scale_price_u128(metrics.volume_all_time),
+        "tokenVolume1d": token_volume_1d.to_string(),
+        "tokenVolume30d": token_volume_30d.to_string(),
+        "tokenVolume7d": token_volume_7d.to_string(),
+        "tokenVolumeAllTime": token_volume_all_time.to_string(),
         "priceChange24h": change_1d,
         "priceChange7d": change_7d,
         "priceChange30d": change_30d,
         "priceChangeAllTime": change_all_time,
+        "derived_data": derived_data,
     }))
 }
 
@@ -3704,9 +4150,8 @@ fn build_pool_details(
     if let Some(factory_id) = factory {
         let factory_match = state
             .ammdata
-            .get_pool_factory(GetPoolFactoryParams { pool })
-            .ok()
-            .and_then(|res| res.factory);
+            .get_pool_factory(GetPoolFactoryParams { pool })?
+            .factory;
         if let Some(found) = factory_match {
             if found != factory_id {
                 return Ok(None);
@@ -3714,20 +4159,15 @@ fn build_pool_details(
         } else {
             let pools = state
                 .ammdata
-                .get_factory_pools(GetFactoryPoolsParams { factory: factory_id })
-                .map(|res| res.pools)
-                .unwrap_or_default();
+                .get_factory_pools(GetFactoryPoolsParams { factory: factory_id })?
+                .pools;
             if !pools.contains(&pool) {
                 return Ok(None);
             }
         }
     }
 
-    let defs = state
-        .ammdata
-        .get_pool_defs(GetPoolDefsParams { pool })
-        .ok()
-        .and_then(|res| res.defs);
+    let defs = state.ammdata.get_pool_defs(GetPoolDefsParams { pool })?.defs;
     let Some(defs) = defs else {
         return Ok(None);
     };
@@ -3735,20 +4175,22 @@ fn build_pool_details(
     let token0 = defs.base_alkane_id;
     let token1 = defs.quote_alkane_id;
 
-    let mut balances = get_alkane_balances(&state.essentials, &pool).unwrap_or_default();
+    let mut balances = get_alkane_balances(&state.essentials, &pool)?;
     let token0_amount = balances.remove(&token0).unwrap_or(0);
     let token1_amount = balances.remove(&token1).unwrap_or(0);
 
-    let token0_label = alkane_label(state, &token0);
-    let token1_label = alkane_label(state, &token1);
+    let token0_label = alkane_label(state, &token0)?;
+    let token1_label = alkane_label(state, &token1)?;
     let pool_name = format!("{token0_label} / {token1_label}");
 
     let mut metrics = state
         .ammdata
-        .get_pool_metrics(GetPoolMetricsParams { pool })
-        .ok()
-        .map(|res| res.metrics)
-        .unwrap_or_default();
+        .get_pool_metrics(GetPoolMetricsParams { pool })?
+        .metrics;
+    let pool_metrics_v2 = state
+        .ammdata
+        .get_pool_metrics_v2(GetPoolMetricsV2Params { pool })?
+        .metrics;
     if metrics.tvl_change_24h.is_empty() {
         metrics.tvl_change_24h = "0".to_string();
     }
@@ -3759,28 +4201,37 @@ fn build_pool_details(
         metrics.pool_apr = "0".to_string();
     }
 
-    let token0_price_usd = token_metrics(state, &token0).price_usd;
-    let token1_price_usd = token_metrics(state, &token1).price_usd;
+    let token0_price_usd = token_metrics(state, &token0)?.price_usd;
+    let token1_price_usd = token_metrics(state, &token1)?.price_usd;
     let now_ts = now_ts();
-    let (token0_price_sats, _) = canonical_pool_prices(state, &token0, now_ts);
-    let (token1_price_sats, _) = canonical_pool_prices(state, &token1, now_ts);
+    let (token0_price_sats, _) = canonical_pool_prices(state, &token0, now_ts)?;
+    let (token1_price_sats, _) = canonical_pool_prices(state, &token1, now_ts)?;
 
-    let token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
-    let token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
+    let mut token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
+    let mut token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
     let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / PRICE_SCALE;
     let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
+
+    let mut canonical_units: HashMap<SchemaAlkaneId, CanonicalQuoteUnit> = HashMap::new();
+    for quote in canonical_quotes(get_network()) {
+        canonical_units.insert(quote.id, quote.unit);
+    }
+    if let Some(unit) = canonical_units.get(&token0) {
+        token0_tvl_usd = canonical_quote_amount_tvl_usd(token0_amount, *unit)?;
+    }
+    if let Some(unit) = canonical_units.get(&token1) {
+        token1_tvl_usd = canonical_quote_amount_tvl_usd(token1_amount, *unit)?;
+    }
 
     let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
     let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
 
     let mut lp_supply = state
         .ammdata
-        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-        .ok()
-        .map(|res| res.supply)
-        .unwrap_or(0);
+        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })?
+        .supply;
     if lp_supply == 0 {
-        lp_supply = latest_circulating_supply(state, &pool);
+        lp_supply = latest_circulating_supply(state, &pool)?;
     }
 
     let lp_value_sats = if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
@@ -3788,9 +4239,8 @@ fn build_pool_details(
 
     let creation = state
         .ammdata
-        .get_pool_creation_info(GetPoolCreationInfoParams { pool })
-        .ok()
-        .and_then(|res| res.info);
+        .get_pool_creation_info(GetPoolCreationInfoParams { pool })?
+        .info;
     let (creator_address, creation_height, initial_token0_amount, initial_token1_amount) =
         if let Some(info) = creation {
             let creator = if info.creator_spk.is_empty() {
@@ -3809,6 +4259,46 @@ fn build_pool_details(
             (None, None, 0, 0)
         };
 
+    let pool_apr = parse_change_f64(&metrics.pool_apr);
+    let tvl_change_24h = parse_change_f64(&metrics.tvl_change_24h);
+    let tvl_change_7d = parse_change_f64(&metrics.tvl_change_7d);
+    let mut pool_volume_7d_usd = pool_metrics_v2
+        .as_ref()
+        .map(|m| m.pool_volume_7d_usd)
+        .unwrap_or(0);
+    let mut pool_volume_all_time_usd = pool_metrics_v2
+        .as_ref()
+        .map(|m| m.pool_volume_all_time_usd)
+        .unwrap_or(0);
+    if pool_volume_7d_usd == 0 || pool_volume_all_time_usd == 0 {
+        if let Ok((token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all)) =
+            pool_candle_volume_sums(state, &pool, now_ts)
+        {
+            let fallback_7d = token0_volume_7d
+                .saturating_mul(token0_price_usd)
+                .saturating_div(PRICE_SCALE)
+                .saturating_add(
+                    token1_volume_7d
+                        .saturating_mul(token1_price_usd)
+                        .saturating_div(PRICE_SCALE),
+                );
+            let fallback_all = token0_volume_all
+                .saturating_mul(token0_price_usd)
+                .saturating_div(PRICE_SCALE)
+                .saturating_add(
+                    token1_volume_all
+                        .saturating_mul(token1_price_usd)
+                        .saturating_div(PRICE_SCALE),
+                );
+            if pool_volume_7d_usd == 0 {
+                pool_volume_7d_usd = fallback_7d;
+            }
+            if pool_volume_all_time_usd == 0 {
+                pool_volume_all_time_usd = fallback_all;
+            }
+        }
+    }
+
     let value = json!({
         "token0": alkane_id_json(&token0),
         "token1": alkane_id_json(&token1),
@@ -3818,36 +4308,36 @@ fn build_pool_details(
         "poolName": pool_name,
         "poolId": alkane_id_json(&pool),
         "token0TvlInSats": token0_tvl_sats.to_string(),
-        "token0TvlInUsd": token0_tvl_usd.to_string(),
+        "token0TvlInUsd": scale_price_u128(token0_tvl_usd),
         "token1TvlInSats": token1_tvl_sats.to_string(),
-        "token1TvlInUsd": token1_tvl_usd.to_string(),
+        "token1TvlInUsd": scale_price_u128(token1_tvl_usd),
         "poolVolume30dInSats": metrics.pool_volume_30d_sats.to_string(),
         "poolVolume1dInSats": metrics.pool_volume_1d_sats.to_string(),
-        "poolVolume30dInUsd": metrics.pool_volume_30d_usd.to_string(),
-        "poolVolume1dInUsd": metrics.pool_volume_1d_usd.to_string(),
+        "poolVolume30dInUsd": scale_price_u128(metrics.pool_volume_30d_usd),
+        "poolVolume1dInUsd": scale_price_u128(metrics.pool_volume_1d_usd),
         "token0Volume30d": metrics.token0_volume_30d.to_string(),
         "token1Volume30d": metrics.token1_volume_30d.to_string(),
         "token0Volume1d": metrics.token0_volume_1d.to_string(),
         "token1Volume1d": metrics.token1_volume_1d.to_string(),
         "lPTokenValueInSats": lp_value_sats.to_string(),
-        "lPTokenValueInUsd": lp_value_usd.to_string(),
+        "lPTokenValueInUsd": scale_price_u128(lp_value_usd),
         "poolTvlInSats": pool_tvl_sats.to_string(),
-        "poolTvlInUsd": pool_tvl_usd.to_string(),
-        "tvlChange24h": metrics.tvl_change_24h.clone(),
-        "tvlChange7d": metrics.tvl_change_7d.clone(),
+        "poolTvlInUsd": scale_price_u128(pool_tvl_usd),
+        "tvlChange24h": tvl_change_24h,
+        "tvlChange7d": tvl_change_7d,
         "totalSupply": lp_supply.to_string(),
-        "poolApr": metrics.pool_apr.clone(),
+        "poolApr": pool_apr,
         "initialToken0Amount": initial_token0_amount.to_string(),
         "initialToken1Amount": initial_token1_amount.to_string(),
         "creatorAddress": creator_address,
         "creationBlockHeight": creation_height,
-        "tvl": pool_tvl_usd.to_string(),
-        "volume1d": metrics.pool_volume_1d_usd.to_string(),
-        "volume7d": "0",
-        "volume30d": metrics.pool_volume_30d_usd.to_string(),
-        "volumeAllTime": "0",
-        "apr": metrics.pool_apr.clone(),
-        "tvlChange": metrics.tvl_change_24h.clone(),
+        "tvl": scale_price_u128(pool_tvl_usd),
+        "volume1d": scale_price_u128(metrics.pool_volume_1d_usd),
+        "volume7d": scale_price_u128(pool_volume_7d_usd),
+        "volume30d": scale_price_u128(metrics.pool_volume_30d_usd),
+        "volumeAllTime": scale_price_u128(pool_volume_all_time_usd),
+        "apr": pool_apr,
+        "tvlChange": tvl_change_24h,
     });
 
     Ok(Some(PoolDetailsComputed {
@@ -3859,8 +4349,8 @@ fn build_pool_details(
         pool_tvl_usd,
         pool_volume_1d_usd: metrics.pool_volume_1d_usd,
         pool_volume_30d_usd: metrics.pool_volume_30d_usd,
-        pool_apr: metrics.pool_apr.parse::<f64>().unwrap_or(0.0),
-        tvl_change_24h: metrics.tvl_change_24h.parse::<f64>().unwrap_or(0.0),
+        pool_apr,
+        tvl_change_24h,
         lp_supply,
     }))
 }
@@ -3894,8 +4384,8 @@ fn search_pools(state: &OylApiState, query: &str) -> Result<Vec<Value>> {
         let Some(snap) = snapshot.get(&pool) else { continue };
         let base = snap.base_id;
         let quote = snap.quote_id;
-        let base_label = alkane_label(state, &base);
-        let quote_label = alkane_label(state, &quote);
+        let base_label = alkane_label(state, &base)?;
+        let quote_label = alkane_label(state, &quote)?;
         let pool_name = format!("{base_label} / {quote_label}");
         out.push(json!({
             "poolId": alkane_id_json(&pool),
@@ -3911,16 +4401,16 @@ fn search_pools(state: &OylApiState, query: &str) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn alkane_label(state: &OylApiState, id: &SchemaAlkaneId) -> String {
+fn alkane_label(state: &OylApiState, id: &SchemaAlkaneId) -> Result<String> {
     let rec = state
         .essentials
         .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
             alkane: *id,
-        })
-        .ok()
-        .and_then(|resp| resp.record);
-    rec.and_then(|r| r.symbols.first().cloned().or_else(|| r.names.first().cloned()))
-        .unwrap_or_else(|| format!("{}:{}", id.block, id.tx))
+        })?
+        .record;
+    Ok(rec
+        .and_then(|r| r.symbols.first().cloned().or_else(|| r.names.first().cloned()))
+        .unwrap_or_else(|| format!("{}:{}", id.block, id.tx)))
 }
 
 fn clamp_count(count: Option<u64>) -> usize {
@@ -3958,10 +4448,10 @@ fn address_from_spk_bytes(spk: &[u8]) -> String {
     spk_to_address_str(&spk, get_network()).unwrap_or_default()
 }
 
-fn pool_name_from_defs(state: &OylApiState, defs: &SchemaMarketDefs) -> String {
-    let token0_label = alkane_label(state, &defs.base_alkane_id);
-    let token1_label = alkane_label(state, &defs.quote_alkane_id);
-    format!("{token0_label} / {token1_label}")
+fn pool_name_from_defs(state: &OylApiState, defs: &SchemaMarketDefs) -> Result<String> {
+    let token0_label = alkane_label(state, &defs.base_alkane_id)?;
+    let token1_label = alkane_label(state, &defs.quote_alkane_id)?;
+    Ok(format!("{token0_label} / {token1_label}"))
 }
 
 fn trade_from_activity(

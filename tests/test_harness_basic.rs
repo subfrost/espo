@@ -92,7 +92,7 @@ fn test_config_builder_basic() {
         .build();
 
     assert_eq!(config.network, bitcoin::Network::Regtest);
-    assert_eq!(config.strict_mode, true);
+    assert!(config.strict_mode.is_some());
 
     // Verify temp directories exist
     assert!(std::path::Path::new(&config.readonly_metashrew_db_dir).exists());

@@ -18,11 +18,15 @@
   "debug": true,
   "debug_ignore_ms": 50,
   "debug_backup": {
-    "blocks": [880100, 900000, 903500, 925000],
+    "blocks": [880100, 900000, 903500, 908368, 913765, 916290, 925000],
     "dir": "./db-bkp"
   },
   "metashrew_db_label": null,
-  "strict_mode": false,
+  "strict_mode": {
+    "check_utxos": false,
+    "check_alkane_balances": true,
+    "check_trace_mismatches": true
+  },
   "block_source_mode": "rpc",
   "simulate_reorg": false,
   "explorer_networks": {
@@ -39,6 +43,7 @@
     "ammdata": {
       "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/THWHjh0GMbRvWxCzc865L",
       "eth_call_throttle": 150,
+      "derived_liquidity": [{ "alkane": "2:0", "strategy": "optimistic" }],
       "search_index_enabled": true,
       "search_prefix_min": 2,
       "search_prefix_max": 6,

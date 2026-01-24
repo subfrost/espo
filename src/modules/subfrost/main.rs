@@ -99,6 +99,13 @@ impl EspoModule for Subfrost {
         let module = self.get_name();
         let provider = self.provider();
         let table = provider.table();
+        let height = block.height;
+        if let Some(prev) = *self.index_height.read().unwrap() {
+            if height <= prev {
+                eprintln!("[SUBFROST] skipping already indexed block #{height} (last={prev})");
+                return Ok(());
+            }
+        }
 
         let timer = debug::start_if(debug);
         let block_ts = block.block_header.time as u64;
@@ -302,7 +309,12 @@ fn parse_wrap_invoke(
     if myself != frbtc {
         return None;
     }
-    let opcode = invoke.context.inputs.get(0).and_then(|s| parse_hex_u64(s))?;
+    let opcode0 = invoke.context.inputs.get(0).and_then(|s| parse_hex_u64(s));
+    let opcode2 = invoke.context.inputs.get(2).and_then(|s| parse_hex_u64(s));
+    let opcode = match opcode0 {
+        Some(0x4d) | Some(0x4e) => opcode0,
+        _ => opcode2,
+    }?;
     let kind = match opcode {
         0x4d => WrapKind::Wrap,
         0x4e => WrapKind::Unwrap,
