@@ -14,7 +14,8 @@ use crate::config::{
 use crate::debug;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
+    AlkaneBalanceTxEntry, AlkaneBalanceTxsMeta, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
+    BALANCE_TXS_PAGE_SIZE,
     decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, decode_u128_value,
     encode_u128_value, encode_vec,
     mk_outpoint, spk_to_address_str,
@@ -43,6 +44,122 @@ fn ammdata_mdb() -> Arc<Mdb> {
     AMMDATA_MDB
         .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
         .clone()
+}
+
+fn append_paged_balance_txs<F>(
+    provider: &EssentialsProvider,
+    meta_key: Vec<u8>,
+    mut page_key: F,
+    new_entries: &[AlkaneBalanceTxEntry],
+    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<(u64, u64)>
+where
+    F: FnMut(u64) -> Vec<u8>,
+{
+    if new_entries.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut meta = if let Ok(resp) = provider.get_raw_value(GetRawValueParams { key: meta_key.clone() })
+    {
+        resp.value
+            .and_then(|bytes| AlkaneBalanceTxsMeta::try_from_slice(&bytes).ok())
+            .unwrap_or(AlkaneBalanceTxsMeta {
+                page_size: BALANCE_TXS_PAGE_SIZE,
+                last_page: 0,
+                total_len: 0,
+            })
+    } else {
+        AlkaneBalanceTxsMeta {
+            page_size: BALANCE_TXS_PAGE_SIZE,
+            last_page: 0,
+            total_len: 0,
+        }
+    };
+
+    if meta.page_size == 0 {
+        meta.page_size = BALANCE_TXS_PAGE_SIZE;
+    }
+    let page_size = meta.page_size as usize;
+
+    let mut last_entries: Vec<AlkaneBalanceTxEntry> = Vec::new();
+    let mut decode_failed = false;
+    if meta.total_len > 0 {
+        let last_key = page_key(meta.last_page);
+        if let Ok(resp) = provider.get_raw_value(GetRawValueParams { key: last_key }) {
+            if let Some(bytes) = resp.value {
+                if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                    last_entries = list;
+                } else {
+                    decode_failed = true;
+                }
+            } else {
+                decode_failed = true;
+            }
+        } else {
+            decode_failed = true;
+        }
+    }
+
+    if decode_failed {
+        meta.total_len = 0;
+        meta.last_page = 0;
+        last_entries.clear();
+    }
+
+    let mut seen: HashMap<[u8; 32], usize> = HashMap::new();
+    for (idx, entry) in last_entries.iter().enumerate() {
+        seen.insert(entry.txid, idx);
+    }
+
+    let mut added: u64 = 0;
+    for entry in new_entries {
+        if let Some(idx) = seen.get(&entry.txid).copied() {
+            if last_entries[idx].outflow.is_empty() && !entry.outflow.is_empty() {
+                last_entries[idx].outflow = entry.outflow.clone();
+            }
+            if last_entries[idx].height == 0 && entry.height != 0 {
+                last_entries[idx].height = entry.height;
+            }
+            continue;
+        }
+        seen.insert(entry.txid, last_entries.len());
+        last_entries.push(entry.clone());
+        added = added.saturating_add(1);
+    }
+
+    let mut pages_written: u64 = 0;
+    let mut page_idx = meta.last_page;
+    if last_entries.len() <= page_size {
+        if let Ok(buf) = encode_vec(&last_entries) {
+            puts.push((page_key(page_idx), buf));
+            pages_written = pages_written.saturating_add(1);
+        }
+    } else {
+        let end = page_size.min(last_entries.len());
+        if let Ok(buf) = encode_vec(&last_entries[..end].to_vec()) {
+            puts.push((page_key(page_idx), buf));
+            pages_written = pages_written.saturating_add(1);
+        }
+        let mut start = end;
+        while start < last_entries.len() {
+            page_idx = page_idx.saturating_add(1);
+            let end = (start + page_size).min(last_entries.len());
+            if let Ok(buf) = encode_vec(&last_entries[start..end].to_vec()) {
+                puts.push((page_key(page_idx), buf));
+                pages_written = pages_written.saturating_add(1);
+            }
+            start = end;
+        }
+    }
+
+    meta.last_page = page_idx;
+    meta.total_len = meta.total_len.saturating_add(added);
+    if let Ok(buf) = borsh::to_vec(&meta) {
+        puts.push((meta_key, buf));
+    }
+
+    Ok((pages_written, added))
 }
 
 pub(crate) fn clean_espo_sandshrew_like_trace(
@@ -1223,7 +1340,7 @@ pub fn bulk_update_balances_for_block(
     debug::log_elapsed(module, "trace_prevout_fetch", timer);
 
     // ---------- Main per-tx loop ----------
-    let timer = debug::start_if(debug);
+    let process_timer = debug::start_if(debug);
     for atx in &block.transactions {
         let tx = &atx.transaction;
         let txid = tx.compute_txid();
@@ -1588,6 +1705,8 @@ pub fn bulk_update_balances_for_block(
         }
     }
 
+    debug::log_elapsed(module, "process_transactions_loop", process_timer);
+
     // Ensure txid indexes are recorded for every alkane/token delta we are about to persist.
     for ((owner, token), entry) in &alkane_balance_delta_src {
         push_balance_tx_entry(&mut alkane_balance_tx_entries, *owner, entry.clone());
@@ -1600,6 +1719,7 @@ pub fn bulk_update_balances_for_block(
     }
 
     // Accumulate alkane holder deltas (alkane -> token) and prepare rows for persistence.
+    let timer = debug::start_if(debug);
     let mut alkane_balances_rows: HashMap<SchemaAlkaneId, Vec<BalanceEntry>> = HashMap::new();
     if !alkane_balance_delta.is_empty() {
         let mut owners: Vec<SchemaAlkaneId> = alkane_balance_delta.keys().copied().collect();
@@ -1666,96 +1786,9 @@ pub fn bulk_update_balances_for_block(
             alkane_balances_rows.insert(*owner, vec_entries);
         }
     }
+    debug::log_elapsed(module, "process_transactions_build_balance_rows", timer);
 
-    // Build balance-change tx rows (merge existing + new)
-    let mut alkane_balance_txs_rows: HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>> =
-        HashMap::new();
-    let mut alkane_balance_txs_by_token_rows: HashMap<
-        (SchemaAlkaneId, SchemaAlkaneId),
-        Vec<AlkaneBalanceTxEntry>,
-    > = HashMap::new();
-
-    fn merge_tx_entries(
-        existing: &mut Vec<AlkaneBalanceTxEntry>,
-        new_entries: &[AlkaneBalanceTxEntry],
-    ) {
-        let mut seen: HashMap<[u8; 32], usize> = HashMap::new();
-        for (idx, entry) in existing.iter().enumerate() {
-            seen.insert(entry.txid, idx);
-        }
-        for entry in new_entries {
-            if let Some(idx) = seen.get(&entry.txid).copied() {
-                if existing[idx].outflow.is_empty() && !entry.outflow.is_empty() {
-                    existing[idx].outflow = entry.outflow.clone();
-                }
-                if existing[idx].height == 0 && entry.height != 0 {
-                    existing[idx].height = entry.height;
-                }
-                continue;
-            }
-            seen.insert(entry.txid, existing.len());
-            existing.push(entry.clone());
-        }
-    }
-
-    if !alkane_balance_tx_entries.is_empty() {
-        let mut tokens: Vec<SchemaAlkaneId> = alkane_balance_tx_entries.keys().copied().collect();
-        tokens.sort();
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(tokens.len());
-        for tok in &tokens {
-            keys.push(table.alkane_balance_txs_key(tok));
-        }
-        let existing = provider
-            .get_multi_values(GetMultiValuesParams { keys })?
-            .values;
-
-        for (idx, tok) in tokens.iter().enumerate() {
-            let mut merged: Vec<AlkaneBalanceTxEntry> = Vec::new();
-            if let Some(bytes) = &existing.get(idx).and_then(|v| v.as_ref()) {
-                if let Ok(cur) = decode_alkane_balance_tx_entries(bytes) {
-                    merged = cur;
-                }
-            }
-
-            if let Some(new) = alkane_balance_tx_entries.get(tok) {
-                merge_tx_entries(&mut merged, new);
-            }
-
-            if !merged.is_empty() {
-                alkane_balance_txs_rows.insert(*tok, merged);
-            }
-        }
-    }
-    if !alkane_balance_tx_entries_by_token.is_empty() {
-        let mut pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> =
-            alkane_balance_tx_entries_by_token.keys().copied().collect();
-        pairs.sort();
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(pairs.len());
-        for (owner, token) in &pairs {
-            keys.push(table.alkane_balance_txs_by_token_key(owner, token));
-        }
-        let existing = provider
-            .get_multi_values(GetMultiValuesParams { keys })?
-            .values;
-
-        for (idx, pair) in pairs.iter().enumerate() {
-            let mut merged: Vec<AlkaneBalanceTxEntry> = Vec::new();
-            if let Some(bytes) = &existing.get(idx).and_then(|v| v.as_ref()) {
-                if let Ok(cur) = decode_alkane_balance_tx_entries(bytes) {
-                    merged = cur;
-                }
-            }
-
-            if let Some(new) = alkane_balance_tx_entries_by_token.get(pair) {
-                merge_tx_entries(&mut merged, new);
-            }
-
-            if !merged.is_empty() {
-                alkane_balance_txs_by_token_rows.insert(*pair, merged);
-            }
-        }
-    }
-
+    let timer = debug::start_if(debug);
     let mut alkane_balance_txs_by_height_row: BTreeMap<
         SchemaAlkaneId,
         Vec<AlkaneBalanceTxEntry>,
@@ -1768,7 +1801,9 @@ pub fn bulk_update_balances_for_block(
             alkane_balance_txs_by_height_row.insert(*alkane, entries.clone());
         }
     }
+    debug::log_elapsed(module, "process_transactions_build_txs_by_height", timer);
 
+    let timer = debug::start_if(debug);
     let mut address_offsets: HashMap<String, u64> = HashMap::new();
     if !alkane_address_txids.is_empty() {
         let mut addrs: Vec<String> = alkane_address_txids.keys().cloned().collect();
@@ -1797,7 +1832,9 @@ pub fn bulk_update_balances_for_block(
             address_offsets.insert(addr.clone(), len);
         }
     }
+    debug::log_elapsed(module, "process_transactions_address_offsets", timer);
 
+    let timer = debug::start_if(debug);
     let mut latest_traces: Vec<[u8; 32]> = provider
         .get_raw_value(GetRawValueParams {
             key: table.alkane_latest_traces_key(),
@@ -1813,8 +1850,9 @@ pub fn bulk_update_balances_for_block(
             latest_traces.truncate(20);
         }
     }
+    debug::log_elapsed(module, "process_transactions_latest_traces", timer);
 
-    debug::log_elapsed(module, "process_transactions", timer);
+    debug::log_elapsed(module, "process_transactions", process_timer);
 
     // logging metric
     stat_outpoints_marked_spent = spent_outpoints.len();
@@ -1878,6 +1916,7 @@ pub fn bulk_update_balances_for_block(
     for (_, row) in row_map {
         new_rows.push(row);
     }
+    debug::log_elapsed(module, "process_transactions_build_new_rows", timer);
 
     // --- Cleanup keys for outpoints that were spent (remove unspent variants) ---
     let mut del_keys_outpoint_balances: Vec<Vec<u8>> = Vec::new();
@@ -1948,28 +1987,59 @@ pub fn bulk_update_balances_for_block(
         }
     }
 
-    // C3) Persist alkane balance change txids
-    for (alk, txids) in alkane_balance_txs_rows.iter() {
-        let key = table.alkane_balance_txs_key(alk);
-        if txids.is_empty() {
-            deletes.push(key);
-            continue;
-        }
-        if let Ok(buf) = encode_vec(txids) {
-            puts.push((key, buf));
+    // C3) Persist alkane balance change txids (paged)
+    let timer = debug::start_if(debug);
+    let mut paged_tokens: usize = 0;
+    let mut paged_pairs: usize = 0;
+    let mut paged_pages: u64 = 0;
+    let mut paged_entries: u64 = 0;
+
+    if !alkane_balance_tx_entries.is_empty() {
+        let mut tokens: Vec<SchemaAlkaneId> = alkane_balance_tx_entries.keys().copied().collect();
+        tokens.sort();
+        paged_tokens = tokens.len();
+        for tok in &tokens {
+            if let Some(new_entries) = alkane_balance_tx_entries.get(tok) {
+                let (pages_written, entries_added) = append_paged_balance_txs(
+                    provider,
+                    table.alkane_balance_txs_meta_key(tok),
+                    |page| table.alkane_balance_txs_page_key(tok, page),
+                    new_entries,
+                    &mut puts,
+                )?;
+                paged_pages = paged_pages.saturating_add(pages_written);
+                paged_entries = paged_entries.saturating_add(entries_added);
+            }
         }
     }
-    // C3b) Persist alkane balance change txids by token
-    for ((owner, token), txids) in alkane_balance_txs_by_token_rows.iter() {
-        let key = table.alkane_balance_txs_by_token_key(owner, token);
-        if txids.is_empty() {
-            deletes.push(key);
-            continue;
-        }
-        if let Ok(buf) = encode_vec(txids) {
-            puts.push((key, buf));
+
+    if !alkane_balance_tx_entries_by_token.is_empty() {
+        let mut pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> =
+            alkane_balance_tx_entries_by_token.keys().copied().collect();
+        pairs.sort();
+        paged_pairs = pairs.len();
+        for (owner, token) in &pairs {
+            if let Some(new_entries) = alkane_balance_tx_entries_by_token.get(&(*owner, *token)) {
+                let (pages_written, entries_added) = append_paged_balance_txs(
+                    provider,
+                    table.alkane_balance_txs_by_token_meta_key(owner, token),
+                    |page| table.alkane_balance_txs_by_token_page_key(owner, token, page),
+                    new_entries,
+                    &mut puts,
+                )?;
+                paged_pages = paged_pages.saturating_add(pages_written);
+                paged_entries = paged_entries.saturating_add(entries_added);
+            }
         }
     }
+
+    if debug {
+        eprintln!(
+            "[balances] paged_balance_txs stats: tokens={} pairs={} pages_written={} entries_added={}",
+            paged_tokens, paged_pairs, paged_pages, paged_entries
+        );
+    }
+    debug::log_elapsed(module, "process_transactions_update_balance_txs_paged", timer);
 
     // C3c) Persist alkane balance change txids by height
     let height_key = table.alkane_balance_txs_by_height_key(block.height);

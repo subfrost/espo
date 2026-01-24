@@ -106,7 +106,11 @@ pub struct EssentialsTable<'a> {
     pub HOLDERS_ORDERED: MdbPointer<'a>,
     pub ALKANE_BALANCES: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS: MdbPointer<'a>,
+    pub ALKANE_BALANCE_TXS_PAGED: MdbPointer<'a>,
+    pub ALKANE_BALANCE_TXS_META: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS_BY_TOKEN: MdbPointer<'a>,
+    pub ALKANE_BALANCE_TXS_BY_TOKEN_PAGED: MdbPointer<'a>,
+    pub ALKANE_BALANCE_TXS_BY_TOKEN_META: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS_BY_HEIGHT: MdbPointer<'a>,
     // Alkane creation + metadata.
     pub ALKANE_INFO: MdbPointer<'a>,
@@ -146,7 +150,11 @@ impl<'a> EssentialsTable<'a> {
             HOLDERS_ORDERED: root.keyword("/alkanes/holders/ordered/"),
             ALKANE_BALANCES: root.keyword("/alkane_balances/"),
             ALKANE_BALANCE_TXS: root.keyword("/alkane_balance_txs/"),
+            ALKANE_BALANCE_TXS_PAGED: root.keyword("/alkane_balance_txs_paged/"),
+            ALKANE_BALANCE_TXS_META: root.keyword("/alkane_balance_txs_meta/"),
             ALKANE_BALANCE_TXS_BY_TOKEN: root.keyword("/alkane_balance_txs_by_token/"),
+            ALKANE_BALANCE_TXS_BY_TOKEN_PAGED: root.keyword("/alkane_balance_txs_by_token_paged/"),
+            ALKANE_BALANCE_TXS_BY_TOKEN_META: root.keyword("/alkane_balance_txs_by_token_meta/"),
             ALKANE_BALANCE_TXS_BY_HEIGHT: root.keyword("/alkane_balance_txs_by_height/"),
             ALKANE_INFO: root.keyword("/alkane_info/"),
             ALKANE_NAME_INDEX: root.keyword("/alkanes/name/"),
@@ -236,6 +244,22 @@ impl<'a> EssentialsTable<'a> {
         self.ALKANE_BALANCE_TXS.select(&suffix).key().to_vec()
     }
 
+    pub fn alkane_balance_txs_page_key(&self, alkane: &SchemaAlkaneId, page: u64) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1 + 8);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&page.to_be_bytes());
+        self.ALKANE_BALANCE_TXS_PAGED.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_balance_txs_meta_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.ALKANE_BALANCE_TXS_META.select(&suffix).key().to_vec()
+    }
+
     pub fn alkane_balance_txs_by_height_key(&self, height: u32) -> Vec<u8> {
         self.ALKANE_BALANCE_TXS_BY_HEIGHT
             .select(&height.to_be_bytes())
@@ -255,6 +279,37 @@ impl<'a> EssentialsTable<'a> {
         suffix.extend_from_slice(&token.block.to_be_bytes());
         suffix.extend_from_slice(&token.tx.to_be_bytes());
         self.ALKANE_BALANCE_TXS_BY_TOKEN.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_balance_txs_by_token_page_key(
+        &self,
+        owner: &SchemaAlkaneId,
+        token: &SchemaAlkaneId,
+        page: u64,
+    ) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(25 + 1 + 8);
+        suffix.extend_from_slice(&owner.block.to_be_bytes());
+        suffix.extend_from_slice(&owner.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&token.block.to_be_bytes());
+        suffix.extend_from_slice(&token.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&page.to_be_bytes());
+        self.ALKANE_BALANCE_TXS_BY_TOKEN_PAGED.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_balance_txs_by_token_meta_key(
+        &self,
+        owner: &SchemaAlkaneId,
+        token: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(25);
+        suffix.extend_from_slice(&owner.block.to_be_bytes());
+        suffix.extend_from_slice(&owner.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&token.block.to_be_bytes());
+        suffix.extend_from_slice(&token.tx.to_be_bytes());
+        self.ALKANE_BALANCE_TXS_BY_TOKEN_META.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_balances_key(&self, owner: &SchemaAlkaneId) -> Vec<u8> {
@@ -1697,21 +1752,61 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
 
         let table = self.table();
-        let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
-        if let Ok(resp) = self.get_raw_value(GetRawValueParams {
-            key: table.alkane_balance_txs_key(&alk),
-        }) {
-            if let Some(bytes) = resp.value {
-                if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
-                    txs = list;
+        let total: usize;
+        let mut slice: Vec<AlkaneBalanceTxEntry> = Vec::new();
+
+        let meta = self
+            .get_raw_value(GetRawValueParams { key: table.alkane_balance_txs_meta_key(&alk) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|bytes| AlkaneBalanceTxsMeta::try_from_slice(&bytes).ok());
+
+        if let Some(meta) = meta {
+            let page_size = meta.page_size.max(1) as usize;
+            total = meta.total_len as usize;
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(total);
+            if off < total {
+                let start_page = off / page_size;
+                let mut end_page = (end.saturating_sub(1)) / page_size;
+                let max_page = meta.last_page as usize;
+                if end_page > max_page {
+                    end_page = max_page;
+                }
+                for page_idx in start_page..=end_page {
+                    let key = table.alkane_balance_txs_page_key(&alk, page_idx as u64);
+                    if let Ok(resp) = self.get_raw_value(GetRawValueParams { key }) {
+                        if let Some(bytes) = resp.value {
+                            if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                                let page_start = page_idx * page_size;
+                                let local_start = off.saturating_sub(page_start);
+                                let local_end = (end.saturating_sub(page_start)).min(list.len());
+                                if local_start < local_end && local_start < list.len() {
+                                    slice.extend_from_slice(&list[local_start..local_end]);
+                                }
+                            }
+                        }
+                    }
                 }
             }
+        } else {
+            let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
+            if let Ok(resp) = self.get_raw_value(GetRawValueParams {
+                key: table.alkane_balance_txs_key(&alk),
+            }) {
+                if let Some(bytes) = resp.value {
+                    if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                        txs = list;
+                    }
+                }
+            }
+            total = txs.len();
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(total);
+            if off < total {
+                slice = txs[off..end].to_vec();
+            }
         }
-
-        let total = txs.len();
-        let off = limit.saturating_mul(page.saturating_sub(1));
-        let end = (off + limit).min(total);
-        let slice = if off >= total { vec![] } else { txs[off..end].to_vec() };
 
         let items: Vec<Value> = slice
             .into_iter()
@@ -1738,7 +1833,7 @@ impl EssentialsProvider {
                 "page": page,
                 "limit": limit,
                 "total": total,
-                "has_more": off + items.len() < total,
+                "has_more": limit.saturating_mul(page.saturating_sub(1)) + items.len() < total,
                 "txids": items
             }),
         })
@@ -1773,21 +1868,68 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
 
         let table = self.table();
-        let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
-        if let Ok(resp) = self.get_raw_value(GetRawValueParams {
-            key: table.alkane_balance_txs_by_token_key(&owner, &token),
-        }) {
-            if let Some(bytes) = resp.value {
-                if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
-                    txs = list;
+        let total: usize;
+        let mut slice: Vec<AlkaneBalanceTxEntry> = Vec::new();
+
+        let meta = self
+            .get_raw_value(GetRawValueParams {
+                key: table.alkane_balance_txs_by_token_meta_key(&owner, &token),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|bytes| AlkaneBalanceTxsMeta::try_from_slice(&bytes).ok());
+
+        if let Some(meta) = meta {
+            let page_size = meta.page_size.max(1) as usize;
+            total = meta.total_len as usize;
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(total);
+            if off < total {
+                let start_page = off / page_size;
+                let mut end_page = (end.saturating_sub(1)) / page_size;
+                let max_page = meta.last_page as usize;
+                if end_page > max_page {
+                    end_page = max_page;
+                }
+                for page_idx in start_page..=end_page {
+                    let key = table.alkane_balance_txs_by_token_page_key(
+                        &owner,
+                        &token,
+                        page_idx as u64,
+                    );
+                    if let Ok(resp) = self.get_raw_value(GetRawValueParams { key }) {
+                        if let Some(bytes) = resp.value {
+                            if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                                let page_start = page_idx * page_size;
+                                let local_start = off.saturating_sub(page_start);
+                                let local_end = (end.saturating_sub(page_start)).min(list.len());
+                                if local_start < local_end && local_start < list.len() {
+                                    slice.extend_from_slice(&list[local_start..local_end]);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
+        } else {
+            let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
+            if let Ok(resp) = self.get_raw_value(GetRawValueParams {
+                key: table.alkane_balance_txs_by_token_key(&owner, &token),
+            }) {
+                if let Some(bytes) = resp.value {
+                    if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
+                        txs = list;
+                    }
+                }
+            }
 
-        let total = txs.len();
-        let off = limit.saturating_mul(page.saturating_sub(1));
-        let end = (off + limit).min(total);
-        let slice = if off >= total { vec![] } else { txs[off..end].to_vec() };
+            total = txs.len();
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(total);
+            if off < total {
+                slice = txs[off..end].to_vec();
+            }
+        }
 
         let items: Vec<Value> = slice
             .into_iter()
@@ -1815,7 +1957,7 @@ impl EssentialsProvider {
                 "page": page,
                 "limit": limit,
                 "total": total,
-                "has_more": off + items.len() < total,
+                "has_more": limit.saturating_mul(page.saturating_sub(1)) + items.len() < total,
                 "txids": items
             }),
         })
@@ -2886,6 +3028,15 @@ pub struct AlkaneInfo {
     pub creation_txid: [u8; 32],
     pub creation_height: u32,
     pub creation_timestamp: u32,
+}
+
+pub const BALANCE_TXS_PAGE_SIZE: u32 = 2048;
+
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct AlkaneBalanceTxsMeta {
+    pub page_size: u32,
+    pub last_page: u64,
+    pub total_len: u64,
 }
 #[derive(BorshSerialize)]
 struct OutpointPrefix {
