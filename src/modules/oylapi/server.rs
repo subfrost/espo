@@ -2,12 +2,13 @@ use crate::modules::oylapi::storage::{
     GetAlkanesParams, OylApiState, get_address_positions, get_address_swap_history_for_pool,
     get_address_swap_history_for_token, get_address_unwrap_history, get_address_wrap_history,
     get_address_pool_burn_history, get_address_pool_creation_history, get_address_pool_mint_history,
-    get_alkane_details, get_alkane_swap_pair_details, get_alkanes, get_alkanes_by_address,
-    get_alkanes_utxo, get_all_address_amm_tx_history, get_all_amm_tx_history,
-    get_all_pools_details, get_all_token_pairs, get_all_unwrap_history, get_all_wrap_history,
-    get_amm_utxos, get_global_alkanes_search, get_pool_burn_history,
-    get_pool_creation_history, get_pool_details, get_pool_mint_history, get_pool_swap_history,
-    get_pools, get_token_pairs, get_token_swap_history, get_total_unwrap_amount,
+    get_address_utxos_portfolio, get_alkane_details, get_alkane_swap_pair_details, get_alkanes,
+    get_alkanes_by_address, get_alkanes_utxo, get_all_address_amm_tx_history,
+    get_all_amm_tx_history, get_all_pools_details, get_all_token_pairs,
+    get_all_unwrap_history, get_all_wrap_history, get_amm_utxos, get_bitcoin_price,
+    get_global_alkanes_search, get_pool_burn_history, get_pool_creation_history,
+    get_pool_details, get_pool_mint_history, get_pool_swap_history, get_pools, get_token_pairs,
+    get_token_swap_history, get_total_unwrap_amount,
 };
 use axum::{Json, Router, extract::State, routing::post};
 use serde::Deserialize;
@@ -23,6 +24,13 @@ struct AddressRequest {
 
 #[derive(Deserialize)]
 struct AmmUtxosRequest {
+    address: String,
+    #[serde(rename = "spendStrategy")]
+    spend_strategy: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct AddressUtxosRequest {
     address: String,
     #[serde(rename = "spendStrategy")]
     spend_strategy: Option<Value>,
@@ -257,7 +265,9 @@ pub fn router(state: OylApiState) -> Router {
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     Router::new()
         .route("/get-alkanes-by-address", post(get_alkanes_by_address_handler))
+        .route("/get-bitcoin-price", post(get_bitcoin_price_handler))
         .route("/get-alkanes-utxo", post(get_alkanes_utxo_handler))
+        .route("/get-address-utxos", post(get_address_utxos_handler))
         .route("/get-amm-utxos", post(get_amm_utxos_handler))
         .route("/get-alkanes", post(get_alkanes_handler))
         .route("/global-alkanes-search", post(global_alkanes_search_handler))
@@ -316,11 +326,22 @@ async fn get_alkanes_by_address_handler(
     Json(get_alkanes_by_address(&state, &req.address).await)
 }
 
+async fn get_bitcoin_price_handler(State(state): State<OylApiState>) -> Json<Value> {
+    Json(get_bitcoin_price(&state).await)
+}
+
 async fn get_alkanes_utxo_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AddressRequest>,
 ) -> Json<Value> {
     Json(get_alkanes_utxo(&state, &req.address).await)
+}
+
+async fn get_address_utxos_handler(
+    State(state): State<OylApiState>,
+    Json(req): Json<AddressUtxosRequest>,
+) -> Json<Value> {
+    Json(get_address_utxos_portfolio(&state, &req.address, req.spend_strategy).await)
 }
 
 async fn get_amm_utxos_handler(

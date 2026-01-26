@@ -1,7 +1,7 @@
 use super::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaMarketDefs,
-    SchemaPoolCreationInfoV1, SchemaPoolMetricsV1, SchemaPoolMetricsV2, SchemaPoolSnapshot,
-    SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
+    SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
+    SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, canonical_quotes,
@@ -122,6 +122,7 @@ pub struct AmmDataTable<'a> {
     pub POOL_METRICS_V2: MdbPointer<'a>,
     pub POOL_CREATION_INFO: MdbPointer<'a>,
     pub POOL_LP_SUPPLY: MdbPointer<'a>,
+    pub POOL_DETAILS_SNAPSHOT: MdbPointer<'a>,
     pub TVL_VERSIONED: MdbPointer<'a>,
     pub TOKEN_SWAPS: MdbPointer<'a>,
     pub POOL_CREATIONS: MdbPointer<'a>,
@@ -166,6 +167,7 @@ impl<'a> AmmDataTable<'a> {
             POOL_METRICS_V2: root.keyword("/pool_metrics/v2/"),
             POOL_CREATION_INFO: root.keyword("/pool_creation_info/v1/"),
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
+            POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details_snapshot/v1/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
             TOKEN_SWAPS: root.keyword("/token_swaps/v1/"),
             POOL_CREATIONS: root.keyword("/pool_creations/v1/"),
@@ -761,6 +763,13 @@ impl<'a> AmmDataTable<'a> {
         suffix.extend_from_slice(&pool.block.to_be_bytes());
         suffix.extend_from_slice(&pool.tx.to_be_bytes());
         self.POOL_LP_SUPPLY.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_details_snapshot_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&pool.block.to_be_bytes());
+        suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        self.POOL_DETAILS_SNAPSHOT.select(&suffix).key().to_vec()
     }
 
     pub fn tvl_versioned_prefix(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
@@ -1802,6 +1811,20 @@ impl AmmDataProvider {
             .and_then(|raw| decode_u128_value(&raw).ok())
             .unwrap_or(0);
         Ok(GetPoolLpSupplyLatestResult { supply })
+    }
+
+    pub fn get_pool_details_snapshot(
+        &self,
+        params: GetPoolDetailsSnapshotParams,
+    ) -> Result<GetPoolDetailsSnapshotResult> {
+        crate::debug_timer_log!("get_pool_details_snapshot");
+        let table = self.table();
+        let snapshot = self
+            .get_raw_value(GetRawValueParams { key: table.pool_details_snapshot_key(&params.pool) })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_pool_details_snapshot(&raw).ok());
+        Ok(GetPoolDetailsSnapshotResult { snapshot })
     }
 
     pub fn get_pool_activity_entries(
@@ -3051,6 +3074,14 @@ pub struct GetPoolLpSupplyLatestResult {
     pub supply: u128,
 }
 
+pub struct GetPoolDetailsSnapshotParams {
+    pub pool: SchemaAlkaneId,
+}
+
+pub struct GetPoolDetailsSnapshotResult {
+    pub snapshot: Option<SchemaPoolDetailsSnapshot>,
+}
+
 pub struct GetPoolActivityEntriesParams {
     pub pool: SchemaAlkaneId,
     pub offset: usize,
@@ -3388,6 +3419,15 @@ pub fn decode_pool_creation_info(bytes: &[u8]) -> anyhow::Result<SchemaPoolCreat
 }
 
 pub fn encode_pool_creation_info(v: &SchemaPoolCreationInfoV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
+}
+
+pub fn decode_pool_details_snapshot(bytes: &[u8]) -> anyhow::Result<SchemaPoolDetailsSnapshot> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaPoolDetailsSnapshot::try_from_slice(bytes)?)
+}
+
+pub fn encode_pool_details_snapshot(v: &SchemaPoolDetailsSnapshot) -> anyhow::Result<Vec<u8>> {
     Ok(borsh::to_vec(v)?)
 }
 

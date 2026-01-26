@@ -1,15 +1,18 @@
 use super::schemas::{
     ActivityDirection, ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry,
-    SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolMetricsV1,
-    SchemaPoolMetricsV2, SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe, active_timeframes,
+    SchemaFullCandleV1, SchemaMarketDefs, SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot,
+    SchemaPoolMetricsV1, SchemaPoolMetricsV2, SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
+    active_timeframes,
 };
 use super::storage::{
     AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetRawValueParams,
-    GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, SearchIndexField, SetBatchParams,
-    TokenMetricsIndexField, decode_candle_v1, decode_canonical_pools, decode_full_candle_v1,
-    decode_reserves_snapshot, decode_token_metrics, encode_candle_v1, encode_canonical_pools,
-    encode_pool_creation_info, encode_pool_metrics, encode_pool_metrics_v2, encode_reserves_snapshot,
-    encode_token_metrics, encode_u128_value, parse_change_basis_points,
+    GetPoolCreationInfoParams, GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams,
+    SearchIndexField, SetBatchParams, TokenMetricsIndexField, decode_candle_v1,
+    decode_canonical_pools, decode_full_candle_v1, decode_reserves_snapshot,
+    decode_token_metrics, encode_candle_v1, encode_canonical_pools, encode_pool_creation_info,
+    encode_pool_details_snapshot, encode_pool_metrics,
+    encode_pool_metrics_v2, encode_reserves_snapshot, encode_token_metrics, encode_u128_value,
+    parse_change_basis_points,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc};
 use crate::alkanes::trace::EspoSandshrewLikeTraceStatus;
@@ -34,7 +37,7 @@ use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
     AlkaneBalanceTxEntry, EssentialsProvider, GetAlkaneStorageValueParams,
     GetCreationRecordParams, GetCreationRecordsOrderedParams, GetLatestCirculatingSupplyParams,
-    GetRawValueParams as EssentialsGetRawValueParams,
+    GetRawValueParams as EssentialsGetRawValueParams, spk_to_address_str,
 };
 use crate::modules::essentials::utils::balances::{
     SignedU128, clean_espo_sandshrew_like_trace, get_alkane_balances,
@@ -52,6 +55,7 @@ use bitcoin::{ScriptBuf, Transaction, Txid};
 use borsh::BorshDeserialize;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -220,6 +224,39 @@ fn apply_delta_u128(current: u128, delta: i128) -> u128 {
         current.saturating_add(delta as u128)
     } else {
         current.saturating_sub((-delta) as u128)
+    }
+}
+
+#[inline]
+fn scale_price_u128(value: u128) -> f64 {
+    (value as f64) / (PRICE_SCALE as f64)
+}
+
+#[inline]
+fn parse_change_f64(raw: &str) -> f64 {
+    raw.parse::<f64>().unwrap_or(0.0)
+}
+
+#[inline]
+fn pool_name_display(raw: &str) -> String {
+    raw.to_ascii_uppercase()
+}
+
+fn alkane_id_json(alkane: &SchemaAlkaneId) -> serde_json::Value {
+    json!({ "block": alkane.block.to_string(), "tx": alkane.tx.to_string() })
+}
+
+fn canonical_quote_amount_tvl_usd(
+    amount: u128,
+    unit: CanonicalQuoteUnit,
+    btc_price_usd: Option<u128>,
+) -> Option<u128> {
+    match unit {
+        CanonicalQuoteUnit::Usd => Some(amount),
+        CanonicalQuoteUnit::Btc => {
+            let btc_price = btc_price_usd?;
+            Some(amount.saturating_mul(btc_price) / PRICE_SCALE)
+        }
     }
 }
 
@@ -498,6 +535,7 @@ impl EspoModule for AmmData {
         let mut pool_defs_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut pool_metrics_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut pool_lp_supply_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut pool_details_snapshot_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut tvl_versioned_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_swaps_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut pool_creations_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -511,6 +549,8 @@ impl EspoModule for AmmData {
         let mut token_pools_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut token_metrics_cache: HashMap<SchemaAlkaneId, SchemaTokenMetricsV1> = HashMap::new();
         let mut alkane_label_cache: HashMap<SchemaAlkaneId, String> = HashMap::new();
+        let mut pool_creation_info_cache: HashMap<SchemaAlkaneId, SchemaPoolCreationInfoV1> =
+            HashMap::new();
         let get_alkane_label = |essentials: &EssentialsProvider,
                                 cache: &mut HashMap<SchemaAlkaneId, String>,
                                 alkane: &SchemaAlkaneId|
@@ -731,6 +771,7 @@ impl EspoModule for AmmData {
                         initial_token1_amount,
                         initial_lp_supply,
                     };
+                    pool_creation_info_cache.insert(pool_id, creation_info.clone());
                     pool_creation_info_writes.push((
                         table.pool_creation_info_key(&pool_id),
                         encode_pool_creation_info(&creation_info)?,
@@ -2442,10 +2483,31 @@ impl EspoModule for AmmData {
                 let token0_price_sats = get_token_price_sats(&defs.base_alkane_id);
                 let token1_price_sats = get_token_price_sats(&defs.quote_alkane_id);
 
-                let token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
-                let token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
+                let mut token0_tvl_usd =
+                    token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
+                let mut token1_tvl_usd =
+                    token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
                 let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / PRICE_SCALE;
                 let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
+
+                if let Some(unit) = canonical_quote_units.get(&defs.base_alkane_id) {
+                    if let Some(value) = canonical_quote_amount_tvl_usd(
+                        token0_amount,
+                        *unit,
+                        btc_usd_price,
+                    ) {
+                        token0_tvl_usd = value;
+                    }
+                }
+                if let Some(unit) = canonical_quote_units.get(&defs.quote_alkane_id) {
+                    if let Some(value) = canonical_quote_amount_tvl_usd(
+                        token1_amount,
+                        *unit,
+                        btc_usd_price,
+                    ) {
+                        token1_tvl_usd = value;
+                    }
+                }
 
                 let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);
                 let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
@@ -2596,6 +2658,109 @@ impl EspoModule for AmmData {
                 pool_lp_supply_writes
                     .push((table.pool_lp_supply_latest_key(pool), encode_u128_value(lp_supply)?));
 
+                let token0_label =
+                    get_alkane_label(essentials, &mut alkane_label_cache, &defs.base_alkane_id);
+                let token1_label =
+                    get_alkane_label(essentials, &mut alkane_label_cache, &defs.quote_alkane_id);
+                let pool_name =
+                    pool_name_display(&format!("{token0_label} / {token1_label}"));
+
+                let creation_info = pool_creation_info_cache
+                    .get(pool)
+                    .cloned()
+                    .or_else(|| {
+                        provider
+                            .get_pool_creation_info(GetPoolCreationInfoParams { pool: *pool })
+                            .ok()
+                            .and_then(|res| res.info)
+                    });
+                let (creator_address, creation_height, initial_token0_amount, initial_token1_amount) =
+                    if let Some(info) = creation_info {
+                        let creator = if info.creator_spk.is_empty() {
+                            None
+                        } else {
+                            let spk = ScriptBuf::from(info.creator_spk.clone());
+                            spk_to_address_str(&spk, network)
+                        };
+                        (
+                            creator,
+                            Some(info.creation_height),
+                            info.initial_token0_amount,
+                            info.initial_token1_amount,
+                        )
+                    } else {
+                        (None, None, 0, 0)
+                    };
+
+                let lp_value_sats =
+                    if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
+                let lp_value_usd =
+                    if lp_supply == 0 { 0 } else { pool_tvl_usd.saturating_div(lp_supply) };
+
+                let pool_apr = parse_change_f64(&metrics.pool_apr);
+                let tvl_change_24h = parse_change_f64(&metrics.tvl_change_24h);
+                let tvl_change_7d = parse_change_f64(&metrics.tvl_change_7d);
+
+                let value = json!({
+                    "token0": alkane_id_json(&defs.base_alkane_id),
+                    "token1": alkane_id_json(&defs.quote_alkane_id),
+                    "token0Amount": token0_amount.to_string(),
+                    "token1Amount": token1_amount.to_string(),
+                    "tokenSupply": lp_supply.to_string(),
+                    "poolName": pool_name,
+                    "poolId": alkane_id_json(pool),
+                    "token0TvlInSats": token0_tvl_sats.to_string(),
+                    "token0TvlInUsd": scale_price_u128(token0_tvl_usd),
+                    "token1TvlInSats": token1_tvl_sats.to_string(),
+                    "token1TvlInUsd": scale_price_u128(token1_tvl_usd),
+                    "poolVolume30dInSats": metrics.pool_volume_30d_sats.to_string(),
+                    "poolVolume1dInSats": metrics.pool_volume_1d_sats.to_string(),
+                    "poolVolume30dInUsd": scale_price_u128(metrics.pool_volume_30d_usd),
+                    "poolVolume1dInUsd": scale_price_u128(metrics.pool_volume_1d_usd),
+                    "token0Volume30d": metrics.token0_volume_30d.to_string(),
+                    "token1Volume30d": metrics.token1_volume_30d.to_string(),
+                    "token0Volume1d": metrics.token0_volume_1d.to_string(),
+                    "token1Volume1d": metrics.token1_volume_1d.to_string(),
+                    "lPTokenValueInSats": lp_value_sats.to_string(),
+                    "lPTokenValueInUsd": scale_price_u128(lp_value_usd),
+                    "poolTvlInSats": pool_tvl_sats.to_string(),
+                    "poolTvlInUsd": scale_price_u128(pool_tvl_usd),
+                    "tvlChange24h": tvl_change_24h,
+                    "tvlChange7d": tvl_change_7d,
+                    "totalSupply": lp_supply.to_string(),
+                    "poolApr": pool_apr,
+                    "initialToken0Amount": initial_token0_amount.to_string(),
+                    "initialToken1Amount": initial_token1_amount.to_string(),
+                    "creatorAddress": creator_address,
+                    "creationBlockHeight": creation_height,
+                    "tvl": scale_price_u128(pool_tvl_usd),
+                    "volume1d": scale_price_u128(metrics.pool_volume_1d_usd),
+                    "volume7d": scale_price_u128(pool_volume_7d_usd),
+                    "volume30d": scale_price_u128(metrics.pool_volume_30d_usd),
+                    "volumeAllTime": scale_price_u128(pool_volume_all_time_usd),
+                    "apr": pool_apr,
+                    "tvlChange": tvl_change_24h,
+                });
+
+                let snapshot = SchemaPoolDetailsSnapshot {
+                    value_json: serde_json::to_vec(&value)?,
+                    token0_tvl_usd,
+                    token1_tvl_usd,
+                    token0_tvl_sats,
+                    token1_tvl_sats,
+                    pool_tvl_usd,
+                    pool_volume_1d_usd: metrics.pool_volume_1d_usd,
+                    pool_volume_30d_usd: metrics.pool_volume_30d_usd,
+                    pool_apr,
+                    tvl_change_24h,
+                    lp_supply,
+                };
+
+                pool_details_snapshot_writes.push((
+                    table.pool_details_snapshot_key(pool),
+                    encode_pool_details_snapshot(&snapshot)?,
+                ));
+
                 tvl_versioned_writes.push((
                     table.tvl_versioned_key(pool, height),
                     encode_u128_value(pool_tvl_usd)?,
@@ -2724,13 +2889,14 @@ impl EspoModule for AmmData {
         let pd_cnt = pool_defs_writes.len();
         let pm_cnt = pool_metrics_writes.len();
         let pls_cnt = pool_lp_supply_writes.len();
+        let pds_cnt = pool_details_snapshot_writes.len();
         let tvl_cnt = tvl_versioned_writes.len();
         let ts_cnt = token_swaps_writes.len();
         let a_cnt = activity_writes.len();
         let i_cnt = index_writes.len();
 
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = c_cnt,
             tc_cnt = tc_cnt,
@@ -2791,6 +2957,7 @@ impl EspoModule for AmmData {
             || !token_pools_writes.is_empty()
             || !pool_metrics_writes.is_empty()
             || !pool_lp_supply_writes.is_empty()
+            || !pool_details_snapshot_writes.is_empty()
             || !tvl_versioned_writes.is_empty()
             || !token_swaps_writes.is_empty()
             || !address_pool_swaps_writes.is_empty()
@@ -2826,6 +2993,7 @@ impl EspoModule for AmmData {
             puts.extend(token_pools_writes);
             puts.extend(pool_metrics_writes);
             puts.extend(pool_lp_supply_writes);
+            puts.extend(pool_details_snapshot_writes);
             puts.extend(tvl_versioned_writes);
             puts.extend(token_swaps_writes);
             puts.extend(address_pool_swaps_writes);
