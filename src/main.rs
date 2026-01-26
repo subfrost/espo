@@ -35,10 +35,10 @@ use crate::config::get_metashrew_sdb;
 use crate::config::get_network;
 use crate::modules::ammdata::main::AmmData;
 use crate::modules::essentials::main::Essentials;
+use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::modules::oylapi::main::OylApi;
 use crate::modules::pizzafun::main::Pizzafun;
 use crate::modules::subfrost::main::Subfrost;
-use crate::modules::essentials::storage::preload_block_summary_cache;
 use crate::utils::{EtaTracker, fmt_duration};
 use anyhow::{Context, Result};
 
@@ -78,16 +78,8 @@ fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> st
     }
     std::fs::create_dir_all(backup_root)?;
     let dest_dir = backup_root.join(format!("bkp-{block}"));
-    eprintln!(
-        "[debug_backup] starting copy: '{}' -> '{}'",
-        db_root.display(),
-        dest_dir.display()
-    );
-    let status = Command::new("cp")
-        .arg("-r")
-        .arg(db_root)
-        .arg(&dest_dir)
-        .status()?;
+    eprintln!("[debug_backup] starting copy: '{}' -> '{}'", db_root.display(), dest_dir.display());
+    let status = Command::new("cp").arg("-r").arg(db_root).arg(&dest_dir).status()?;
     if !status.success() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -403,7 +395,7 @@ async fn main() -> Result<()> {
     let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
-    mods.register_module(Pizzafun::new());
+    //mods.register_module(Pizzafun::new());
     if get_module_config("ammdata").is_some() {
         mods.register_module(AmmData::new());
     } else {
@@ -495,14 +487,7 @@ async fn main() -> Result<()> {
             .enable_all()
             .build()
             .expect("build indexer runtime");
-        rt.block_on(run_indexer_loop(
-            mods,
-            start_height,
-            next_height,
-            network,
-            metashrew_sdb,
-            cfg,
-        ));
+        rt.block_on(run_indexer_loop(mods, start_height, next_height, network, metashrew_sdb, cfg));
     });
     std::thread::spawn(move || {
         if let Err(err) = indexer_handle.join() {

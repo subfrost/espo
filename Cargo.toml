@@ -55,6 +55,7 @@ time = { version = "0.3.36", features = ["formatting"] }
 alloy-primitives = "0.8.7"
 bitcoincore-rpc = "0.19.0"
 lru = "0.16.1"
+tower-http = { version = "0.5", features = ["cors"] }
 alkanes-cli-common = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 
 # Required dependencies for alkanes support (from alkanes-rs)

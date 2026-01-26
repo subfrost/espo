@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Deserialize)]
 struct AddressRequest {
@@ -253,6 +254,7 @@ struct GetAlkaneSwapPairDetailsRequest {
 }
 
 pub fn router(state: OylApiState) -> Router {
+    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     Router::new()
         .route("/get-alkanes-by-address", post(get_alkanes_by_address_handler))
         .route("/get-alkanes-utxo", post(get_alkanes_utxo_handler))
@@ -297,6 +299,7 @@ pub fn router(state: OylApiState) -> Router {
             post(get_alkane_swap_pair_details_handler),
         )
         .with_state(state)
+        .layer(cors)
 }
 
 pub async fn run(addr: SocketAddr, state: OylApiState) -> anyhow::Result<()> {

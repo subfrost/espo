@@ -1978,12 +1978,15 @@ pub fn bulk_update_balances_for_block(
     // C2) Persist alkane balance index (alkane -> Vec<BalanceEntry>)
     for (owner, entries) in alkane_balances_rows.iter() {
         let key = table.alkane_balances_key(owner);
+        let encoded = encode_vec(entries).ok();
         if entries.is_empty() {
             deletes.push(key);
-            continue;
+        } else if let Some(buf) = encoded.as_ref() {
+            puts.push((key, buf.clone()));
         }
-        if let Ok(buf) = encode_vec(entries) {
-            puts.push((key, buf));
+        if let Some(buf) = encoded {
+            let height_key = table.alkane_balances_by_height_key(owner, block.height);
+            puts.push((height_key, buf));
         }
     }
 
@@ -2360,6 +2363,192 @@ pub fn bulk_update_balances_for_block(
 
         if !balance_mismatches.is_empty() || !utxo_mismatches.is_empty() {
             if check_balances {
+                let mut height_history_cache: HashMap<
+                    SchemaAlkaneId,
+                    Vec<(u32, Vec<BalanceEntry>)>,
+                > = HashMap::new();
+                let mut self_balance_cache: HashMap<SchemaAlkaneId, Option<u128>> = HashMap::new();
+
+                let balance_for_token = |entries: &[BalanceEntry],
+                                         owner: &SchemaAlkaneId,
+                                         token: &SchemaAlkaneId,
+                                         self_balance: Option<u128>|
+                 -> u128 {
+                    let mut amount = 0u128;
+                    for entry in entries {
+                        if entry.alkane == *token {
+                            amount = amount.saturating_add(entry.amount);
+                        }
+                    }
+                    if *token == *owner {
+                        if let Some(self_balance) = self_balance {
+                            return self_balance;
+                        }
+                    }
+                    amount
+                };
+
+                let mut find_mismatch_origin = |owner: &SchemaAlkaneId,
+                                                token: &SchemaAlkaneId,
+                                                current_balance: u128|
+                 -> Option<(u32, u128, u128, bool)> {
+                    let history = if let Some(cached) = height_history_cache.get(owner) {
+                        cached.clone()
+                    } else {
+                        let prefix = table.alkane_balances_by_height_prefix(owner);
+                        let keys = match provider.get_scan_prefix(GetScanPrefixParams { prefix: prefix.clone() }) {
+                            Ok(v) => v.keys,
+                            Err(_) => Vec::new(),
+                        };
+                        if keys.is_empty() {
+                            return None;
+                        }
+                        let values = match provider.get_multi_values(GetMultiValuesParams { keys: keys.clone() }) {
+                            Ok(v) => v.values,
+                            Err(_) => Vec::new(),
+                        };
+                        let mut entries_by_height: Vec<(u32, Vec<BalanceEntry>)> = Vec::new();
+                        for (key, value) in keys.iter().zip(values) {
+                            let Some(bytes) = value else { continue; };
+                            if !key.starts_with(&prefix) {
+                                continue;
+                            }
+                            let suffix = &key[prefix.len()..];
+                            if suffix.len() != 4 {
+                                continue;
+                            }
+                            let mut arr = [0u8; 4];
+                            arr.copy_from_slice(suffix);
+                            let height = u32::from_be_bytes(arr);
+                            if let Ok(list) = decode_balances_vec(&bytes) {
+                                entries_by_height.push((height, list));
+                            }
+                        }
+                        if entries_by_height.is_empty() {
+                            return None;
+                        }
+                        entries_by_height.sort_by_key(|(h, _)| *h);
+                        height_history_cache.insert(*owner, entries_by_height.clone());
+                        entries_by_height
+                    };
+
+                    if history.is_empty() {
+                        return None;
+                    }
+
+                    let self_balance =
+                        *self_balance_cache.entry(*owner).or_insert_with(|| lookup_self_balance(owner));
+
+                    let mut snapshots: Vec<(u32, u128)> = history
+                        .iter()
+                        .map(|(height, entries)| {
+                            (*height, balance_for_token(entries, owner, token, self_balance))
+                        })
+                        .collect();
+                    snapshots.sort_by_key(|(h, _)| *h);
+                    snapshots.dedup_by_key(|(h, _)| *h);
+                    let current_height = block.height;
+                    snapshots.retain(|(h, _)| *h <= current_height);
+
+                    if let Some(last) = snapshots.last_mut() {
+                        if last.0 == current_height {
+                            last.1 = current_balance;
+                        } else if last.0 < current_height {
+                            snapshots.push((current_height, current_balance));
+                        }
+                    } else {
+                        return None;
+                    }
+
+                    #[derive(Clone, Copy)]
+                    struct Segment {
+                        start: u32,
+                        end: u32,
+                        balance: u128,
+                    }
+
+                    let mut segments: Vec<Segment> = Vec::with_capacity(snapshots.len());
+                    for idx in 0..snapshots.len() {
+                        let (start, balance) = snapshots[idx];
+                        let end = if idx + 1 < snapshots.len() {
+                            let next_start = snapshots[idx + 1].0;
+                            if next_start == 0 {
+                                0
+                            } else {
+                                next_start.saturating_sub(1)
+                            }
+                        } else {
+                            current_height
+                        };
+                        if end < start {
+                            continue;
+                        }
+                        segments.push(Segment { start, end, balance });
+                    }
+
+                    if segments.is_empty() {
+                        return None;
+                    }
+
+                    let mut meta_cache: HashMap<u32, u128> = HashMap::new();
+                    let mut metashrew_at = |height: u32| -> u128 {
+                        if let Some(val) = meta_cache.get(&height).copied() {
+                            return val;
+                        }
+                        let height_u64 = height as u64;
+                        let value = match metashrew.get_reserves_for_alkane_with_db(
+                            sdb,
+                            owner,
+                            token,
+                            Some(height_u64),
+                        ) {
+                            Ok(Some(bal)) => bal,
+                            Ok(None) => 0,
+                            Err(e) => {
+                                panic!(
+                                    "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
+                                    owner.block, owner.tx, token.block, token.tx, height_u64
+                                );
+                            }
+                        };
+                        meta_cache.insert(height, value);
+                        value
+                    };
+
+                    for idx in (0..segments.len()).rev() {
+                        let seg = segments[idx];
+                        let meta_start = metashrew_at(seg.start);
+                        if meta_start == seg.balance {
+                            let mut lo = seg.start;
+                            let mut hi = seg.end;
+                            while lo < hi {
+                                let mid = lo + (hi - lo) / 2;
+                                let meta_mid = metashrew_at(mid);
+                                if meta_mid == seg.balance {
+                                    lo = mid + 1;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            let meta_at = metashrew_at(lo);
+                            return Some((lo, seg.balance, meta_at, true));
+                        }
+
+                        if idx == 0 || seg.start == 0 {
+                            return Some((seg.start, seg.balance, meta_start, false));
+                        }
+
+                        let prev_end = seg.start - 1;
+                        let prev_balance = segments[idx - 1].balance;
+                        let meta_prev_end = metashrew_at(prev_end);
+                        if meta_prev_end == prev_balance {
+                            return Some((seg.start, seg.balance, meta_start, true));
+                        }
+                    }
+
+                    None
+                };
+
                 for (owner, token, local_balance, metashrew_balance) in &balance_mismatches {
                     eprintln!(
                         "[balances][strict] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
@@ -2394,6 +2583,34 @@ pub fn bulk_update_balances_for_block(
                             "[balances][strict] balance-change txids: {}",
                             txids.join(",")
                         );
+                    }
+
+                    if let Some((first_height, local_at, meta_at, exact)) =
+                        find_mismatch_origin(owner, token, *local_balance)
+                    {
+                        if exact {
+                            eprintln!(
+                                "[balances][strict] mismatch origin height={} owner={}:{} token={}:{} local={} metashrew={}",
+                                first_height,
+                                owner.block,
+                                owner.tx,
+                                token.block,
+                                token.tx,
+                                local_at,
+                                meta_at
+                            );
+                        } else {
+                            eprintln!(
+                                "[balances][strict] mismatch origin at or before height={} owner={}:{} token={}:{} local={} metashrew={}",
+                                first_height,
+                                owner.block,
+                                owner.tx,
+                                token.block,
+                                token.tx,
+                                local_at,
+                                meta_at
+                            );
+                        }
                     }
                 }
             }

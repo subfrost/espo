@@ -1,7 +1,7 @@
 {
-  "readonly_metashrew_db_dir": "/data/.metashrew/v9-rb",
+  "readonly_metashrew_db_dir": "/data/.metashrew/v9-rb2",
   "electrum_rpc_url": null,
-  "metashrew_rpc_url": "http://127.0.0.1:7144",
+  "metashrew_rpc_url": "http://127.0.0.1:7145",
   "electrs_esplora_url": "http://127.0.0.1:4332",
   "bitcoind_rpc_url": "http://127.0.0.1:8332",
   "bitcoind_rpc_user": "admin",
@@ -18,7 +18,10 @@
   "debug": true,
   "debug_ignore_ms": 50,
   "debug_backup": {
-    "blocks": [880100, 900000, 903500, 908368, 913765, 916290, 925000],
+    "blocks": [
+      880100, 900000, 903500, 908368, 913765, 916290, 920000, 925000, 930000,
+      933300
+    ],
     "dir": "./db-bkp"
   },
   "metashrew_db_label": null,
@@ -42,7 +45,7 @@
     "subfrost": {},
     "ammdata": {
       "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/THWHjh0GMbRvWxCzc865L",
-      "eth_call_throttle": 150,
+      "eth_call_throttle": 50,
       "derived_liquidity": [{ "alkane": "2:0", "strategy": "optimistic" }],
       "search_index_enabled": true,
       "search_prefix_min": 2,

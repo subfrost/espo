@@ -105,6 +105,7 @@ pub struct EssentialsTable<'a> {
     pub HOLDERS_COUNT: MdbPointer<'a>,
     pub HOLDERS_ORDERED: MdbPointer<'a>,
     pub ALKANE_BALANCES: MdbPointer<'a>,
+    pub ALKANE_BALANCES_BY_HEIGHT: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS_PAGED: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS_META: MdbPointer<'a>,
@@ -149,6 +150,7 @@ impl<'a> EssentialsTable<'a> {
             HOLDERS_COUNT: root.keyword("/holders/count/"),
             HOLDERS_ORDERED: root.keyword("/alkanes/holders/ordered/"),
             ALKANE_BALANCES: root.keyword("/alkane_balances/"),
+            ALKANE_BALANCES_BY_HEIGHT: root.keyword("/alkane_balances_by_height/"),
             ALKANE_BALANCE_TXS: root.keyword("/alkane_balance_txs/"),
             ALKANE_BALANCE_TXS_PAGED: root.keyword("/alkane_balance_txs_paged/"),
             ALKANE_BALANCE_TXS_META: root.keyword("/alkane_balance_txs_meta/"),
@@ -317,6 +319,23 @@ impl<'a> EssentialsTable<'a> {
         suffix.extend_from_slice(&owner.block.to_be_bytes());
         suffix.extend_from_slice(&owner.tx.to_be_bytes());
         self.ALKANE_BALANCES.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_balances_by_height_key(&self, owner: &SchemaAlkaneId, height: u32) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1 + 4);
+        suffix.extend_from_slice(&owner.block.to_be_bytes());
+        suffix.extend_from_slice(&owner.tx.to_be_bytes());
+        suffix.push(b'/');
+        suffix.extend_from_slice(&height.to_be_bytes());
+        self.ALKANE_BALANCES_BY_HEIGHT.select(&suffix).key().to_vec()
+    }
+
+    pub fn alkane_balances_by_height_prefix(&self, owner: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12 + 1);
+        suffix.extend_from_slice(&owner.block.to_be_bytes());
+        suffix.extend_from_slice(&owner.tx.to_be_bytes());
+        suffix.push(b'/');
+        self.ALKANE_BALANCES_BY_HEIGHT.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_info_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
