@@ -222,9 +222,12 @@ pub async fn alkane_page(
                     }
                 }
 
-                section class="alkane-section" {
-                    h2 class="section-title" { "Overview" }
-                    div class="alkane-overview-grid" {
+                section class="alkane-section" data-alkane-overview="" {
+                    div class="alkane-overview-head" data-alkane-chart-head="" {
+                        h2 class="section-title" { "Overview" }
+                        h2 class="section-title alkane-market-title" data-alkane-chart-title="" { "Market" }
+                    }
+                    div class="alkane-overview-grid" data-alkane-chart-grid="" {
                         div class="alkane-overview-card" {
                             div class="alkane-stat" {
                                 span class="alkane-stat-label" { "Symbol" }
@@ -284,19 +287,20 @@ pub async fn alkane_page(
                             }
                         }
                         div class="alkane-market-card" data-alkane-chart="" data-alkane-id=(alk_str.clone()) data-default-range="3m" {
-                            div class="alkane-market-title" { "Market" }
-                            div class="alkane-market-header" {
-                                div {
-                                    div class="alkane-market-price" data-alkane-price="" { "$0.00" }
-                                    div class="alkane-market-sub" { "USD price" }
-                                }
-                                div {
-                                    div class="alkane-market-change" data-alkane-change="" { "0.00%" }
-                                    div class="alkane-market-range" data-alkane-range="" { "Past 3 months" }
-                                }
-                            }
                             div class="alkane-market-chart" data-alkane-chart-root="" {
                                 div class="alkane-market-loading" data-alkane-loading="" { "Loading chart..." }
+                            }
+                            div class="alkane-market-content" {
+                                div class="alkane-market-header" {
+                                    div {
+                                        div class="alkane-market-price" data-alkane-price="" { "$0.00" }
+                                        div class="alkane-market-sub" { "USD price" }
+                                    }
+                                    div {
+                                        div class="alkane-market-change" data-alkane-change="" { "0.00%" }
+                                        div class="alkane-market-range" data-alkane-range="" { "Past 3 months" }
+                                    }
+                                }
                             }
                             div class="alkane-market-tabs" {
                                 button class="alkane-market-tab" type="button" data-range="1d" { "1D" }
@@ -756,6 +760,9 @@ fn chart_scripts() -> Markup {
   if (!alkaneId) return;
 
   const root = card.querySelector('[data-alkane-chart-root]');
+  const overview = card.closest('[data-alkane-overview]');
+  const grid = overview ? overview.querySelector('[data-alkane-chart-grid]') : null;
+  const head = overview ? overview.querySelector('[data-alkane-chart-head]') : null;
   const priceEl = card.querySelector('[data-alkane-price]');
   const changeEl = card.querySelector('[data-alkane-change]');
   const rangeEl = card.querySelector('[data-alkane-range]');
@@ -881,7 +888,7 @@ fn chart_scripts() -> Markup {
           {
             data: values,
             borderColor: lineColor,
-            borderWidth: 2,
+            borderWidth: 3,
             pointRadius: 0,
             tension: 0.35,
             cubicInterpolationMode: 'monotone',
@@ -900,7 +907,7 @@ fn chart_scripts() -> Markup {
             displayColors: false,
             backgroundColor: tooltipBg,
             borderColor: tooltipBorder,
-            borderWidth: 1,
+            borderWidth: 0,
             titleColor: tooltipText,
             bodyColor: tooltipText,
             callbacks: {
@@ -933,6 +940,9 @@ fn chart_scripts() -> Markup {
         scales: {
           x: { display: false },
           y: { display: false }
+        },
+        layout: {
+          padding: { top: 48, right: 12, bottom: 16, left: 12 }
         }
       }
     });
@@ -950,9 +960,31 @@ fn chart_scripts() -> Markup {
     return data;
   };
 
+  const setChartHidden = (hidden) => {
+    if (hidden) {
+      card.style.display = 'none';
+    } else {
+      card.style.removeProperty('display');
+    }
+    if (head) {
+      if (hidden) {
+        head.dataset.chartHidden = '1';
+      } else {
+        delete head.dataset.chartHidden;
+      }
+    }
+    if (grid) {
+      if (hidden) {
+        grid.dataset.chartHidden = '1';
+      } else {
+        delete grid.dataset.chartHidden;
+      }
+    }
+  };
+
   const updateCard = (data, range, canRender) => {
     if (!data || !Array.isArray(data.candles) || data.candles.length === 0) {
-      card.style.display = 'none';
+      setChartHidden(true);
       if (chart) {
         chart.destroy();
         chart = null;
@@ -973,7 +1005,7 @@ fn chart_scripts() -> Markup {
     if (changeEl) changeEl.textContent = formatPct(change);
     if (rangeEl) rangeEl.textContent = rangeLabel(range);
     if (loadingEl) loadingEl.style.display = 'none';
-    card.style.removeProperty('display');
+    setChartHidden(false);
     if (canRender) {
       renderChart(points, isUp);
     } else if (loadingEl) {
@@ -989,7 +1021,7 @@ fn chart_scripts() -> Markup {
     try {
       const data = await fetchRange(range);
       if (!data) {
-        card.style.display = 'none';
+        setChartHidden(true);
         return;
       }
       let canRender = true;

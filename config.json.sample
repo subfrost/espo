@@ -23,6 +23,7 @@
     "check_trace_mismatches": false
   },
   "debug": false,
+  "safe_tip_hook_script": null,
   "block_source_mode": "rpc",
   "simulate_reorg": false,
   "debug_backup": null,

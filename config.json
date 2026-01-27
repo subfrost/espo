@@ -16,7 +16,6 @@
   "explorer_host": "0.0.0.0:5081",
   "network": "mainnet",
   "debug": true,
-  "safe_tip_hook_script": "./upload.sh",
   "debug_ignore_ms": 50,
   "debug_backup": {
     "blocks": [

@@ -1,14 +1,14 @@
 use crate::modules::oylapi::storage::{
-    GetAlkanesParams, OylApiState, get_address_positions, get_address_swap_history_for_pool,
-    get_address_swap_history_for_token, get_address_unwrap_history, get_address_wrap_history,
-    get_address_pool_burn_history, get_address_pool_creation_history, get_address_pool_mint_history,
-    get_address_utxos_portfolio, get_alkane_details, get_alkane_swap_pair_details, get_alkanes,
-    get_alkanes_by_address, get_alkanes_utxo, get_all_address_amm_tx_history,
-    get_all_amm_tx_history, get_all_pools_details, get_all_token_pairs,
-    get_all_unwrap_history, get_all_wrap_history, get_amm_utxos, get_bitcoin_price,
-    get_global_alkanes_search, get_pool_burn_history, get_pool_creation_history,
-    get_pool_details, get_pool_mint_history, get_pool_swap_history, get_pools, get_token_pairs,
-    get_token_swap_history, get_total_unwrap_amount,
+    GetAlkanesParams, OylApiState, get_address_pool_burn_history,
+    get_address_pool_creation_history, get_address_pool_mint_history, get_address_positions,
+    get_address_swap_history_for_pool, get_address_swap_history_for_token,
+    get_address_unwrap_history, get_address_utxos_portfolio, get_address_wrap_history,
+    get_alkane_details, get_alkane_swap_pair_details, get_alkanes, get_alkanes_by_address,
+    get_alkanes_utxo, get_all_address_amm_tx_history, get_all_amm_tx_history,
+    get_all_pools_details, get_all_token_pairs, get_all_unwrap_history, get_all_wrap_history,
+    get_amm_utxos, get_bitcoin_price, get_global_alkanes_search, get_pool_burn_history,
+    get_pool_creation_history, get_pool_details, get_pool_mint_history, get_pool_swap_history,
+    get_pools, get_token_pairs, get_token_swap_history, get_total_unwrap_amount,
 };
 use axum::{Json, Router, extract::State, routing::post};
 use serde::Deserialize;
@@ -268,6 +268,7 @@ pub fn router(state: OylApiState) -> Router {
         .route("/get-bitcoin-price", post(get_bitcoin_price_handler))
         .route("/get-alkanes-utxo", post(get_alkanes_utxo_handler))
         .route("/get-address-utxos", post(get_address_utxos_handler))
+        .route("/get-account-utxos", post(get_address_utxos_handler))
         .route("/get-amm-utxos", post(get_amm_utxos_handler))
         .route("/get-alkanes", post(get_alkanes_handler))
         .route("/global-alkanes-search", post(global_alkanes_search_handler))
@@ -279,7 +280,10 @@ pub fn router(state: OylApiState) -> Router {
         .route("/get-pool-mint-history", post(get_pool_mint_history_handler))
         .route("/get-pool-burn-history", post(get_pool_burn_history_handler))
         .route("/get-pool-creation-history", post(get_pool_creation_history_handler))
-        .route("/get-address-swap-history-for-pool", post(get_address_swap_history_for_pool_handler))
+        .route(
+            "/get-address-swap-history-for-pool",
+            post(get_address_swap_history_for_pool_handler),
+        )
         .route(
             "/get-address-swap-history-for-token",
             post(get_address_swap_history_for_token_handler),
@@ -297,17 +301,11 @@ pub fn router(state: OylApiState) -> Router {
         .route("/get-address-pool-burn-history", post(get_address_pool_burn_history_handler))
         .route("/address-positions", post(get_address_positions_handler))
         .route("/get-all-pools-details", post(get_all_pools_details_handler))
-        .route(
-            "/get-all-address-amm-tx-history",
-            post(get_all_address_amm_tx_history_handler),
-        )
+        .route("/get-all-address-amm-tx-history", post(get_all_address_amm_tx_history_handler))
         .route("/get-all-amm-tx-history", post(get_all_amm_tx_history_handler))
         .route("/get-all-token-pairs", post(get_all_token_pairs_handler))
         .route("/get-token-pairs", post(get_token_pairs_handler))
-        .route(
-            "/get-alkane-swap-pair-details",
-            post(get_alkane_swap_pair_details_handler),
-        )
+        .route("/get-alkane-swap-pair-details", post(get_alkane_swap_pair_details_handler))
         .with_state(state)
         .layer(cors)
 }
@@ -376,25 +374,14 @@ async fn get_alkane_details_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AlkaneDetailsRequest>,
 ) -> Json<Value> {
-    Json(
-        get_alkane_details(&state, &req.alkane_id.block, &req.alkane_id.tx).await,
-    )
+    Json(get_alkane_details(&state, &req.alkane_id.block, &req.alkane_id.tx).await)
 }
 
 async fn get_pools_handler(
     State(state): State<OylApiState>,
     Json(req): Json<GetPoolsRequest>,
 ) -> Json<Value> {
-    Json(
-        get_pools(
-            &state,
-            &req.factory_id.block,
-            &req.factory_id.tx,
-            req.limit,
-            req.offset,
-        )
-        .await,
-    )
+    Json(get_pools(&state, &req.factory_id.block, &req.factory_id.tx, req.limit, req.offset).await)
 }
 
 async fn get_pool_details_handler(
@@ -491,14 +478,8 @@ async fn get_pool_creation_history_handler(
 ) -> Json<Value> {
     let _ = &req.pool_id;
     Json(
-        get_pool_creation_history(
-            &state,
-            req.count,
-            req.offset,
-            req.successful,
-            req.include_total,
-        )
-        .await,
+        get_pool_creation_history(&state, req.count, req.offset, req.successful, req.include_total)
+            .await,
     )
 }
 
@@ -579,14 +560,8 @@ async fn get_all_wrap_history_handler(
     Json(req): Json<AllWrapHistoryRequest>,
 ) -> Json<Value> {
     Json(
-        get_all_wrap_history(
-            &state,
-            req.count,
-            req.offset,
-            req.successful,
-            req.include_total,
-        )
-        .await,
+        get_all_wrap_history(&state, req.count, req.offset, req.successful, req.include_total)
+            .await,
     )
 }
 
@@ -595,14 +570,8 @@ async fn get_all_unwrap_history_handler(
     Json(req): Json<AllWrapHistoryRequest>,
 ) -> Json<Value> {
     Json(
-        get_all_unwrap_history(
-            &state,
-            req.count,
-            req.offset,
-            req.successful,
-            req.include_total,
-        )
-        .await,
+        get_all_unwrap_history(&state, req.count, req.offset, req.successful, req.include_total)
+            .await,
     )
 }
 
@@ -670,13 +639,8 @@ async fn get_address_positions_handler(
     Json(req): Json<AddressPositionsRequest>,
 ) -> Json<Value> {
     Json(
-        get_address_positions(
-            &state,
-            &req.address,
-            &req.factory_id.block,
-            &req.factory_id.tx,
-        )
-        .await,
+        get_address_positions(&state, &req.address, &req.factory_id.block, &req.factory_id.tx)
+            .await,
     )
 }
 
@@ -741,9 +705,7 @@ async fn get_all_token_pairs_handler(
     State(state): State<OylApiState>,
     Json(req): Json<GetAllTokenPairsRequest>,
 ) -> Json<Value> {
-    Json(
-        get_all_token_pairs(&state, &req.factory_id.block, &req.factory_id.tx).await,
-    )
+    Json(get_all_token_pairs(&state, &req.factory_id.block, &req.factory_id.tx).await)
 }
 
 async fn get_token_pairs_handler(
