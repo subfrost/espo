@@ -15,6 +15,8 @@
   --link-dark2: #2a60be;
   --danger: #ff4141;
   --success: #33e183;
+  --chart-green: rgba(51, 225, 131, 0.85);
+  --chart-red: rgba(255, 85, 85, 0.85);
   --bg-success: #335c45;
   --warning: #fda948;
   --radius: 8px;
@@ -1648,6 +1650,98 @@ a:hover {
   display: flex;
   flex-direction: column;
 }
+.alkane-overview-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 420px);
+  gap: 14px;
+  align-items: start;
+}
+.alkane-market-card {
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 240px;
+}
+.alkane-market-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+.alkane-market-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+.alkane-market-price {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+.alkane-market-sub {
+  color: var(--muted2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.alkane-market-change {
+  font-size: 18px;
+  font-weight: 700;
+  text-align: right;
+}
+.alkane-market-range {
+  color: var(--muted2);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: right;
+}
+.alkane-market-card[data-tone="up"] .alkane-market-change {
+  color: var(--chart-green);
+}
+.alkane-market-card[data-tone="down"] .alkane-market-change {
+  color: var(--chart-red);
+}
+.alkane-market-chart {
+  position: relative;
+  height: 180px;
+  border-radius: 10px;
+  background: var(--panel2);
+  overflow: hidden;
+}
+.alkane-market-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--muted2);
+}
+.alkane-market-tabs {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.alkane-market-tab {
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--muted2);
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+.alkane-market-tab.active {
+  color: var(--text);
+  background: var(--panel2);
+  border-color: var(--panel3);
+}
+.alkane-market-tab:hover {
+  color: var(--text);
+  background: var(--panel2);
+}
 .alkane-stat {
   padding: 12px;
   border-bottom: 1px solid var(--panel2);
@@ -1810,6 +1904,11 @@ button:hover {
 
 .alkane-panel-empty {
   min-height: 140px;
+}
+@media (max-width: 980px) {
+  .alkane-overview-grid {
+    grid-template-columns: 1fr;
+  }
 }
 @media (max-width: 720px) {
   .alkane-hero-card {

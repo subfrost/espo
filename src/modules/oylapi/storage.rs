@@ -3065,17 +3065,6 @@ fn scale_price_u128(value: u128) -> f64 {
     (value as f64) / (PRICE_SCALE as f64)
 }
 
-#[inline]
-fn base_volume_from_quote(volume_quote: u128, price_quote_per_base: u128) -> u128 {
-    if price_quote_per_base == 0 {
-        0
-    } else {
-        volume_quote
-            .saturating_mul(PRICE_SCALE)
-            / price_quote_per_base
-    }
-}
-
 fn pool_candle_volume_sums(
     state: &OylApiState,
     pool: &SchemaAlkaneId,
@@ -4234,11 +4223,10 @@ fn build_alkane_token(
     let change_30d = parse_change_f64(change_30d_raw);
     let change_all_time = parse_change_f64(change_all_time_raw);
     let percentage_minted_num = percentage_minted as u64;
-    let price_for_volume = if price_usd > 0 { price_usd } else { metrics.price_usd };
-    let token_volume_1d = base_volume_from_quote(metrics.volume_1d, price_for_volume);
-    let token_volume_30d = base_volume_from_quote(metrics.volume_30d, price_for_volume);
-    let token_volume_7d = base_volume_from_quote(metrics.volume_7d, price_for_volume);
-    let token_volume_all_time = base_volume_from_quote(metrics.volume_all_time, price_for_volume);
+    let token_volume_1d = scale_price_u128(metrics.volume_1d);
+    let token_volume_30d = scale_price_u128(metrics.volume_30d);
+    let token_volume_7d = scale_price_u128(metrics.volume_7d);
+    let token_volume_all_time = scale_price_u128(metrics.volume_all_time);
 
     let mut derived_data = serde_json::Map::new();
     for quote in derived_quotes.iter() {
@@ -4253,11 +4241,10 @@ fn build_alkane_token(
 
         let suffix = format!("derived_{}:{}", quote.block, quote.tx);
         let price_usd = dm.price_usd;
-        let price_for_volume = if price_usd > 0 { price_usd } else { metrics.price_usd };
-        let token_volume_1d = base_volume_from_quote(dm.volume_1d, price_for_volume);
-        let token_volume_30d = base_volume_from_quote(dm.volume_30d, price_for_volume);
-        let token_volume_7d = base_volume_from_quote(dm.volume_7d, price_for_volume);
-        let token_volume_all_time = base_volume_from_quote(dm.volume_all_time, price_for_volume);
+        let token_volume_1d = scale_price_u128(dm.volume_1d);
+        let token_volume_30d = scale_price_u128(dm.volume_30d);
+        let token_volume_7d = scale_price_u128(dm.volume_7d);
+        let token_volume_all_time = scale_price_u128(dm.volume_all_time);
 
         let change_1d_raw = if dm.change_1d.trim().is_empty() { "0" } else { dm.change_1d.as_str() };
         let change_7d_raw = if dm.change_7d.trim().is_empty() { "0" } else { dm.change_7d.as_str() };
@@ -4292,19 +4279,19 @@ fn build_alkane_token(
         );
         derived_data.insert(
             format!("tokenVolume1d-{}", suffix),
-            json!(token_volume_1d.to_string()),
+            json!(token_volume_1d),
         );
         derived_data.insert(
             format!("tokenVolume7d-{}", suffix),
-            json!(token_volume_7d.to_string()),
+            json!(token_volume_7d),
         );
         derived_data.insert(
             format!("tokenVolume30d-{}", suffix),
-            json!(token_volume_30d.to_string()),
+            json!(token_volume_30d),
         );
         derived_data.insert(
             format!("tokenVolumeAllTime-{}", suffix),
-            json!(token_volume_all_time.to_string()),
+            json!(token_volume_all_time),
         );
         derived_data.insert(
             format!("priceChange24h-{}", suffix),
@@ -4354,10 +4341,10 @@ fn build_alkane_token(
         "tokenPoolsVolume30dInUsd": scale_price_u128(metrics.volume_30d),
         "tokenPoolsVolume7dInUsd": scale_price_u128(metrics.volume_7d),
         "tokenPoolsVolumeAllTimeInUsd": scale_price_u128(metrics.volume_all_time),
-        "tokenVolume1d": token_volume_1d.to_string(),
-        "tokenVolume30d": token_volume_30d.to_string(),
-        "tokenVolume7d": token_volume_7d.to_string(),
-        "tokenVolumeAllTime": token_volume_all_time.to_string(),
+        "tokenVolume1d": token_volume_1d,
+        "tokenVolume30d": token_volume_30d,
+        "tokenVolume7d": token_volume_7d,
+        "tokenVolumeAllTime": token_volume_all_time,
         "priceChange24h": change_1d,
         "priceChange7d": change_7d,
         "priceChange30d": change_30d,

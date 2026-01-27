@@ -146,6 +146,24 @@ fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
     Some(next_height.saturating_sub(revert_count as u32))
 }
 
+fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
+    let script = script.trim();
+    if script.is_empty() {
+        return;
+    }
+    let script = script.to_string();
+    std::thread::spawn(move || {
+        eprintln!(
+            "[safe_tip_hook] running (next_height={}, tip={}): {}",
+            next_height, tip, script
+        );
+        match Command::new("sh").arg("-c").arg(&script).status() {
+            Ok(status) => eprintln!("[safe_tip_hook] finished: {}", status),
+            Err(e) => eprintln!("[safe_tip_hook] failed: {e:?}"),
+        }
+    });
+}
+
 async fn run_indexer_loop(
     mods: ModuleRegistry,
     start_height: u32,
@@ -158,6 +176,7 @@ async fn run_indexer_loop(
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
     let mut logged_start = false;
+    let mut safe_tip_hook_ran = false;
     if cfg.reset_mempool_on_startup {
         if let Err(e) = reset_mempool_store() {
             eprintln!("[mempool] failed to reset store on startup: {e:?}");
@@ -315,6 +334,12 @@ async fn run_indexer_loop(
                 }
             }
         } else {
+            if !safe_tip_hook_ran {
+                if let Some(script) = cfg.safe_tip_hook_script.as_deref() {
+                    safe_tip_hook_ran = true;
+                    run_safe_tip_hook(script, next_height, tip);
+                }
+            }
             if let Some(new_next) = check_and_handle_reorg(next_height, tip) {
                 if new_next < next_height {
                     next_height = new_next;

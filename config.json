@@ -16,11 +16,12 @@
   "explorer_host": "0.0.0.0:5081",
   "network": "mainnet",
   "debug": true,
+  "safe_tip_hook_script": "./upload.sh",
   "debug_ignore_ms": 50,
   "debug_backup": {
     "blocks": [
       880100, 900000, 903500, 908368, 913765, 916290, 920000, 925000, 930000,
-      933300
+      933300, 933925
     ],
     "dir": "./db-bkp"
   },

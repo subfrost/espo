@@ -45,6 +45,7 @@ impl TestConfigBuilder {
             debug: false,
             debug_ignore_ms: 0,
             debug_backup: None,
+            safe_tip_hook_script: None,
             block_source_mode: BlockFetchMode::RpcOnly,
             simulate_reorg: false,
             explorer_networks: None,

@@ -32,6 +32,7 @@ fn init_test_config_from_run_sh() {
         strict_mode: None,
         debug: false,
         debug_ignore_ms: 0,
+        safe_tip_hook_script: None,
         block_source_mode: BlockFetchMode::RpcOnly,
         simulate_reorg: false,
         explorer_networks: None,

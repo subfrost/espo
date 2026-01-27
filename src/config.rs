@@ -241,6 +241,8 @@ pub struct ConfigFile {
     pub debug_ignore_ms: u64,
     #[serde(default)]
     pub debug_backup: Option<DebugBackupConfig>,
+    #[serde(default)]
+    pub safe_tip_hook_script: Option<String>,
     #[serde(default = "default_block_source_mode")]
     pub block_source_mode: String,
     #[serde(default)]
@@ -276,6 +278,7 @@ pub struct AppConfig {
     pub debug: bool,
     pub debug_ignore_ms: u64,
     pub debug_backup: Option<DebugBackupConfig>,
+    pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
@@ -333,6 +336,7 @@ impl AppConfig {
             debug: file.debug,
             debug_ignore_ms: file.debug_ignore_ms,
             debug_backup,
+            safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
             explorer_networks,

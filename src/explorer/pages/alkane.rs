@@ -224,61 +224,85 @@ pub async fn alkane_page(
 
                 section class="alkane-section" {
                     h2 class="section-title" { "Overview" }
-                    div class="alkane-overview-card" {
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Symbol" }
-                            div class="alkane-stat-line" {
-                                span class="alkane-stat-value" { (meta.symbol.clone()) }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Circulating supply" }
-                            div class="alkane-stat-line" {
-                                span class="alkane-stat-value" { (fmt_alkane_amount(circulating_supply)) }
-                                span class="alkane-stat-sub" { "(with 8 decimals)" }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Holders" }
-                            div class="alkane-stat-line" {
-                                span class="alkane-stat-value" { (holders_count) }
-                            }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Deploy date" }
-                            @if let Some(ts) = creation_ts {
-                                div class="alkane-stat-line" data-ts-group="" {
-                                    span class="alkane-stat-value" data-header-ts=(ts) { (ts) }
-                                    span class="alkane-stat-sub" data-header-ts-rel { "" }
-                                }
-                            } @else {
+                    div class="alkane-overview-grid" {
+                        div class="alkane-overview-card" {
+                            div class="alkane-stat" {
+                                span class="alkane-stat-label" { "Symbol" }
                                 div class="alkane-stat-line" {
-                                    span class="alkane-stat-value muted" { "Unknown" }
+                                    span class="alkane-stat-value" { (meta.symbol.clone()) }
                                 }
                             }
-                        }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Deploy transaction" }
-                            @if let Some(txid) = creation_txid.as_ref() {
+                            div class="alkane-stat" {
+                                span class="alkane-stat-label" { "Circulating supply" }
                                 div class="alkane-stat-line" {
-                                    a class="alkane-stat-value link mono" href=(explorer_path(&format!("/tx/{txid}"))) { (short_hex(txid)) }
+                                    span class="alkane-stat-value" { (fmt_alkane_amount(circulating_supply)) }
+                                    span class="alkane-stat-sub" { "(with 8 decimals)" }
                                 }
-                            } @else {
+                            }
+                            div class="alkane-stat" {
+                                span class="alkane-stat-label" { "Holders" }
                                 div class="alkane-stat-line" {
-                                    span class="alkane-stat-value muted" { "Unknown" }
+                                    span class="alkane-stat-value" { (holders_count) }
+                                }
+                            }
+                            div class="alkane-stat" {
+                                span class="alkane-stat-label" { "Deploy date" }
+                                @if let Some(ts) = creation_ts {
+                                    div class="alkane-stat-line" data-ts-group="" {
+                                        span class="alkane-stat-value" data-header-ts=(ts) { (ts) }
+                                        span class="alkane-stat-sub" data-header-ts-rel { "" }
+                                    }
+                                } @else {
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value muted" { "Unknown" }
+                                    }
+                                }
+                            }
+                            div class="alkane-stat" {
+                                span class="alkane-stat-label" { "Deploy transaction" }
+                                @if let Some(txid) = creation_txid.as_ref() {
+                                    div class="alkane-stat-line" {
+                                        a class="alkane-stat-value link mono" href=(explorer_path(&format!("/tx/{txid}"))) { (short_hex(txid)) }
+                                    }
+                                } @else {
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value muted" { "Unknown" }
+                                    }
+                                }
+                            }
+                            div class="alkane-stat" {
+                                span class="alkane-stat-label" { "Deploy block" }
+                                @if let Some(h) = creation_height {
+                                    div class="alkane-stat-line" {
+                                        a class="alkane-stat-value link" href=(explorer_path(&format!("/block/{h}"))) { (h) }
+                                    }
+                                } @else {
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value muted" { "Unknown" }
+                                    }
                                 }
                             }
                         }
-                        div class="alkane-stat" {
-                            span class="alkane-stat-label" { "Deploy block" }
-                            @if let Some(h) = creation_height {
-                                div class="alkane-stat-line" {
-                                    a class="alkane-stat-value link" href=(explorer_path(&format!("/block/{h}"))) { (h) }
+                        div class="alkane-market-card" data-alkane-chart="" data-alkane-id=(alk_str.clone()) data-default-range="3m" {
+                            div class="alkane-market-title" { "Market" }
+                            div class="alkane-market-header" {
+                                div {
+                                    div class="alkane-market-price" data-alkane-price="" { "$0.00" }
+                                    div class="alkane-market-sub" { "USD price" }
                                 }
-                            } @else {
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value muted" { "Unknown" }
+                                div {
+                                    div class="alkane-market-change" data-alkane-change="" { "0.00%" }
+                                    div class="alkane-market-range" data-alkane-range="" { "Past 3 months" }
                                 }
+                            }
+                            div class="alkane-market-chart" data-alkane-chart-root="" {
+                                div class="alkane-market-loading" data-alkane-loading="" { "Loading chart..." }
+                            }
+                            div class="alkane-market-tabs" {
+                                button class="alkane-market-tab" type="button" data-range="1d" { "1D" }
+                                button class="alkane-market-tab" type="button" data-range="1w" { "1W" }
+                                button class="alkane-market-tab" type="button" data-range="1m" { "1M" }
+                                button class="alkane-market-tab active" type="button" data-range="3m" { "3M" }
                             }
                         }
                     }
@@ -403,6 +427,7 @@ pub async fn alkane_page(
                 }
             }
             (header_scripts())
+            (chart_scripts())
             @if tab == AlkaneTab::Inspect {
                 (inspect_scripts())
             }
@@ -712,6 +737,290 @@ fn inspect_scripts() -> Markup {
       await runSim(details);
     });
   });
+})();
+</script>
+"#;
+    PreEscaped(script.replace("__BASE_PATH__", &base_path_js))
+}
+
+fn chart_scripts() -> Markup {
+    let base_path_js = format!("{:?}", explorer_base_path());
+    let script = r#"
+<script>
+(() => {
+  const basePath = __BASE_PATH__;
+  const basePrefix = basePath === '/' ? '' : basePath;
+  const card = document.querySelector('[data-alkane-chart]');
+  if (!card) return;
+  const alkaneId = card.dataset.alkaneId || '';
+  if (!alkaneId) return;
+
+  const root = card.querySelector('[data-alkane-chart-root]');
+  const priceEl = card.querySelector('[data-alkane-price]');
+  const changeEl = card.querySelector('[data-alkane-change]');
+  const rangeEl = card.querySelector('[data-alkane-range]');
+  const loadingEl = card.querySelector('[data-alkane-loading]');
+  const tabs = Array.from(card.querySelectorAll('[data-range]'));
+  const defaultRange = (card.dataset.defaultRange || '3m').toLowerCase();
+  let activeRange = defaultRange;
+  let source = null;
+  let quote = null;
+  let chart = null;
+  let canvas = null;
+  let loading = false;
+
+  const rangeLabel = (range) => {
+    switch (range) {
+      case '1d':
+        return 'Past 24 hours';
+      case '1w':
+        return 'Past 7 days';
+      case '1m':
+        return 'Past 30 days';
+      case '3m':
+      default:
+        return 'Past 3 months';
+    }
+  };
+
+  const formatUsd = (value) => {
+    if (!Number.isFinite(value)) return '$0.00';
+    const digits = value >= 1 ? 2 : 6;
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      maximumFractionDigits: digits
+    }).format(value);
+  };
+
+  const formatPct = (value) => {
+    if (!Number.isFinite(value)) return '0.00%';
+    return `${value.toFixed(2)}%`;
+  };
+
+  const setActiveTab = (range) => {
+    tabs.forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.range === range);
+    });
+  };
+
+  const ensureScript = (src) => new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') {
+        resolve();
+      } else {
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.dataset.chartLib = '1';
+    script.addEventListener(
+      'load',
+      () => {
+        script.dataset.loaded = '1';
+        resolve();
+      },
+      { once: true }
+    );
+    script.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+    document.head.appendChild(script);
+  });
+
+  const loadChartJs = async () => {
+    if (window.Chart) return;
+    await ensureScript('https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js');
+  };
+
+  const resolveColor = (cssVar, fallback) => {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
+    return value || fallback;
+  };
+
+  const ensureCanvas = () => {
+    if (!root) return null;
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.setAttribute('aria-label', 'Market chart');
+      canvas.setAttribute('role', 'img');
+      root.replaceChildren(canvas);
+    }
+    return canvas.getContext('2d');
+  };
+
+  const renderChart = (points, isUp) => {
+    if (!root || !window.Chart) return;
+    const ctx = ensureCanvas();
+    if (!ctx) return;
+    const lineColor = isUp
+      ? resolveColor('--chart-green', '#33e183')
+      : resolveColor('--chart-red', '#ff5555');
+    const tooltipBg = resolveColor('--panel3', '#1f2228');
+    const tooltipBorder = resolveColor('--panel2', '#353742');
+    const tooltipText = resolveColor('--text', '#ffffff');
+    const labels = points.map((p) => p.ts);
+    const values = points.map((p) => p.close);
+
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.data.datasets[0].borderColor = lineColor;
+      chart.update('none');
+      return;
+    }
+
+    chart = new window.Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            data: values,
+            borderColor: lineColor,
+            borderWidth: 2,
+            pointRadius: 0,
+            tension: 0.35,
+            cubicInterpolationMode: 'monotone',
+            fill: false
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            enabled: true,
+            displayColors: false,
+            backgroundColor: tooltipBg,
+            borderColor: tooltipBorder,
+            borderWidth: 1,
+            titleColor: tooltipText,
+            bodyColor: tooltipText,
+            callbacks: {
+              title: (items) => {
+                const ts = Number(items && items[0] && items[0].label);
+                if (!Number.isFinite(ts)) return '';
+                return new Intl.DateTimeFormat('en-US', {
+                  dateStyle: 'medium',
+                  timeStyle: 'short'
+                }).format(new Date(ts * 1000));
+              },
+              label: (item) => {
+                const value =
+                  item && item.parsed && typeof item.parsed.y === 'number'
+                    ? item.parsed.y
+                    : item.parsed;
+                return formatUsd(Number(value));
+              }
+            }
+          }
+        },
+        interaction: {
+          mode: 'index',
+          intersect: false
+        },
+        hover: {
+          mode: 'index',
+          intersect: false
+        },
+        scales: {
+          x: { display: false },
+          y: { display: false }
+        }
+      }
+    });
+  };
+
+  const fetchRange = async (range) => {
+    const params = new URLSearchParams({ alkane: alkaneId, range });
+    if (source) params.set('source', source);
+    if (quote) params.set('quote', quote);
+    const res = await fetch(`${basePrefix}/api/alkane/chart?${params.toString()}`);
+    const data = await res.json();
+    if (!data || !data.ok) return null;
+    source = data.source || source;
+    quote = data.quote || quote;
+    return data;
+  };
+
+  const updateCard = (data, range, canRender) => {
+    if (!data || !Array.isArray(data.candles) || data.candles.length === 0) {
+      card.style.display = 'none';
+      if (chart) {
+        chart.destroy();
+        chart = null;
+      }
+      if (canvas) {
+        canvas.remove();
+        canvas = null;
+      }
+      return;
+    }
+    const points = data.candles.slice().sort((a, b) => a.ts - b.ts);
+    const first = points[0].close;
+    const last = points[points.length - 1].close;
+    const change = points.length > 1 && first ? ((last - first) / first) * 100 : 0;
+    const isUp = change >= 0;
+    card.dataset.tone = isUp ? 'up' : 'down';
+    if (priceEl) priceEl.textContent = formatUsd(last);
+    if (changeEl) changeEl.textContent = formatPct(change);
+    if (rangeEl) rangeEl.textContent = rangeLabel(range);
+    if (loadingEl) loadingEl.style.display = 'none';
+    card.style.removeProperty('display');
+    if (canRender) {
+      renderChart(points, isUp);
+    } else if (loadingEl) {
+      loadingEl.textContent = 'Chart unavailable';
+      loadingEl.style.display = '';
+    }
+  };
+
+  const load = async (range) => {
+    if (loading) return;
+    loading = true;
+    if (loadingEl) loadingEl.style.display = '';
+    try {
+      const data = await fetchRange(range);
+      if (!data) {
+        card.style.display = 'none';
+        return;
+      }
+      let canRender = true;
+      try {
+        await loadChartJs();
+      } catch (_) {
+        canRender = false;
+      }
+      updateCard(data, range, canRender);
+    } catch (_) {
+      if (loadingEl) {
+        loadingEl.textContent = 'Chart unavailable';
+        loadingEl.style.display = '';
+      }
+    } finally {
+      loading = false;
+    }
+  };
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const range = (tab.dataset.range || '').toLowerCase();
+      if (!range || range === activeRange) return;
+      activeRange = range;
+      setActiveTab(range);
+      load(range);
+    });
+  });
+
+  setActiveTab(activeRange);
+  load(activeRange);
 })();
 </script>
 "#;

@@ -8,7 +8,9 @@ use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::config::AmmDataConfig;
-use crate::modules::ammdata::storage::{AmmDataProvider, GetTokenSearchIndexPageParams, SearchIndexField};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
+};
 use crate::modules::essentials::storage::{
     EssentialsProvider, EssentialsTable, HoldersCountEntry, get_cached_block_summary, load_creation_record,
     BlockSummary,
@@ -35,7 +37,7 @@ use ordinals::Runestone;
 use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
@@ -87,6 +89,31 @@ pub struct SearchGuessGroup {
 pub struct SearchGuessResponse {
     pub query: String,
     pub groups: Vec<SearchGuessGroup>,
+}
+
+#[derive(Deserialize)]
+pub struct AlkaneChartQuery {
+    pub alkane: Option<String>,
+    pub range: Option<String>,
+    pub source: Option<String>,
+    pub quote: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AlkaneChartPoint {
+    pub ts: u64,
+    pub close: f64,
+}
+
+#[derive(Serialize)]
+pub struct AlkaneChartResponse {
+    pub ok: bool,
+    pub available: bool,
+    pub range: String,
+    pub source: Option<String>,
+    pub quote: Option<String>,
+    pub candles: Vec<AlkaneChartPoint>,
+    pub error: Option<String>,
 }
 
 pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselResponse> {
@@ -498,6 +525,137 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     Json(SearchGuessResponse { query, groups })
+}
+
+pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChartResponse> {
+    let Some(alkane_raw) = q.alkane.as_deref() else {
+        return Json(AlkaneChartResponse {
+            ok: false,
+            available: false,
+            range: "3m".to_string(),
+            source: None,
+            quote: None,
+            candles: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+    let Some(alkane) = parse_alkane_id(alkane_raw) else {
+        return Json(AlkaneChartResponse {
+            ok: false,
+            available: false,
+            range: "3m".to_string(),
+            source: None,
+            quote: None,
+            candles: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+
+    let range = normalize_chart_range(q.range.as_deref());
+    let (timeframe, limit) = chart_range_params(&range);
+
+    let cfg = match AmmDataConfig::load_from_global_config() {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            return Json(AlkaneChartResponse {
+                ok: true,
+                available: false,
+                range,
+                source: None,
+                quote: None,
+                candles: Vec::new(),
+                error: None,
+            });
+        }
+    };
+
+    let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb));
+    let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
+    let provider = AmmDataProvider::new(ammdata_mdb, essentials_provider);
+
+    let mut source = q
+        .source
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let mut quote = q
+        .quote
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if source.is_none() {
+        let pool = format!("{}-usd", alkane_id_str(&alkane));
+        if candles_available(&provider, &pool, timeframe) {
+            source = Some("usd".to_string());
+        } else if let Some(derived_cfg) = cfg.derived_liquidity.as_ref() {
+            for entry in &derived_cfg.derived_quotes {
+                let pool =
+                    format!("{}-derived_{}-usd", alkane_id_str(&alkane), alkane_id_str(&entry.alkane));
+                if candles_available(&provider, &pool, timeframe) {
+                    source = Some("derived".to_string());
+                    quote = Some(alkane_id_str(&entry.alkane));
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(source_kind) = source.clone() else {
+        return Json(AlkaneChartResponse {
+            ok: true,
+            available: false,
+            range,
+            source: None,
+            quote: None,
+            candles: Vec::new(),
+            error: None,
+        });
+    };
+
+    let pool = if source_kind == "derived" {
+        let Some(quote_id) = quote.as_deref().and_then(parse_alkane_id) else {
+            return Json(AlkaneChartResponse {
+                ok: false,
+                available: false,
+                range,
+                source: Some(source_kind),
+                quote,
+                candles: Vec::new(),
+                error: Some("missing_or_invalid_quote".to_string()),
+            });
+        };
+        format!(
+            "{}-derived_{}-usd",
+            alkane_id_str(&alkane),
+            alkane_id_str(&quote_id)
+        )
+    } else {
+        format!("{}-usd", alkane_id_str(&alkane))
+    };
+
+    if source_kind != "derived" {
+        quote = None;
+    }
+
+    let value = rpc_get_candles_value(&provider, &pool, timeframe, limit);
+    let mut candles = value
+        .as_ref()
+        .map(parse_candles)
+        .unwrap_or_default();
+    candles.sort_by_key(|c| c.ts);
+    let available = !candles.is_empty();
+
+    Json(AlkaneChartResponse {
+        ok: true,
+        available,
+        range,
+        source: Some(source_kind),
+        quote,
+        candles,
+        error: None,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1056,6 +1214,73 @@ fn decode_u128_tuple(bytes: &[u8]) -> Option<(u128, u128)> {
 
 fn hex_string(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
+}
+
+fn normalize_chart_range(raw: Option<&str>) -> String {
+    match raw.unwrap_or("3m").trim().to_ascii_lowercase().as_str() {
+        "1d" | "24h" => "1d".to_string(),
+        "1w" | "7d" => "1w".to_string(),
+        "1m" | "30d" => "1m".to_string(),
+        "3m" | "90d" => "3m".to_string(),
+        _ => "3m".to_string(),
+    }
+}
+
+fn chart_range_params(range: &str) -> (&'static str, u64) {
+    match range {
+        "1d" => ("1h", 24),
+        "1w" => ("1h", 24 * 7),
+        "1m" => ("1d", 30),
+        _ => ("1d", 90),
+    }
+}
+
+fn alkane_id_str(id: &SchemaAlkaneId) -> String {
+    format!("{}:{}", id.block, id.tx)
+}
+
+fn rpc_get_candles_value(
+    provider: &AmmDataProvider,
+    pool: &str,
+    timeframe: &str,
+    limit: u64,
+) -> Option<Value> {
+    provider
+        .rpc_get_candles(RpcGetCandlesParams {
+            pool: Some(pool.to_string()),
+            timeframe: Some(timeframe.to_string()),
+            limit: Some(limit),
+            size: None,
+            page: Some(1),
+            side: None,
+            now: None,
+        })
+        .ok()
+        .map(|resp| resp.value)
+}
+
+fn candles_available(provider: &AmmDataProvider, pool: &str, timeframe: &str) -> bool {
+    rpc_get_candles_value(provider, pool, timeframe, 2)
+        .as_ref()
+        .and_then(|v| v.get("total").and_then(|n| n.as_u64()))
+        .unwrap_or(0)
+        > 0
+}
+
+fn parse_candles(value: &Value) -> Vec<AlkaneChartPoint> {
+    value
+        .get("candles")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let ts = item.get("ts").and_then(|v| v.as_u64())?;
+                    let close = item.get("close").and_then(|v| v.as_f64())?;
+                    Some(AlkaneChartPoint { ts, close })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_alkane_id(s: &str) -> Option<SchemaAlkaneId> {

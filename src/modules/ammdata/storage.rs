@@ -100,6 +100,7 @@ pub struct AmmDataTable<'a> {
     pub TOKEN_USD_CANDLES: MdbPointer<'a>,
     pub TOKEN_DERIVED_USD_CANDLES: MdbPointer<'a>,
     pub TOKEN_MCAP_USD_CANDLES: MdbPointer<'a>,
+    pub BTC_USD_PRICE: MdbPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
     pub ACTIVITY: MdbPointer<'a>,
     pub ACTIVITY_INDEX: MdbPointer<'a>,
@@ -111,6 +112,8 @@ pub struct AmmDataTable<'a> {
     pub TOKEN_DERIVED_METRICS_INDEX: MdbPointer<'a>,
     pub TOKEN_METRICS_INDEX_COUNT: MdbPointer<'a>,
     pub TOKEN_DERIVED_METRICS_INDEX_COUNT: MdbPointer<'a>,
+    pub POOL_METRICS_INDEX: MdbPointer<'a>,
+    pub POOL_METRICS_INDEX_COUNT: MdbPointer<'a>,
     pub TOKEN_SEARCH_INDEX: MdbPointer<'a>,
     pub TOKEN_DERIVED_SEARCH_INDEX: MdbPointer<'a>,
     pub POOL_NAME_INDEX: MdbPointer<'a>,
@@ -148,6 +151,7 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_USD_CANDLES: root.keyword("tuc1:"),
             TOKEN_DERIVED_USD_CANDLES: root.keyword("tud1:"),
             TOKEN_MCAP_USD_CANDLES: root.keyword("tmc1:"),
+            BTC_USD_PRICE: root.keyword("/btc_usd_price/v1/"),
             ACTIVITY: root.keyword("activity:v1:"),
             ACTIVITY_INDEX: root.keyword("activity:idx:"),
             CANONICAL_POOL: root.keyword("/canonical_pool/v1/"),
@@ -157,6 +161,8 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_DERIVED_METRICS_INDEX: root.keyword("/token_metrics/derived/index/"),
             TOKEN_METRICS_INDEX_COUNT: root.keyword("/token_metrics/index_count"),
             TOKEN_DERIVED_METRICS_INDEX_COUNT: root.keyword("/token_metrics/derived/index_count"),
+            POOL_METRICS_INDEX: root.keyword("/pool_metrics/index/"),
+            POOL_METRICS_INDEX_COUNT: root.keyword("/pool_metrics/index_count"),
             TOKEN_SEARCH_INDEX: root.keyword("/token_search_index/v1/"),
             TOKEN_DERIVED_SEARCH_INDEX: root.keyword("/token_search_index/derived/v1/"),
             POOL_NAME_INDEX: root.keyword("/pool_name_index/"),
@@ -219,6 +225,38 @@ impl TokenMetricsIndexField {
             | TokenMetricsIndexField::Change7d
             | TokenMetricsIndexField::Change30d
             | TokenMetricsIndexField::ChangeAllTime => 8,
+            _ => 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PoolMetricsIndexField {
+    TvlUsd,
+    Volume1dUsd,
+    Volume7dUsd,
+    Volume30dUsd,
+    VolumeAllTimeUsd,
+    Apr,
+    TvlChange24h,
+}
+
+impl PoolMetricsIndexField {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PoolMetricsIndexField::TvlUsd => "tvl_usd",
+            PoolMetricsIndexField::Volume1dUsd => "volume_1d_usd",
+            PoolMetricsIndexField::Volume7dUsd => "volume_7d_usd",
+            PoolMetricsIndexField::Volume30dUsd => "volume_30d_usd",
+            PoolMetricsIndexField::VolumeAllTimeUsd => "volume_all_time_usd",
+            PoolMetricsIndexField::Apr => "apr",
+            PoolMetricsIndexField::TvlChange24h => "tvl_change_24h",
+        }
+    }
+
+    pub fn value_len(&self) -> usize {
+        match self {
+            PoolMetricsIndexField::Apr | PoolMetricsIndexField::TvlChange24h => 8,
             _ => 16,
         }
     }
@@ -388,6 +426,16 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn btc_usd_price_prefix(&self) -> Vec<u8> {
+        self.BTC_USD_PRICE.key().to_vec()
+    }
+
+    pub fn btc_usd_price_key(&self, height: u64) -> Vec<u8> {
+        let mut k = self.btc_usd_price_prefix();
+        k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
     pub fn token_metrics_index_prefix(&self, field: TokenMetricsIndexField) -> Vec<u8> {
         let mut k = self.TOKEN_METRICS_INDEX.select(field.as_str().as_bytes()).key().to_vec();
         k.push(b'/');
@@ -443,6 +491,63 @@ impl<'a> AmmDataTable<'a> {
 
     pub fn token_metrics_index_count_key(&self) -> Vec<u8> {
         self.TOKEN_METRICS_INDEX_COUNT.key().to_vec()
+    }
+
+    pub fn pool_metrics_index_prefix(&self, field: PoolMetricsIndexField) -> Vec<u8> {
+        let mut k = self.POOL_METRICS_INDEX.select(field.as_str().as_bytes()).key().to_vec();
+        k.push(b'/');
+        k
+    }
+
+    pub fn pool_metrics_index_key_u128(
+        &self,
+        field: PoolMetricsIndexField,
+        value: u128,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.pool_metrics_index_prefix(field);
+        k.extend_from_slice(&value.to_be_bytes());
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn pool_metrics_index_key_i64(
+        &self,
+        field: PoolMetricsIndexField,
+        value: i64,
+        pool: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.pool_metrics_index_prefix(field);
+        k.extend_from_slice(&encode_i64_be_ordered(value));
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
+    }
+
+    pub fn parse_pool_metrics_index_key(
+        &self,
+        field: PoolMetricsIndexField,
+        key: &[u8],
+    ) -> Option<SchemaAlkaneId> {
+        let prefix = self.pool_metrics_index_prefix(field);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != field.value_len() + 12 {
+            return None;
+        }
+        let id_bytes = &rest[field.value_len()..];
+        let mut block_arr = [0u8; 4];
+        block_arr.copy_from_slice(&id_bytes[..4]);
+        let mut tx_arr = [0u8; 8];
+        tx_arr.copy_from_slice(&id_bytes[4..12]);
+        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+    }
+
+    pub fn pool_metrics_index_count_key(&self) -> Vec<u8> {
+        self.POOL_METRICS_INDEX_COUNT.key().to_vec()
     }
 
     pub fn token_search_index_prefix(&self, field: SearchIndexField, prefix: &str) -> Vec<u8> {
@@ -2155,13 +2260,27 @@ impl AmmDataProvider {
                 Some(u) => *u,
                 None => continue,
             };
+            let defs = match self.get_pool_defs(GetPoolDefsParams { pool: entry.pool_id }) {
+                Ok(res) => res.defs,
+                Err(_) => None,
+            };
+            let Some(defs) = defs else { continue };
+            let side = if defs.base_alkane_id == params.token && defs.quote_alkane_id == entry.quote_id
+            {
+                PriceSide::Base
+            } else if defs.quote_alkane_id == params.token && defs.base_alkane_id == entry.quote_id
+            {
+                PriceSide::Quote
+            } else {
+                continue;
+            };
             let res = read_candles_v1(
                 self,
                 entry.pool_id,
                 Timeframe::M10,
                 1,
                 params.now_ts,
-                PriceSide::Base,
+                side,
             )
             .ok();
             let close = res
