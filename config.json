@@ -39,7 +39,7 @@
   "modules": {
     "oylapi": {
       "host": "0.0.0.0",
-      "port": 9710,
+      "port": 9712,
       "alkane_icon_cdn": "https://asset.oyl.gg/alkanes/mainnet"
     },
     "subfrost": {},

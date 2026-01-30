@@ -49,9 +49,9 @@ struct CandleKey {
 
 #[derive(Debug, Clone, Copy)]
 struct DualCandle {
-    // base_candle: price = quote/base, vol = base_in
+    // base_candle: price = quote/base, vol = abs(base_delta)
     base: SchemaCandleV1,
-    // quote_candle: price = base/quote, vol = quote_out
+    // quote_candle: price = base/quote, vol = abs(quote_delta)
     quote: SchemaCandleV1,
 }
 
@@ -96,8 +96,8 @@ impl CandleCache {
     /// Apply one trade to all specified frames.
     /// - `p_b_per_q`   = price quoted in BASE per 1 QUOTE (base/quote)
     /// - `p_q_per_b`   = price quoted in QUOTE per 1 BASE (quote/base)
-    /// - `base_in`     = amount of BASE sent into the pool
-    /// - `quote_out`   = amount of QUOTE sent out of the pool
+    /// - `base_volume` = absolute BASE traded (in or out)
+    /// - `quote_volume`= absolute QUOTE traded (in or out)
     pub fn apply_trade_for_frames(
         &mut self,
         ts: u64,
@@ -105,17 +105,17 @@ impl CandleCache {
         frames: &[Timeframe],
         p_b_per_q: u128,
         p_q_per_b: u128,
-        base_in: u128,
-        quote_out: u128,
+        base_volume: u128,
+        quote_volume: u128,
     ) {
         for &tf in frames {
             let key = CandleKey { pool, tf, bucket_ts: bucket_start(ts, tf) };
             self.map
                 .entry(key)
-                .and_modify(|dc| dc.update(p_q_per_b, p_b_per_q, base_in, quote_out))
+                .and_modify(|dc| dc.update(p_q_per_b, p_b_per_q, base_volume, quote_volume))
                 .or_insert_with(|| {
                     let mut dc = DualCandle::new(p_q_per_b, p_b_per_q);
-                    dc.update(p_q_per_b, p_b_per_q, base_in, quote_out);
+                    dc.update(p_q_per_b, p_b_per_q, base_volume, quote_volume);
                     dc
                 });
         }

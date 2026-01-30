@@ -420,7 +420,7 @@ async fn main() -> Result<()> {
     let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
-    //mods.register_module(Pizzafun::new());
+    mods.register_module(Pizzafun::new());
     if get_module_config("ammdata").is_some() {
         mods.register_module(AmmData::new());
     } else {

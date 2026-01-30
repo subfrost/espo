@@ -1215,11 +1215,11 @@ impl EspoModule for AmmData {
                     entry.1 = entry.1.saturating_add(quote_abs);
                     let p_q_per_b = price_quote_per_base(new_base, new_quote);
                     let p_b_per_q = price_base_per_quote(new_base, new_quote);
-                    let base_in = if base_delta > 0 { base_delta as u128 } else { 0 };
-                    let quote_out = if quote_delta < 0 { (-quote_delta) as u128 } else { 0 };
+                    let base_volume = base_abs;
+                    let quote_volume = quote_abs;
 
                     candle_cache.apply_trade_for_frames(
-                        block_ts, owner, &frames, p_b_per_q, p_q_per_b, base_in, quote_out,
+                        block_ts, owner, &frames, p_b_per_q, p_q_per_b, base_volume, quote_volume,
                     );
 
                     if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
@@ -1771,7 +1771,7 @@ impl EspoModule for AmmData {
                     let Some(info) = derived_pool_by_token_quote.get(&(token, quote)) else {
                         continue;
                     };
-                    let Some((_pool_ts, pool_candle)) =
+                    let Some((pool_ts, pool_candle)) =
                         latest_pool_candle(&info.pool_id, tf, bucket_ts)
                     else {
                         continue;
@@ -1839,6 +1839,28 @@ impl EspoModule for AmmData {
                         volume: volume_usd,
                     };
 
+                    let stale_pool = pool_ts < bucket_ts;
+                    if stale_pool {
+                        let prev_bucket = bucket_ts.saturating_sub(tf.duration_secs());
+                        if let Some((_ts, prev)) = latest_derived_candle(
+                            &derived_overrides_by_token_quote_tf,
+                            &token,
+                            &quote,
+                            tf,
+                            prev_bucket,
+                        ) {
+                            derived.open = prev.close;
+                            derived.high = prev.close;
+                            derived.low = prev.close;
+                            derived.close = prev.close;
+                        } else {
+                            derived.high = derived.open;
+                            derived.low = derived.open;
+                            derived.close = derived.open;
+                        }
+                        derived.volume = 0;
+                    }
+
                     if let Some((_ts, canonical)) =
                         latest_token_usd_candle(&token, tf, bucket_ts)
                     {
@@ -1846,7 +1868,7 @@ impl EspoModule for AmmData {
                             .get(&quote)
                             .unwrap_or(&DerivedMergeStrategy::Neutral);
                         let mut merged = merge_candles(derived, canonical, strategy);
-                        merged.volume = derived.volume;
+                        merged.volume = derived.volume.saturating_add(canonical.volume);
                         derived = merged;
                     }
 
