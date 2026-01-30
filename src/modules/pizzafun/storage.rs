@@ -19,6 +19,18 @@ pub fn normalize_series_id(s: &str) -> Option<String> {
     Some(trimmed.to_ascii_lowercase())
 }
 
+fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
+    if series_id == name_norm {
+        return true;
+    }
+    if let Some(rest) = series_id.strip_prefix(name_norm) {
+        if let Some(num) = rest.strip_prefix('-') {
+            return !num.is_empty() && num.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
 #[derive(Clone)]
 pub struct MdbPointer<'a> {
     mdb: &'a Mdb,
@@ -227,6 +239,73 @@ impl PizzafunProvider {
             }
         }
         Ok(out)
+    }
+
+    pub fn get_series_entries_by_name(&self, name_norm: &str) -> Result<Vec<SeriesEntry>> {
+        let table = self.table();
+        let base_prefix = table.series_by_id_prefix();
+        let mut prefix = base_prefix.clone();
+        prefix.extend_from_slice(name_norm.as_bytes());
+        let keys = self.mdb.scan_prefix(&prefix)?;
+
+        let mut filtered_keys: Vec<Vec<u8>> = Vec::new();
+        for key in keys {
+            if !key.starts_with(base_prefix.as_slice()) {
+                continue;
+            }
+            let raw_id = &key[base_prefix.len()..];
+            let Ok(series_id) = std::str::from_utf8(raw_id) else { continue };
+            if series_id_matches_name(series_id, name_norm) {
+                filtered_keys.push(key);
+            }
+        }
+
+        if filtered_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let raw = self
+            .mdb
+            .multi_get(&filtered_keys)
+            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let mut out = Vec::with_capacity(raw.len());
+        for item in raw {
+            if let Some(bytes) = item {
+                out.push(SeriesEntry::try_from_slice(&bytes)?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn update_series_for_name(
+        &self,
+        existing: &[SeriesEntry],
+        updated: &[SeriesEntry],
+    ) -> Result<()> {
+        let table = self.table();
+        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 2);
+        for entry in existing {
+            deletes.push(table.series_by_id_key(&entry.series_id));
+            deletes.push(table.series_by_alkane_key(&entry.alkane_id));
+        }
+
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(updated.len() * 2);
+        for entry in updated {
+            let encoded = borsh::to_vec(entry)?;
+            puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
+            puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
+        }
+
+        self.mdb
+            .bulk_write(|wb: &mut MdbBatch<'_>| {
+                for key in &deletes {
+                    wb.delete(key);
+                }
+                for (key, value) in &puts {
+                    wb.put(key, value);
+                }
+            })
+            .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
     }
 
     pub fn replace_series_entries(&self, entries: &[SeriesEntry], height: u32) -> Result<()> {
