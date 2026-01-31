@@ -1,5 +1,5 @@
-pub mod consts;
 pub mod config;
+pub mod consts;
 pub mod main;
 pub mod price_feeds;
 pub mod rpc;

@@ -18,9 +18,7 @@ use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{
-    AlkaneTxSummary, EssentialsTable, load_creation_record,
-};
+use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load_creation_record};
 use crate::schemas::EspoOutpoint;
 
 struct AlkaneTxRow {

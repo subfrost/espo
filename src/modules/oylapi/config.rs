@@ -15,9 +15,9 @@ impl OylApiConfig {
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| anyhow!("oylapi config must be an object; expected: {}", Self::spec()))?;
+        let obj = value.as_object().ok_or_else(|| {
+            anyhow!("oylapi config must be an object; expected: {}", Self::spec())
+        })?;
 
         let host = obj
             .get("host")
@@ -45,11 +45,6 @@ impl OylApiConfig {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        Ok(Self {
-            host,
-            port,
-            alkane_icon_cdn,
-            ord_endpoint,
-        })
+        Ok(Self { host, port, alkane_icon_cdn, ord_endpoint })
     }
 }

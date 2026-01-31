@@ -4,15 +4,16 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use anyhow::{Result, anyhow};
 use bitcoincore_rpc::RpcApi;
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 use alloy_primitives::{Address, U256, U512};
 
-const WBTC_USDC_POOL: Address = alloy_primitives::address!("99ac8cA7087fA4A2A1FB6357269965A2014ABc35");
+const WBTC_USDC_POOL: Address =
+    alloy_primitives::address!("99ac8cA7087fA4A2A1FB6357269965A2014ABc35");
 const WBTC_TOKEN: Address = alloy_primitives::address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
 const USDC_TOKEN: Address = alloy_primitives::address!("A0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 
@@ -78,18 +79,8 @@ impl UniswapPriceFeed {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T> {
-        let req = RpcRequest {
-            jsonrpc: "2.0",
-            id: 1,
-            method,
-            params,
-        };
-        let resp = self
-            .client
-            .post(url)
-            .json(&req)
-            .send()?
-            .error_for_status()?;
+        let req = RpcRequest { jsonrpc: "2.0", id: 1, method, params };
+        let resp = self.client.post(url).json(&req).send()?.error_for_status()?;
         let resp: RpcResponse<T> = resp.json()?;
         if let Some(err) = resp.error {
             anyhow::bail!("eth rpc error {}: {}", err.code, err.message);
@@ -107,8 +98,7 @@ impl UniswapPriceFeed {
 
     fn parse_hex_u64(raw: &str) -> Result<u64> {
         let trimmed = raw.trim_start_matches("0x");
-        u64::from_str_radix(trimmed, 16)
-            .map_err(|e| anyhow!("invalid hex u64 '{raw}': {e}"))
+        u64::from_str_radix(trimmed, 16).map_err(|e| anyhow!("invalid hex u64 '{raw}': {e}"))
     }
 
     fn eth_call(&self, to: &Address, data: &str, block: Option<u64>) -> Result<String> {
@@ -234,9 +224,8 @@ impl UniswapPriceFeed {
             .ok_or_else(|| anyhow!("price scale overflow"))?;
         let scale = U512::from(scale);
         let sqrt = U512::from(sqrt_price_x96);
-        let numerator = sqrt
-            .checked_mul(sqrt)
-            .ok_or_else(|| anyhow!("sqrtPriceX96 squared overflow"))?;
+        let numerator =
+            sqrt.checked_mul(sqrt).ok_or_else(|| anyhow!("sqrtPriceX96 squared overflow"))?;
         if numerator.is_zero() {
             anyhow::bail!("sqrtPriceX96 is zero");
         }
@@ -248,9 +237,8 @@ impl UniswapPriceFeed {
                 .ok_or_else(|| anyhow!("price numerator overflow"))?;
             scaled / q192
         } else if token0 == USDC_TOKEN && token1 == WBTC_TOKEN {
-            let scaled = q192
-                .checked_mul(scale)
-                .ok_or_else(|| anyhow!("price numerator overflow"))?;
+            let scaled =
+                q192.checked_mul(scale).ok_or_else(|| anyhow!("price numerator overflow"))?;
             scaled / numerator
         } else {
             anyhow::bail!("unexpected pool tokens: {token0:?} / {token1:?}");
@@ -261,23 +249,11 @@ impl UniswapPriceFeed {
 
     fn price_at_bitcoin_height(&self, height: u64) -> Result<u128> {
         let btc_ts = Self::bitcoin_block_timestamp(height)?;
-        eprintln!(
-            "[uniswap] btc height {} -> timestamp {}",
-            height,
-            btc_ts
-        );
+        eprintln!("[uniswap] btc height {} -> timestamp {}", height, btc_ts);
         let eth_block = self.find_closest_block_by_timestamp(btc_ts)?;
-        eprintln!(
-            "[uniswap] closest eth block {} for btc ts {}",
-            eth_block,
-            btc_ts
-        );
+        eprintln!("[uniswap] closest eth block {} for btc ts {}", eth_block, btc_ts);
         let sqrt_price_x96 = self.get_sqrt_price_x96_at_block(eth_block)?;
-        eprintln!(
-            "[uniswap] slot0 sqrtPriceX96 at eth block {}: {}",
-            eth_block,
-            sqrt_price_x96
-        );
+        eprintln!("[uniswap] slot0 sqrtPriceX96 at eth block {}: {}", eth_block, sqrt_price_x96);
         let (token0, token1) = self.get_pool_tokens()?;
         self.price_from_sqrt_price(sqrt_price_x96, token0, token1)
     }

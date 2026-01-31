@@ -46,7 +46,9 @@ pub fn extract_new_pools_from_espo_transaction(
     };
     let cleaned_traces: Vec<EspoSandshrewLikeTrace> = traces
         .iter()
-        .filter_map(|trace| clean_espo_sandshrew_like_trace(&trace.sandshrew_trace, host_function_values))
+        .filter_map(|trace| {
+            clean_espo_sandshrew_like_trace(&trace.sandshrew_trace, host_function_values)
+        })
         .collect();
     if cleaned_traces.is_empty() {
         return Ok(vec![]);
@@ -172,8 +174,8 @@ pub fn extract_new_pools_from_espo_transaction(
                         continue;
                     }
 
-                    let factory_id = factory_id
-                        .and_then(|val| schema_id_from_storage_val_32b(val).ok());
+                    let factory_id =
+                        factory_id.and_then(|val| schema_id_from_storage_val_32b(val).ok());
 
                     results.push(NewPoolInfo {
                         pool_id,

@@ -12,10 +12,7 @@ pub struct OrdOutput {
 
 impl Default for OrdOutput {
     fn default() -> Self {
-        Self {
-            inscriptions: Vec::new(),
-            runes: Value::Object(Default::default()),
-        }
+        Self { inscriptions: Vec::new(), runes: Value::Object(Default::default()) }
     }
 }
 
@@ -37,10 +34,7 @@ pub async fn fetch_ord_outputs(
                 Ok(r) => r.json::<Value>().await.ok(),
                 Err(_) => None,
             };
-            let ord = value
-                .as_ref()
-                .map(parse_ord_output)
-                .unwrap_or_else(OrdOutput::default);
+            let ord = value.as_ref().map(parse_ord_output).unwrap_or_else(OrdOutput::default);
             (op, ord)
         });
     }

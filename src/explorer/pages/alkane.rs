@@ -14,9 +14,9 @@ use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
     AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
-use crate::explorer::paths::{explorer_base_path, explorer_path};
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
+use crate::explorer::paths::{explorer_base_path, explorer_path};
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
 };
@@ -91,8 +91,7 @@ pub async fn alkane_page(
     let creation_height = creation_record.as_ref().map(|r| r.creation_height);
     let creation_txid = creation_record.as_ref().map(|r| hex::encode(r.txid));
 
-    let balances_map =
-        get_alkane_balances(&state.essentials_provider(), &alk).unwrap_or_default();
+    let balances_map = get_alkane_balances(&state.essentials_provider(), &alk).unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances_map
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -123,9 +122,7 @@ pub async fn alkane_page(
     let mut inspect_source = inspection.cloned();
     let mut proxy_target_label: Option<String> = None;
     let inspect_alkane_id = alk_str.clone();
-    if let Some(proxy_target) =
-        resolve_proxy_target_recursive(&alk, &state.essentials_provider())
-    {
+    if let Some(proxy_target) = resolve_proxy_target_recursive(&alk, &state.essentials_provider()) {
         let label = format!("{}:{}", proxy_target.block, proxy_target.tx);
         proxy_target_label = Some(label.clone());
         inspect_source =
@@ -229,11 +226,8 @@ pub async fn alkane_page(
     let activity_display_start =
         if activity_total > 0 && activity_off < activity_total { activity_off + 1 } else { 0 };
     let activity_display_end = (activity_off + activity_len).min(activity_total);
-    let activity_last_page = if activity_total > 0 {
-        (activity_total + limit - 1) / limit
-    } else {
-        1
-    };
+    let activity_last_page =
+        if activity_total > 0 { (activity_total + limit - 1) / limit } else { 1 };
 
     let activity_rows: Vec<Vec<Markup>> = activity_entries
         .into_iter()
@@ -622,11 +616,7 @@ fn fmt_activity_amount(raw: u128) -> String {
     let whole = units / unit;
     let rem = units % unit;
     let dec = (rem * 10) / unit;
-    if dec == 0 {
-        format!("{whole}{suffix}")
-    } else {
-        format!("{whole}.{dec}{suffix}")
-    }
+    if dec == 0 { format!("{whole}{suffix}") } else { format!("{whole}.{dec}{suffix}") }
 }
 
 fn split_methods(
@@ -686,7 +676,10 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
 }
 
-fn proxy_target_from_db(alk: &SchemaAlkaneId, provider: &EssentialsProvider) -> Option<SchemaAlkaneId> {
+fn proxy_target_from_db(
+    alk: &SchemaAlkaneId,
+    provider: &EssentialsProvider,
+) -> Option<SchemaAlkaneId> {
     let lookup = |key| {
         provider
             .get_raw_value(GetRawValueParams { key: kv_row_key(alk, key) })

@@ -7,21 +7,21 @@
 
 #[cfg(feature = "test-utils")]
 mod tests {
-    use anyhow::Result;
-    use bitcoin::hashes::Hash;
-    use bitcoin::OutPoint;
-    use espo::test_utils::*;
-    use alkanes_support::id::AlkaneId;
     use alkanes_support::cellpack::Cellpack;
-    use metashrew_support::index_pointer::KeyValuePointer;
+    use alkanes_support::id::AlkaneId;
+    use anyhow::Result;
+    use bitcoin::OutPoint;
+    use bitcoin::hashes::Hash;
+    use espo::test_utils::*;
     use metashrew_core::index_pointer::AtomicPointer;
+    use metashrew_support::index_pointer::KeyValuePointer;
 
     /// Clear test environment and index initial blocks
     fn setup_test_environment() -> Result<()> {
         metashrew_core::clear();
 
         // Configure network for regtest
-        use protorune_support::network::{set_network, NetworkParams};
+        use protorune_support::network::{NetworkParams, set_network};
         set_network(NetworkParams {
             bech32_prefix: String::from("bcrt"),
             p2pkh_prefix: 0x64,
@@ -113,7 +113,9 @@ mod tests {
 
 // Helper function that shows how trace extraction would work
 #[cfg(feature = "test-utils")]
-fn extract_traces_from_block_example(block: &bitcoin::Block) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+fn extract_traces_from_block_example(
+    block: &bitcoin::Block,
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
     use anyhow::Result;
 
     // This is the pattern from subfrost-alkanes:
@@ -128,10 +130,7 @@ fn extract_traces_from_block_example(block: &bitcoin::Block) -> Result<Vec<Vec<u
         let txid = tx.compute_txid();
 
         for vout in 0..tx.output.len() {
-            let outpoint = bitcoin::OutPoint {
-                txid,
-                vout: vout as u32,
-            };
+            let outpoint = bitcoin::OutPoint { txid, vout: vout as u32 };
 
             // This is the key call - gets trace from metashrew after indexing
             #[cfg(feature = "test-utils")]

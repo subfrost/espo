@@ -277,11 +277,10 @@ pub async fn block_page(
                     }
                 }
 
-                let summary_keys: Vec<Vec<u8>> =
-                    all_txids
-                        .iter()
-                        .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
-                        .collect();
+                let summary_keys: Vec<Vec<u8>> = all_txids
+                    .iter()
+                    .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
+                    .collect();
                 let summary_vals =
                     state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
                 let mut summary_map: HashMap<Txid, Option<AlkaneTxSummary>> = HashMap::new();
@@ -364,11 +363,10 @@ pub async fn block_page(
                         }
                     }
 
-                    let summary_keys: Vec<Vec<u8>> =
-                        txids
-                            .iter()
-                            .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
-                            .collect();
+                    let summary_keys: Vec<Vec<u8>> = txids
+                        .iter()
+                        .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
+                        .collect();
                     let summary_vals =
                         state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
 

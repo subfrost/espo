@@ -57,8 +57,7 @@ impl MockBitcoinNode {
 
     /// Get block by height
     pub fn get_block_by_height(&self, height: u32) -> Option<&Block> {
-        self.get_block_hash(height)
-            .and_then(|hash| self.get_block(&hash))
+        self.get_block_hash(height).and_then(|hash| self.get_block(&hash))
     }
 
     /// Get height of a block by hash
@@ -84,11 +83,8 @@ impl MockBitcoinNode {
     /// Simulate a reorg by replacing blocks from fork_height onwards
     pub fn apply_reorg(&mut self, fork_height: u32, new_blocks: Vec<Block>) {
         // Remove blocks from fork_height onwards
-        let heights_to_remove: Vec<u32> = self.height_to_hash
-            .keys()
-            .filter(|&&h| h >= fork_height)
-            .copied()
-            .collect();
+        let heights_to_remove: Vec<u32> =
+            self.height_to_hash.keys().filter(|&&h| h >= fork_height).copied().collect();
 
         for height in heights_to_remove {
             if let Some(hash) = self.height_to_hash.remove(&height) {
@@ -164,10 +160,10 @@ mod tests {
         // Create alternative chain that forks at height 5
         // Build up to height 5, then fork back 1 block to height 4, then build 6 more
         let fork_blocks = ChainBuilder::new()
-            .add_blocks(5)  // Heights 0-5 (6 blocks)
-            .fork(1)        // Go back to height 4
-            .with_salt(1)   // Different hashes
-            .add_blocks(6)  // Add 6 more blocks: heights 5-10
+            .add_blocks(5) // Heights 0-5 (6 blocks)
+            .fork(1) // Go back to height 4
+            .with_salt(1) // Different hashes
+            .add_blocks(6) // Add 6 more blocks: heights 5-10
             .build();
 
         // Extract blocks from height 5 onwards

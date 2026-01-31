@@ -10,9 +10,9 @@ pub mod bitcoind_flexible;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod debug;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod core;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod debug;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod explorer;
 #[cfg(not(target_arch = "wasm32"))]

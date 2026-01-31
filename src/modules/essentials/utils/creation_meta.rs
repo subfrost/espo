@@ -105,8 +105,7 @@ async fn simulate_get_u128_async(
         from: None,
         protocol_tag: 1,
     };
-    let protocol_values =
-        vec![protostone].encipher().context("protostone encode failed")?;
+    let protocol_values = vec![protostone].encipher().context("protostone encode failed")?;
     let runestone =
         Runestone { protocol: Some(protocol_values), pointer: Some(0), ..Default::default() };
     let runestone_script = runestone.encipher();

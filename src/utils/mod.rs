@@ -1,8 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod electrum_like;
 
-use std::time::{Duration, Instant};
 use crate::schemas::SchemaAlkaneId;
+use std::time::{Duration, Instant};
 
 /// Parse an alkane ID from a string like "2:68441" (block:tx)
 /// Supports both decimal and hex (0x-prefixed) formats
@@ -30,10 +30,7 @@ pub fn parse_alkane_id(s: &str) -> Option<SchemaAlkaneId> {
         }
     };
 
-    Some(SchemaAlkaneId {
-        block: parse_u32(parts[0])?,
-        tx: parse_u64(parts[1])?,
-    })
+    Some(SchemaAlkaneId { block: parse_u32(parts[0])?, tx: parse_u64(parts[1])? })
 }
 
 /// Tracks a simple running *average* of seconds per block.

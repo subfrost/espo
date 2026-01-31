@@ -22,7 +22,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                 async move {
                     let params = RpcGetCandlesParams {
                         pool: payload.get("pool").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        timeframe: payload.get("timeframe").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        timeframe: payload
+                            .get("timeframe")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         limit: payload.get("limit").and_then(|v| v.as_u64()),
                         size: payload.get("size").and_then(|v| v.as_u64()),
                         page: payload.get("page").and_then(|v| v.as_u64()),
@@ -49,7 +52,10 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         limit: payload.get("limit").and_then(|v| v.as_u64()),
                         page: payload.get("page").and_then(|v| v.as_u64()),
                         side: payload.get("side").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        filter_side: payload.get("filter_side").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        filter_side: payload
+                            .get("filter_side")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         activity_type: payload
                             .get("activity_type")
                             .or_else(|| payload.get("type"))
@@ -120,8 +126,14 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                 async move {
                     let params = RpcFindBestSwapPathParams {
                         mode: payload.get("mode").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        token_in: payload.get("token_in").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        token_out: payload.get("token_out").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        token_in: payload
+                            .get("token_in")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        token_out: payload
+                            .get("token_out")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         fee_bps: payload.get("fee_bps").and_then(|v| v.as_u64()),
                         max_hops: payload.get("max_hops").and_then(|v| v.as_u64()),
                         amount_in: payload.get("amount_in").cloned(),

@@ -2,13 +2,12 @@
 ///
 /// This module provides utilities to deploy and initialize the OYL AMM
 /// following the patterns from reference/subfrost-alkanes.
-
-use crate::test_utils::{fixtures, TestMetashrewRuntime};
+use crate::test_utils::{TestMetashrewRuntime, fixtures};
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId;
 use anyhow::Result;
-use bitcoin::{Block, OutPoint};
 use bitcoin::hashes::Hash;
+use bitcoin::{Block, OutPoint};
 use metashrew_support::index_pointer::KeyValuePointer;
 
 // Constants from OYL protocol
@@ -47,10 +46,7 @@ impl BinaryAndCellpack {
 
     /// Creates a BinaryAndCellpack with an empty binary (cellpack-only operation)
     pub fn cellpack_only(cellpack: Cellpack) -> Self {
-        Self {
-            binary: Vec::new(),
-            cellpack,
-        }
+        Self { binary: Vec::new(), cellpack }
     }
 }
 
@@ -75,10 +71,7 @@ pub fn deploy_amm_infrastructure(
     let pool_cellpack = vec![BinaryAndCellpack {
         binary: fixtures::get_pool_wasm().to_vec(),
         cellpack: Cellpack {
-            target: AlkaneId {
-                block: 3,
-                tx: AMM_FACTORY_ID,
-            },
+            target: AlkaneId { block: 3, tx: AMM_FACTORY_ID },
             inputs: vec![50], // Deployment marker
         },
     }];
@@ -93,10 +86,7 @@ pub fn deploy_amm_infrastructure(
     let auth_cellpack = vec![BinaryAndCellpack {
         binary: fixtures::get_auth_token_wasm().to_vec(),
         cellpack: Cellpack {
-            target: AlkaneId {
-                block: 3,
-                tx: AUTH_TOKEN_FACTORY_ID,
-            },
+            target: AlkaneId { block: 3, tx: AUTH_TOKEN_FACTORY_ID },
             inputs: vec![100], // Deployment marker
         },
     }];
@@ -110,10 +100,7 @@ pub fn deploy_amm_infrastructure(
     let factory_cellpack = vec![BinaryAndCellpack {
         binary: fixtures::get_factory_wasm().to_vec(),
         cellpack: Cellpack {
-            target: AlkaneId {
-                block: 3,
-                tx: AMM_FACTORY_LOGIC_IMPL_TX,
-            },
+            target: AlkaneId { block: 3, tx: AMM_FACTORY_LOGIC_IMPL_TX },
             inputs: vec![50], // Deployment marker
         },
     }];
@@ -128,10 +115,7 @@ pub fn deploy_amm_infrastructure(
     let beacon_proxy_cellpack = vec![BinaryAndCellpack {
         binary: fixtures::get_beacon_proxy_wasm().to_vec(),
         cellpack: Cellpack {
-            target: AlkaneId {
-                block: 3,
-                tx: POOL_BEACON_PROXY_TX,
-            },
+            target: AlkaneId { block: 3, tx: POOL_BEACON_PROXY_TX },
             inputs: vec![0x8fff], // Beacon proxy marker
         },
     }];
@@ -146,10 +130,7 @@ pub fn deploy_amm_infrastructure(
     let upgradeable_beacon_cellpack = vec![BinaryAndCellpack {
         binary: fixtures::get_upgradeable_beacon_wasm().to_vec(),
         cellpack: Cellpack {
-            target: AlkaneId {
-                block: 3,
-                tx: POOL_UPGRADEABLE_BEACON_TX,
-            },
+            target: AlkaneId { block: 3, tx: POOL_UPGRADEABLE_BEACON_TX },
             inputs: vec![
                 0x7fff,         // Upgradeable beacon marker
                 4,              // pool_template.block (deployed at start_height)
@@ -167,26 +148,14 @@ pub fn deploy_amm_infrastructure(
 
     let deployment = AmmDeployment {
         factory_proxy_id: AlkaneId { block: 0, tx: 0 }, // Will be set after proxy deployment
-        factory_logic_id: AlkaneId {
-            block: start_height as u128,
-            tx: AMM_FACTORY_LOGIC_IMPL_TX,
-        },
-        pool_template_id: AlkaneId {
-            block: start_height as u128,
-            tx: AMM_FACTORY_ID,
-        },
-        pool_beacon_proxy_id: AlkaneId {
-            block: start_height as u128,
-            tx: POOL_BEACON_PROXY_TX,
-        },
+        factory_logic_id: AlkaneId { block: start_height as u128, tx: AMM_FACTORY_LOGIC_IMPL_TX },
+        pool_template_id: AlkaneId { block: start_height as u128, tx: AMM_FACTORY_ID },
+        pool_beacon_proxy_id: AlkaneId { block: start_height as u128, tx: POOL_BEACON_PROXY_TX },
         pool_upgradeable_beacon_id: AlkaneId {
             block: start_height as u128,
             tx: POOL_UPGRADEABLE_BEACON_TX,
         },
-        auth_token_factory_id: AlkaneId {
-            block: start_height as u128,
-            tx: AUTH_TOKEN_FACTORY_ID,
-        },
+        auth_token_factory_id: AlkaneId { block: start_height as u128, tx: AUTH_TOKEN_FACTORY_ID },
         factory_auth_token_id: AlkaneId { block: 0, tx: 0 }, // Will be determined after initialization
         blocks,
     };
@@ -214,10 +183,7 @@ pub fn deploy_factory_proxy(
         BinaryAndCellpack {
             binary: fixtures::get_upgradeable_proxy_wasm().to_vec(),
             cellpack: Cellpack {
-                target: AlkaneId {
-                    block: 3,
-                    tx: AMM_FACTORY_PROXY_TX,
-                },
+                target: AlkaneId { block: 3, tx: AMM_FACTORY_PROXY_TX },
                 inputs: vec![
                     0x7fff, // Upgradeable proxy marker
                     deployment.factory_logic_id.block,
@@ -228,13 +194,10 @@ pub fn deploy_factory_proxy(
         },
         // 2. Initialize the factory (via proxy) - SAME transaction batch
         BinaryAndCellpack::cellpack_only(Cellpack {
-            target: AlkaneId {
-                block: block_height as u128,
-                tx: AMM_FACTORY_PROXY_TX,
-            },
+            target: AlkaneId { block: block_height as u128, tx: AMM_FACTORY_PROXY_TX },
             inputs: vec![
-                0,                                              // InitFactory opcode
-                POOL_BEACON_PROXY_TX,                           // pool_factory_id for cloning
+                0,                                           // InitFactory opcode
+                POOL_BEACON_PROXY_TX,                        // pool_factory_id for cloning
                 deployment.pool_upgradeable_beacon_id.block, // beacon_id.block
                 deployment.pool_upgradeable_beacon_id.tx,    // beacon_id.tx
             ],
@@ -243,28 +206,16 @@ pub fn deploy_factory_proxy(
 
     // Get a dummy outpoint for chaining
     let dummy_block = protorune::test_helpers::create_block_with_coinbase_tx(block_height);
-    let input_outpoint = OutPoint {
-        txid: dummy_block.txdata[0].compute_txid(),
-        vout: 0,
-    };
+    let input_outpoint = OutPoint { txid: dummy_block.txdata[0].compute_txid(), vout: 0 };
 
     let test_block = init_with_cellpack_pairs_w_input(cellpack_pairs, input_outpoint);
     runtime.index_block(&test_block, block_height)?;
 
-    let factory_proxy_id = AlkaneId {
-        block: block_height as u128,
-        tx: AMM_FACTORY_PROXY_TX,
-    };
+    let factory_proxy_id = AlkaneId { block: block_height as u128, tx: AMM_FACTORY_PROXY_TX };
 
-    let factory_auth_token_id = AlkaneId {
-        block: 2,
-        tx: auth_sequence,
-    };
+    let factory_auth_token_id = AlkaneId { block: 2, tx: auth_sequence };
 
-    println!(
-        "[AMM] Factory proxy deployed and initialized: {:?}",
-        factory_proxy_id
-    );
+    println!("[AMM] Factory proxy deployed and initialized: {:?}", factory_proxy_id);
     println!("[AMM] Factory auth token: {:?}", factory_auth_token_id);
 
     Ok((test_block, factory_proxy_id, factory_auth_token_id))
@@ -350,14 +301,14 @@ fn init_with_cellpack_pairs_w_input(
         });
 
         // Create a Runestone with a Protostone containing the cellpack
-        use protorune_support::protostone::{Protostone, Protostones};
         use ordinals::Runestone;
+        use protorune_support::protostone::{Protostone, Protostones};
 
         let protostone = Protostone {
             burn: None,
             message: pair.cellpack.encipher(),
             edicts: vec![],
-            refund: Some(0), // Refund to output 0 (the regular output) on error
+            refund: Some(0),  // Refund to output 0 (the regular output) on error
             pointer: Some(0), // Pointer to output 0 (where alkanes/runes go on success)
             from: None,
             protocol_tag: 1, // Alkanes protocol tag
@@ -390,10 +341,7 @@ fn init_with_cellpack_pairs_w_input(
                     script_pubkey: ScriptBuf::new(),
                 },
                 // OP_RETURN output SECOND (index 1)
-                TxOut {
-                    value: Amount::ZERO,
-                    script_pubkey: runestone_script,
-                },
+                TxOut { value: Amount::ZERO, script_pubkey: runestone_script },
             ],
         };
 
@@ -410,12 +358,8 @@ fn init_with_cellpack_pairs_w_input(
         nonce: 0,
     };
 
-    Block {
-        header,
-        txdata: transactions,
-    }
+    Block { header, txdata: transactions }
 }
 
 // WASM getters have been moved to fixtures.rs for better organization
 // They are now loaded via include_bytes! from test_data/ directory
-

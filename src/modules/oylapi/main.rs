@@ -99,16 +99,10 @@ impl EspoModule for OylApi {
             .as_ref()
             .expect("oylapi module missing essentials provider")
             .clone();
-        let ammdata = self
-            .ammdata
-            .as_ref()
-            .expect("oylapi module missing ammdata provider")
-            .clone();
-        let subfrost = self
-            .subfrost
-            .as_ref()
-            .expect("oylapi module missing subfrost provider")
-            .clone();
+        let ammdata =
+            self.ammdata.as_ref().expect("oylapi module missing ammdata provider").clone();
+        let subfrost =
+            self.subfrost.as_ref().expect("oylapi module missing subfrost provider").clone();
 
         let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
             .parse()
@@ -136,9 +130,7 @@ impl EspoModule for OylApi {
 
     fn set_config(&mut self, config: &serde_json::Value) -> Result<()> {
         if get_config().electrs_esplora_url.is_none() {
-            return Err(anyhow!(
-                "oylapi requires electrs_esplora_url (script-hash UTXO support)"
-            ));
+            return Err(anyhow!("oylapi requires electrs_esplora_url (script-hash UTXO support)"));
         }
         let parsed = OylApiConfig::from_value(config)?;
         self.config = Some(parsed);

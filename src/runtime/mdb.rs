@@ -36,12 +36,7 @@ impl Mdb {
         let namespace_label = label.unwrap_or_else(|| {
             String::from_utf8(prefix_vec.clone()).unwrap_or_else(|_| hex::encode(&prefix_vec))
         });
-        Self {
-            db,
-            prefix: prefix_vec,
-            namespace_label,
-            aof,
-        }
+        Self { db, prefix: prefix_vec, namespace_label, aof }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {

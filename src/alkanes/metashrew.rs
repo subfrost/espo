@@ -18,26 +18,18 @@ use protorune_support::balance_sheet::ProtoruneRuneId;
 use protorune_support::utils::consensus_encode;
 use rocksdb::{Direction, IteratorMode};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 fn try_decode_trace_prost(raw: &[u8]) -> Option<AlkanesTrace> {
     AlkanesTrace::decode(raw).ok().or_else(|| {
-        if raw.len() >= 4 {
-            AlkanesTrace::decode(&raw[..raw.len() - 4]).ok()
-        } else {
-            None
-        }
+        if raw.len() >= 4 { AlkanesTrace::decode(&raw[..raw.len() - 4]).ok() } else { None }
     })
 }
 
 fn try_decode_trace_event_prost(raw: &[u8]) -> Option<AlkanesTraceEvent> {
     AlkanesTraceEvent::decode(raw).ok().or_else(|| {
-        if raw.len() >= 4 {
-            AlkanesTraceEvent::decode(&raw[..raw.len() - 4]).ok()
-        } else {
-            None
-        }
+        if raw.len() >= 4 { AlkanesTraceEvent::decode(&raw[..raw.len() - 4]).ok() } else { None }
     })
 }
 
@@ -290,12 +282,12 @@ impl<'a> RuneTableNative<'a> {
             HEIGHT_TO_BLOCKHASH: root.keyword("/runes/null"),
             BLOCKHASH_TO_HEIGHT: root.keyword("/runes/null"),
             HEIGHT_TO_RUNE_ID: root.keyword(format!("/runes/proto/{tag}/byheight/").as_str()),
-            RUNE_ID_TO_INITIALIZED: root.keyword(format!("/runes/proto/{tag}/initialized/").as_str()),
+            RUNE_ID_TO_INITIALIZED: root
+                .keyword(format!("/runes/proto/{tag}/initialized/").as_str()),
             OUTPOINT_TO_RUNES: root.keyword(format!("/runes/proto/{tag}/byoutpoint/").as_str()),
             OUTPOINT_TO_HEIGHT: root.keyword("/runes/null"),
-            HEIGHT_TO_TRANSACTION_IDS: root.keyword(
-                format!("/runes/proto/{tag}/txids/byheight").as_str(),
-            ),
+            HEIGHT_TO_TRANSACTION_IDS: root
+                .keyword(format!("/runes/proto/{tag}/txids/byheight").as_str()),
             SYMBOL: root.keyword(format!("/runes/proto/{tag}/symbol/").as_str()),
             CAP: root.keyword(format!("/runes/proto/{tag}/cap/").as_str()),
             SPACERS: root.keyword(format!("/runes/proto/{tag}/spaces/").as_str()),
@@ -309,12 +301,10 @@ impl<'a> RuneTableNative<'a> {
             DIVISIBILITY: root.keyword(format!("/runes/proto/{tag}/divisibility/").as_str()),
             RUNE_ID_TO_HEIGHT: root.keyword("/rune/null"),
             ETCHINGS: root.keyword(format!("/runes/proto/{tag}/names").as_str()),
-            RUNE_ID_TO_ETCHING: root.keyword(
-                format!("/runes/proto/{tag}/etching/byruneid/").as_str(),
-            ),
-            ETCHING_TO_RUNE_ID: root.keyword(
-                format!("/runes/proto/{tag}/runeid/byetching/").as_str(),
-            ),
+            RUNE_ID_TO_ETCHING: root
+                .keyword(format!("/runes/proto/{tag}/etching/byruneid/").as_str()),
+            ETCHING_TO_RUNE_ID: root
+                .keyword(format!("/runes/proto/{tag}/runeid/byetching/").as_str()),
             RUNTIME_BALANCE: root.keyword(format!("/runes/proto/{tag}/runtime/balance").as_str()),
             INTERNAL_MINT: root.keyword(format!("/runes/proto/{tag}/mint/isinternal").as_str()),
             TXID_TO_TXINDEX: root.keyword("/txindex/byid"),
@@ -398,11 +388,7 @@ impl MetashrewAdapter {
 
     fn latest_version_ptr<'a>(&self, base: &SdbPointer<'a>) -> Option<SdbPointer<'a>> {
         let len = base.length();
-        if len == 0 {
-            None
-        } else {
-            Some(base.select_index(len.saturating_sub(1)))
-        }
+        if len == 0 { None } else { Some(base.select_index(len.saturating_sub(1))) }
     }
 
     fn load_wasm_inner(
@@ -427,9 +413,8 @@ impl MetashrewAdapter {
         }
 
         if payload.len() == 32 {
-            let alias = SupportAlkaneId::try_from(payload.as_ref().clone()).map_err(|e| {
-                anyhow!("decode alkane alias for ({}, {}): {e}", id.block, id.tx)
-            })?;
+            let alias = SupportAlkaneId::try_from(payload.as_ref().clone())
+                .map_err(|e| anyhow!("decode alkane alias for ({}, {}): {e}", id.block, id.tx))?;
             return self.load_wasm_inner(ptr, alias, seen, hops + 1);
         }
 
@@ -548,11 +533,8 @@ impl MetashrewAdapter {
         let mut out: Vec<PartialEspoTrace> = Vec::new();
         for (outpoint, fallback) in traces_by_outpoint {
             let trace_bytes = traces.TRACES_NATIVE.select(&outpoint).get();
-            let trace = if !trace_bytes.is_empty() {
-                decode_trace_blob(&trace_bytes)
-            } else {
-                fallback
-            };
+            let trace =
+                if !trace_bytes.is_empty() { decode_trace_blob(&trace_bytes) } else { fallback };
             if let Some(trace) = trace {
                 out.push(PartialEspoTrace { protobuf_trace: trace, outpoint });
             }
@@ -569,7 +551,8 @@ impl MetashrewAdapter {
         height: Option<u64>,
     ) -> Result<Option<u128>> {
         let root = self.root_ptr(db);
-        let what_id = SupportAlkaneId { block: what_alkane.block as u128, tx: what_alkane.tx as u128 };
+        let what_id =
+            SupportAlkaneId { block: what_alkane.block as u128, tx: what_alkane.tx as u128 };
         let who_id = SupportAlkaneId { block: who_alkane.block as u128, tx: who_alkane.tx as u128 };
         let what_bytes: Vec<u8> = (&what_id).into();
         let who_bytes: Vec<u8> = (&who_id).into();
@@ -744,11 +727,7 @@ impl MetashrewAdapter {
         let sheet = BalanceSheet::new_ptr_backed(ptr);
         let rune_id: ProtoruneRuneId = (*id).into();
         let balance = sheet.load_balance(&rune_id);
-        if balance == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(balance))
-        }
+        if balance == 0 { Ok(None) } else { Ok(Some(balance)) }
     }
 
     pub fn traces_for_block_as_prost(&self, block: u64) -> Result<Vec<PartialEspoTrace>> {
@@ -765,10 +744,7 @@ impl MetashrewAdapter {
         db.catch_up_now().context("metashrew catch_up before scanning traces")?;
         let root = self.root_ptr(db);
         let traces = TraceTablesNative::new(&root);
-        let outpoints = traces
-            .TRACES_BY_HEIGHT_NATIVE
-            .select_value(block)
-            .get_list();
+        let outpoints = traces.TRACES_BY_HEIGHT_NATIVE.select_value(block).get_list();
         let list_len = outpoints.len();
 
         let mut missing_trace_blobs = 0usize;

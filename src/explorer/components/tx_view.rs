@@ -16,17 +16,17 @@ use crate::explorer::consts::{
     ALKANE_CONTRACT_ICON_BASE, ALKANE_TOKEN_ICON_BASE, alkane_contract_name_overrides,
     alkane_factory_icon_blacklist, alkane_icon_overrides, alkane_name_overrides,
 };
-use crate::explorer::paths::explorer_path;
 use crate::explorer::pages::common::{fmt_alkane_amount, fmt_amount};
+use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{BalanceEntry, EssentialsProvider, load_creation_record};
 use crate::modules::essentials::utils::balances::OutpointLookup;
 use crate::modules::essentials::utils::inspections::{StoredInspectionResult, load_inspection};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
-use std::sync::Arc;
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
 
@@ -115,14 +115,8 @@ const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
 const KV_KEY_BEACON: &[u8] = b"/beacon";
 const UPGRADEABLE_METHODS: [(&str, u128); 2] = [("initialize", 32767), ("forward", 36863)];
 const TOKEN_METHOD_OPCODES: [u128; 6] = [99, 100, 101, 102, 103, 104];
-const TOKEN_METHOD_NAMES: [&str; 6] = [
-    "get_name",
-    "get_symbol",
-    "get_total_supply",
-    "get_cap",
-    "get_minted",
-    "get_value_per_mint",
-];
+const TOKEN_METHOD_NAMES: [&str; 6] =
+    ["get_name", "get_symbol", "get_total_supply", "get_cap", "get_minted", "get_value_per_mint"];
 
 fn decode_op_return_payload(spk: &ScriptBuf) -> Option<OpReturnDecoded> {
     let mut instructions = spk.instructions();
@@ -319,16 +313,13 @@ fn kv_implementation_value(
     }
     let mut meta = cache.get(alk).cloned().unwrap_or_default();
     let lookup = |key| {
-        mdb.get(&kv_row_key(alk, key))
-            .ok()
-            .flatten()
-            .and_then(|raw| {
-                if raw.len() >= 32 {
-                    decode_kv_implementation(&raw[32..])
-                } else {
-                    decode_kv_implementation(&raw)
-                }
-            })
+        mdb.get(&kv_row_key(alk, key)).ok().flatten().and_then(|raw| {
+            if raw.len() >= 32 {
+                decode_kv_implementation(&raw[32..])
+            } else {
+                decode_kv_implementation(&raw)
+            }
+        })
     };
     let implementation = lookup(KV_KEY_IMPLEMENTATION).or_else(|| lookup(KV_KEY_BEACON));
     meta.implementation = Some(implementation);
@@ -365,11 +356,9 @@ fn is_token_contract(inspection: Option<&StoredInspectionResult>) -> bool {
     if has_all_opcodes {
         return true;
     }
-    TOKEN_METHOD_NAMES.iter().all(|name| {
-        meta.methods
-            .iter()
-            .any(|m| m.name.eq_ignore_ascii_case(name))
-    })
+    TOKEN_METHOD_NAMES
+        .iter()
+        .all(|name| meta.methods.iter().any(|m| m.name.eq_ignore_ascii_case(name)))
 }
 
 fn contract_name_override(id: &SchemaAlkaneId) -> Option<String> {

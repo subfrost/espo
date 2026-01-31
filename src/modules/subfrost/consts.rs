@@ -1,5 +1,5 @@
-use bitcoin::Network;
 use crate::schemas::SchemaAlkaneId;
+use bitcoin::Network;
 
 pub const KEY_INDEX_HEIGHT: &[u8] = b"/index_height";
 

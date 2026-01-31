@@ -12,9 +12,7 @@ use std::sync::Arc;
 #[test]
 fn test_chain_builder_basic() {
     // Build a chain with blocks (add_blocks adds to genesis, so 10 -> 11 total)
-    let blocks = ChainBuilder::new()
-        .add_blocks(10)
-        .build();
+    let blocks = ChainBuilder::new().add_blocks(10).build();
 
     assert_eq!(blocks.len(), 11); // genesis + 10 blocks
 
@@ -29,9 +27,7 @@ fn test_mock_node_basic() {
     let mut node = MockBitcoinNode::new();
 
     // Build initial chain (genesis + 20 = 21 blocks, heights 0-20)
-    let blocks = ChainBuilder::new()
-        .add_blocks(20)
-        .build();
+    let blocks = ChainBuilder::new().add_blocks(20).build();
 
     node.set_chain(blocks.clone());
 
@@ -50,9 +46,7 @@ fn test_mock_node_reorg() {
     let mut node = MockBitcoinNode::new();
 
     // Build initial chain (genesis + 10 = 11 blocks, heights 0-10)
-    let blocks = ChainBuilder::new()
-        .add_blocks(10)
-        .build();
+    let blocks = ChainBuilder::new().add_blocks(10).build();
 
     node.set_chain(blocks.clone());
 
@@ -61,10 +55,10 @@ fn test_mock_node_reorg() {
     // Create alternative chain that forks at height 5
     // Build to height 5 (6 blocks), then fork back 1 block to height 4, then build 6 more
     let fork_blocks = ChainBuilder::new()
-        .add_blocks(5)  // Heights 0-5 (6 blocks)
-        .fork(1)        // Go back to height 4 (truncate to 5 blocks)
-        .with_salt(1)   // Different hashes for subsequent blocks
-        .add_blocks(6)  // Add 6 more blocks: heights 5-10
+        .add_blocks(5) // Heights 0-5 (6 blocks)
+        .fork(1) // Go back to height 4 (truncate to 5 blocks)
+        .with_salt(1) // Different hashes for subsequent blocks
+        .add_blocks(6) // Add 6 more blocks: heights 5-10
         .build();
 
     // Extract blocks from height 5 onwards (the forked portion)

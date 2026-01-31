@@ -1,9 +1,9 @@
-use bitcoin::{
-    block::{Header, Version},
-    hashes::{sha256d, Hash},
-    Block, BlockHash, CompactTarget, Transaction, TxIn, TxOut, TxMerkleNode, Witness,
-};
 use bitcoin::script::ScriptBuf;
+use bitcoin::{
+    Block, BlockHash, CompactTarget, Transaction, TxIn, TxMerkleNode, TxOut, Witness,
+    block::{Header, Version},
+    hashes::{Hash, sha256d},
+};
 
 /// Builder for creating test blockchain sequences
 pub struct ChainBuilder {
@@ -16,10 +16,7 @@ impl ChainBuilder {
     pub fn new() -> Self {
         let genesis = Self::create_regtest_genesis();
 
-        Self {
-            blocks: vec![genesis],
-            salt: 0,
-        }
+        Self { blocks: vec![genesis], salt: 0 }
     }
 
     /// Add a specified number of blocks to the chain
@@ -76,10 +73,7 @@ impl ChainBuilder {
             nonce: 2,
         };
 
-        Block {
-            header,
-            txdata: vec![coinbase_tx],
-        }
+        Block { header, txdata: vec![coinbase_tx] }
     }
 
     /// Create the next block in the chain
@@ -103,10 +97,7 @@ impl ChainBuilder {
             nonce: height + self.salt as u32,
         };
 
-        Block {
-            header,
-            txdata: vec![coinbase_tx],
-        }
+        Block { header, txdata: vec![coinbase_tx] }
     }
 
     /// Create a coinbase transaction
@@ -142,7 +133,8 @@ impl ChainBuilder {
             return TxMerkleNode::all_zeros();
         }
 
-        let mut hashes: Vec<TxMerkleNode> = txs.iter()
+        let mut hashes: Vec<TxMerkleNode> = txs
+            .iter()
             .map(|tx| {
                 let txid = tx.compute_txid();
                 TxMerkleNode::from_byte_array(txid.to_byte_array())
@@ -189,26 +181,19 @@ mod tests {
 
     #[test]
     fn test_chain_builder_basic() {
-        let chain = ChainBuilder::new()
-            .add_blocks(10)
-            .build();
+        let chain = ChainBuilder::new().add_blocks(10).build();
 
         assert_eq!(chain.len(), 11); // Genesis + 10 blocks
 
         // Verify chain linkage
         for i in 1..chain.len() {
-            assert_eq!(
-                chain[i].header.prev_blockhash,
-                chain[i - 1].block_hash()
-            );
+            assert_eq!(chain[i].header.prev_blockhash, chain[i - 1].block_hash());
         }
     }
 
     #[test]
     fn test_chain_fork() {
-        let main_chain = ChainBuilder::new()
-            .add_blocks(10)
-            .build();
+        let main_chain = ChainBuilder::new().add_blocks(10).build();
 
         let fork_chain = ChainBuilder::new()
             .add_blocks(10)
@@ -219,18 +204,12 @@ mod tests {
 
         // Fork chain should have same blocks up to fork point
         for i in 0..=5 {
-            assert_eq!(
-                main_chain[i].block_hash(),
-                fork_chain[i].block_hash()
-            );
+            assert_eq!(main_chain[i].block_hash(), fork_chain[i].block_hash());
         }
 
         // After fork point, blocks should be different
         if fork_chain.len() > 6 {
-            assert_ne!(
-                main_chain[6].block_hash(),
-                fork_chain[6].block_hash()
-            );
+            assert_ne!(main_chain[6].block_hash(), fork_chain[6].block_hash());
         }
     }
 

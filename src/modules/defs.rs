@@ -173,12 +173,7 @@ impl ModuleRegistry {
             }
         } else if name == "essentials" {
             panic!("ModuleRegistry requires essentials to be registered before any other modules");
-        } else if self
-            .modules
-            .first()
-            .map(|m| m.get_name() != "essentials")
-            .unwrap_or(true)
-        {
+        } else if self.modules.first().map(|m| m.get_name() != "essentials").unwrap_or(true) {
             panic!("ModuleRegistry requires essentials to be registered first");
         }
 

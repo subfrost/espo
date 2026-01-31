@@ -8,19 +8,19 @@ use crate::modules::essentials::utils::balances::{
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
-use bitcoin::{Address, Network, ScriptBuf, Txid};
 use bitcoin::hashes::Hash;
+use bitcoin::{Address, Network, ScriptBuf, Txid};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 
-use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use crate::runtime::mempool::{
     MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
 };
+use anyhow::{Result, anyhow};
+use hex;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, RwLock};
-use hex;
 
 #[derive(Clone)]
 pub struct MdbPointer<'a> {
@@ -72,7 +72,9 @@ impl<'a> MdbPointer<'a> {
     }
 
     pub fn scan_prefix(&self) -> Result<Vec<Vec<u8>>> {
-        self.mdb.scan_prefix(&self.key).map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
+        self.mdb
+            .scan_prefix(&self.key)
+            .map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -288,10 +290,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn alkane_balance_txs_by_height_key(&self, height: u32) -> Vec<u8> {
-        self.ALKANE_BALANCE_TXS_BY_HEIGHT
-            .select(&height.to_be_bytes())
-            .key()
-            .to_vec()
+        self.ALKANE_BALANCE_TXS_BY_HEIGHT.select(&height.to_be_bytes()).key().to_vec()
     }
 
     pub fn alkane_balance_txs_by_token_key(
@@ -454,10 +453,7 @@ impl<'a> EssentialsTable<'a> {
         ))
     }
 
-    pub fn parse_alkane_holders_ordered_key(
-        &self,
-        key: &[u8],
-    ) -> Option<(u64, SchemaAlkaneId)> {
+    pub fn parse_alkane_holders_ordered_key(&self, key: &[u8]) -> Option<(u64, SchemaAlkaneId)> {
         let prefix = self.HOLDERS_ORDERED.key();
         if !key.starts_with(prefix) {
             return None;
@@ -644,13 +640,18 @@ impl EssentialsProvider {
     }
 
     pub fn get_multi_values(&self, params: GetMultiValuesParams) -> Result<GetMultiValuesResult> {
-        let values =
-            self.mdb.multi_get(&params.keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self
+            .mdb
+            .multi_get(&params.keys)
+            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         Ok(GetMultiValuesResult { values })
     }
 
     pub fn get_scan_prefix(&self, params: GetScanPrefixParams) -> Result<GetScanPrefixResult> {
-        let keys = self.mdb.scan_prefix(&params.prefix).map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))?;
+        let keys = self
+            .mdb
+            .scan_prefix(&params.prefix)
+            .map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))?;
         Ok(GetScanPrefixResult { keys })
     }
 
@@ -742,8 +743,7 @@ impl EssentialsProvider {
         let table = self.table();
         let keys: Vec<Vec<u8>> =
             params.alkanes.iter().map(|alk| table.alkane_creation_by_id_key(alk)).collect();
-        let values =
-            self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         let mut records = Vec::with_capacity(values.len());
         for val in values {
             if let Some(bytes) = val {
@@ -971,9 +971,7 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_holders_count");
         let table = self.table();
         let count = self
-            .get_raw_value(GetRawValueParams {
-                key: table.holders_count_key(&params.alkane),
-            })
+            .get_raw_value(GetRawValueParams { key: table.holders_count_key(&params.alkane) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| HoldersCountEntry::try_from_slice(&raw).ok())
@@ -990,8 +988,7 @@ impl EssentialsProvider {
         let table = self.table();
         let keys: Vec<Vec<u8>> =
             params.alkanes.iter().map(|alk| table.holders_count_key(alk)).collect();
-        let values =
-            self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         let mut counts = Vec::with_capacity(values.len());
         for val in values {
             let count = val
@@ -1079,14 +1076,29 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_latest_total_minted");
         let table = self.table();
         let total_minted = self
-            .get_raw_value(GetRawValueParams {
-                key: table.total_minted_latest_key(&params.alkane),
-            })
+            .get_raw_value(GetRawValueParams { key: table.total_minted_latest_key(&params.alkane) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_u128_value(&raw).ok())
             .unwrap_or(0);
         Ok(GetLatestTotalMintedResult { total_minted })
+    }
+
+    pub fn get_circulating_supply(
+        &self,
+        params: GetCirculatingSupplyParams,
+    ) -> Result<GetCirculatingSupplyResult> {
+        crate::debug_timer_log!("get_circulating_supply");
+        let table = self.table();
+        let supply = self
+            .get_raw_value(GetRawValueParams {
+                key: table.circulating_supply_key(&params.alkane, params.height),
+            })
+            .ok()
+            .and_then(|resp| resp.value)
+            .and_then(|raw| decode_u128_value(&raw).ok())
+            .unwrap_or(0);
+        Ok(GetCirculatingSupplyResult { supply })
     }
 
     pub fn get_alkane_storage_value(
@@ -1168,9 +1180,7 @@ impl EssentialsProvider {
         params: GetMempoolPendingForAddressParams,
     ) -> Result<GetMempoolPendingForAddressResult> {
         crate::debug_timer_log!("get_mempool_pending_for_address");
-        Ok(GetMempoolPendingForAddressResult {
-            entries: pending_for_address(&params.address),
-        })
+        Ok(GetMempoolPendingForAddressResult { entries: pending_for_address(&params.address) })
     }
 
     pub fn rpc_get_mempool_traces(
@@ -1277,9 +1287,7 @@ impl EssentialsProvider {
             dedup_sort_keys(v)
         } else {
             let scan_pref = table.dir_scan_prefix(&alk);
-            let rel_keys = match self.get_scan_prefix(GetScanPrefixParams {
-                prefix: scan_pref,
-            }) {
+            let rel_keys = match self.get_scan_prefix(GetScanPrefixParams { prefix: scan_pref }) {
                 Ok(v) => v.keys,
                 Err(_) => Vec::new(),
             };
@@ -1329,11 +1337,7 @@ impl EssentialsProvider {
             let key_str_val = utf8_or_null(k);
 
             let top_key = if try_decode_utf8 {
-                if let Value::String(s) = &key_str_val {
-                    s.clone()
-                } else {
-                    key_hex.clone()
-                }
+                if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
             } else {
                 key_hex.clone()
             };
@@ -1373,10 +1377,7 @@ impl EssentialsProvider {
         let offset = limit.saturating_mul(page.saturating_sub(1));
 
         let table = self.table();
-        let total = self
-            .get_creation_count(GetCreationCountParams)
-            .map(|r| r.count)
-            .unwrap_or(0);
+        let total = self.get_creation_count(GetCreationCountParams).map(|r| r.count).unwrap_or(0);
 
         let mut items: Vec<Value> = Vec::new();
         let mut seen: usize = 0;
@@ -1481,14 +1482,12 @@ impl EssentialsProvider {
         let holder_count = get_holders_for_alkane(self, alk, 1, 1)
             .map(|(total, _, _)| total as u64)
             .unwrap_or_else(|_| {
-                self.get_raw_value(GetRawValueParams {
-                    key: table.holders_count_key(&alk),
-                })
-                .ok()
-                .and_then(|resp| resp.value)
-                .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
-                .map(|hc| hc.count)
-                .unwrap_or(0)
+                self.get_raw_value(GetRawValueParams { key: table.holders_count_key(&alk) })
+                    .ok()
+                    .and_then(|resp| resp.value)
+                    .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+                    .map(|hc| hc.count)
+                    .unwrap_or(0)
             });
         let inspection_json = record.inspection.as_ref().map(inspection_to_json);
         let name = record.names.first().cloned();
@@ -1700,6 +1699,57 @@ impl EssentialsProvider {
         })
     }
 
+    pub fn rpc_get_circulating_supply(
+        &self,
+        params: RpcGetCirculatingSupplyParams,
+    ) -> Result<RpcGetCirculatingSupplyResult> {
+        let Some(alk_raw) = params.alkane.as_deref() else {
+            return Ok(RpcGetCirculatingSupplyResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+        let Some(alkane) = parse_alkane_from_str(alk_raw) else {
+            return Ok(RpcGetCirculatingSupplyResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+
+        if params.height_present && params.height.is_none() {
+            return Ok(RpcGetCirculatingSupplyResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        }
+
+        let (supply, height_value) = if params.height_present {
+            let height_val = params.height.unwrap();
+            let height_u32 = match u32::try_from(height_val) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(RpcGetCirculatingSupplyResult {
+                        value: json!({"ok": false, "error": "height_out_of_range"}),
+                    });
+                }
+            };
+            let supply = self
+                .get_circulating_supply(GetCirculatingSupplyParams { alkane, height: height_u32 })?
+                .supply;
+            (supply, json!(height_val))
+        } else {
+            let supply = self
+                .get_latest_circulating_supply(GetLatestCirculatingSupplyParams { alkane })?
+                .supply;
+            (supply, Value::String("latest".to_string()))
+        };
+
+        let mut body = Map::new();
+        body.insert("ok".to_string(), Value::Bool(true));
+        body.insert("alkane".to_string(), Value::String(format!("{}:{}", alkane.block, alkane.tx)));
+        body.insert("supply".to_string(), Value::String(supply.to_string()));
+        body.insert("height".to_string(), height_value);
+
+        Ok(RpcGetCirculatingSupplyResult { value: Value::Object(body) })
+    }
+
     pub fn rpc_get_address_activity(
         &self,
         params: RpcGetAddressActivityParams,
@@ -1727,11 +1777,13 @@ impl EssentialsProvider {
 
         let mut transfer_volume: Map<String, Value> = Map::new();
         for (alk, amt) in activity.transfer_volume {
-            transfer_volume.insert(format!("{}:{}", alk.block, alk.tx), Value::String(amt.to_string()));
+            transfer_volume
+                .insert(format!("{}:{}", alk.block, alk.tx), Value::String(amt.to_string()));
         }
         let mut total_received: Map<String, Value> = Map::new();
         for (alk, amt) in activity.total_received {
-            total_received.insert(format!("{}:{}", alk.block, alk.tx), Value::String(amt.to_string()));
+            total_received
+                .insert(format!("{}:{}", alk.block, alk.tx), Value::String(amt.to_string()));
         }
 
         Ok(RpcGetAddressActivityResult {
@@ -1981,9 +2033,9 @@ impl EssentialsProvider {
             }
         } else {
             let mut txs: Vec<AlkaneBalanceTxEntry> = Vec::new();
-            if let Ok(resp) = self.get_raw_value(GetRawValueParams {
-                key: table.alkane_balance_txs_key(&alk),
-            }) {
+            if let Ok(resp) =
+                self.get_raw_value(GetRawValueParams { key: table.alkane_balance_txs_key(&alk) })
+            {
                 if let Some(bytes) = resp.value {
                     if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
                         txs = list;
@@ -2082,11 +2134,8 @@ impl EssentialsProvider {
                     end_page = max_page;
                 }
                 for page_idx in start_page..=end_page {
-                    let key = table.alkane_balance_txs_by_token_page_key(
-                        &owner,
-                        &token,
-                        page_idx as u64,
-                    );
+                    let key =
+                        table.alkane_balance_txs_by_token_page_key(&owner, &token, page_idx as u64);
                     if let Ok(resp) = self.get_raw_value(GetRawValueParams { key }) {
                         if let Some(bytes) = resp.value {
                             if let Ok(list) = decode_alkane_balance_tx_entries(&bytes) {
@@ -2188,9 +2237,9 @@ impl EssentialsProvider {
         let addr = {
             let pref = table.outpoint_balances_prefix(txid.to_byte_array().as_slice(), vout_u32);
             if let Ok(pref) = pref {
-                if let Ok(keys_resp) = self.get_scan_prefix(GetScanPrefixParams {
-                    prefix: pref.clone(),
-                }) {
+                if let Ok(keys_resp) =
+                    self.get_scan_prefix(GetScanPrefixParams { prefix: pref.clone() })
+                {
                     let keys = keys_resp.keys;
                     if let Some(full_key) = keys.first() {
                         let raw = &full_key[b"/outpoint_balances/".len()..];
@@ -2317,9 +2366,7 @@ impl EssentialsProvider {
         let table = self.table();
         let count: u64 = match HoldersCountEntry::try_from_slice(
             &self
-                .get_raw_value(GetRawValueParams {
-                    key: table.holders_count_key(&alkane),
-                })
+                .get_raw_value(GetRawValueParams { key: table.holders_count_key(&alkane) })
                 .ok()
                 .and_then(|resp| resp.value)
                 .unwrap_or_else(Vec::new),
@@ -2424,8 +2471,7 @@ impl EssentialsProvider {
             sa.cmp(sb)
         });
         outpoints.dedup_by(|a, b| {
-            a.get("outpoint").and_then(|v| v.as_str())
-                == b.get("outpoint").and_then(|v| v.as_str())
+            a.get("outpoint").and_then(|v| v.as_str()) == b.get("outpoint").and_then(|v| v.as_str())
         });
 
         Ok(RpcGetAddressOutpointsResult {
@@ -2457,10 +2503,8 @@ impl EssentialsProvider {
 
         let table = self.table();
         let key = table.alkane_tx_summary_key(&txid.to_byte_array());
-        let Some(bytes) = self
-            .get_raw_value(GetRawValueParams { key })
-            .ok()
-            .and_then(|resp| resp.value)
+        let Some(bytes) =
+            self.get_raw_value(GetRawValueParams { key }).ok().and_then(|resp| resp.value)
         else {
             return Ok(RpcGetAlkaneTxSummaryResult {
                 value: json!({"ok": false, "error": "not_found"}),
@@ -2480,10 +2524,8 @@ impl EssentialsProvider {
         for entry in &summary.outflows {
             let mut outflow_map = Map::new();
             for (alk, delta) in &entry.outflow {
-                outflow_map.insert(
-                    format!("{}:{}", alk.block, alk.tx),
-                    Value::String(delta.to_string()),
-                );
+                outflow_map
+                    .insert(format!("{}:{}", alk.block, alk.tx), Value::String(delta.to_string()));
             }
             outflows_json.push(json!({
                 "txid": Txid::from_byte_array(entry.txid).to_string(),
@@ -2518,9 +2560,7 @@ impl EssentialsProvider {
 
         let table = self.table();
         let total = self
-            .get_raw_value(GetRawValueParams {
-                key: table.alkane_block_len_key(height),
-            })
+            .get_raw_value(GetRawValueParams { key: table.alkane_block_len_key(height) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|b| {
@@ -2601,9 +2641,7 @@ impl EssentialsProvider {
 
         let table = self.table();
         let total = self
-            .get_raw_value(GetRawValueParams {
-                key: table.alkane_address_len_key(&address),
-            })
+            .get_raw_value(GetRawValueParams { key: table.alkane_address_len_key(&address) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|b| {
@@ -2668,9 +2706,7 @@ impl EssentialsProvider {
     ) -> Result<RpcGetAlkaneLatestTracesResult> {
         let table = self.table();
         let list: Vec<[u8; 32]> = self
-            .get_raw_value(GetRawValueParams {
-                key: table.alkane_latest_traces_key(),
-            })
+            .get_raw_value(GetRawValueParams { key: table.alkane_latest_traces_key() })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
@@ -2846,6 +2882,15 @@ pub struct GetHoldersOrderedPageResult {
     pub ids: Vec<SchemaAlkaneId>,
 }
 
+pub struct GetCirculatingSupplyParams {
+    pub alkane: SchemaAlkaneId,
+    pub height: u32,
+}
+
+pub struct GetCirculatingSupplyResult {
+    pub supply: u128,
+}
+
 pub struct GetLatestCirculatingSupplyParams {
     pub alkane: SchemaAlkaneId,
 }
@@ -2979,6 +3024,16 @@ pub struct RpcGetTotalReceivedParams {
 }
 
 pub struct RpcGetTotalReceivedResult {
+    pub value: Value,
+}
+
+pub struct RpcGetCirculatingSupplyParams {
+    pub alkane: Option<String>,
+    pub height: Option<u64>,
+    pub height_present: bool,
+}
+
+pub struct RpcGetCirculatingSupplyResult {
     pub value: Value,
 }
 
@@ -3202,10 +3257,7 @@ static BLOCK_SUMMARY_CACHE: OnceLock<Arc<RwLock<BlockSummaryCache>>> = OnceLock:
 
 fn block_summary_cache() -> &'static Arc<RwLock<BlockSummaryCache>> {
     BLOCK_SUMMARY_CACHE.get_or_init(|| {
-        Arc::new(RwLock::new(BlockSummaryCache {
-            order: VecDeque::new(),
-            map: HashMap::new(),
-        }))
+        Arc::new(RwLock::new(BlockSummaryCache { order: VecDeque::new(), map: HashMap::new() }))
     })
 }
 
@@ -3217,10 +3269,7 @@ pub fn cache_block_summary(height: u32, summary: BlockSummary) {
 
 pub fn get_cached_block_summary(height: u32) -> Option<BlockSummary> {
     crate::debug_timer_log!("get_cached_block_summary");
-    block_summary_cache()
-        .read()
-        .ok()
-        .and_then(|cache| cache.get(height))
+    block_summary_cache().read().ok().and_then(|cache| cache.get(height))
 }
 
 pub fn preload_block_summary_cache(mdb: &Mdb) -> usize {
@@ -3318,11 +3367,7 @@ pub fn decode_alkane_balance_tx_entries(bytes: &[u8]) -> Result<Vec<AlkaneBalanc
     let legacy: Vec<[u8; 32]> = Vec::<[u8; 32]>::try_from_slice(bytes)?;
     Ok(legacy
         .into_iter()
-        .map(|txid| AlkaneBalanceTxEntry {
-            txid,
-            height: 0,
-            outflow: BTreeMap::new(),
-        })
+        .map(|txid| AlkaneBalanceTxEntry { txid, height: 0, outflow: BTreeMap::new() })
         .collect())
 }
 

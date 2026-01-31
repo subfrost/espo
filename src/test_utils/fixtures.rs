@@ -49,12 +49,12 @@ pub fn get_upgradeable_proxy_wasm() -> &'static [u8] {
 
 /// Check if all AMM WASM files are available
 pub fn has_amm_wasms() -> bool {
-    !get_factory_wasm().is_empty() &&
-    !get_pool_wasm().is_empty() &&
-    !get_auth_token_wasm().is_empty() &&
-    !get_beacon_proxy_wasm().is_empty() &&
-    !get_upgradeable_beacon_wasm().is_empty() &&
-    !get_upgradeable_proxy_wasm().is_empty()
+    !get_factory_wasm().is_empty()
+        && !get_pool_wasm().is_empty()
+        && !get_auth_token_wasm().is_empty()
+        && !get_beacon_proxy_wasm().is_empty()
+        && !get_upgradeable_beacon_wasm().is_empty()
+        && !get_upgradeable_proxy_wasm().is_empty()
 }
 
 #[cfg(test)]

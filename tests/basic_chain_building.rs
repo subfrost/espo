@@ -9,9 +9,7 @@ use espo::test_utils::{ChainBuilder, MockBitcoinNode};
 #[test]
 fn test_build_simple_chain() {
     // Build a simple chain with 10 blocks
-    let blocks = ChainBuilder::new()
-        .add_blocks(10)
-        .build();
+    let blocks = ChainBuilder::new().add_blocks(10).build();
 
     assert_eq!(blocks.len(), 11); // Genesis + 10 blocks
 
@@ -32,9 +30,7 @@ fn test_mock_node_with_chain() {
     let mut node = MockBitcoinNode::new();
 
     // Build and load a chain
-    let blocks = ChainBuilder::new()
-        .add_blocks(20)
-        .build();
+    let blocks = ChainBuilder::new().add_blocks(20).build();
 
     node.set_chain(blocks.clone());
 
@@ -44,7 +40,8 @@ fn test_mock_node_with_chain() {
 
     // Verify we can retrieve blocks by height
     for (i, expected_block) in blocks.iter().enumerate() {
-        let block = node.get_block_by_height(i as u32)
+        let block = node
+            .get_block_by_height(i as u32)
             .expect(&format!("Block at height {} should exist", i));
 
         assert_eq!(
@@ -61,19 +58,17 @@ fn test_fork_and_reorg_simulation() {
     let mut node = MockBitcoinNode::new();
 
     // Build initial chain
-    let initial_chain = ChainBuilder::new()
-        .add_blocks(10)
-        .build();
+    let initial_chain = ChainBuilder::new().add_blocks(10).build();
 
     node.set_chain(initial_chain.clone());
     let initial_tip = node.get_tip_hash().unwrap();
 
     // Create a fork at height 5
     let fork_chain = ChainBuilder::new()
-        .add_blocks(5)  // Build up to height 5
-        .fork(1)        // Go back to height 4
-        .with_salt(1)   // Use different salt for different hashes
-        .add_blocks(8)  // Build longer alternative chain
+        .add_blocks(5) // Build up to height 5
+        .fork(1) // Go back to height 4
+        .with_salt(1) // Use different salt for different hashes
+        .add_blocks(8) // Build longer alternative chain
         .build();
 
     // Extract new blocks from height 5 onwards

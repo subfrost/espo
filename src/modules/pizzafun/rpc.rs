@@ -34,9 +34,7 @@ fn parse_alkane_id(s: &str) -> Option<SchemaAlkaneId> {
 }
 
 fn confirmations_for(creation_height: u32) -> u32 {
-    get_last_safe_tip()
-        .map(|tip| tip.saturating_sub(creation_height))
-        .unwrap_or(0)
+    get_last_safe_tip().map(|tip| tip.saturating_sub(creation_height)).unwrap_or(0)
 }
 
 fn entry_to_json(entry: &SeriesEntry) -> Value {
@@ -66,7 +64,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         {
                             Some(a) => a,
                             None => {
-                                log_rpc("get_series_id_from_alkane_id", "missing_or_invalid_alkane_id");
+                                log_rpc(
+                                    "get_series_id_from_alkane_id",
+                                    "missing_or_invalid_alkane_id",
+                                );
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_alkane_id",
@@ -107,7 +108,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         let ids = match payload.get("alkane_ids").and_then(|v| v.as_array()) {
                             Some(v) => v,
                             None => {
-                                log_rpc("get_series_ids_from_alkane_ids", "missing_or_invalid_alkane_ids");
+                                log_rpc(
+                                    "get_series_ids_from_alkane_ids",
+                                    "missing_or_invalid_alkane_ids",
+                                );
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_alkane_ids",
@@ -135,7 +139,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         let results = match provider.get_series_by_alkanes(&lookup) {
                             Ok(res) => res,
                             Err(e) => {
-                                log_rpc("get_series_ids_from_alkane_ids", &format!("db_error: {e}"));
+                                log_rpc(
+                                    "get_series_ids_from_alkane_ids",
+                                    &format!("db_error: {e}"),
+                                );
                                 return json!({"ok": false, "error": "db_error"});
                             }
                         };
@@ -179,7 +186,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         {
                             Some(s) => s,
                             None => {
-                                log_rpc("get_alkane_id_from_series_id", "missing_or_invalid_series_id");
+                                log_rpc(
+                                    "get_alkane_id_from_series_id",
+                                    "missing_or_invalid_series_id",
+                                );
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_series_id"
@@ -219,7 +229,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         let ids = match payload.get("series_ids").and_then(|v| v.as_array()) {
                             Some(v) => v,
                             None => {
-                                log_rpc("get_alkane_ids_from_series_ids", "missing_or_invalid_series_ids");
+                                log_rpc(
+                                    "get_alkane_ids_from_series_ids",
+                                    "missing_or_invalid_series_ids",
+                                );
                                 return json!({
                                     "ok": false,
                                     "error": "missing_or_invalid_series_ids",
@@ -247,7 +260,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         let results = match provider.get_series_by_ids(&lookup) {
                             Ok(res) => res,
                             Err(e) => {
-                                log_rpc("get_alkane_ids_from_series_ids", &format!("db_error: {e}"));
+                                log_rpc(
+                                    "get_alkane_ids_from_series_ids",
+                                    &format!("db_error: {e}"),
+                                );
                                 return json!({"ok": false, "error": "db_error"});
                             }
                         };

@@ -51,9 +51,7 @@ pub fn fetch_all_pools(
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
     let table = provider.table();
     let pools_snapshot_bytes = provider
-        .get_raw_value(GetRawValueParams {
-            key: table.reserves_snapshot_key(),
-        })?
+        .get_raw_value(GetRawValueParams { key: table.reserves_snapshot_key() })?
         .value
         .ok_or(anyhow!("AMMDATA ERROR: Failed to fetch all pools"))?;
 

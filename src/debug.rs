@@ -19,12 +19,7 @@ impl Drop for DebugTimer {
         if ignore_below != 0 && elapsed_ms < ignore_below {
             return;
         }
-        eprintln!(
-            "[debug] module={} fn={} elapsed_ms={}",
-            self.module,
-            self.name,
-            elapsed_ms
-        );
+        eprintln!("[debug] module={} fn={} elapsed_ms={}", self.module, self.name, elapsed_ms);
     }
 }
 
@@ -40,11 +35,7 @@ macro_rules! debug_timer_log {
 }
 
 pub fn start_if(enabled: bool) -> Option<Instant> {
-    if enabled {
-        Some(Instant::now())
-    } else {
-        None
-    }
+    if enabled { Some(Instant::now()) } else { None }
 }
 
 pub fn log_elapsed(module: &str, section: &str, start: Option<Instant>) {
@@ -54,11 +45,6 @@ pub fn log_elapsed(module: &str, section: &str, start: Option<Instant>) {
         if ignore_below != 0 && elapsed_ms < ignore_below {
             return;
         }
-        eprintln!(
-            "[debug] module={} section={} elapsed_ms={}",
-            module,
-            section,
-            elapsed_ms
-        );
+        eprintln!("[debug] module={} section={} elapsed_ms={}", module, section, elapsed_ms);
     }
 }

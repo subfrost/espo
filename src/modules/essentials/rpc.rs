@@ -1,13 +1,13 @@
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
-    EssentialsProvider, RpcGetAddressBalancesParams, RpcGetAddressOutpointsParams,
-    RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
-    RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams,
-    RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams,
-    RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams,
-    RpcGetBlockSummaryParams, RpcGetBlockTracesParams, RpcGetHoldersCountParams,
+    EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
+    RpcGetAddressOutpointsParams, RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
+    RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
+    RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
+    RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams, RpcGetBlockSummaryParams,
+    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams,
     RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
-    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcGetAddressActivityParams, RpcPingParams,
+    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -51,17 +51,19 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_keys", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_get);
                     async move {
-                        let keys = payload
-                            .get("keys")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect::<Vec<String>>()
-                            });
+                        let keys = payload.get("keys").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<String>>()
+                        });
                         let params = RpcGetKeysParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            try_decode_utf8: payload.get("try_decode_utf8").and_then(|v| v.as_bool()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            try_decode_utf8: payload
+                                .get("try_decode_utf8")
+                                .and_then(|v| v.as_bool()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             keys,
@@ -105,7 +107,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_info);
                     async move {
                         let params = RpcGetAlkaneInfoParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_alkane_info(params)
                             .map(|resp| resp.value)
@@ -145,7 +150,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_holders);
                     async move {
                         let params = RpcGetHoldersParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
@@ -167,7 +175,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_transfer);
                     async move {
                         let params = RpcGetTransferVolumeParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
@@ -189,11 +200,39 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_received);
                     async move {
                         let params = RpcGetTotalReceivedParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         mdb.rpc_get_total_received(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_supply = reg.clone();
+        let mdb_supply = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_supply
+                .register("get_circulating_supply", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_supply);
+                    async move {
+                        let params = RpcGetCirculatingSupplyParams {
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            height: payload.get("height").and_then(|v| v.as_u64()),
+                            height_present: payload.get("height").is_some(),
+                        };
+                        mdb.rpc_get_circulating_supply(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -211,7 +250,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_activity);
                     async move {
                         let params = RpcGetAddressActivityParams {
-                            address: payload.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_address_activity(params)
                             .map(|resp| resp.value)
@@ -231,8 +273,13 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_addr_bal);
                     async move {
                         let params = RpcGetAddressBalancesParams {
-                            address: payload.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            include_outpoints: payload.get("include_outpoints").and_then(|v| v.as_bool()),
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            include_outpoints: payload
+                                .get("include_outpoints")
+                                .and_then(|v| v.as_bool()),
                         };
                         mdb.rpc_get_address_balances(params)
                             .map(|resp| resp.value)
@@ -252,7 +299,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_alk_bal);
                     async move {
                         let params = RpcGetAlkaneBalancesParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_alkane_balances(params)
                             .map(|resp| resp.value)
@@ -273,7 +323,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     async move {
                         let height_present = payload.get("height").is_some();
                         let params = RpcGetAlkaneBalanceMetashrewParams {
-                            owner: payload.get("owner").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            owner: payload
+                                .get("owner")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             target: payload
                                 .get("alkane")
                                 .or_else(|| payload.get("target"))
@@ -300,7 +353,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_bal_txs);
                     async move {
                         let params = RpcGetAlkaneBalanceTxsParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
@@ -322,8 +378,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_bal_txs_tok);
                     async move {
                         let params = RpcGetAlkaneBalanceTxsByTokenParams {
-                            owner: payload.get("owner").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            token: payload.get("token").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            owner: payload
+                                .get("owner")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            token: payload
+                                .get("token")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
@@ -345,7 +407,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_op_bal);
                     async move {
                         let params = RpcGetOutpointBalancesParams {
-                            outpoint: payload.get("outpoint").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            outpoint: payload
+                                .get("outpoint")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_outpoint_balances(params)
                             .map(|resp| resp.value)
@@ -385,7 +450,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_holders_count);
                     async move {
                         let params = RpcGetHoldersCountParams {
-                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            alkane: payload
+                                .get("alkane")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_holders_count(params)
                             .map(|resp| resp.value)
@@ -405,7 +473,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_addr_ops);
                     async move {
                         let params = RpcGetAddressOutpointsParams {
-                            address: payload.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_address_outpoints(params)
                             .map(|resp| resp.value)
@@ -425,7 +496,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_tx_summary);
                     async move {
                         let params = RpcGetAlkaneTxSummaryParams {
-                            txid: payload.get("txid").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            txid: payload
+                                .get("txid")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         mdb.rpc_get_alkane_tx_summary(params)
                             .map(|resp| resp.value)
@@ -467,7 +541,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                     let mdb = Arc::clone(&mdb_addr_txs);
                     async move {
                         let params = RpcGetAlkaneAddressTxsParams {
-                            address: payload.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };

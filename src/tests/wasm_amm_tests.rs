@@ -11,19 +11,19 @@
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
-    use wasm_bindgen_test::*;
-    use anyhow::Result;
+    use crate::test_utils::*;
     use alkanes::vm::utils::sequence_pointer;
     use alkanes_support::cellpack::Cellpack;
     use alkanes_support::id::AlkaneId;
+    use anyhow::Result;
     use metashrew_core::index_pointer::AtomicPointer;
     use metashrew_support::index_pointer::KeyValuePointer;
-    use crate::test_utils::*;
+    use wasm_bindgen_test::*;
 
     fn setup_test_environment() -> Result<()> {
         metashrew_core::clear();
-        
-        use protorune_support::network::{set_network, NetworkParams};
+
+        use protorune_support::network::{NetworkParams, set_network};
         set_network(NetworkParams {
             bech32_prefix: String::from("bcrt"),
             p2pkh_prefix: 0x64,
@@ -117,12 +117,14 @@ mod wasm_tests {
         let create_pool_cellpack = vec![BinaryAndCellpack::cellpack_only(Cellpack {
             target: AlkaneId {
                 block: deployment.factory_proxy_id.block,
-                tx: deployment.factory_proxy_id.tx
+                tx: deployment.factory_proxy_id.tx,
             },
             inputs: vec![
                 1, // CreateNewPool opcode
-                start_height as u128, token1_tx,
-                start_height as u128, token2_tx,
+                start_height as u128,
+                token1_tx,
+                start_height as u128,
+                token2_tx,
                 amount1,
                 amount2,
             ],
@@ -183,12 +185,14 @@ mod wasm_tests {
         let create_pool_cellpack = vec![BinaryAndCellpack::cellpack_only(Cellpack {
             target: AlkaneId {
                 block: deployment.factory_proxy_id.block,
-                tx: deployment.factory_proxy_id.tx
+                tx: deployment.factory_proxy_id.tx,
             },
             inputs: vec![
                 1, // CreateNewPool opcode
-                start_height as u128, token1_tx,
-                start_height as u128, token2_tx,
+                start_height as u128,
+                token1_tx,
+                start_height as u128,
+                token2_tx,
                 amount1,
                 amount2,
             ],
@@ -270,12 +274,14 @@ mod wasm_tests {
         let create_pool_cellpack = vec![BinaryAndCellpack::cellpack_only(Cellpack {
             target: AlkaneId {
                 block: deployment.factory_proxy_id.block,
-                tx: deployment.factory_proxy_id.tx
+                tx: deployment.factory_proxy_id.tx,
             },
             inputs: vec![
                 1, // CreateNewPool opcode
-                start_height as u128, token1_tx,
-                start_height as u128, token2_tx,
+                start_height as u128,
+                token1_tx,
+                start_height as u128,
+                token2_tx,
                 amount1,
                 amount2,
             ],

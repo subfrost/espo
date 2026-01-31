@@ -25,7 +25,8 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                         return json!({ "ok": false, "error": "invalid_address" });
                     };
                     let count = clamp_count(payload.get("count").and_then(|v| v.as_u64()));
-                    let offset = payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let offset =
+                        payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
                     provider
                         .get_wrap_events_by_address(GetWrapEventsByAddressParams {
@@ -55,7 +56,8 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                         return json!({ "ok": false, "error": "invalid_address" });
                     };
                     let count = clamp_count(payload.get("count").and_then(|v| v.as_u64()));
-                    let offset = payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let offset =
+                        payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
                     provider
                         .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
@@ -79,7 +81,8 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                 let provider = Arc::clone(&provider_wrap_all);
                 async move {
                     let count = clamp_count(payload.get("count").and_then(|v| v.as_u64()));
-                    let offset = payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let offset =
+                        payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
                     provider
                         .get_wrap_events_all(GetWrapEventsAllParams {
@@ -102,7 +105,8 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                 let provider = Arc::clone(&provider_unwrap_all);
                 async move {
                     let count = clamp_count(payload.get("count").and_then(|v| v.as_u64()));
-                    let offset = payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let offset =
+                        payload.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                     let successful = payload.get("successful").and_then(|v| v.as_bool());
                     provider
                         .get_unwrap_events_all(GetUnwrapEventsAllParams {

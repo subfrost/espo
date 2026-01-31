@@ -39,7 +39,9 @@ impl<'a> MdbPointer<'a> {
     }
 
     pub fn scan_prefix(&self) -> Result<Vec<Vec<u8>>> {
-        self.mdb.scan_prefix(&self.key).map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
+        self.mdb
+            .scan_prefix(&self.key)
+            .map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -169,7 +171,6 @@ fn decode_u128_value(bytes: &[u8]) -> Option<u128> {
     arr.copy_from_slice(bytes);
     Some(u128::from_be_bytes(arr))
 }
-
 
 #[derive(Clone)]
 pub struct SubfrostProvider {

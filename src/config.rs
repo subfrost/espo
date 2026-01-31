@@ -23,8 +23,8 @@ use std::{
 };
 
 // Bitcoin Core / bitcoin::Network
-use bitcoincore_rpc::bitcoin::Network;
 use crate::bitcoind_flexible::FlexibleBitcoindClient as CoreClient;
+use bitcoincore_rpc::bitcoin::Network;
 
 // Block fetcher (blk files + RPC fallback)
 use crate::core::blockfetcher::{BlkOrRpcBlockSource, BlockFetchMode};
@@ -107,9 +107,7 @@ fn default_block_source_mode() -> String {
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -298,16 +296,16 @@ pub struct CliArgs {
 }
 
 fn load_config_file(path: &str) -> Result<ConfigFile> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file: {path}"))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read config file: {path}"))?;
     serde_json::from_str(&raw).context("failed to parse config JSON")
 }
 
 impl AppConfig {
     fn from_file(file: ConfigFile, view_only: bool) -> Result<Self> {
         let network = parse_network(&file.network)?;
-        let block_source_mode = parse_block_fetch_mode(&file.block_source_mode)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let block_source_mode =
+            parse_block_fetch_mode(&file.block_source_mode).map_err(|e| anyhow::anyhow!(e))?;
         let explorer_base_path = normalize_explorer_base_path(&file.explorer_base_path)?;
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
         let debug_backup = file.debug_backup;
@@ -363,18 +361,16 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
     let db_root = Path::new(&cfg.db_path);
     if !db_root.exists() {
-        fs::create_dir_all(db_root).map_err(|e| {
-            anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path)
-        })?;
+        fs::create_dir_all(db_root)
+            .map_err(|e| anyhow::anyhow!("Failed to create db_path {}: {e}", cfg.db_path))?;
     } else if !db_root.is_dir() {
         anyhow::bail!("db_path is not a directory: {}", cfg.db_path);
     }
 
     let tmp = db_root.join("tmp");
     if !tmp.exists() {
-        fs::create_dir_all(&tmp).map_err(|e| {
-            anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display())
-        })?;
+        fs::create_dir_all(&tmp)
+            .map_err(|e| anyhow::anyhow!("Failed to create tmp dbs dir {}: {e}", tmp.display()))?;
     } else if !tmp.is_dir() {
         anyhow::bail!("Temporary dbs dir is not a directory: {}", tmp.display());
     }
@@ -570,10 +566,7 @@ pub fn get_metashrew_sdb() -> std::sync::Arc<SDB> {
 
 /// Getter for the ESPO module DB path (directory for RocksDB)
 pub fn get_espo_db_path() -> String {
-    Path::new(&get_config().db_path)
-        .join("espo")
-        .to_string_lossy()
-        .into_owned()
+    Path::new(&get_config().db_path).join("espo").to_string_lossy().into_owned()
 }
 
 /// Cloneable handle to the global ESPO RocksDB
@@ -607,11 +600,7 @@ pub fn is_strict_mode() -> bool {
 }
 
 pub fn strict_check_utxos() -> bool {
-    get_config()
-        .strict_mode
-        .as_ref()
-        .map(|cfg| cfg.check_utxos)
-        .unwrap_or(false)
+    get_config().strict_mode.as_ref().map(|cfg| cfg.check_utxos).unwrap_or(false)
 }
 
 pub fn strict_check_alkane_balances() -> bool {

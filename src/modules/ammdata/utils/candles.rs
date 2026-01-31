@@ -2,8 +2,10 @@ use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timeframe};
 use crate::schemas::SchemaAlkaneId;
 
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
+};
 use crate::modules::ammdata::storage::{decode_full_candle_v1, encode_full_candle_v1};
-use crate::modules::ammdata::storage::{AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams};
 use anyhow::Result;
 use std::collections::BTreeMap;
 
@@ -143,9 +145,8 @@ impl CandleCache {
         for (ck, dc_new) in self.map.into_iter() {
             let k = table.candle_key(&ck.pool, ck.tf, ck.bucket_ts);
 
-            let merged = if let Some(raw) = provider
-                .get_raw_value(GetRawValueParams { key: k.clone() })?
-                .value
+            let merged = if let Some(raw) =
+                provider.get_raw_value(GetRawValueParams { key: k.clone() })?.value
             {
                 let existing = decode_full_candle_v1(&raw)?;
 

@@ -14,18 +14,16 @@ use crate::modules::ammdata::storage::{
     GetFactoryPoolsParams, GetIterPrefixRevParams, GetLatestTokenUsdCloseParams,
     GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
     GetPoolDefsParams, GetPoolDetailsSnapshotParams, GetPoolFactoryParams,
-    GetPoolIdsByNamePrefixParams,
-    GetPoolLpSupplyLatestParams, GetPoolMetricsParams, GetPoolMetricsV2Params,
-    GetReservesSnapshotParams, decode_full_candle_v1,
-    GetTokenDerivedMetricsByIdParams, GetTokenDerivedMetricsIndexCountParams,
-    GetTokenDerivedMetricsIndexPageParams, GetTokenDerivedMetricsParams,
-    GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
+    GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
+    GetPoolMetricsV2Params, GetReservesSnapshotParams, GetTokenDerivedMetricsByIdParams,
+    GetTokenDerivedMetricsIndexCountParams, GetTokenDerivedMetricsIndexPageParams,
+    GetTokenDerivedMetricsParams, GetTokenDerivedSearchIndexPageParams, GetTokenMetricsByIdParams,
     GetTokenMetricsIndexCountParams, GetTokenMetricsIndexPageParams, GetTokenMetricsParams,
-    GetTokenPoolsParams, GetTokenSearchIndexPageParams,
-    GetTokenSwapsPageParams, SearchIndexField, TokenMetricsIndexField,
+    GetTokenPoolsParams, GetTokenSearchIndexPageParams, GetTokenSwapsPageParams, SearchIndexField,
+    TokenMetricsIndexField, decode_full_candle_v1,
 };
-use crate::modules::ammdata::utils::pathfinder::plan_exact_in_default_fee;
 use crate::modules::ammdata::utils::candles::bucket_start_for;
+use crate::modules::ammdata::utils::pathfinder::plan_exact_in_default_fee;
 use crate::modules::ammdata::utils::search::normalize_search_text;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetAlkaneIdsByNamePrefixParams, GetAlkaneIdsBySymbolPrefixParams,
@@ -439,18 +437,17 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
                     };
                 }
             } else {
-                ids = match state.ammdata.get_token_search_index_page(
-                    GetTokenSearchIndexPageParams {
+                ids =
+                    match state.ammdata.get_token_search_index_page(GetTokenSearchIndexPageParams {
                         field,
                         prefix: query_norm.clone(),
                         offset: offset as u64,
                         limit: limit as u64,
                         desc,
-                    },
-                ) {
-                    Ok(res) => res.ids,
-                    Err(err) => return internal_error(err),
-                };
+                    }) {
+                        Ok(res) => res.ids,
+                        Err(err) => return internal_error(err),
+                    };
             }
         }
 
@@ -509,12 +506,14 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
         let desc = order.eq_ignore_ascii_case("desc");
         let sort_index = alkane_sort_index(&sort_by);
         total = match sort_index {
-            AlkaneSortIndex::Derived { quote, .. } => match state.ammdata.get_token_derived_metrics_index_count(
-                GetTokenDerivedMetricsIndexCountParams { quote },
-            ) {
-                Ok(res) => res.count as usize,
-                Err(err) => return internal_error(err),
-            },
+            AlkaneSortIndex::Derived { quote, .. } => {
+                match state.ammdata.get_token_derived_metrics_index_count(
+                    GetTokenDerivedMetricsIndexCountParams { quote },
+                ) {
+                    Ok(res) => res.count as usize,
+                    Err(err) => return internal_error(err),
+                }
+            }
             _ => match state.essentials.get_creation_count(GetCreationCountParams) {
                 Ok(res) => res.count as usize,
                 Err(err) => return internal_error(err),
@@ -535,11 +534,9 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
             };
 
             if !ids.is_empty() {
-                let records = match state
-                    .essentials
-                    .get_creation_records_by_id(GetCreationRecordsByIdParams {
-                        alkanes: ids.clone(),
-                    }) {
+                let records = match state.essentials.get_creation_records_by_id(
+                    GetCreationRecordsByIdParams { alkanes: ids.clone() },
+                ) {
                     Ok(res) => res.records,
                     Err(err) => return internal_error(err),
                 };
@@ -634,10 +631,7 @@ pub async fn get_alkane_details(state: &OylApiState, block: &str, tx: &str) -> V
         return error_response(400, "invalid_alkane_id");
     };
 
-    let rec = match state
-        .essentials
-        .get_creation_record(GetCreationRecordParams { alkane })
-    {
+    let rec = match state.essentials.get_creation_record(GetCreationRecordParams { alkane }) {
         Ok(resp) => resp.record,
         Err(err) => return internal_error(err),
     };
@@ -696,10 +690,7 @@ pub async fn get_pools(
         return error_response(400, "invalid_factory_id");
     };
 
-    let pools = match state
-        .ammdata
-        .get_factory_pools(GetFactoryPoolsParams { factory })
-    {
+    let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -742,7 +733,8 @@ pub async fn get_pool_details(
         Ok(res) => match res.factory {
             Some(found) => found == factory,
             None => {
-                let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+                let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory })
+                {
                     Ok(res) => res.pools,
                     Err(err) => return internal_error(err),
                 };
@@ -789,10 +781,7 @@ pub async fn get_address_positions(
         return json!({ "statusCode": 200, "data": [] });
     }
 
-    let pool_ids = match state
-        .ammdata
-        .get_factory_pools(GetFactoryPoolsParams { factory })
-    {
+    let pool_ids = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -885,10 +874,7 @@ pub async fn get_all_pools_details(
     };
 
     let timer = debug::start_if(debug);
-    let mut pools = match state
-        .ammdata
-        .get_factory_pools(GetFactoryPoolsParams { factory })
-    {
+    let mut pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -1221,13 +1207,14 @@ pub async fn get_token_swap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .ammdata
-        .get_token_swaps_page(GetTokenSwapsPageParams { token, offset, limit })
-    {
-        Ok(res) => res,
-        Err(err) => return internal_error(err),
-    };
+    let resp =
+        match state
+            .ammdata
+            .get_token_swaps_page(GetTokenSwapsPageParams { token, offset, limit })
+        {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut swaps = Vec::new();
@@ -1249,13 +1236,11 @@ pub async fn get_token_swap_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-            {
-                Ok(res) => res,
-                Err(err) => return internal_error(err),
-            };
+            let defs_resp =
+                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -1338,13 +1323,11 @@ pub async fn get_pool_mint_history(
         Err(err) => return internal_error(err),
     };
 
-    let lp_supply = match state
-        .ammdata
-        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-    {
-        Ok(res) => res.supply,
-        Err(err) => return internal_error(err),
-    };
+    let lp_supply =
+        match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool }) {
+            Ok(res) => res.supply,
+            Err(err) => return internal_error(err),
+        };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1422,13 +1405,11 @@ pub async fn get_pool_burn_history(
         Err(err) => return internal_error(err),
     };
 
-    let lp_supply = match state
-        .ammdata
-        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })
-    {
-        Ok(res) => res.supply,
-        Err(err) => return internal_error(err),
-    };
+    let lp_supply =
+        match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool }) {
+            Ok(res) => res.supply,
+            Err(err) => return internal_error(err),
+        };
 
     let mut items = Vec::new();
     for entry in resp.entries {
@@ -1504,13 +1485,11 @@ pub async fn get_pool_creation_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-            {
-                Ok(res) => res,
-                Err(err) => return internal_error(err),
-            };
+            let defs_resp =
+                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -1605,25 +1584,23 @@ pub async fn get_address_swap_history_for_pool(
         Err(err) => return internal_error(err),
     };
 
-    let resp = match state
-        .ammdata
-        .get_address_pool_swaps_page(GetAddressPoolSwapsPageParams {
-            address_spk: address_spk.clone(),
-            pool,
-            offset,
-            limit,
-        })
-    {
+    let resp = match state.ammdata.get_address_pool_swaps_page(GetAddressPoolSwapsPageParams {
+        address_spk: address_spk.clone(),
+        pool,
+        offset,
+        limit,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
 
     let mut items = Vec::new();
     for entry in resp.entries {
-        let activity = match state
-            .ammdata
-            .get_activity_entry(GetActivityEntryParams { pool, ts: entry.ts, seq: entry.seq })
-        {
+        let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            pool,
+            ts: entry.ts,
+            seq: entry.seq,
+        }) {
             Ok(res) => match res.entry {
                 Some(v) => v,
                 None => continue,
@@ -1688,15 +1665,12 @@ pub async fn get_address_swap_history_for_token(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .ammdata
-        .get_address_token_swaps_page(GetAddressTokenSwapsPageParams {
-            address_spk: address_spk.clone(),
-            token,
-            offset,
-            limit,
-        })
-    {
+    let resp = match state.ammdata.get_address_token_swaps_page(GetAddressTokenSwapsPageParams {
+        address_spk: address_spk.clone(),
+        token,
+        offset,
+        limit,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -1721,13 +1695,11 @@ pub async fn get_address_swap_history_for_token(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-            {
-                Ok(res) => res,
-                Err(err) => return internal_error(err),
-            };
+            let defs_resp =
+                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -1784,17 +1756,17 @@ pub async fn get_address_pool_creation_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .ammdata
-        .get_address_pool_creations_page(GetAddressPoolCreationsPageParams {
-            address_spk,
-            offset,
-            limit,
-        })
-    {
-        Ok(res) => res,
-        Err(err) => return internal_error(err),
-    };
+    let resp =
+        match state
+            .ammdata
+            .get_address_pool_creations_page(GetAddressPoolCreationsPageParams {
+                address_spk,
+                offset,
+                limit,
+            }) {
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
 
     let mut defs_cache: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
     let mut items = Vec::new();
@@ -1816,13 +1788,11 @@ pub async fn get_address_pool_creation_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-            {
-                Ok(res) => res,
-                Err(err) => return internal_error(err),
-            };
+            let defs_resp =
+                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -1899,10 +1869,11 @@ pub async fn get_address_pool_mint_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .ammdata
-        .get_address_pool_mints_page(GetAddressPoolMintsPageParams { address_spk, offset, limit })
-    {
+    let resp = match state.ammdata.get_address_pool_mints_page(GetAddressPoolMintsPageParams {
+        address_spk,
+        offset,
+        limit,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -1927,13 +1898,11 @@ pub async fn get_address_pool_mint_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-            {
-                Ok(res) => res,
-                Err(err) => return internal_error(err),
-            };
+            let defs_resp =
+                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -1994,10 +1963,11 @@ pub async fn get_address_pool_burn_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .ammdata
-        .get_address_pool_burns_page(GetAddressPoolBurnsPageParams { address_spk, offset, limit })
-    {
+    let resp = match state.ammdata.get_address_pool_burns_page(GetAddressPoolBurnsPageParams {
+        address_spk,
+        offset,
+        limit,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -2022,13 +1992,11 @@ pub async fn get_address_pool_burn_history(
         let defs = if let Some(cached) = defs_cache.get(&entry.pool) {
             *cached
         } else {
-            let defs_resp = match state
-                .ammdata
-                .get_pool_defs(GetPoolDefsParams { pool: entry.pool })
-            {
-                Ok(res) => res,
-                Err(err) => return internal_error(err),
-            };
+            let defs_resp =
+                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                    Ok(res) => res,
+                    Err(err) => return internal_error(err),
+                };
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -2089,14 +2057,12 @@ pub async fn get_address_wrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .subfrost
-        .get_wrap_events_by_address(GetWrapEventsByAddressParams {
-            address_spk: address_spk.clone(),
-            offset,
-            limit,
-            successful,
-        }) {
+    let resp = match state.subfrost.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+        address_spk: address_spk.clone(),
+        offset,
+        limit,
+        successful,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -2140,14 +2106,12 @@ pub async fn get_address_unwrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .subfrost
-        .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
-            address_spk: address_spk.clone(),
-            offset,
-            limit,
-            successful,
-        }) {
+    let resp = match state.subfrost.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+        address_spk: address_spk.clone(),
+        offset,
+        limit,
+        successful,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -2187,9 +2151,11 @@ pub async fn get_all_wrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .subfrost
-        .get_wrap_events_all(GetWrapEventsAllParams { offset, limit, successful }) {
+    let resp = match state.subfrost.get_wrap_events_all(GetWrapEventsAllParams {
+        offset,
+        limit,
+        successful,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -2229,9 +2195,11 @@ pub async fn get_all_unwrap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let resp = match state
-        .subfrost
-        .get_unwrap_events_all(GetUnwrapEventsAllParams { offset, limit, successful }) {
+    let resp = match state.subfrost.get_unwrap_events_all(GetUnwrapEventsAllParams {
+        offset,
+        limit,
+        successful,
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -2313,14 +2281,12 @@ pub async fn get_all_address_amm_tx_history(
     };
 
     if let Some(AmmTxType::Wrap) = tx_type {
-        let resp = match state
-            .subfrost
-            .get_wrap_events_by_address(GetWrapEventsByAddressParams {
-                address_spk: address_spk.clone(),
-                offset,
-                limit,
-                successful: if successful_only { Some(true) } else { None },
-            }) {
+        let resp = match state.subfrost.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+            address_spk: address_spk.clone(),
+            offset,
+            limit,
+            successful: if successful_only { Some(true) } else { None },
+        }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
         };
@@ -2340,17 +2306,16 @@ pub async fn get_all_address_amm_tx_history(
         });
     }
     if let Some(AmmTxType::Unwrap) = tx_type {
-        let resp = match state
-            .subfrost
-            .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+        let resp =
+            match state.subfrost.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
                 address_spk: address_spk.clone(),
                 offset,
                 limit,
                 successful: if successful_only { Some(true) } else { None },
             }) {
-            Ok(res) => res,
-            Err(err) => return internal_error(err),
-        };
+                Ok(res) => res,
+                Err(err) => return internal_error(err),
+            };
         let mut items = Vec::new();
         for entry in resp.entries {
             items.push(wrap_event_to_value(&entry, "unwrap"));
@@ -2415,28 +2380,25 @@ pub async fn get_all_address_amm_tx_history(
         Err(err) => return internal_error(err),
     };
 
-    let wrap_resp = match state
-        .subfrost
-        .get_wrap_events_by_address(GetWrapEventsByAddressParams {
+    let wrap_resp = match state.subfrost.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+        address_spk: address_spk.clone(),
+        offset: 0,
+        limit: combined_limit,
+        successful: if successful_only { Some(true) } else { None },
+    }) {
+        Ok(res) => res,
+        Err(err) => return internal_error(err),
+    };
+    let unwrap_resp =
+        match state.subfrost.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
             address_spk: address_spk.clone(),
             offset: 0,
             limit: combined_limit,
             successful: if successful_only { Some(true) } else { None },
         }) {
-        Ok(res) => res,
-        Err(err) => return internal_error(err),
-    };
-    let unwrap_resp = match state
-        .subfrost
-        .get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
-            address_spk: address_spk.clone(),
-            offset: 0,
-            limit: combined_limit,
-            successful: if successful_only { Some(true) } else { None },
-        }) {
-        Ok(res) => res,
-        Err(err) => return internal_error(err),
-    };
+            Ok(res) => res,
+            Err(err) => return internal_error(err),
+        };
 
     for entry in wrap_resp.entries {
         combined.push(wrap_event_to_history_item(&entry, "wrap"));
@@ -2488,13 +2450,11 @@ pub async fn get_all_amm_tx_history(
     };
 
     if let Some(AmmTxType::Wrap) = tx_type {
-        let resp = match state
-            .subfrost
-            .get_wrap_events_all(GetWrapEventsAllParams {
-                offset,
-                limit,
-                successful: if successful_only { Some(true) } else { None },
-            }) {
+        let resp = match state.subfrost.get_wrap_events_all(GetWrapEventsAllParams {
+            offset,
+            limit,
+            successful: if successful_only { Some(true) } else { None },
+        }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
         };
@@ -2514,13 +2474,11 @@ pub async fn get_all_amm_tx_history(
         });
     }
     if let Some(AmmTxType::Unwrap) = tx_type {
-        let resp = match state
-            .subfrost
-            .get_unwrap_events_all(GetUnwrapEventsAllParams {
-                offset,
-                limit,
-                successful: if successful_only { Some(true) } else { None },
-            }) {
+        let resp = match state.subfrost.get_unwrap_events_all(GetUnwrapEventsAllParams {
+            offset,
+            limit,
+            successful: if successful_only { Some(true) } else { None },
+        }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
         };
@@ -2588,23 +2546,19 @@ pub async fn get_all_amm_tx_history(
         Err(err) => return internal_error(err),
     };
 
-    let wrap_resp = match state
-        .subfrost
-        .get_wrap_events_all(GetWrapEventsAllParams {
-            offset: 0,
-            limit: combined_limit,
-            successful: if successful_only { Some(true) } else { None },
-        }) {
+    let wrap_resp = match state.subfrost.get_wrap_events_all(GetWrapEventsAllParams {
+        offset: 0,
+        limit: combined_limit,
+        successful: if successful_only { Some(true) } else { None },
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
-    let unwrap_resp = match state
-        .subfrost
-        .get_unwrap_events_all(GetUnwrapEventsAllParams {
-            offset: 0,
-            limit: combined_limit,
-            successful: if successful_only { Some(true) } else { None },
-        }) {
+    let unwrap_resp = match state.subfrost.get_unwrap_events_all(GetUnwrapEventsAllParams {
+        offset: 0,
+        limit: combined_limit,
+        successful: if successful_only { Some(true) } else { None },
+    }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
     };
@@ -2650,10 +2604,7 @@ pub async fn get_all_token_pairs(
         return error_response(400, "invalid_factory_id");
     };
 
-    let pools = match state
-        .ammdata
-        .get_factory_pools(GetFactoryPoolsParams { factory })
-    {
+    let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -2692,17 +2643,11 @@ pub async fn get_token_pairs(
         return error_response(400, "invalid_token_id");
     };
 
-    let pools = match state
-        .ammdata
-        .get_token_pools(GetTokenPoolsParams { token })
-    {
+    let pools = match state.ammdata.get_token_pools(GetTokenPoolsParams { token }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
-    let factory_pools = match state
-        .ammdata
-        .get_factory_pools(GetFactoryPoolsParams { factory })
-    {
+    let factory_pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -2775,10 +2720,7 @@ pub async fn get_alkane_swap_pair_details(
         Err(err) => return internal_error(err),
     };
 
-    let factory_pools = match state
-        .ammdata
-        .get_factory_pools(GetFactoryPoolsParams { factory })
-    {
+    let factory_pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -2969,10 +2911,8 @@ async fn fetch_address_balances(client: &Client, address: &str) -> Result<(u64, 
         .json::<EsploraAddressStats>()
         .await
         .map_err(|e| anyhow!("esplora address decode failed: {e}"))?;
-    let confirmed = stats
-        .chain_stats
-        .funded_txo_sum
-        .saturating_sub(stats.chain_stats.spent_txo_sum);
+    let confirmed =
+        stats.chain_stats.funded_txo_sum.saturating_sub(stats.chain_stats.spent_txo_sum);
     let pending = stats
         .mempool_stats
         .funded_txo_sum
@@ -3030,11 +2970,7 @@ fn btc_price_usd_cached() -> Result<u128> {
             feed.get_bitcoin_price_usd_at_block_height(tip as u64)
         }))
         .map_err(|_| anyhow!("btc price feed panicked"))?;
-        if price == 0 {
-            Err(anyhow!("btc price unavailable"))
-        } else {
-            Ok(price)
-        }
+        if price == 0 { Err(anyhow!("btc price unavailable")) } else { Ok(price) }
     };
 
     match fetch() {
@@ -3074,10 +3010,7 @@ fn pool_candle_volume_sums(
     let window_start = bucket_now.saturating_sub(6 * Timeframe::D1.duration_secs());
     let table = state.ammdata.table();
     let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
-    let entries = state
-        .ammdata
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?
-        .entries;
+    let entries = state.ammdata.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?.entries;
 
     let mut token0_volume_7d = 0u128;
     let mut token1_volume_7d = 0u128;
@@ -3574,10 +3507,7 @@ fn build_token_pair(
     let reserve0 = balances.remove(&defs.base_alkane_id).unwrap_or(0);
     let reserve1 = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
-    let metrics = state
-        .ammdata
-        .get_pool_metrics(GetPoolMetricsParams { pool })?
-        .metrics;
+    let metrics = state.ammdata.get_pool_metrics(GetPoolMetricsParams { pool })?.metrics;
 
     let token0_meta = get_token_meta(state, meta_cache, &defs.base_alkane_id)?;
     let token1_meta = get_token_meta(state, meta_cache, &defs.quote_alkane_id)?;
@@ -3858,13 +3788,13 @@ fn filter_ids_with_derived_metrics(
     if ids.is_empty() {
         return Ok(ids);
     }
-    let metrics = state
-        .ammdata
-        .get_token_derived_metrics_by_id(GetTokenDerivedMetricsByIdParams {
-            tokens: ids.clone(),
-            quote,
-        })
-        ?;
+    let metrics =
+        state
+            .ammdata
+            .get_token_derived_metrics_by_id(GetTokenDerivedMetricsByIdParams {
+                tokens: ids.clone(),
+                quote,
+            })?;
     let metrics = metrics.metrics;
     if metrics.len() != ids.len() {
         return Ok(Vec::new());
@@ -3926,8 +3856,9 @@ fn token_metrics_multi(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let res =
-        state.ammdata.get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.to_vec() })?;
+    let res = state
+        .ammdata
+        .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.to_vec() })?;
     Ok(res.metrics.into_iter().map(|m| m.unwrap_or_default()).collect())
 }
 
@@ -4246,21 +4177,19 @@ fn build_alkane_token(
         let token_volume_7d = scale_price_u128(dm.volume_7d);
         let token_volume_all_time = scale_price_u128(dm.volume_all_time);
 
-        let change_1d_raw = if dm.change_1d.trim().is_empty() { "0" } else { dm.change_1d.as_str() };
-        let change_7d_raw = if dm.change_7d.trim().is_empty() { "0" } else { dm.change_7d.as_str() };
-        let change_30d_raw = if dm.change_30d.trim().is_empty() { "0" } else { dm.change_30d.as_str() };
+        let change_1d_raw =
+            if dm.change_1d.trim().is_empty() { "0" } else { dm.change_1d.as_str() };
+        let change_7d_raw =
+            if dm.change_7d.trim().is_empty() { "0" } else { dm.change_7d.as_str() };
+        let change_30d_raw =
+            if dm.change_30d.trim().is_empty() { "0" } else { dm.change_30d.as_str() };
         let change_all_time_raw =
             if dm.change_all_time.trim().is_empty() { "0" } else { dm.change_all_time.as_str() };
 
         derived_data.insert(format!("priceUsd-{}", suffix), json!(scale_price_u128(price_usd)));
-        derived_data.insert(
-            format!("fdvUsd-{}", suffix),
-            json!(scale_price_u128(dm.fdv_usd)),
-        );
-        derived_data.insert(
-            format!("marketcap-{}", suffix),
-            json!(scale_price_u128(dm.marketcap_usd)),
-        );
+        derived_data.insert(format!("fdvUsd-{}", suffix), json!(scale_price_u128(dm.fdv_usd)));
+        derived_data
+            .insert(format!("marketcap-{}", suffix), json!(scale_price_u128(dm.marketcap_usd)));
         derived_data.insert(
             format!("tokenPoolsVolume1dInUsd-{}", suffix),
             json!(scale_price_u128(dm.volume_1d)),
@@ -4277,34 +4206,16 @@ fn build_alkane_token(
             format!("tokenPoolsVolumeAllTimeInUsd-{}", suffix),
             json!(scale_price_u128(dm.volume_all_time)),
         );
-        derived_data.insert(
-            format!("tokenVolume1d-{}", suffix),
-            json!(token_volume_1d),
-        );
-        derived_data.insert(
-            format!("tokenVolume7d-{}", suffix),
-            json!(token_volume_7d),
-        );
-        derived_data.insert(
-            format!("tokenVolume30d-{}", suffix),
-            json!(token_volume_30d),
-        );
-        derived_data.insert(
-            format!("tokenVolumeAllTime-{}", suffix),
-            json!(token_volume_all_time),
-        );
-        derived_data.insert(
-            format!("priceChange24h-{}", suffix),
-            json!(parse_change_f64(change_1d_raw)),
-        );
-        derived_data.insert(
-            format!("priceChange7d-{}", suffix),
-            json!(parse_change_f64(change_7d_raw)),
-        );
-        derived_data.insert(
-            format!("priceChange30d-{}", suffix),
-            json!(parse_change_f64(change_30d_raw)),
-        );
+        derived_data.insert(format!("tokenVolume1d-{}", suffix), json!(token_volume_1d));
+        derived_data.insert(format!("tokenVolume7d-{}", suffix), json!(token_volume_7d));
+        derived_data.insert(format!("tokenVolume30d-{}", suffix), json!(token_volume_30d));
+        derived_data.insert(format!("tokenVolumeAllTime-{}", suffix), json!(token_volume_all_time));
+        derived_data
+            .insert(format!("priceChange24h-{}", suffix), json!(parse_change_f64(change_1d_raw)));
+        derived_data
+            .insert(format!("priceChange7d-{}", suffix), json!(parse_change_f64(change_7d_raw)));
+        derived_data
+            .insert(format!("priceChange30d-{}", suffix), json!(parse_change_f64(change_30d_raw)));
         derived_data.insert(
             format!("priceChangeAllTime-{}", suffix),
             json!(parse_change_f64(change_all_time_raw)),
@@ -4353,9 +4264,7 @@ fn build_alkane_token(
     }))
 }
 
-fn pool_details_from_snapshot(
-    snapshot: &SchemaPoolDetailsSnapshot,
-) -> Option<PoolDetailsComputed> {
+fn pool_details_from_snapshot(snapshot: &SchemaPoolDetailsSnapshot) -> Option<PoolDetailsComputed> {
     let value: Value = serde_json::from_slice(&snapshot.value_json).ok()?;
     Some(PoolDetailsComputed {
         value,
@@ -4477,23 +4386,21 @@ fn build_pool_details(
     let skip_factory_check = ctx.as_ref().map(|c| c.skip_factory_check).unwrap_or(false);
     if !skip_factory_check {
         if let Some(factory_id) = factory {
-        let factory_match = state
-            .ammdata
-            .get_pool_factory(GetPoolFactoryParams { pool })?
-            .factory;
-        if let Some(found) = factory_match {
-            if found != factory_id {
-                return Ok(None);
+            let factory_match =
+                state.ammdata.get_pool_factory(GetPoolFactoryParams { pool })?.factory;
+            if let Some(found) = factory_match {
+                if found != factory_id {
+                    return Ok(None);
+                }
+            } else {
+                let pools = state
+                    .ammdata
+                    .get_factory_pools(GetFactoryPoolsParams { factory: factory_id })?
+                    .pools;
+                if !pools.contains(&pool) {
+                    return Ok(None);
+                }
             }
-        } else {
-            let pools = state
-                .ammdata
-                .get_factory_pools(GetFactoryPoolsParams { factory: factory_id })?
-                .pools;
-            if !pools.contains(&pool) {
-                return Ok(None);
-            }
-        }
         }
     }
 
@@ -4519,14 +4426,9 @@ fn build_pool_details(
     };
     let pool_name = pool_name_display(&format!("{token0_label} / {token1_label}"));
 
-    let mut metrics = state
-        .ammdata
-        .get_pool_metrics(GetPoolMetricsParams { pool })?
-        .metrics;
-    let pool_metrics_v2 = state
-        .ammdata
-        .get_pool_metrics_v2(GetPoolMetricsV2Params { pool })?
-        .metrics;
+    let mut metrics = state.ammdata.get_pool_metrics(GetPoolMetricsParams { pool })?.metrics;
+    let pool_metrics_v2 =
+        state.ammdata.get_pool_metrics_v2(GetPoolMetricsV2Params { pool })?.metrics;
     if metrics.tvl_change_24h.is_empty() {
         metrics.tvl_change_24h = "0".to_string();
     }
@@ -4597,10 +4499,7 @@ fn build_pool_details(
     let lp_value_sats = if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
     let lp_value_usd = if lp_supply == 0 { 0 } else { pool_tvl_usd.saturating_div(lp_supply) };
 
-    let creation = state
-        .ammdata
-        .get_pool_creation_info(GetPoolCreationInfoParams { pool })?
-        .info;
+    let creation = state.ammdata.get_pool_creation_info(GetPoolCreationInfoParams { pool })?.info;
     let (creator_address, creation_height, initial_token0_amount, initial_token1_amount) =
         if let Some(info) = creation {
             let creator = if info.creator_spk.is_empty() {
@@ -4622,14 +4521,10 @@ fn build_pool_details(
     let pool_apr = parse_change_f64(&metrics.pool_apr);
     let tvl_change_24h = parse_change_f64(&metrics.tvl_change_24h);
     let tvl_change_7d = parse_change_f64(&metrics.tvl_change_7d);
-    let mut pool_volume_7d_usd = pool_metrics_v2
-        .as_ref()
-        .map(|m| m.pool_volume_7d_usd)
-        .unwrap_or(0);
-    let mut pool_volume_all_time_usd = pool_metrics_v2
-        .as_ref()
-        .map(|m| m.pool_volume_all_time_usd)
-        .unwrap_or(0);
+    let mut pool_volume_7d_usd =
+        pool_metrics_v2.as_ref().map(|m| m.pool_volume_7d_usd).unwrap_or(0);
+    let mut pool_volume_all_time_usd =
+        pool_metrics_v2.as_ref().map(|m| m.pool_volume_all_time_usd).unwrap_or(0);
     if pool_volume_7d_usd == 0 || pool_volume_all_time_usd == 0 {
         if let Ok((token0_volume_7d, token1_volume_7d, token0_volume_all, token1_volume_all)) =
             pool_candle_volume_sums(state, &pool, now_ts)
@@ -4638,17 +4533,13 @@ fn build_pool_details(
                 .saturating_mul(token0_price_usd)
                 .saturating_div(PRICE_SCALE)
                 .saturating_add(
-                    token1_volume_7d
-                        .saturating_mul(token1_price_usd)
-                        .saturating_div(PRICE_SCALE),
+                    token1_volume_7d.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE),
                 );
             let fallback_all = token0_volume_all
                 .saturating_mul(token0_price_usd)
                 .saturating_div(PRICE_SCALE)
                 .saturating_add(
-                    token1_volume_all
-                        .saturating_mul(token1_price_usd)
-                        .saturating_div(PRICE_SCALE),
+                    token1_volume_all.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE),
                 );
             if pool_volume_7d_usd == 0 {
                 pool_volume_7d_usd = fallback_7d;

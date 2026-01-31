@@ -2,13 +2,13 @@
 // Based on ord-rocksdb's approach - uses custom HTTP + JSON-RPC 2.0
 // Compatible with both Bitcoin Core and alternative endpoints like Subfrost
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bitcoin::{Block, BlockHash};
 use bitcoincore_rpc::bitcoin;
 use bitcoincore_rpc::bitcoincore_rpc_json::{GetBlockHeaderResult, GetBlockchainInfoResult};
 use bitcoincore_rpc::{Error as RpcError, RpcApi};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Serialize)]
@@ -50,12 +50,7 @@ impl FlexibleBitcoindClient {
             format!("Basic {}", base64_encode(credentials.as_bytes()))
         });
 
-        Ok(Self {
-            url: url.to_string(),
-            auth: auth_header,
-            client,
-            request_id: AtomicU32::new(1),
-        })
+        Ok(Self { url: url.to_string(), auth: auth_header, client, request_id: AtomicU32::new(1) })
     }
 
     fn rpc_call<T: serde::de::DeserializeOwned>(
@@ -65,12 +60,8 @@ impl FlexibleBitcoindClient {
     ) -> Result<T, RpcError> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
 
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id,
-            method: method.to_string(),
-            params,
-        };
+        let request =
+            JsonRpcRequest { jsonrpc: "2.0".to_string(), id, method: method.to_string(), params };
 
         let mut req = self
             .client
@@ -159,10 +150,8 @@ impl RpcApi for FlexibleBitcoindClient {
     }
 
     fn get_block(&self, hash: &BlockHash) -> Result<Block, RpcError> {
-        let block_hex: String = self.rpc_call(
-            "getblock",
-            vec![json!(hash.to_string()), json!(0)],
-        )?;
+        let block_hex: String =
+            self.rpc_call("getblock", vec![json!(hash.to_string()), json!(0)])?;
         let block_bytes = hex::decode(&block_hex).map_err(|e| {
             RpcError::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(
                 bitcoincore_rpc::jsonrpc::error::RpcError {
@@ -200,7 +189,8 @@ fn base64_encode(input: &[u8]) -> String {
     use std::io::Write;
     let mut buf = Vec::new();
     {
-        let mut encoder = base64::write::EncoderWriter::new(&mut buf, &base64::engine::general_purpose::STANDARD);
+        let mut encoder =
+            base64::write::EncoderWriter::new(&mut buf, &base64::engine::general_purpose::STANDARD);
         encoder.write_all(input).unwrap();
     }
     String::from_utf8(buf).unwrap()

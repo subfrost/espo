@@ -1,16 +1,16 @@
 use super::schemas::{
-    ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaCandleV1, SchemaMarketDefs,
+    ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaMarketDefs,
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
     SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
+use crate::config::get_network;
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, canonical_quotes,
 };
-use crate::config::get_network;
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
-    ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir,
-    decode_activity_v1, read_activity_for_pool, read_activity_for_pool_sorted,
+    ActivityFilter, ActivityPage, ActivitySideFilter, ActivitySortKey, SortDir, decode_activity_v1,
+    read_activity_for_pool, read_activity_for_pool_sorted,
 };
 use crate::modules::ammdata::utils::candles::{CandleSlice, PriceSide, read_candles_v1};
 use crate::modules::ammdata::utils::live_reserves::fetch_all_pools;
@@ -75,7 +75,9 @@ impl<'a> MdbPointer<'a> {
     }
 
     pub fn scan_prefix(&self) -> Result<Vec<Vec<u8>>> {
-        self.mdb.scan_prefix(&self.key).map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
+        self.mdb
+            .scan_prefix(&self.key)
+            .map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -382,18 +384,8 @@ impl<'a> AmmDataTable<'a> {
         let tx_hex = format!("{:x}", token.tx);
         let q_blk_hex = format!("{:x}", quote.block);
         let q_tx_hex = format!("{:x}", quote.tx);
-        let suffix = format!(
-            "{}:{}:{}:{}:{}:",
-            blk_hex,
-            tx_hex,
-            q_blk_hex,
-            q_tx_hex,
-            tf.code()
-        );
-        self.TOKEN_DERIVED_USD_CANDLES
-            .select(suffix.as_bytes())
-            .key()
-            .to_vec()
+        let suffix = format!("{}:{}:{}:{}:{}:", blk_hex, tx_hex, q_blk_hex, q_tx_hex, tf.code());
+        self.TOKEN_DERIVED_USD_CANDLES.select(suffix.as_bytes()).key().to_vec()
     }
 
     pub fn token_derived_usd_candle_key(
@@ -486,7 +478,10 @@ impl<'a> AmmDataTable<'a> {
         block_arr.copy_from_slice(&id_bytes[..4]);
         let mut tx_arr = [0u8; 8];
         tx_arr.copy_from_slice(&id_bytes[4..12]);
-        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+        Some(SchemaAlkaneId {
+            block: u32::from_be_bytes(block_arr),
+            tx: u64::from_be_bytes(tx_arr),
+        })
     }
 
     pub fn token_metrics_index_count_key(&self) -> Vec<u8> {
@@ -543,7 +538,10 @@ impl<'a> AmmDataTable<'a> {
         block_arr.copy_from_slice(&id_bytes[..4]);
         let mut tx_arr = [0u8; 8];
         tx_arr.copy_from_slice(&id_bytes[4..12]);
-        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+        Some(SchemaAlkaneId {
+            block: u32::from_be_bytes(block_arr),
+            tx: u64::from_be_bytes(tx_arr),
+        })
     }
 
     pub fn pool_metrics_index_count_key(&self) -> Vec<u8> {
@@ -600,7 +598,11 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
-    pub fn parse_token_search_index_key(&self, field: SearchIndexField, key: &[u8]) -> Option<SchemaAlkaneId> {
+    pub fn parse_token_search_index_key(
+        &self,
+        field: SearchIndexField,
+        key: &[u8],
+    ) -> Option<SchemaAlkaneId> {
         if key.len() < field.score_len() + 12 {
             return None;
         }
@@ -609,7 +611,10 @@ impl<'a> AmmDataTable<'a> {
         block_arr.copy_from_slice(&id_bytes[..4]);
         let mut tx_arr = [0u8; 8];
         tx_arr.copy_from_slice(&id_bytes[4..12]);
-        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+        Some(SchemaAlkaneId {
+            block: u32::from_be_bytes(block_arr),
+            tx: u64::from_be_bytes(tx_arr),
+        })
     }
 
     pub fn canonical_pool_key(&self, token: &SchemaAlkaneId) -> Vec<u8> {
@@ -700,17 +705,17 @@ impl<'a> AmmDataTable<'a> {
         block_arr.copy_from_slice(&id_bytes[..4]);
         let mut tx_arr = [0u8; 8];
         tx_arr.copy_from_slice(&id_bytes[4..12]);
-        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+        Some(SchemaAlkaneId {
+            block: u32::from_be_bytes(block_arr),
+            tx: u64::from_be_bytes(tx_arr),
+        })
     }
 
     pub fn token_derived_metrics_index_count_key(&self, quote: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12);
         suffix.extend_from_slice(&quote.block.to_be_bytes());
         suffix.extend_from_slice(&quote.tx.to_be_bytes());
-        self.TOKEN_DERIVED_METRICS_INDEX_COUNT
-            .select(&suffix)
-            .key()
-            .to_vec()
+        self.TOKEN_DERIVED_METRICS_INDEX_COUNT.select(&suffix).key().to_vec()
     }
 
     pub fn token_derived_search_index_prefix(
@@ -774,7 +779,10 @@ impl<'a> AmmDataTable<'a> {
         block_arr.copy_from_slice(&id_bytes[..4]);
         let mut tx_arr = [0u8; 8];
         tx_arr.copy_from_slice(&id_bytes[4..12]);
-        Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
+        Some(SchemaAlkaneId {
+            block: u32::from_be_bytes(block_arr),
+            tx: u64::from_be_bytes(tx_arr),
+        })
     }
 
     pub fn pool_name_index_key(&self, name: &str, pool: &SchemaAlkaneId) -> Vec<u8> {
@@ -807,7 +815,10 @@ impl<'a> AmmDataTable<'a> {
         let mut tx_arr = [0u8; 8];
         tx_arr.copy_from_slice(&id_bytes[4..12]);
         let name = String::from_utf8(name_bytes.to_vec()).ok()?;
-        Some((name, SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) }))
+        Some((
+            name,
+            SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) },
+        ))
     }
 
     pub fn amm_factory_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
@@ -931,11 +942,7 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
-    pub fn address_pool_swaps_prefix(
-        &self,
-        address_spk: &[u8],
-        pool: &SchemaAlkaneId,
-    ) -> Vec<u8> {
+    pub fn address_pool_swaps_prefix(&self, address_spk: &[u8], pool: &SchemaAlkaneId) -> Vec<u8> {
         let mut k = self.ADDRESS_POOL_SWAPS.key().to_vec();
         push_spk(&mut k, address_spk);
         k.extend_from_slice(&pool.block.to_be_bytes());
@@ -1171,11 +1178,11 @@ fn read_address_pool_events(
     offset: usize,
     limit: usize,
 ) -> Result<GetAddressPoolEventsPageResult> {
-    let entries = match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-    {
-        Ok(v) => v.entries,
-        Err(_) => Vec::new(),
-    };
+    let entries =
+        match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
 
     let mut parsed: Vec<AddressPoolEventEntry> = Vec::new();
     for (k, _v) in entries {
@@ -1213,11 +1220,11 @@ fn read_amm_history(
     limit: usize,
     kind_filter: Option<ActivityKind>,
 ) -> Result<GetAmmHistoryPageResult> {
-    let entries = match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-    {
-        Ok(v) => v.entries,
-        Err(_) => Vec::new(),
-    };
+    let entries =
+        match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
 
     let mut total = 0usize;
     let mut out = Vec::new();
@@ -1290,8 +1297,10 @@ impl AmmDataProvider {
     }
 
     pub fn get_multi_values(&self, params: GetMultiValuesParams) -> Result<GetMultiValuesResult> {
-        let values =
-            self.mdb.multi_get(&params.keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self
+            .mdb
+            .multi_get(&params.keys)
+            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         Ok(GetMultiValuesResult { values })
     }
 
@@ -1379,10 +1388,7 @@ impl AmmDataProvider {
         Ok(GetReservesSnapshotResult { snapshot })
     }
 
-    pub fn set_reserves_snapshot(
-        &self,
-        params: SetReservesSnapshotParams,
-    ) -> Result<()> {
+    pub fn set_reserves_snapshot(&self, params: SetReservesSnapshotParams) -> Result<()> {
         crate::debug_timer_log!("set_reserves_snapshot");
         let table = self.table();
         let encoded = encode_reserves_snapshot(&params.snapshot)?;
@@ -1461,13 +1467,9 @@ impl AmmDataProvider {
     ) -> Result<GetTokenMetricsByIdResult> {
         crate::debug_timer_log!("get_token_metrics_by_id");
         let table = self.table();
-        let keys: Vec<Vec<u8>> = params
-            .tokens
-            .iter()
-            .map(|token| table.token_metrics_key(token))
-            .collect();
-        let values =
-            self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let keys: Vec<Vec<u8>> =
+            params.tokens.iter().map(|token| table.token_metrics_key(token)).collect();
+        let values = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         let mut metrics = Vec::with_capacity(values.len());
         for val in values {
             if let Some(bytes) = val {
@@ -1490,8 +1492,7 @@ impl AmmDataProvider {
             .iter()
             .map(|token| table.token_derived_metrics_key(token, &params.quote))
             .collect();
-        let values =
-            self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         let mut metrics = Vec::with_capacity(values.len());
         for val in values {
             if let Some(bytes) = val {
@@ -1716,11 +1717,8 @@ impl AmmDataProvider {
     ) -> Result<GetTokenDerivedSearchIndexPageResult> {
         crate::debug_timer_log!("get_token_derived_search_index_page");
         let table = self.table();
-        let prefix = table.token_derived_search_index_prefix(
-            &params.quote,
-            params.field,
-            &params.prefix,
-        );
+        let prefix =
+            table.token_derived_search_index_prefix(&params.quote, params.field, &params.prefix);
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
 
@@ -1800,9 +1798,9 @@ impl AmmDataProvider {
     ) -> Result<GetAmmFactoriesResult> {
         crate::debug_timer_log!("get_amm_factories");
         let table = self.table();
-        let keys = match self.get_scan_prefix(GetScanPrefixParams {
-            prefix: table.AMM_FACTORIES.key().to_vec(),
-        }) {
+        let keys = match self
+            .get_scan_prefix(GetScanPrefixParams { prefix: table.AMM_FACTORIES.key().to_vec() })
+        {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -1846,10 +1844,7 @@ impl AmmDataProvider {
         Ok(GetPoolDefsResult { defs })
     }
 
-    pub fn get_pool_factory(
-        &self,
-        params: GetPoolFactoryParams,
-    ) -> Result<GetPoolFactoryResult> {
+    pub fn get_pool_factory(&self, params: GetPoolFactoryParams) -> Result<GetPoolFactoryResult> {
         crate::debug_timer_log!("get_pool_factory");
         let table = self.table();
         let factory = self
@@ -1860,10 +1855,7 @@ impl AmmDataProvider {
         Ok(GetPoolFactoryResult { factory })
     }
 
-    pub fn get_pool_metrics(
-        &self,
-        params: GetPoolMetricsParams,
-    ) -> Result<GetPoolMetricsResult> {
+    pub fn get_pool_metrics(&self, params: GetPoolMetricsParams) -> Result<GetPoolMetricsResult> {
         crate::debug_timer_log!("get_pool_metrics");
         let table = self.table();
         let metrics = self
@@ -1970,7 +1962,10 @@ impl AmmDataProvider {
             if out.len() < params.limit {
                 out.push(entry);
             }
-            if out.len() >= params.limit && params.offset + out.len() >= total && !params.include_total {
+            if out.len() >= params.limit
+                && params.offset + out.len() >= total
+                && !params.include_total
+            {
                 break;
             }
         }
@@ -1999,11 +1994,11 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_swaps_page");
         let table = self.table();
         let prefix = table.token_swaps_prefix(&params.token);
-        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-        {
-            Ok(v) => v.entries,
-            Err(_) => Vec::new(),
-        };
+        let entries =
+            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+                Ok(v) => v.entries,
+                Err(_) => Vec::new(),
+            };
 
         let mut parsed: Vec<TokenSwapEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2040,11 +2035,11 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_pool_creations_page");
         let table = self.table();
         let prefix = table.pool_creations_prefix();
-        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-        {
-            Ok(v) => v.entries,
-            Err(_) => Vec::new(),
-        };
+        let entries =
+            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+                Ok(v) => v.entries,
+                Err(_) => Vec::new(),
+            };
 
         let mut parsed: Vec<PoolCreationEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2081,11 +2076,11 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_address_pool_swaps_page");
         let table = self.table();
         let prefix = table.address_pool_swaps_prefix(&params.address_spk, &params.pool);
-        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-        {
-            Ok(v) => v.entries,
-            Err(_) => Vec::new(),
-        };
+        let entries =
+            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+                Ok(v) => v.entries,
+                Err(_) => Vec::new(),
+            };
 
         let mut parsed: Vec<AddressPoolSwapEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2115,11 +2110,11 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_address_token_swaps_page");
         let table = self.table();
         let prefix = table.address_token_swaps_prefix(&params.address_spk, &params.token);
-        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })
-        {
-            Ok(v) => v.entries,
-            Err(_) => Vec::new(),
-        };
+        let entries =
+            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+                Ok(v) => v.entries,
+                Err(_) => Vec::new(),
+            };
 
         let mut parsed: Vec<AddressTokenSwapEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2254,7 +2249,8 @@ impl AmmDataProvider {
         for cq in canonical_quotes(get_network()) {
             unit_map.insert(cq.id, cq.unit);
         }
-        let pools = self.get_canonical_pools(GetCanonicalPoolsParams { token: params.token })?.pools;
+        let pools =
+            self.get_canonical_pools(GetCanonicalPoolsParams { token: params.token })?.pools;
         for entry in pools {
             let unit = match unit_map.get(&entry.quote_id) {
                 Some(u) => *u,
@@ -2265,7 +2261,8 @@ impl AmmDataProvider {
                 Err(_) => None,
             };
             let Some(defs) = defs else { continue };
-            let side = if defs.base_alkane_id == params.token && defs.quote_alkane_id == entry.quote_id
+            let side = if defs.base_alkane_id == params.token
+                && defs.quote_alkane_id == entry.quote_id
             {
                 PriceSide::Base
             } else if defs.quote_alkane_id == params.token && defs.base_alkane_id == entry.quote_id
@@ -2274,15 +2271,8 @@ impl AmmDataProvider {
             } else {
                 continue;
             };
-            let res = read_candles_v1(
-                self,
-                entry.pool_id,
-                Timeframe::M10,
-                1,
-                params.now_ts,
-                side,
-            )
-            .ok();
+            let res =
+                read_candles_v1(self, entry.pool_id, Timeframe::M10, 1, params.now_ts, side).ok();
             let close = res
                 .and_then(|slice| slice.candles_newest_first.first().copied())
                 .map(|c| c.close)
@@ -2296,21 +2286,13 @@ impl AmmDataProvider {
     }
 
     pub fn rpc_get_candles(&self, params: RpcGetCandlesParams) -> Result<RpcGetCandlesResult> {
-        let tf = params
-            .timeframe
-            .as_deref()
-            .and_then(parse_timeframe)
-            .unwrap_or(Timeframe::H1);
+        let tf = params.timeframe.as_deref().and_then(parse_timeframe).unwrap_or(Timeframe::H1);
 
         let legacy_size = params.size.map(|n| n as usize);
         let limit = params.limit.map(|n| n as usize).or(legacy_size).unwrap_or(120);
         let page = params.page.map(|n| n as usize).unwrap_or(1);
 
-        let side = params
-            .side
-            .as_deref()
-            .and_then(parse_price_side)
-            .unwrap_or(PriceSide::Base);
+        let side = params.side.as_deref().and_then(parse_price_side).unwrap_or(PriceSide::Base);
 
         let now = params.now.unwrap_or_else(now_ts);
 
@@ -2467,11 +2449,7 @@ impl AmmDataProvider {
         let limit = params.limit.map(|n| n as usize).unwrap_or(50);
         let page = params.page.map(|n| n as usize).unwrap_or(1);
 
-        let side = params
-            .side
-            .as_deref()
-            .and_then(parse_price_side)
-            .unwrap_or(PriceSide::Base);
+        let side = params.side.as_deref().and_then(parse_price_side).unwrap_or(PriceSide::Base);
 
         let filter_side = parse_side_filter_str(params.filter_side.as_deref());
         let activity_type = parse_activity_type_str(params.activity_type.as_deref());
@@ -2579,11 +2557,7 @@ impl AmmDataProvider {
         rows.sort_by(|(a, _), (b, _)| a.block.cmp(&b.block).then(a.tx.cmp(&b.tx)));
         let total = rows.len();
 
-        let limit = params
-            .limit
-            .map(|n| n as usize)
-            .unwrap_or(total.max(1))
-            .clamp(1, 20_000);
+        let limit = params.limit.map(|n| n as usize).unwrap_or(total.max(1)).clamp(1, 20_000);
         let page = params.page.map(|n| n as usize).unwrap_or(1).max(1);
 
         let offset = limit.saturating_mul(page.saturating_sub(1));
@@ -2633,11 +2607,7 @@ impl AmmDataProvider {
         factories.sort();
         let total = factories.len();
 
-        let limit = params
-            .limit
-            .map(|n| n as usize)
-            .unwrap_or(total.max(1))
-            .clamp(1, 20_000);
+        let limit = params.limit.map(|n| n as usize).unwrap_or(total.max(1)).clamp(1, 20_000);
         let page = params.page.map(|n| n as usize).unwrap_or(1).max(1);
         let offset = limit.saturating_mul(page.saturating_sub(1));
         let end = (offset + limit).min(total);
@@ -2662,7 +2632,8 @@ impl AmmDataProvider {
         &self,
         params: RpcFindBestSwapPathParams,
     ) -> Result<RpcFindBestSwapPathResult> {
-        let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match fetch_all_pools(self) {
+        let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match fetch_all_pools(self)
+        {
             Ok(m) => m,
             Err(_) => {
                 return Ok(RpcFindBestSwapPathResult {
@@ -2685,11 +2656,7 @@ impl AmmDataProvider {
             });
         }
 
-        let mode = params
-            .mode
-            .as_deref()
-            .unwrap_or("exact_in")
-            .to_ascii_lowercase();
+        let mode = params.mode.as_deref().unwrap_or("exact_in").to_ascii_lowercase();
 
         let token_in = match params.token_in.as_deref().and_then(parse_id_from_str) {
             Some(t) => t,
@@ -2709,12 +2676,7 @@ impl AmmDataProvider {
         };
 
         let fee_bps = params.fee_bps.map(|n| n as u32).unwrap_or(DEFAULT_FEE_BPS);
-        let max_hops = params
-            .max_hops
-            .map(|n| n as usize)
-            .unwrap_or(3)
-            .max(1)
-            .min(6);
+        let max_hops = params.max_hops.map(|n| n as usize).unwrap_or(3).max(1).min(6);
 
         let plan = match mode.as_str() {
             "exact_in" => {
@@ -2866,7 +2828,8 @@ impl AmmDataProvider {
         &self,
         params: RpcGetBestMevSwapParams,
     ) -> Result<RpcGetBestMevSwapResult> {
-        let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match fetch_all_pools(self) {
+        let snapshot_map: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = match fetch_all_pools(self)
+        {
             Ok(m) => m,
             Err(_) => {
                 return Ok(RpcGetBestMevSwapResult {
@@ -2898,11 +2861,7 @@ impl AmmDataProvider {
             }
         };
         let fee_bps = params.fee_bps.map(|n| n as u32).unwrap_or(DEFAULT_FEE_BPS);
-        let max_hops = params
-            .max_hops
-            .map(|n| n as usize)
-            .unwrap_or(3)
-            .clamp(2, 6);
+        let max_hops = params.max_hops.map(|n| n as usize).unwrap_or(3).clamp(2, 6);
 
         match plan_best_mev_swap(&snapshot_map, token, fee_bps, max_hops) {
             Some(pq) => {
@@ -3499,9 +3458,7 @@ pub fn decode_canonical_pools(bytes: &[u8]) -> anyhow::Result<Vec<SchemaCanonica
     Ok(Vec::<SchemaCanonicalPoolEntry>::try_from_slice(bytes)?)
 }
 
-pub fn encode_canonical_pools(
-    entries: &[SchemaCanonicalPoolEntry],
-) -> anyhow::Result<Vec<u8>> {
+pub fn encode_canonical_pools(entries: &[SchemaCanonicalPoolEntry]) -> anyhow::Result<Vec<u8>> {
     Ok(borsh::to_vec(entries)?)
 }
 
@@ -3726,8 +3683,7 @@ fn read_token_usd_candles_v1(
         }
     }
 
-    let newest_first: Vec<SchemaCandleV1> =
-        forward.into_iter().rev().map(|(_ts, c)| c).collect();
+    let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
@@ -3823,8 +3779,7 @@ fn read_token_derived_usd_candles_v1(
         }
     }
 
-    let newest_first: Vec<SchemaCandleV1> =
-        forward.into_iter().rev().map(|(_ts, c)| c).collect();
+    let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
@@ -3919,8 +3874,7 @@ fn read_token_mcusd_candles_v1(
         }
     }
 
-    let newest_first: Vec<SchemaCandleV1> =
-        forward.into_iter().rev().map(|(_ts, c)| c).collect();
+    let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
 
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }

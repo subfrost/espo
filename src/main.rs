@@ -153,10 +153,7 @@ fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
     }
     let script = script.to_string();
     std::thread::spawn(move || {
-        eprintln!(
-            "[safe_tip_hook] running (next_height={}, tip={}): {}",
-            next_height, tip, script
-        );
+        eprintln!("[safe_tip_hook] running (next_height={}, tip={}): {}", next_height, tip, script);
         match Command::new("sh").arg("-c").arg(&script).status() {
             Ok(status) => eprintln!("[safe_tip_hook] finished: {}", status),
             Err(e) => eprintln!("[safe_tip_hook] failed: {e:?}"),

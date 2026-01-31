@@ -191,14 +191,8 @@ impl PizzafunProvider {
 
     pub fn get_series_by_ids(&self, series_ids: &[String]) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> = series_ids
-            .iter()
-            .map(|s| table.series_by_id_key(s))
-            .collect();
-        let raw = self
-            .mdb
-            .multi_get(&keys)
-            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let keys: Vec<Vec<u8>> = series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
+        let raw = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             match item {
@@ -223,14 +217,8 @@ impl PizzafunProvider {
         alkanes: &[SchemaAlkaneId],
     ) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> = alkanes
-            .iter()
-            .map(|a| table.series_by_alkane_key(a))
-            .collect();
-        let raw = self
-            .mdb
-            .multi_get(&keys)
-            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let keys: Vec<Vec<u8>> = alkanes.iter().map(|a| table.series_by_alkane_key(a)).collect();
+        let raw = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             match item {

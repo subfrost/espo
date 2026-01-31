@@ -26,7 +26,7 @@ impl TestConfigBuilder {
             electrum_rpc_url: None,
             metashrew_rpc_url: "http://127.0.0.1:7044".to_string(), // Placeholder
             electrs_esplora_url: Some("http://127.0.0.1:4332".to_string()), // Placeholder
-            bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(), // Placeholder
+            bitcoind_rpc_url: "http://127.0.0.1:8332".to_string(),  // Placeholder
             bitcoind_rpc_user: "test".to_string(),
             bitcoind_rpc_pass: "test".to_string(),
             bitcoind_blocks_dir: "/tmp".to_string(), // Placeholder
@@ -34,7 +34,7 @@ impl TestConfigBuilder {
             view_only: true, // Default to view-only for tests
             db_path: espo_path,
             enable_aof: false, // Disabled by default for tests
-            sdb_poll_ms: 100, // Fast polling for tests
+            sdb_poll_ms: 100,  // Fast polling for tests
             indexer_block_delay_ms: 0,
             port: 0, // Let OS assign port
             explorer_host: None,
@@ -52,10 +52,7 @@ impl TestConfigBuilder {
             modules: HashMap::new(),
         };
 
-        Self {
-            config,
-            temp_dirs: vec![metashrew_temp, espo_temp],
-        }
+        Self { config, temp_dirs: vec![metashrew_temp, espo_temp] }
     }
 
     /// Set the network (mainnet, testnet, regtest, etc.)

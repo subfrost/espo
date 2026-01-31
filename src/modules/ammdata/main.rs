@@ -5,15 +5,14 @@ use super::schemas::{
     active_timeframes,
 };
 use super::storage::{
-    AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetRawValueParams,
-    GetPoolCreationInfoParams, GetPoolDefsParams, GetPoolMetricsV2Params, GetTokenMetricsParams,
-    GetTokenPoolsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField,
-    SearchIndexField, SetBatchParams, TokenMetricsIndexField, decode_candle_v1,
-    decode_canonical_pools, decode_full_candle_v1,
-    decode_reserves_snapshot, decode_token_metrics, decode_u128_value, encode_candle_v1,
-    encode_canonical_pools, encode_pool_creation_info, encode_pool_details_snapshot,
-    encode_pool_metrics, encode_pool_metrics_v2, encode_reserves_snapshot, encode_token_metrics,
-    encode_u128_value, parse_change_basis_points,
+    AmmDataProvider, GetAmmFactoriesParams, GetIterPrefixRevParams, GetPoolCreationInfoParams,
+    GetPoolDefsParams, GetPoolMetricsV2Params, GetRawValueParams, GetTokenMetricsParams,
+    GetTokenPoolsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField, SearchIndexField,
+    SetBatchParams, TokenMetricsIndexField, decode_candle_v1, decode_canonical_pools,
+    decode_full_candle_v1, decode_reserves_snapshot, decode_token_metrics, decode_u128_value,
+    encode_candle_v1, encode_canonical_pools, encode_pool_creation_info,
+    encode_pool_details_snapshot, encode_pool_metrics, encode_pool_metrics_v2,
+    encode_reserves_snapshot, encode_token_metrics, encode_u128_value, parse_change_basis_points,
 };
 use super::utils::activity::{ActivityIndexAcc, ActivityWriteAcc, decode_activity_v1};
 use crate::alkanes::trace::EspoSandshrewLikeTraceStatus;
@@ -30,14 +29,14 @@ use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::utils::candles::{
     CandleCache, bucket_start_for, price_base_per_quote, price_quote_per_base,
 };
-use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::ammdata::utils::reserves::{
     NewPoolInfo, extract_new_pools_from_espo_transaction,
 };
+use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, EssentialsProvider, GetAlkaneStorageValueParams,
-    GetCreationRecordParams, GetCreationRecordsOrderedParams, GetLatestCirculatingSupplyParams,
+    AlkaneBalanceTxEntry, EssentialsProvider, GetAlkaneStorageValueParams, GetCreationRecordParams,
+    GetCreationRecordsOrderedParams, GetLatestCirculatingSupplyParams,
     GetRawValueParams as EssentialsGetRawValueParams, spk_to_address_str,
 };
 use crate::modules::essentials::utils::balances::{
@@ -98,13 +97,13 @@ fn decode_kv_implementation(raw: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: block as u32, tx: tx as u64 })
 }
 
-fn lookup_proxy_target(essentials: &EssentialsProvider, alkane: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
+fn lookup_proxy_target(
+    essentials: &EssentialsProvider,
+    alkane: SchemaAlkaneId,
+) -> Option<SchemaAlkaneId> {
     let lookup = |key: &[u8]| {
         essentials
-            .get_alkane_storage_value(GetAlkaneStorageValueParams {
-                alkane,
-                key: key.to_vec(),
-            })
+            .get_alkane_storage_value(GetAlkaneStorageValueParams { alkane, key: key.to_vec() })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_kv_implementation(&raw))
@@ -153,11 +152,7 @@ fn merge_candles(
 }
 
 fn invert_price_value(p: u128) -> Option<u128> {
-    if p == 0 {
-        None
-    } else {
-        Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p)
-    }
+    if p == 0 { None } else { Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p) }
 }
 
 fn parse_factory_create_call(
@@ -418,15 +413,9 @@ fn token_trade_windows(
 
     let mut out = TokenTradeWindows::default();
     for pool in pools {
-        let defs = pools_map
-            .get(&pool)
-            .cloned()
-            .or_else(|| {
-                provider
-                    .get_pool_defs(GetPoolDefsParams { pool })
-                    .ok()
-                    .and_then(|res| res.defs)
-            });
+        let defs = pools_map.get(&pool).cloned().or_else(|| {
+            provider.get_pool_defs(GetPoolDefsParams { pool }).ok().and_then(|res| res.defs)
+        });
         let Some(defs) = defs else { continue };
 
         let token_is_base = defs.base_alkane_id == *token;
@@ -584,9 +573,12 @@ impl EspoModule for AmmData {
         let essentials = provider.essentials();
         let table = provider.table();
         let search_cfg = AmmDataConfig::load_from_global_config().ok();
-        let search_index_enabled = search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
-        let mut search_prefix_min = search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
-        let mut search_prefix_max = search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
+        let search_index_enabled =
+            search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
+        let mut search_prefix_min =
+            search_cfg.as_ref().map(|c| c.search_prefix_min_len as usize).unwrap_or(2);
+        let mut search_prefix_max =
+            search_cfg.as_ref().map(|c| c.search_prefix_max_len as usize).unwrap_or(6);
         let derived_quotes: Vec<DerivedQuoteConfig> = search_cfg
             .as_ref()
             .and_then(|c| c.derived_liquidity.as_ref())
@@ -642,10 +634,9 @@ impl EspoModule for AmmData {
             .unwrap_or_default();
         let mut amm_factory_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
-        if amm_factories.is_empty()
-            && !self.factories_bootstrapped.swap(true, Ordering::Relaxed)
-        {
-            if let Ok(resp) = essentials.get_creation_records_ordered(GetCreationRecordsOrderedParams)
+        if amm_factories.is_empty() && !self.factories_bootstrapped.swap(true, Ordering::Relaxed) {
+            if let Ok(resp) =
+                essentials.get_creation_records_ordered(GetCreationRecordsOrderedParams)
             {
                 let records_len = resp.records.len();
                 let mut discovered = 0usize;
@@ -653,15 +644,14 @@ impl EspoModule for AmmData {
                     if amm_factories.contains(&rec.alkane) {
                         continue;
                     }
-                    let mut is_factory = rec
-                        .inspection
-                        .as_ref()
-                        .map(inspection_is_amm_factory)
-                        .unwrap_or(false);
+                    let mut is_factory =
+                        rec.inspection.as_ref().map(inspection_is_amm_factory).unwrap_or(false);
                     if !is_factory {
                         if let Some(proxy_target) = lookup_proxy_target(essentials, rec.alkane) {
-                            if let Ok(resp) = essentials
-                                .get_creation_record(GetCreationRecordParams { alkane: proxy_target })
+                            if let Ok(resp) =
+                                essentials.get_creation_record(GetCreationRecordParams {
+                                    alkane: proxy_target,
+                                })
                             {
                                 if let Some(rec) = resp.record {
                                     if let Some(inspection) = rec.inspection.as_ref() {
@@ -681,8 +671,7 @@ impl EspoModule for AmmData {
                 }
                 eprintln!(
                     "[AMMDATA] factory bootstrap scanned {} creation records, discovered {} factories",
-                    records_len,
-                    discovered
+                    records_len, discovered
                 );
             }
         }
@@ -840,7 +829,8 @@ impl EspoModule for AmmData {
                     for ev in &cleaned.events {
                         match ev {
                             EspoSandshrewLikeTraceEvent::Invoke(inv) => {
-                                if let Some(factory) = parse_factory_create_call(inv, &amm_factories)
+                                if let Some(factory) =
+                                    parse_factory_create_call(inv, &amm_factories)
                                 {
                                     pending_factory = Some(factory);
                                 }
@@ -870,9 +860,8 @@ impl EspoModule for AmmData {
                     }
                     let factory_from_call = pool_factory_by_id.get(&pool_id).copied();
                     let factory_id = factory_from_call.or(factory_id);
-                    let factory_ok = factory_id
-                        .map(|id| amm_factories.contains(&id))
-                        .unwrap_or(false);
+                    let factory_ok =
+                        factory_id.map(|id| amm_factories.contains(&id)).unwrap_or(false);
                     if !factory_ok {
                         continue;
                     }
@@ -881,14 +870,10 @@ impl EspoModule for AmmData {
                     if let Ok(encoded_defs) = borsh::to_vec(&defs) {
                         pool_defs_writes.push((table.pools_key(&pool_id), encoded_defs));
                     }
-                    token_pools_writes.push((
-                        table.token_pools_key(&defs.base_alkane_id, &pool_id),
-                        Vec::new(),
-                    ));
-                    token_pools_writes.push((
-                        table.token_pools_key(&defs.quote_alkane_id, &pool_id),
-                        Vec::new(),
-                    ));
+                    token_pools_writes
+                        .push((table.token_pools_key(&defs.base_alkane_id, &pool_id), Vec::new()));
+                    token_pools_writes
+                        .push((table.token_pools_key(&defs.quote_alkane_id, &pool_id), Vec::new()));
                     reserves_snapshot.entry(pool_id).or_insert(SchemaPoolSnapshot {
                         base_reserve: 0,
                         quote_reserve: 0,
@@ -1044,12 +1029,7 @@ impl EspoModule for AmmData {
                             ));
                         }
                         amm_history_all_writes.push((
-                            table.amm_history_all_key(
-                                block_ts,
-                                seq,
-                                activity.kind,
-                                &pool_id,
-                            ),
+                            table.amm_history_all_key(block_ts, seq, activity.kind, &pool_id),
                             Vec::new(),
                         ));
                     }
@@ -1194,13 +1174,17 @@ impl EspoModule for AmmData {
                             _ => {}
                         }
                     }
-                    amm_history_all_writes.push((
-                        table.amm_history_all_key(block_ts, seq, kind, &owner),
-                        Vec::new(),
-                    ));
+                    amm_history_all_writes
+                        .push((table.amm_history_all_key(block_ts, seq, kind, &owner), Vec::new()));
                     if !address_spk.is_empty() {
                         address_amm_history_writes.push((
-                            table.address_amm_history_key(&address_spk, block_ts, seq, kind, &owner),
+                            table.address_amm_history_key(
+                                &address_spk,
+                                block_ts,
+                                seq,
+                                kind,
+                                &owner,
+                            ),
                             Vec::new(),
                         ));
                     }
@@ -1219,7 +1203,13 @@ impl EspoModule for AmmData {
                     let quote_volume = quote_abs;
 
                     candle_cache.apply_trade_for_frames(
-                        block_ts, owner, &frames, p_b_per_q, p_q_per_b, base_volume, quote_volume,
+                        block_ts,
+                        owner,
+                        &frames,
+                        p_b_per_q,
+                        p_q_per_b,
+                        base_volume,
+                        quote_volume,
                     );
 
                     if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
@@ -1229,7 +1219,8 @@ impl EspoModule for AmmData {
                         }
                     }
                     if canonical_quote_units.contains_key(&defs.base_alkane_id) {
-                        let entry = canonical_trade_buckets.entry(defs.quote_alkane_id).or_default();
+                        let entry =
+                            canonical_trade_buckets.entry(defs.quote_alkane_id).or_default();
                         for tf in &frames {
                             entry.insert((*tf, bucket_start_for(block_ts, *tf)));
                         }
@@ -1431,17 +1422,15 @@ impl EspoModule for AmmData {
                         let conv = |p: u128, inv: u128| -> Option<u128> {
                             match unit {
                                 CanonicalQuoteUnit::Usd => Some(p),
-                                CanonicalQuoteUnit::Btc => {
-                                    btc_usd_price.map(|btc| {
-                                        if p != 0 {
-                                            p.saturating_mul(btc) / PRICE_SCALE
-                                        } else if inv != 0 {
-                                            btc.saturating_mul(PRICE_SCALE) / inv
-                                        } else {
-                                            0
-                                        }
-                                    })
-                                }
+                                CanonicalQuoteUnit::Btc => btc_usd_price.map(|btc| {
+                                    if p != 0 {
+                                        p.saturating_mul(btc) / PRICE_SCALE
+                                    } else if inv != 0 {
+                                        btc.saturating_mul(PRICE_SCALE) / inv
+                                    } else {
+                                        0
+                                    }
+                                }),
                             }
                         };
                         let conv_vol = |v: u128| -> Option<u128> {
@@ -1564,49 +1553,38 @@ impl EspoModule for AmmData {
                     DerivedPoolInfo,
                 > = HashMap::new();
 
-                let mut maybe_insert_pool = |token: SchemaAlkaneId,
-                                             quote: SchemaAlkaneId,
-                                             pool: SchemaAlkaneId,
-                                             token_is_base: bool| {
-                    let key = (token, quote);
-                    match derived_pool_by_token_quote.get(&key) {
-                        None => {
-                            derived_pool_by_token_quote.insert(
-                                key,
-                                DerivedPoolInfo { pool_id: pool, token_is_base },
-                            );
-                        }
-                        Some(existing) => {
-                            let prefer = token_is_base && !existing.token_is_base;
-                            let smaller = pool.block < existing.pool_id.block
-                                || (pool.block == existing.pool_id.block
-                                    && pool.tx < existing.pool_id.tx);
-                            if prefer || (existing.token_is_base == token_is_base && smaller) {
-                                derived_pool_by_token_quote.insert(
-                                    key,
-                                    DerivedPoolInfo { pool_id: pool, token_is_base },
-                                );
+                let mut maybe_insert_pool =
+                    |token: SchemaAlkaneId,
+                     quote: SchemaAlkaneId,
+                     pool: SchemaAlkaneId,
+                     token_is_base: bool| {
+                        let key = (token, quote);
+                        match derived_pool_by_token_quote.get(&key) {
+                            None => {
+                                derived_pool_by_token_quote
+                                    .insert(key, DerivedPoolInfo { pool_id: pool, token_is_base });
+                            }
+                            Some(existing) => {
+                                let prefer = token_is_base && !existing.token_is_base;
+                                let smaller = pool.block < existing.pool_id.block
+                                    || (pool.block == existing.pool_id.block
+                                        && pool.tx < existing.pool_id.tx);
+                                if prefer || (existing.token_is_base == token_is_base && smaller) {
+                                    derived_pool_by_token_quote.insert(
+                                        key,
+                                        DerivedPoolInfo { pool_id: pool, token_is_base },
+                                    );
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
                 for (pool, defs) in pools_map.iter() {
                     if derived_quote_set.contains(&defs.quote_alkane_id) {
-                        maybe_insert_pool(
-                            defs.base_alkane_id,
-                            defs.quote_alkane_id,
-                            *pool,
-                            true,
-                        );
+                        maybe_insert_pool(defs.base_alkane_id, defs.quote_alkane_id, *pool, true);
                     }
                     if derived_quote_set.contains(&defs.base_alkane_id) {
-                        maybe_insert_pool(
-                            defs.quote_alkane_id,
-                            defs.base_alkane_id,
-                            *pool,
-                            false,
-                        );
+                        maybe_insert_pool(defs.quote_alkane_id, defs.base_alkane_id, *pool, false);
                     }
                 }
 
@@ -1617,10 +1595,11 @@ impl EspoModule for AmmData {
                 let mut quote_to_tokens: HashMap<SchemaAlkaneId, Vec<SchemaAlkaneId>> =
                     HashMap::new();
                 for ((token, quote), info) in derived_pool_by_token_quote.iter() {
-                    pool_to_edges
-                        .entry(info.pool_id)
-                        .or_default()
-                        .push((*token, *quote, info.token_is_base));
+                    pool_to_edges.entry(info.pool_id).or_default().push((
+                        *token,
+                        *quote,
+                        info.token_is_base,
+                    ));
                     quote_to_tokens.entry(*quote).or_default().push(*token);
                 }
 
@@ -1669,7 +1648,9 @@ impl EspoModule for AmmData {
                         }
                     }
                     let prefix = table.candle_ns_prefix(pool, tf);
-                    if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                    if let Ok(resp) =
+                        provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+                    {
                         for (k, v) in resp.entries {
                             let Some(ts) = parse_ts(&k) else { continue };
                             if ts > target {
@@ -1698,7 +1679,9 @@ impl EspoModule for AmmData {
                         }
                     }
                     let prefix = table.token_usd_candle_ns_prefix(token, tf);
-                    if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                    if let Ok(resp) =
+                        provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+                    {
                         for (k, v) in resp.entries {
                             let Some(ts) = parse_ts(&k) else { continue };
                             if ts > target {
@@ -1732,7 +1715,9 @@ impl EspoModule for AmmData {
                         }
                     }
                     let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, tf);
-                    if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                    if let Ok(resp) =
+                        provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+                    {
                         for (k, v) in resp.entries {
                             let Some(ts) = parse_ts(&k) else { continue };
                             if ts > target {
@@ -1822,7 +1807,9 @@ impl EspoModule for AmmData {
                     let Some(open_conv) = conv(q_usd_candle.open, q_per_t_open) else { continue };
                     let Some(high_conv) = conv(q_usd_candle.high, q_per_t_high) else { continue };
                     let Some(low_conv) = conv(q_usd_candle.low, q_per_t_low) else { continue };
-                    let Some(close_conv) = conv(q_usd_candle.close, q_per_t_close) else { continue };
+                    let Some(close_conv) = conv(q_usd_candle.close, q_per_t_close) else {
+                        continue;
+                    };
 
                     let token_volume = if info.token_is_base {
                         pool_candle.base_candle.volume
@@ -1861,9 +1848,7 @@ impl EspoModule for AmmData {
                         derived.volume = 0;
                     }
 
-                    if let Some((_ts, canonical)) =
-                        latest_token_usd_candle(&token, tf, bucket_ts)
-                    {
+                    if let Some((_ts, canonical)) = latest_token_usd_candle(&token, tf, bucket_ts) {
                         let strategy = derived_quote_strategies
                             .get(&quote)
                             .unwrap_or(&DerivedMergeStrategy::Neutral);
@@ -2050,11 +2035,10 @@ impl EspoModule for AmmData {
                 let marketcap_usd = fdv_usd;
 
                 let metrics_key = table.token_metrics_key(token);
-                let prev_raw = provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
-                let prev_metrics = prev_raw
-                    .value
-                    .as_ref()
-                    .and_then(|raw| decode_token_metrics(raw).ok());
+                let prev_raw =
+                    provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
+                let prev_metrics =
+                    prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
                 let full_history = prev_metrics.is_none();
                 let token_trade = match token_trade_windows(
@@ -2099,90 +2083,91 @@ impl EspoModule for AmmData {
                     token_metrics_index_new = token_metrics_index_new.saturating_add(1);
                 }
 
-                let build_index_keys = |m: &SchemaTokenMetricsV1| -> Vec<(TokenMetricsIndexField, Vec<u8>)> {
-                    vec![
-                        (
-                            TokenMetricsIndexField::PriceUsd,
-                            table.token_metrics_index_key_u128(
+                let build_index_keys =
+                    |m: &SchemaTokenMetricsV1| -> Vec<(TokenMetricsIndexField, Vec<u8>)> {
+                        vec![
+                            (
                                 TokenMetricsIndexField::PriceUsd,
-                                m.price_usd,
-                                token,
+                                table.token_metrics_index_key_u128(
+                                    TokenMetricsIndexField::PriceUsd,
+                                    m.price_usd,
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::MarketcapUsd,
-                            table.token_metrics_index_key_u128(
+                            (
                                 TokenMetricsIndexField::MarketcapUsd,
-                                m.marketcap_usd,
-                                token,
+                                table.token_metrics_index_key_u128(
+                                    TokenMetricsIndexField::MarketcapUsd,
+                                    m.marketcap_usd,
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::Volume1d,
-                            table.token_metrics_index_key_u128(
+                            (
                                 TokenMetricsIndexField::Volume1d,
-                                m.volume_1d,
-                                token,
+                                table.token_metrics_index_key_u128(
+                                    TokenMetricsIndexField::Volume1d,
+                                    m.volume_1d,
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::Volume7d,
-                            table.token_metrics_index_key_u128(
+                            (
                                 TokenMetricsIndexField::Volume7d,
-                                m.volume_7d,
-                                token,
+                                table.token_metrics_index_key_u128(
+                                    TokenMetricsIndexField::Volume7d,
+                                    m.volume_7d,
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::Volume30d,
-                            table.token_metrics_index_key_u128(
+                            (
                                 TokenMetricsIndexField::Volume30d,
-                                m.volume_30d,
-                                token,
+                                table.token_metrics_index_key_u128(
+                                    TokenMetricsIndexField::Volume30d,
+                                    m.volume_30d,
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::VolumeAllTime,
-                            table.token_metrics_index_key_u128(
+                            (
                                 TokenMetricsIndexField::VolumeAllTime,
-                                m.volume_all_time,
-                                token,
+                                table.token_metrics_index_key_u128(
+                                    TokenMetricsIndexField::VolumeAllTime,
+                                    m.volume_all_time,
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::Change1d,
-                            table.token_metrics_index_key_i64(
+                            (
                                 TokenMetricsIndexField::Change1d,
-                                parse_change_basis_points(&m.change_1d),
-                                token,
+                                table.token_metrics_index_key_i64(
+                                    TokenMetricsIndexField::Change1d,
+                                    parse_change_basis_points(&m.change_1d),
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::Change7d,
-                            table.token_metrics_index_key_i64(
+                            (
                                 TokenMetricsIndexField::Change7d,
-                                parse_change_basis_points(&m.change_7d),
-                                token,
+                                table.token_metrics_index_key_i64(
+                                    TokenMetricsIndexField::Change7d,
+                                    parse_change_basis_points(&m.change_7d),
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::Change30d,
-                            table.token_metrics_index_key_i64(
+                            (
                                 TokenMetricsIndexField::Change30d,
-                                parse_change_basis_points(&m.change_30d),
-                                token,
+                                table.token_metrics_index_key_i64(
+                                    TokenMetricsIndexField::Change30d,
+                                    parse_change_basis_points(&m.change_30d),
+                                    token,
+                                ),
                             ),
-                        ),
-                        (
-                            TokenMetricsIndexField::ChangeAllTime,
-                            table.token_metrics_index_key_i64(
+                            (
                                 TokenMetricsIndexField::ChangeAllTime,
-                                parse_change_basis_points(&m.change_all_time),
-                                token,
+                                table.token_metrics_index_key_i64(
+                                    TokenMetricsIndexField::ChangeAllTime,
+                                    parse_change_basis_points(&m.change_all_time),
+                                    token,
+                                ),
                             ),
-                        ),
-                    ]
-                };
+                        ]
+                    };
 
                 let new_keys = build_index_keys(&metrics);
                 if let Some(prev) = prev_metrics.as_ref() {
@@ -2221,8 +2206,9 @@ impl EspoModule for AmmData {
 
                             let prev_marketcap = prev_metrics.as_ref().map(|m| m.marketcap_usd);
                             let prev_volume_7d = prev_metrics.as_ref().map(|m| m.volume_7d);
-                            let prev_change_7d =
-                                prev_metrics.as_ref().map(|m| parse_change_basis_points(&m.change_7d));
+                            let prev_change_7d = prev_metrics
+                                .as_ref()
+                                .map(|m| parse_change_basis_points(&m.change_7d));
                             let prev_volume_all = prev_metrics.as_ref().map(|m| m.volume_all_time);
 
                             for prefix in prefixes {
@@ -2329,8 +2315,7 @@ impl EspoModule for AmmData {
             }
 
             for (token, quote) in derived_tokens_for_metrics.iter() {
-                let prefix =
-                    table.token_derived_usd_candle_ns_prefix(token, quote, Timeframe::M10);
+                let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, Timeframe::M10);
                 let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
                 for (k, v) in provider
                     .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
@@ -2424,10 +2409,8 @@ impl EspoModule for AmmData {
                 let metrics_key = table.token_derived_metrics_key(token, quote);
                 let prev_raw =
                     provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
-                let prev_metrics = prev_raw
-                    .value
-                    .as_ref()
-                    .and_then(|raw| decode_token_metrics(raw).ok());
+                let prev_metrics =
+                    prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
                 let full_history = prev_metrics.is_none();
                 let token_trade = match token_trade_windows(
@@ -2761,8 +2744,10 @@ impl EspoModule for AmmData {
                         if !token_is_base && !token_is_quote {
                             continue;
                         }
-                        let use_base_price = token_is_base && defs.quote_alkane_id == entry.quote_id;
-                        let use_quote_price = token_is_quote && defs.base_alkane_id == entry.quote_id;
+                        let use_base_price =
+                            token_is_base && defs.quote_alkane_id == entry.quote_id;
+                        let use_quote_price =
+                            token_is_quote && defs.base_alkane_id == entry.quote_id;
                         if !use_base_price && !use_quote_price {
                             continue;
                         }
@@ -2842,20 +2827,16 @@ impl EspoModule for AmmData {
                 let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
 
                 if let Some(unit) = canonical_quote_units.get(&defs.base_alkane_id) {
-                    if let Some(value) = canonical_quote_amount_tvl_usd(
-                        token0_amount,
-                        *unit,
-                        btc_usd_price,
-                    ) {
+                    if let Some(value) =
+                        canonical_quote_amount_tvl_usd(token0_amount, *unit, btc_usd_price)
+                    {
                         token0_tvl_usd = value;
                     }
                 }
                 if let Some(unit) = canonical_quote_units.get(&defs.quote_alkane_id) {
-                    if let Some(value) = canonical_quote_amount_tvl_usd(
-                        token1_amount,
-                        *unit,
-                        btc_usd_price,
-                    ) {
+                    if let Some(value) =
+                        canonical_quote_amount_tvl_usd(token1_amount, *unit, btc_usd_price)
+                    {
                         token1_tvl_usd = value;
                     }
                 }
@@ -2941,17 +2922,13 @@ impl EspoModule for AmmData {
                     .saturating_mul(token0_price_usd)
                     .saturating_div(PRICE_SCALE)
                     .saturating_add(
-                        block_quote
-                            .saturating_mul(token1_price_usd)
-                            .saturating_div(PRICE_SCALE),
+                        block_quote.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE),
                     );
                 let block_volume_sats = block_base
                     .saturating_mul(token0_price_sats)
                     .saturating_div(PRICE_SCALE)
                     .saturating_add(
-                        block_quote
-                            .saturating_mul(token1_price_sats)
-                            .saturating_div(PRICE_SCALE),
+                        block_quote.saturating_mul(token1_price_sats).saturating_div(PRICE_SCALE),
                     );
 
                 let pool_volume_all_time_usd = if trade_windows.has_all_time {
@@ -3139,32 +3116,33 @@ impl EspoModule for AmmData {
                 let pool_label = get_alkane_label(essentials, &mut alkane_label_cache, pool);
                 let pool_name = pool_name_display(&strip_lp_suffix(&pool_label));
 
-                let creation_info = pool_creation_info_cache
-                    .get(pool)
-                    .cloned()
-                    .or_else(|| {
-                        provider
-                            .get_pool_creation_info(GetPoolCreationInfoParams { pool: *pool })
-                            .ok()
-                            .and_then(|res| res.info)
-                    });
-                let (creator_address, creation_height, initial_token0_amount, initial_token1_amount) =
-                    if let Some(info) = creation_info {
-                        let creator = if info.creator_spk.is_empty() {
-                            None
-                        } else {
-                            let spk = ScriptBuf::from(info.creator_spk.clone());
-                            spk_to_address_str(&spk, network)
-                        };
-                        (
-                            creator,
-                            Some(info.creation_height),
-                            info.initial_token0_amount,
-                            info.initial_token1_amount,
-                        )
+                let creation_info = pool_creation_info_cache.get(pool).cloned().or_else(|| {
+                    provider
+                        .get_pool_creation_info(GetPoolCreationInfoParams { pool: *pool })
+                        .ok()
+                        .and_then(|res| res.info)
+                });
+                let (
+                    creator_address,
+                    creation_height,
+                    initial_token0_amount,
+                    initial_token1_amount,
+                ) = if let Some(info) = creation_info {
+                    let creator = if info.creator_spk.is_empty() {
+                        None
                     } else {
-                        (None, None, 0, 0)
+                        let spk = ScriptBuf::from(info.creator_spk.clone());
+                        spk_to_address_str(&spk, network)
                     };
+                    (
+                        creator,
+                        Some(info.creation_height),
+                        info.initial_token0_amount,
+                        info.initial_token1_amount,
+                    )
+                } else {
+                    (None, None, 0, 0)
+                };
 
                 let lp_value_sats =
                     if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };

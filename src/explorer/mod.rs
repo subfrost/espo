@@ -1,8 +1,8 @@
 mod api;
 pub mod components;
 pub mod consts;
-pub mod paths;
 mod pages;
+pub mod paths;
 
 use std::net::SocketAddr;
 
@@ -19,8 +19,8 @@ use pages::state::ExplorerState;
 use pages::tx::tx_page;
 use tokio::net::TcpListener;
 
-use components::layout::style;
 use crate::config::get_explorer_base_path;
+use components::layout::style;
 
 pub fn explorer_router(state: ExplorerState) -> Router {
     Router::new()

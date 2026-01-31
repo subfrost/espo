@@ -2,15 +2,14 @@
 ///
 /// This module provides a test-friendly wrapper around the metashrew/alkanes runtime
 /// for integration testing of ESPO with AMM operations using actual RocksDB storage.
-
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use bitcoin::Block;
 use metashrew_runtime::MetashrewRuntime;
-use rockshrew_runtime::adapter::RocksDBRuntimeAdapter;
+use metashrew_support::utils;
 use rocksdb::DB;
+use rockshrew_runtime::adapter::RocksDBRuntimeAdapter;
 use std::sync::Arc;
 use tempfile::TempDir;
-use metashrew_support::utils;
 
 /// The alkanes.wasm indexer binary (v2.1.6 regtest)
 const ALKANES_WASM: &[u8] = include_bytes!("../../test_data/alkanes.wasm");
@@ -41,13 +40,11 @@ impl TestMetashrewRuntime {
         Self::configure_network();
 
         // Create temporary directory for RocksDB
-        let temp_dir = TempDir::new()
-            .context("Failed to create temp directory")?;
+        let temp_dir = TempDir::new().context("Failed to create temp directory")?;
 
         // Open RocksDB with optimized options
         let opts = RocksDBRuntimeAdapter::get_optimized_options();
-        let db = Arc::new(DB::open(&opts, temp_dir.path())
-            .context("Failed to open RocksDB")?);
+        let db = Arc::new(DB::open(&opts, temp_dir.path()).context("Failed to open RocksDB")?);
 
         // Create RocksDB adapter
         let adapter = RocksDBRuntimeAdapter::new(db.clone());
@@ -55,8 +52,7 @@ impl TestMetashrewRuntime {
         // Create wasmtime engine with async support
         let mut config = wasmtime::Config::default();
         config.async_support(true);
-        let engine = wasmtime::Engine::new(&config)
-            .context("Failed to create wasmtime engine")?;
+        let engine = wasmtime::Engine::new(&config).context("Failed to create wasmtime engine")?;
 
         // Create MetashrewRuntime
         // Note: This is blocking, but only called during test setup
@@ -68,20 +64,17 @@ impl TestMetashrewRuntime {
                     engine,
                     None,  // intercept_logging
                     false, // enable_smt
-                ).await
+                )
+                .await
             })
         })?;
 
-        Ok(Self {
-            runtime: Arc::new(tokio::sync::Mutex::new(runtime)),
-            db,
-            _temp_dir: temp_dir,
-        })
+        Ok(Self { runtime: Arc::new(tokio::sync::Mutex::new(runtime)), db, _temp_dir: temp_dir })
     }
 
     /// Configure network parameters for regtest
     fn configure_network() {
-        use protorune_support::network::{set_network, NetworkParams};
+        use protorune_support::network::{NetworkParams, set_network};
 
         set_network(NetworkParams {
             bech32_prefix: String::from("bcrt"),
@@ -113,11 +106,15 @@ impl TestMetashrewRuntime {
                 }
 
                 // Run the indexer
-                runtime.run().await
+                runtime
+                    .run()
+                    .await
                     .with_context(|| format!("Failed to index block at height {}", height))?;
 
                 // Refresh memory
-                runtime.refresh_memory().await
+                runtime
+                    .refresh_memory()
+                    .await
                     .with_context(|| format!("Failed to refresh memory at height {}", height))?;
 
                 Ok::<(), anyhow::Error>(())
@@ -141,7 +138,10 @@ impl TestMetashrewRuntime {
     /// let traces = runtime.get_traces_for_block(height)?;
     /// let espo_block = build_espo_block(height, &block, traces)?;
     /// ```
-    pub fn get_traces_for_block(&self, height: u32) -> Result<Vec<crate::alkanes::trace::PartialEspoTrace>> {
+    pub fn get_traces_for_block(
+        &self,
+        height: u32,
+    ) -> Result<Vec<crate::alkanes::trace::PartialEspoTrace>> {
         use crate::alkanes::metashrew::decode_trace_blob;
 
         // Scan for all trace keys that match /trace/{outpoint} pattern

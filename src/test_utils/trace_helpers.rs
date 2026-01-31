@@ -1,19 +1,17 @@
+use crate::alkanes::trace::{
+    EspoAlkanesTransaction, EspoBlock, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
+    EspoTrace, PartialEspoTrace, extract_alkane_storage, prettyify_protobuf_trace_json,
+};
+use crate::schemas::EspoOutpoint;
 /// Helpers for extracting and working with traces in tests
 ///
 /// This module provides utilities to bridge metashrew traces with ESPO structures
 /// for testing purposes.
-
-use anyhow::{Result, Context};
-use bitcoin::{Block, Transaction};
+use anyhow::{Context, Result};
 use bitcoin::consensus::Encodable;
-use crate::alkanes::trace::{
-    EspoBlock, EspoAlkanesTransaction, EspoTrace, PartialEspoTrace,
-    extract_alkane_storage, prettyify_protobuf_trace_json,
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
-};
-use crate::schemas::EspoOutpoint;
-use std::collections::HashMap;
 use bitcoin::hashes::Hash;
+use bitcoin::{Block, Transaction};
+use std::collections::HashMap;
 
 /// Build EspoBlock from a Bitcoin block and metashrew traces
 ///
@@ -63,24 +61,19 @@ pub fn build_espo_block(
 /// Build host function values from a block
 fn build_host_function_values(block: &Block) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let mut header_bytes = Vec::new();
-    block.header.consensus_encode(&mut header_bytes)
+    block
+        .header
+        .consensus_encode(&mut header_bytes)
         .context("Failed to encode block header")?;
 
-    let coinbase_tx = block
-        .txdata
-        .first()
-        .cloned()
-        .context("Block has no coinbase transaction")?;
+    let coinbase_tx = block.txdata.first().cloned().context("Block has no coinbase transaction")?;
 
     let mut coinbase_bytes = Vec::new();
-    coinbase_tx.consensus_encode(&mut coinbase_bytes)
+    coinbase_tx
+        .consensus_encode(&mut coinbase_bytes)
         .context("Failed to encode coinbase transaction")?;
 
-    let total_fees: u128 = coinbase_tx
-        .output
-        .iter()
-        .map(|out| out.value.to_sat() as u128)
-        .sum();
+    let total_fees: u128 = coinbase_tx.output.iter().map(|out| out.value.to_sat() as u128).sum();
     let total_fees_bytes = total_fees.to_le_bytes().to_vec();
 
     // TODO: Calculate actual diesel mints if needed
@@ -102,9 +95,7 @@ fn group_traces_by_txid(
 
         let (tx_bytes, vout_le) = partial.outpoint.split_at(32);
         let vout = u32::from_le_bytes(
-            vout_le[..4]
-                .try_into()
-                .context("Failed to parse vout from outpoint")?,
+            vout_le[..4].try_into().context("Failed to parse vout from outpoint")?,
         );
 
         // Convert txid to hex (little-endian)
@@ -112,10 +103,7 @@ fn group_traces_by_txid(
         tx_bytes_rev.reverse();
         let txid_hex = hex::encode(&tx_bytes_rev);
 
-        traces_by_txid
-            .entry(txid_hex)
-            .or_default()
-            .push((vout, partial));
+        traces_by_txid.entry(txid_hex).or_default().push((vout, partial));
     }
 
     // Sort traces by vout within each transaction
@@ -143,10 +131,7 @@ fn build_espo_transactions(
             None
         };
 
-        result.push(EspoAlkanesTransaction {
-            traces: traces_opt,
-            transaction: tx.clone(),
-        });
+        result.push(EspoAlkanesTransaction { traces: traces_opt, transaction: tx.clone() });
     }
 
     Ok(result)
@@ -166,23 +151,18 @@ fn build_espo_traces(
         let events_json_str = prettyify_protobuf_trace_json(&partial.protobuf_trace)
             .context("Failed to convert protobuf trace to JSON")?;
 
-        let events: Vec<EspoSandshrewLikeTraceEvent> = serde_json::from_str(&events_json_str)
-            .context("Failed to parse trace events")?;
+        let events: Vec<EspoSandshrewLikeTraceEvent> =
+            serde_json::from_str(&events_json_str).context("Failed to parse trace events")?;
 
-        let sandshrew_trace = EspoSandshrewLikeTrace {
-            outpoint: format!("{}:{}", txid_hex, vout),
-            events,
-        };
+        let sandshrew_trace =
+            EspoSandshrewLikeTrace { outpoint: format!("{}:{}", txid_hex, vout), events };
 
         // Extract storage changes from the trace
         let storage_changes = extract_alkane_storage(&partial.protobuf_trace, tx)
             .context("Failed to extract alkane storage")?;
 
-        let outpoint = EspoOutpoint {
-            txid: txid.as_byte_array().to_vec(),
-            vout: *vout,
-            tx_spent: None,
-        };
+        let outpoint =
+            EspoOutpoint { txid: txid.as_byte_array().to_vec(), vout: *vout, tx_spent: None };
 
         traces.push(EspoTrace {
             sandshrew_trace,
@@ -199,7 +179,6 @@ fn build_espo_traces(
 ///
 /// Since alkanes.wasm computes traces on-demand via view functions (not stored in DB),
 /// we manually construct traces for testing purposes.
-
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use alkanes_support::id::AlkaneId;
 
@@ -231,10 +210,7 @@ pub fn build_pool_creation_trace(
         events: vec![], // TODO: Add proper trace events
     };
 
-    PartialEspoTrace {
-        protobuf_trace,
-        outpoint,
-    }
+    PartialEspoTrace { protobuf_trace, outpoint }
 }
 
 /// Build EspoBlock from Bitcoin block without traces

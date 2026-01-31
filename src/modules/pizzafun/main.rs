@@ -2,13 +2,15 @@ use crate::alkanes::trace::EspoBlock;
 use crate::config::{debug_enabled, get_espo_db, get_network};
 use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
+use crate::modules::essentials::consts::{
+    ESSENTIALS_GENESIS_INSPECTIONS, essentials_genesis_block,
+};
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationRecordsByIdParams,
     GetIndexHeightParams as EssentialsGetIndexHeightParams,
 };
-use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::modules::essentials::utils::inspections::created_alkanes_from_block;
-use crate::modules::essentials::consts::{ESSENTIALS_GENESIS_INSPECTIONS, essentials_genesis_block};
+use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
@@ -67,10 +69,7 @@ impl Pizzafun {
 
     #[inline]
     fn provider(&self) -> &PizzafunProvider {
-        self.provider
-            .as_ref()
-            .expect("ModuleRegistry must call set_mdb()")
-            .as_ref()
+        self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
     }
 
     fn load_essentials_index_height(&self) -> Option<u32> {
@@ -108,7 +107,8 @@ impl Pizzafun {
             let a_pri = priority_index.get(&a.alkane_id);
             let b_pri = priority_index.get(&b.alkane_id);
             match (a_pri, b_pri) {
-                (Some(ai), Some(bi)) => ai.cmp(bi)
+                (Some(ai), Some(bi)) => ai
+                    .cmp(bi)
                     .then_with(|| a.creation_height.cmp(&b.creation_height))
                     .then_with(|| a.alkane_id.cmp(&b.alkane_id)),
                 (Some(_), None) => Ordering::Less,
@@ -174,14 +174,11 @@ impl EspoModule for Pizzafun {
             for rec in records.into_iter().flatten() {
                 let Some(raw_name) = rec.names.first() else { continue };
                 let Some(name_norm) = normalize_alkane_name(raw_name) else { continue };
-                by_name
-                    .entry(name_norm)
-                    .or_default()
-                    .push(SeriesEntry {
-                        series_id: String::new(),
-                        alkane_id: rec.alkane,
-                        creation_height: rec.creation_height,
-                    });
+                by_name.entry(name_norm).or_default().push(SeriesEntry {
+                    series_id: String::new(),
+                    alkane_id: rec.alkane,
+                    creation_height: rec.creation_height,
+                });
             }
 
             if !by_name.is_empty() {
@@ -203,11 +200,8 @@ impl EspoModule for Pizzafun {
 
                     let mut updated: Vec<SeriesEntry> = Vec::with_capacity(combined.len());
                     for (idx, entry) in combined.into_iter().enumerate() {
-                        let series_id = if idx == 0 {
-                            name.clone()
-                        } else {
-                            format!("{}-{}", name, idx + 1)
-                        };
+                        let series_id =
+                            if idx == 0 { name.clone() } else { format!("{}-{}", name, idx + 1) };
                         updated.push(SeriesEntry {
                             series_id,
                             alkane_id: entry.alkane_id,
@@ -222,9 +216,8 @@ impl EspoModule for Pizzafun {
         debug::log_elapsed(module, "update_series_index", timer);
 
         let timer = debug::start_if(debug);
-        self.provider().set_index_height(super::storage::SetIndexHeightParams {
-            height: block.height,
-        })?;
+        self.provider()
+            .set_index_height(super::storage::SetIndexHeightParams { height: block.height })?;
         *self.index_height.write().expect("pizzafun index height lock poisoned") =
             Some(block.height);
         debug::log_elapsed(module, "store_height", timer);

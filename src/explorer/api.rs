@@ -12,8 +12,8 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    EssentialsProvider, EssentialsTable, HoldersCountEntry, get_cached_block_summary, load_creation_record,
-    BlockSummary,
+    BlockSummary, EssentialsProvider, EssentialsTable, HoldersCountEntry, get_cached_block_summary,
+    load_creation_record,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -24,14 +24,14 @@ use alkanes_support::proto::alkanes::{
     AlkaneId as ProtoAlkaneId, MessageContextParcel, SimulateResponse as SimulateProto,
 };
 use anyhow::Context;
-use bitcoincore_rpc::bitcoin::Network;
 use bitcoin::blockdata::block::Header;
-use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::locktime::absolute::LockTime;
-use bitcoin::transaction::Version;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
+use bitcoin::transaction::Version;
 use bitcoin::{Address, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut};
+use bitcoincore_rpc::bitcoin::Network;
 use borsh::BorshDeserialize;
 use ordinals::Runestone;
 use prost::Message;
@@ -138,9 +138,7 @@ pub async fn carousel_blocks(Query(q): Query<CarouselQuery>) -> Json<CarouselRes
         });
 
         let (traces, time) = if let Some(summary) = summary {
-            let time = deserialize::<Header>(&summary.header)
-                .ok()
-                .map(|hdr| hdr.time as u32);
+            let time = deserialize::<Header>(&summary.header).ok().map(|hdr| hdr.time as u32);
             (summary.trace_count as usize, time)
         } else {
             (0, None)
@@ -240,11 +238,8 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                 return;
             }
             let meta = alkane_meta(&alk, meta_cache, essentials_mdb);
-            let icon_url = if !meta.icon_url.trim().is_empty() {
-                Some(meta.icon_url.clone())
-            } else {
-                None
-            };
+            let icon_url =
+                if !meta.icon_url.trim().is_empty() { Some(meta.icon_url.clone()) } else { None };
             let holders = holders_for(table, essentials_mdb, &alk);
             alkanes.push(RankedAlkaneItem {
                 item: SearchGuessItem {
@@ -270,9 +265,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         let query_len = query_norm.chars().count();
         let mut used_search_index = false;
 
-        if search_index_enabled
-            && query_len >= search_prefix_min
-            && query_len <= search_prefix_max
+        if search_index_enabled && query_len >= search_prefix_min && query_len <= search_prefix_max
         {
             let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
             let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb.clone()));
@@ -312,7 +305,9 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
             for res in it {
                 let Ok((k, _)) = res else { continue };
                 let rel = &k[essentials_mdb.prefix().len()..];
-                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
+                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else {
+                    continue;
+                };
                 let Some(rec) = load_creation_record(&essentials_mdb, &alk).ok().flatten() else {
                     continue;
                 };
@@ -443,11 +438,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         if let Ok(addr) = addr.require_network(get_network()) {
             let addr_str = addr.to_string();
             let label = if addr_str.len() > 24 {
-                format!(
-                    "{}...{}",
-                    &addr_str[..8],
-                    &addr_str[addr_str.len().saturating_sub(6)..]
-                )
+                format!("{}...{}", &addr_str[..8], &addr_str[addr_str.len().saturating_sub(6)..])
             } else {
                 addr_str.clone()
             };
@@ -498,9 +489,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
     if !alkanes.is_empty() {
         alkanes.sort_by(|a, b| {
-            b.holders
-                .cmp(&a.holders)
-                .then_with(|| a.item.label.cmp(&b.item.label))
+            b.holders.cmp(&a.holders).then_with(|| a.item.label.cmp(&b.item.label))
         });
         let alkanes: Vec<SearchGuessItem> = alkanes.into_iter().map(|item| item.item).collect();
         groups.push(SearchGuessGroup {
@@ -579,11 +568,7 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
         .as_deref()
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty());
-    let mut quote = q
-        .quote
-        .as_deref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let mut quote = q.quote.as_deref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
     if source.is_none() {
         let pool = format!("{}-usd", alkane_id_str(&alkane));
@@ -591,8 +576,11 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
             source = Some("usd".to_string());
         } else if let Some(derived_cfg) = cfg.derived_liquidity.as_ref() {
             for entry in &derived_cfg.derived_quotes {
-                let pool =
-                    format!("{}-derived_{}-usd", alkane_id_str(&alkane), alkane_id_str(&entry.alkane));
+                let pool = format!(
+                    "{}-derived_{}-usd",
+                    alkane_id_str(&alkane),
+                    alkane_id_str(&entry.alkane)
+                );
                 if candles_available(&provider, &pool, timeframe) {
                     source = Some("derived".to_string());
                     quote = Some(alkane_id_str(&entry.alkane));
@@ -626,11 +614,7 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
                 error: Some("missing_or_invalid_quote".to_string()),
             });
         };
-        format!(
-            "{}-derived_{}-usd",
-            alkane_id_str(&alkane),
-            alkane_id_str(&quote_id)
-        )
+        format!("{}-derived_{}-usd", alkane_id_str(&alkane), alkane_id_str(&quote_id))
     } else {
         format!("{}-usd", alkane_id_str(&alkane))
     };
@@ -640,10 +624,7 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
     }
 
     let value = rpc_get_candles_value(&provider, &pool, timeframe, limit);
-    let mut candles = value
-        .as_ref()
-        .map(parse_candles)
-        .unwrap_or_default();
+    let mut candles = value.as_ref().map(parse_candles).unwrap_or_default();
     candles.sort_by_key(|c| c.ts);
     let available = !candles.is_empty();
 
@@ -925,21 +906,15 @@ fn should_decode_alkanes(returns_norm: &str) -> bool {
     }
 
     let is_alkane_type = |ty: &str| {
-        matches!(
-            ty,
-            "alkane" | "alkaneid" | "alkane_id" | "schemaalkaneid" | "schema_alkane_id"
-        )
+        matches!(ty, "alkane" | "alkaneid" | "alkane_id" | "schemaalkaneid" | "schema_alkane_id")
     };
 
     if is_alkane_type(returns_norm) {
         return true;
     }
 
-    let unwrap_inner = |prefix: &str| {
-        returns_norm
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix('>'))
-    };
+    let unwrap_inner =
+        |prefix: &str| returns_norm.strip_prefix(prefix).and_then(|rest| rest.strip_suffix('>'));
 
     if let Some(inner) = unwrap_inner("vec<") {
         return is_alkane_type(inner);
@@ -1044,10 +1019,7 @@ fn decode_address_cards(bytes: &[u8], network: Network) -> Option<Vec<SearchGues
     }])
 }
 
-fn decode_taproot_address(
-    bytes: &[u8],
-    network: Network,
-) -> Option<String> {
+fn decode_taproot_address(bytes: &[u8], network: Network) -> Option<String> {
     let payload = if bytes.len() == 32 {
         Some(bytes)
     } else {
@@ -1104,18 +1076,25 @@ fn decode_alkane_cards(
 fn decode_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
     decode_support_alkane_ids(bytes)
         .or_else(|| strip_len_prefix(bytes).and_then(decode_support_alkane_ids))
-        .or_else(|| strip_u128_prefix(bytes).and_then(|(count, payload)| {
-            decode_support_alkane_ids_prefixed(payload, count)
-        }))
-        .or_else(|| decode_proto_alkane_id(bytes).map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 }))
-        .or_else(|| strip_len_prefix(bytes).and_then(|payload| {
-            decode_proto_alkane_id(payload)
-                .map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
-        }))
-        .or_else(|| strip_u128_prefix(bytes).and_then(|(_, payload)| {
-            decode_proto_alkane_id(payload)
-                .map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
-        }))
+        .or_else(|| {
+            strip_u128_prefix(bytes)
+                .and_then(|(count, payload)| decode_support_alkane_ids_prefixed(payload, count))
+        })
+        .or_else(|| {
+            decode_proto_alkane_id(bytes).map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
+        })
+        .or_else(|| {
+            strip_len_prefix(bytes).and_then(|payload| {
+                decode_proto_alkane_id(payload)
+                    .map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
+            })
+        })
+        .or_else(|| {
+            strip_u128_prefix(bytes).and_then(|(_, payload)| {
+                decode_proto_alkane_id(payload)
+                    .map(|id| AlkaneDecodeResult { ids: vec![id], total: 1 })
+            })
+        })
 }
 
 fn decode_support_alkane_ids_prefixed(bytes: &[u8], total: usize) -> Option<AlkaneDecodeResult> {
@@ -1170,11 +1149,7 @@ fn schema_from_support_id(id: SupportAlkaneId) -> Option<SchemaAlkaneId> {
 }
 
 fn validate_schema_alkane(id: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
-    if (id.block as u128) <= MAX_ALKANE_BLOCK {
-        Some(id)
-    } else {
-        None
-    }
+    if (id.block as u128) <= MAX_ALKANE_BLOCK { Some(id) } else { None }
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<String> {

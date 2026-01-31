@@ -30,18 +30,12 @@ pub struct Subfrost {
 
 impl Subfrost {
     pub fn new() -> Self {
-        Self {
-            provider: None,
-            index_height: Arc::new(std::sync::RwLock::new(None)),
-        }
+        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
     }
 
     #[inline]
     fn provider(&self) -> &SubfrostProvider {
-        self.provider
-            .as_ref()
-            .expect("ModuleRegistry must call set_mdb()")
-            .as_ref()
+        self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
@@ -130,9 +124,10 @@ impl EspoModule for Subfrost {
             let Some(traces) = &tx.traces else { continue };
             let mut address_spk_bytes: Option<Vec<u8>> = None;
             for trace in traces {
-                let Some(cleaned) =
-                    clean_espo_sandshrew_like_trace(&trace.sandshrew_trace, &block.host_function_values)
-                else {
+                let Some(cleaned) = clean_espo_sandshrew_like_trace(
+                    &trace.sandshrew_trace,
+                    &block.host_function_values,
+                ) else {
                     continue;
                 };
                 let mut stack: Vec<Option<PendingWrap>> = Vec::new();
@@ -144,11 +139,12 @@ impl EspoModule for Subfrost {
                                 continue;
                             };
                             let address_spk_bytes = address_spk_bytes.get_or_insert_with(|| {
-                                let address_spk =
-                                    tx_owner_spk(&tx.transaction, &block_tx_map, &mut prev_tx_cache);
-                                address_spk
-                                    .map(|s| s.as_bytes().to_vec())
-                                    .unwrap_or_default()
+                                let address_spk = tx_owner_spk(
+                                    &tx.transaction,
+                                    &block_tx_map,
+                                    &mut prev_tx_cache,
+                                );
+                                address_spk.map(|s| s.as_bytes().to_vec()).unwrap_or_default()
                             });
                             stack.push(Some(PendingWrap {
                                 kind,
@@ -160,10 +156,9 @@ impl EspoModule for Subfrost {
                             let Some(pending) = stack.pop().flatten() else { continue };
                             let success = ret.status == EspoSandshrewLikeTraceStatus::Success;
                             let amount = match pending.kind {
-                                WrapKind::Wrap => extract_amount_for_alkane(
-                                    &ret.response.alkanes,
-                                    frbtc,
-                                ),
+                                WrapKind::Wrap => {
+                                    extract_amount_for_alkane(&ret.response.alkanes, frbtc)
+                                }
                                 WrapKind::Unwrap => pending.amount,
                             };
                             let Some(amount) = amount else { continue };
@@ -231,14 +226,8 @@ impl EspoModule for Subfrost {
                     .unwrap_or(0);
                 let total_all = prev_all.saturating_add(unwrap_delta_all);
                 let total_success = prev_success.saturating_add(unwrap_delta_success);
-                puts.push((
-                    table.unwrap_total_latest_key(false),
-                    encode_u128_value(total_all),
-                ));
-                puts.push((
-                    table.unwrap_total_latest_key(true),
-                    encode_u128_value(total_success),
-                ));
+                puts.push((table.unwrap_total_latest_key(false), encode_u128_value(total_all)));
+                puts.push((table.unwrap_total_latest_key(true), encode_u128_value(total_success)));
                 puts.push((
                     table.unwrap_total_by_height_key(block.height, false),
                     encode_u128_value(total_all),
@@ -250,10 +239,7 @@ impl EspoModule for Subfrost {
             }
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
-            let _ = provider.set_batch(SetBatchParams {
-                puts,
-                deletes: Vec::new(),
-            });
+            let _ = provider.set_batch(SetBatchParams { puts, deletes: Vec::new() });
             debug::log_elapsed(module, "write_batch", timer);
         }
 
@@ -345,7 +331,9 @@ fn extract_amount_for_alkane(
     if found { Some(total) } else { None }
 }
 
-fn parse_trace_id(id: &crate::alkanes::trace::EspoSandshrewLikeTraceShortId) -> Option<SchemaAlkaneId> {
+fn parse_trace_id(
+    id: &crate::alkanes::trace::EspoSandshrewLikeTraceShortId,
+) -> Option<SchemaAlkaneId> {
     let block = parse_hex_u32(&id.block)?;
     let tx = parse_hex_u64(&id.tx)?;
     Some(SchemaAlkaneId { block, tx })

@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
 use crate::schemas::SchemaAlkaneId;
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 #[derive(Clone, Debug)]
@@ -38,15 +38,15 @@ impl AmmDataConfig {
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| anyhow!("ammdata config must be an object; expected: {}", Self::spec()))?;
+        let obj = value.as_object().ok_or_else(|| {
+            anyhow!("ammdata config must be an object; expected: {}", Self::spec())
+        })?;
         let eth_rpc_val = obj
             .get("eth_rpc")
             .ok_or_else(|| anyhow!("ammdata.eth_rpc missing; expected: {}", Self::spec()))?;
-        let eth_call_throttle_val = obj
-            .get("eth_call_throttle")
-            .ok_or_else(|| anyhow!("ammdata.eth_call_throttle missing; expected: {}", Self::spec()))?;
+        let eth_call_throttle_val = obj.get("eth_call_throttle").ok_or_else(|| {
+            anyhow!("ammdata.eth_call_throttle missing; expected: {}", Self::spec())
+        })?;
         let eth_rpc = eth_rpc_val
             .as_str()
             .ok_or_else(|| anyhow!("ammdata.eth_rpc must be a string; expected: {}", Self::spec()))?
@@ -55,16 +55,15 @@ impl AmmDataConfig {
         if eth_rpc.is_empty() {
             anyhow::bail!("ammdata.eth_rpc must be set; expected: {}", Self::spec());
         }
-        let eth_call_throttle_ms = eth_call_throttle_val
-            .as_u64()
-            .ok_or_else(|| {
-                anyhow!("ammdata.eth_call_throttle must be a non-negative integer; expected: {}", Self::spec())
-            })?;
+        let eth_call_throttle_ms = eth_call_throttle_val.as_u64().ok_or_else(|| {
+            anyhow!(
+                "ammdata.eth_call_throttle must be a non-negative integer; expected: {}",
+                Self::spec()
+            )
+        })?;
 
-        let search_index_enabled = obj
-            .get("search_index_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let search_index_enabled =
+            obj.get("search_index_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
         let search_prefix_min_len = obj
             .get("search_prefix_min")
             .and_then(|v| v.as_u64())
@@ -75,14 +74,9 @@ impl AmmDataConfig {
             .and_then(|v| v.as_u64())
             .map(|v| v as u8)
             .unwrap_or(6);
-        let search_fallback_scan_cap = obj
-            .get("search_fallback_scan_cap")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5000);
-        let search_limit_cap = obj
-            .get("search_limit_cap")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20);
+        let search_fallback_scan_cap =
+            obj.get("search_fallback_scan_cap").and_then(|v| v.as_u64()).unwrap_or(5000);
+        let search_limit_cap = obj.get("search_limit_cap").and_then(|v| v.as_u64()).unwrap_or(20);
 
         let derived_liquidity = match obj.get("derived_liquidity") {
             None => None,
@@ -118,10 +112,8 @@ impl AmmDataConfig {
                             Self::spec()
                         )
                     })?;
-                    let alkane_str = entry_obj
-                        .get("alkane")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
+                    let alkane_str =
+                        entry_obj.get("alkane").and_then(|v| v.as_str()).ok_or_else(|| {
                             anyhow!(
                                 "ammdata.derived_liquidity[].alkane must be a string; expected: {}",
                                 Self::spec()
@@ -133,10 +125,8 @@ impl AmmDataConfig {
                             alkane_str
                         )
                     })?;
-                    let strategy_str = entry_obj
-                        .get("strategy")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
+                    let strategy_str =
+                        entry_obj.get("strategy").and_then(|v| v.as_str()).ok_or_else(|| {
                             anyhow!(
                                 "ammdata.derived_liquidity[].strategy missing; expected: {}",
                                 Self::spec()

@@ -7,12 +7,12 @@ use crate::modules::essentials::consts::{
 };
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
-    EssentialsProvider, cache_block_summary, encode_creation_record, BlockSummary,
+    BlockSummary, EssentialsProvider, cache_block_summary, encode_creation_record,
 };
+use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::inspections::{
     AlkaneCreationRecord, created_alkane_records_from_block, inspect_wasm_metadata,
 };
-use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::names::{
     get_name as get_alkane_name, normalize_alkane_name,
 };
@@ -73,10 +73,7 @@ impl Essentials {
 
     #[inline]
     fn provider(&self) -> &EssentialsProvider {
-        self.provider
-            .as_ref()
-            .expect("ModuleRegistry must call set_mdb()")
-            .as_ref()
+        self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").as_ref()
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
@@ -87,9 +84,8 @@ impl Essentials {
     }
 
     fn persist_index_height(&self, height: u32) -> Result<()> {
-        self.provider().set_index_height(crate::modules::essentials::storage::SetIndexHeightParams {
-            height,
-        })
+        self.provider()
+            .set_index_height(crate::modules::essentials::storage::SetIndexHeightParams { height })
     }
 
     fn set_index_height(&self, new_height: u32) -> Result<()> {
@@ -171,10 +167,10 @@ impl EspoModule for Essentials {
         let mut symbol_index_rows: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         let add_name_index =
             |rows: &mut HashMap<Vec<u8>, Vec<u8>>, alk: &SchemaAlkaneId, name: &str| {
-            if let Some(norm) = normalize_alkane_name(name) {
-                rows.insert(table.alkane_name_index_key(&norm, alk), Vec::new());
-            }
-        };
+                if let Some(norm) = normalize_alkane_name(name) {
+                    rows.insert(table.alkane_name_index_key(&norm, alk), Vec::new());
+                }
+            };
         let add_symbol_index =
             |rows: &mut HashMap<Vec<u8>, Vec<u8>>, alk: &SchemaAlkaneId, symbol: &str| {
                 if let Some(norm) = normalize_alkane_name(symbol) {
@@ -422,8 +418,10 @@ impl EspoModule for Essentials {
                     crate::modules::essentials::storage::GetCreationRecordsByIdParams { alkanes },
                 )?
                 .records;
-            let id_keys: Vec<Vec<u8>> =
-                created_records.iter().map(|r| table.alkane_creation_by_id_key(&r.alkane)).collect();
+            let id_keys: Vec<Vec<u8>> = created_records
+                .iter()
+                .map(|r| table.alkane_creation_by_id_key(&r.alkane))
+                .collect();
 
             for (idx, rec) in created_records.into_iter().enumerate() {
                 let key_id = &id_keys[idx];
@@ -681,6 +679,9 @@ impl EspoModule for Essentials {
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {
-        rpc::register_rpc(reg.clone(), self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").clone());
+        rpc::register_rpc(
+            reg.clone(),
+            self.provider.as_ref().expect("ModuleRegistry must call set_mdb()").clone(),
+        );
     }
 }

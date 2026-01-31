@@ -1,7 +1,9 @@
 use crate::modules::ammdata::consts::PRICE_SCALE;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, SchemaActivityV1};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
+};
 use crate::modules::ammdata::utils::candles::PriceSide;
-use crate::modules::ammdata::storage::{AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use borsh::{BorshDeserialize, to_vec};
@@ -320,10 +322,7 @@ impl ActivityIndexAcc {
         append_index_entries(&mut self.writes, pool, ts, seq, a, Some(group));
 
         *self.per_pool_delta.entry((pool.block, pool.tx)).or_insert(0) += 1;
-        *self
-            .per_pool_group_delta
-            .entry((pool.block, pool.tx, group))
-            .or_insert(0) += 1;
+        *self.per_pool_group_delta.entry((pool.block, pool.tx, group)).or_insert(0) += 1;
     }
 
     pub fn into_writes(self) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -477,10 +476,7 @@ pub fn read_activity_for_pool(
     // Collect newest → oldest
     let mut all: Vec<(u64, SchemaActivityV1)> = Vec::new();
     let prefix = activity_ns_prefix(&pool);
-    for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?
-        .entries
-    {
+    for (k, v) in provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?.entries {
         let ts = parse_ts_from_key_tail(&k).unwrap_or_default();
         let a = decode_activity_v1(&v)?;
         if let Some(group) = group_from_filter(activity_type) {
@@ -533,7 +529,11 @@ pub enum ActivitySideFilter {
     Sell,
 }
 
-fn idx_prefix_for(pool: &SchemaAlkaneId, k: ActivitySortKey, group: Option<ActivityGroup>) -> Vec<u8> {
+fn idx_prefix_for(
+    pool: &SchemaAlkaneId,
+    k: ActivitySortKey,
+    group: Option<ActivityGroup>,
+) -> Vec<u8> {
     match k {
         ActivitySortKey::Timestamp => idx_prefix_ts(pool, group),
         ActivitySortKey::AmountBaseAbs => idx_prefix_absb(pool, group),
@@ -585,10 +585,7 @@ fn total_for_pool_index(
     count_key: Option<Vec<u8>>,
 ) -> Result<usize> {
     if let Some(count_k) = count_key {
-        if let Some(v) = provider
-            .get_raw_value(GetRawValueParams { key: count_k })?
-            .value
-        {
+        if let Some(v) = provider.get_raw_value(GetRawValueParams { key: count_k })?.value {
             if let Some(n) = decode_u64_be(&v) {
                 return Ok(n as usize);
             }
@@ -705,10 +702,7 @@ pub fn read_activity_for_pool_sorted(
         pk.push(b':');
         pk.extend_from_slice(seq.to_string().as_bytes());
 
-        if let Some(v) = provider
-            .get_raw_value(GetRawValueParams { key: pk })?
-            .value
-        {
+        if let Some(v) = provider.get_raw_value(GetRawValueParams { key: pk })?.value {
             let a = decode_activity_v1(&v)?;
             if let Some(g) = group {
                 if group_for_kind(a.kind) != g {
