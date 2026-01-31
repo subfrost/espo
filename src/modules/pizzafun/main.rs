@@ -187,7 +187,7 @@ impl EspoModule for Pizzafun {
             if !by_name.is_empty() {
                 let priority_index = Self::priority_index_map();
                 for (name, mut new_entries) in by_name {
-                    let mut existing = self.provider().get_series_entries_by_name(&name)?;
+                    let existing = self.provider().get_series_entries_by_name(&name)?;
                     if !existing.is_empty() {
                         let mut existing_ids: HashSet<SchemaAlkaneId> =
                             existing.iter().map(|e| e.alkane_id).collect();

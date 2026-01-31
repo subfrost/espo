@@ -1,8 +1,9 @@
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, prettyify_protobuf_trace_json};
 use crate::config::{get_metashrew, get_network};
 use crate::modules::essentials::utils::balances::{
-    SignedU128, get_alkane_balances, get_balance_for_address, get_holders_for_alkane,
-    get_outpoint_balances as get_outpoint_balances_index,
+    SignedU128, get_address_activity_for_address, get_alkane_balances, get_balance_for_address,
+    get_holders_for_alkane, get_outpoint_balances as get_outpoint_balances_index,
+    get_total_received_for_alkane, get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -104,6 +105,9 @@ pub struct EssentialsTable<'a> {
     pub HOLDERS: MdbPointer<'a>,
     pub HOLDERS_COUNT: MdbPointer<'a>,
     pub HOLDERS_ORDERED: MdbPointer<'a>,
+    pub TRANSFER_VOLUME: MdbPointer<'a>,
+    pub TOTAL_RECEIVED: MdbPointer<'a>,
+    pub ADDRESS_ACTIVITY: MdbPointer<'a>,
     pub ALKANE_BALANCES: MdbPointer<'a>,
     pub ALKANE_BALANCES_BY_HEIGHT: MdbPointer<'a>,
     pub ALKANE_BALANCE_TXS: MdbPointer<'a>,
@@ -149,6 +153,9 @@ impl<'a> EssentialsTable<'a> {
             HOLDERS: root.keyword("/holders/"),
             HOLDERS_COUNT: root.keyword("/holders/count/"),
             HOLDERS_ORDERED: root.keyword("/alkanes/holders/ordered/"),
+            TRANSFER_VOLUME: root.keyword("/alkanes/transfer_volume/"),
+            TOTAL_RECEIVED: root.keyword("/alkanes/total_received/"),
+            ADDRESS_ACTIVITY: root.keyword("/addresses/alkane_activity/"),
             ALKANE_BALANCES: root.keyword("/alkane_balances/"),
             ALKANE_BALANCES_BY_HEIGHT: root.keyword("/alkane_balances_by_height/"),
             ALKANE_BALANCE_TXS: root.keyword("/alkane_balance_txs/"),
@@ -237,6 +244,24 @@ impl<'a> EssentialsTable<'a> {
         suffix.extend_from_slice(&alkane.block.to_be_bytes());
         suffix.extend_from_slice(&alkane.tx.to_be_bytes());
         self.HOLDERS_COUNT.select(&suffix).key().to_vec()
+    }
+
+    pub fn transfer_volume_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.TRANSFER_VOLUME.select(&suffix).key().to_vec()
+    }
+
+    pub fn total_received_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&alkane.block.to_be_bytes());
+        suffix.extend_from_slice(&alkane.tx.to_be_bytes());
+        self.TOTAL_RECEIVED.select(&suffix).key().to_vec()
+    }
+
+    pub fn address_activity_key(&self, address: &str) -> Vec<u8> {
+        self.ADDRESS_ACTIVITY.select(address.as_bytes()).key().to_vec()
     }
 
     pub fn alkane_balance_txs_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
@@ -1573,6 +1598,152 @@ impl EssentialsProvider {
         })
     }
 
+    pub fn rpc_get_transfer_volume(
+        &self,
+        params: RpcGetTransferVolumeParams,
+    ) -> Result<RpcGetTransferVolumeResult> {
+        let Some(alk_raw) = params.alkane.as_deref() else {
+            return Ok(RpcGetTransferVolumeResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+        let Some(alk) = parse_alkane_from_str(alk_raw) else {
+            return Ok(RpcGetTransferVolumeResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+
+        let limit = params.limit.unwrap_or(100).max(1) as usize;
+        let page = params.page.unwrap_or(1).max(1) as usize;
+
+        let (total, slice) = match get_transfer_volume_for_alkane(self, alk, page, limit) {
+            Ok(tup) => tup,
+            Err(_) => {
+                return Ok(RpcGetTransferVolumeResult {
+                    value: json!({"ok": false, "error": "internal_error"}),
+                });
+            }
+        };
+
+        let has_more = page.saturating_mul(limit) < total;
+        let items: Vec<Value> = slice
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "address": entry.address,
+                    "amount": entry.amount.to_string()
+                })
+            })
+            .collect();
+
+        Ok(RpcGetTransferVolumeResult {
+            value: json!({
+                "ok": true,
+                "alkane": format!("{}:{}", alk.block, alk.tx),
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "items": items
+            }),
+        })
+    }
+
+    pub fn rpc_get_total_received(
+        &self,
+        params: RpcGetTotalReceivedParams,
+    ) -> Result<RpcGetTotalReceivedResult> {
+        let Some(alk_raw) = params.alkane.as_deref() else {
+            return Ok(RpcGetTotalReceivedResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+        let Some(alk) = parse_alkane_from_str(alk_raw) else {
+            return Ok(RpcGetTotalReceivedResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_alkane"}),
+            });
+        };
+
+        let limit = params.limit.unwrap_or(100).max(1) as usize;
+        let page = params.page.unwrap_or(1).max(1) as usize;
+
+        let (total, slice) = match get_total_received_for_alkane(self, alk, page, limit) {
+            Ok(tup) => tup,
+            Err(_) => {
+                return Ok(RpcGetTotalReceivedResult {
+                    value: json!({"ok": false, "error": "internal_error"}),
+                });
+            }
+        };
+
+        let has_more = page.saturating_mul(limit) < total;
+        let items: Vec<Value> = slice
+            .into_iter()
+            .map(|entry| {
+                json!({
+                    "address": entry.address,
+                    "amount": entry.amount.to_string()
+                })
+            })
+            .collect();
+
+        Ok(RpcGetTotalReceivedResult {
+            value: json!({
+                "ok": true,
+                "alkane": format!("{}:{}", alk.block, alk.tx),
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "has_more": has_more,
+                "items": items
+            }),
+        })
+    }
+
+    pub fn rpc_get_address_activity(
+        &self,
+        params: RpcGetAddressActivityParams,
+    ) -> Result<RpcGetAddressActivityResult> {
+        let Some(address_raw) = params.address.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAddressActivityResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_address"}),
+            });
+        };
+        let Some(address) = normalize_address(address_raw) else {
+            return Ok(RpcGetAddressActivityResult {
+                value: json!({"ok": false, "error": "invalid_address_format"}),
+            });
+        };
+
+        let activity = match get_address_activity_for_address(self, &address) {
+            Ok(entry) => entry,
+            Err(_) => {
+                return Ok(RpcGetAddressActivityResult {
+                    value: json!({"ok": false, "error": "internal_error"}),
+                });
+            }
+        };
+
+        let mut transfer_volume: Map<String, Value> = Map::new();
+        for (alk, amt) in activity.transfer_volume {
+            transfer_volume.insert(format!("{}:{}", alk.block, alk.tx), Value::String(amt.to_string()));
+        }
+        let mut total_received: Map<String, Value> = Map::new();
+        for (alk, amt) in activity.total_received {
+            total_received.insert(format!("{}:{}", alk.block, alk.tx), Value::String(amt.to_string()));
+        }
+
+        Ok(RpcGetAddressActivityResult {
+            value: json!({
+                "ok": true,
+                "address": address,
+                "transfer_volume": Value::Object(transfer_volume),
+                "total_received": Value::Object(total_received),
+            }),
+        })
+    }
+
     pub fn rpc_get_address_balances(
         &self,
         params: RpcGetAddressBalancesParams,
@@ -2791,6 +2962,34 @@ pub struct RpcGetHoldersResult {
     pub value: Value,
 }
 
+pub struct RpcGetTransferVolumeParams {
+    pub alkane: Option<String>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcGetTransferVolumeResult {
+    pub value: Value,
+}
+
+pub struct RpcGetTotalReceivedParams {
+    pub alkane: Option<String>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+}
+
+pub struct RpcGetTotalReceivedResult {
+    pub value: Value,
+}
+
+pub struct RpcGetAddressActivityParams {
+    pub address: Option<String>,
+}
+
+pub struct RpcGetAddressActivityResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAddressBalancesParams {
     pub address: Option<String>,
     pub include_outpoints: Option<bool>,
@@ -2924,6 +3123,20 @@ pub enum HolderId {
 pub struct HolderEntry {
     pub holder: HolderId,
     pub amount: u128,
+}
+
+/// Entry in per-alkane address activity indexes.
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+pub struct AddressAmountEntry {
+    pub address: String,
+    pub amount: u128,
+}
+
+/// Per-address activity summary across alkanes.
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
+pub struct AddressActivityEntry {
+    pub transfer_volume: BTreeMap<SchemaAlkaneId, u128>,
+    pub total_received: BTreeMap<SchemaAlkaneId, u128>,
 }
 
 /// One alkane balance record inside a single outpoint (BORSH)
@@ -3129,6 +3342,22 @@ pub fn decode_holders_vec(bytes: &[u8]) -> Result<Vec<HolderEntry>> {
         .into_iter()
         .map(|h| HolderEntry { holder: HolderId::Address(h.address), amount: h.amount })
         .collect())
+}
+
+pub fn decode_address_amount_vec(bytes: &[u8]) -> Result<Vec<AddressAmountEntry>> {
+    Ok(Vec::<AddressAmountEntry>::try_from_slice(bytes)?)
+}
+
+pub fn encode_address_amount_vec(entries: &Vec<AddressAmountEntry>) -> Result<Vec<u8>> {
+    encode_vec(entries)
+}
+
+pub fn decode_address_activity_entry(bytes: &[u8]) -> Result<AddressActivityEntry> {
+    Ok(AddressActivityEntry::try_from_slice(bytes)?)
+}
+
+pub fn encode_address_activity_entry(entry: &AddressActivityEntry) -> Result<Vec<u8>> {
+    Ok(borsh::to_vec(entry)?)
 }
 
 pub fn encode_alkane_info(info: &AlkaneInfo) -> Result<Vec<u8>> {

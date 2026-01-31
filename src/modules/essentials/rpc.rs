@@ -7,7 +7,7 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams,
     RpcGetBlockSummaryParams, RpcGetBlockTracesParams, RpcGetHoldersCountParams,
     RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
-    RpcPingParams,
+    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcGetAddressActivityParams, RpcPingParams,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -150,6 +150,70 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         mdb.rpc_get_holders(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_transfer = reg.clone();
+        let mdb_transfer = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_transfer
+                .register("get_transfer_volume", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_transfer);
+                    async move {
+                        let params = RpcGetTransferVolumeParams {
+                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        mdb.rpc_get_transfer_volume(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_received = reg.clone();
+        let mdb_received = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_received
+                .register("get_total_received", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_received);
+                    async move {
+                        let params = RpcGetTotalReceivedParams {
+                            alkane: payload.get("alkane").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                        };
+                        mdb.rpc_get_total_received(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_activity = reg.clone();
+        let mdb_activity = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_activity
+                .register("get_address_activity", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_activity);
+                    async move {
+                        let params = RpcGetAddressActivityParams {
+                            address: payload.get("address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        };
+                        mdb.rpc_get_address_activity(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }

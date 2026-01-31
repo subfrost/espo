@@ -14,11 +14,11 @@ use crate::config::{
 use crate::debug;
 use crate::modules::essentials::storage::get_holders_values_encoded;
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, AlkaneBalanceTxsMeta, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
-    BALANCE_TXS_PAGE_SIZE,
-    decode_alkane_balance_tx_entries, decode_balances_vec, decode_holders_vec, decode_u128_value,
-    encode_u128_value, encode_vec,
-    mk_outpoint, spk_to_address_str,
+    AddressActivityEntry, AddressAmountEntry, AlkaneBalanceTxEntry, AlkaneBalanceTxsMeta,
+    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId, BALANCE_TXS_PAGE_SIZE,
+    decode_address_activity_entry, decode_address_amount_vec, decode_alkane_balance_tx_entries,
+    decode_balances_vec, decode_holders_vec, decode_u128_value, encode_address_activity_entry,
+    encode_address_amount_vec, encode_u128_value, encode_vec, mk_outpoint, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, GetScanPrefixParams, SetBatchParams,
@@ -1094,6 +1094,13 @@ fn apply_holders_delta(
     holders
 }
 
+fn sort_address_amount_entries(entries: &mut Vec<AddressAmountEntry>) {
+    entries.sort_by(|a, b| match b.amount.cmp(&a.amount) {
+        std::cmp::Ordering::Equal => a.address.cmp(&b.address),
+        o => o,
+    });
+}
+
 /* ===========================================================
 Public API
 =========================================================== */
@@ -1132,6 +1139,12 @@ pub fn bulk_update_balances_for_block(
     let mut alkane_block_txids: Vec<[u8; 32]> = Vec::new();
     let mut alkane_address_txids: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
     let mut latest_trace_txids: Vec<[u8; 32]> = Vec::new();
+    let mut transfer_volume_delta: HashMap<SchemaAlkaneId, HashMap<String, u128>> = HashMap::new();
+    let mut total_received_delta: HashMap<SchemaAlkaneId, HashMap<String, u128>> = HashMap::new();
+    let mut address_activity_transfer_delta: HashMap<String, HashMap<SchemaAlkaneId, u128>> =
+        HashMap::new();
+    let mut address_activity_received_delta: HashMap<String, HashMap<SchemaAlkaneId, u128>> =
+        HashMap::new();
 
     let push_balance_tx_entry = |map: &mut HashMap<SchemaAlkaneId, Vec<AlkaneBalanceTxEntry>>,
                                  alk: SchemaAlkaneId,
@@ -1346,6 +1359,9 @@ pub fn bulk_update_balances_for_block(
         let txid = tx.compute_txid();
         let txid_bytes = txid.to_byte_array();
         let mut tx_addrs: HashSet<String> = HashSet::new();
+        let mut vin_addrs: HashSet<String> = HashSet::new();
+        let mut vout_addrs: HashSet<String> = HashSet::new();
+        let mut tx_transfer_amounts_by_alkane: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
         let mut has_alkane_vin = false;
         let has_traces = atx.traces.as_ref().map_or(false, |t| !t.is_empty());
         let mut holder_alkanes_changed: HashSet<SchemaAlkaneId> = HashSet::new();
@@ -1412,7 +1428,8 @@ pub fn bulk_update_balances_for_block(
                     }
                 }
                 if let Some(addr) = input_addr {
-                    tx_addrs.insert(addr);
+                    tx_addrs.insert(addr.clone());
+                    vin_addrs.insert(addr);
                 }
             }
 
@@ -1423,6 +1440,7 @@ pub fn bulk_update_balances_for_block(
 
                 if let Some(addr) = ephem_outpoint_addr.get(&in_str) {
                     tx_addrs.insert(addr.clone());
+                    vin_addrs.insert(addr.clone());
                     for be in bals {
                         add_holder_delta(
                             be.alkane,
@@ -1466,6 +1484,7 @@ pub fn bulk_update_balances_for_block(
 
                 if let Some(ref addr) = resolved_addr {
                     tx_addrs.insert(addr.clone());
+                    vin_addrs.insert(addr.clone());
                     // holders-- and mark legacy addr-row delete
                     for be in &bals {
                         add_holder_delta(
@@ -1591,6 +1610,23 @@ pub fn bulk_update_balances_for_block(
 
                 // holders++ stats
                 for (alkane_id, delta_amount) in amounts_by_alkane {
+                    *tx_transfer_amounts_by_alkane.entry(alkane_id).or_default() = tx_transfer_amounts_by_alkane
+                        .get(&alkane_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(delta_amount);
+                    let total_by_addr = total_received_delta.entry(alkane_id).or_default();
+                    *total_by_addr.entry(address_str.clone()).or_default() = total_by_addr
+                        .get(&address_str)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(delta_amount);
+                    let activity_by_addr = address_activity_received_delta.entry(address_str.clone()).or_default();
+                    *activity_by_addr.entry(alkane_id).or_default() = activity_by_addr
+                        .get(&alkane_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(delta_amount);
                     add_holder_delta(
                         alkane_id,
                         HolderId::Address(address_str.clone()),
@@ -1605,6 +1641,38 @@ pub fn bulk_update_balances_for_block(
                 }
 
                 stat_outpoints_written += 1;
+            }
+        }
+
+        if !tx_transfer_amounts_by_alkane.is_empty() {
+            for output in &tx.output {
+                if is_op_return(&output.script_pubkey) {
+                    continue;
+                }
+                if let Some(addr) = spk_to_address_str(&output.script_pubkey, network) {
+                    vout_addrs.insert(addr);
+                }
+            }
+
+            let mut participants = vin_addrs;
+            participants.extend(vout_addrs);
+            if !participants.is_empty() {
+                for (alkane_id, amount) in tx_transfer_amounts_by_alkane {
+                    let per_addr = transfer_volume_delta.entry(alkane_id).or_default();
+                    for addr in participants.iter() {
+                        *per_addr.entry(addr.clone()).or_default() = per_addr
+                            .get(addr)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(amount);
+                        let activity = address_activity_transfer_delta.entry(addr.clone()).or_default();
+                        *activity.entry(alkane_id).or_default() = activity
+                            .get(&alkane_id)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(amount);
+                    }
+                }
             }
         }
         for (holder_alk, per_token) in &local_alkane_delta {
@@ -2166,6 +2234,100 @@ pub fn bulk_update_balances_for_block(
         {
             puts.push((holders_key, encoded_holders_vec));
             puts.push((holders_count_key, encoded_holders_count_vec));
+        }
+    }
+
+    // E) Transfer volume + total received + address activity
+    for (alkane, per_addr) in transfer_volume_delta.iter() {
+        let key = table.transfer_volume_key(alkane);
+        let current = provider.get_raw_value(GetRawValueParams { key: key.clone() })?.value;
+        let mut map: HashMap<String, u128> = HashMap::new();
+        if let Some(bytes) = current {
+            if let Ok(entries) = decode_address_amount_vec(&bytes) {
+                for entry in entries {
+                    map.insert(entry.address, entry.amount);
+                }
+            }
+        }
+        for (addr, delta) in per_addr {
+            *map.entry(addr.clone()).or_default() = map
+                .get(addr)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(*delta);
+        }
+        let mut entries: Vec<AddressAmountEntry> = map
+            .into_iter()
+            .map(|(address, amount)| AddressAmountEntry { address, amount })
+            .collect();
+        sort_address_amount_entries(&mut entries);
+        if let Ok(buf) = encode_address_amount_vec(&entries) {
+            puts.push((key, buf));
+        }
+    }
+
+    for (alkane, per_addr) in total_received_delta.iter() {
+        let key = table.total_received_key(alkane);
+        let current = provider.get_raw_value(GetRawValueParams { key: key.clone() })?.value;
+        let mut map: HashMap<String, u128> = HashMap::new();
+        if let Some(bytes) = current {
+            if let Ok(entries) = decode_address_amount_vec(&bytes) {
+                for entry in entries {
+                    map.insert(entry.address, entry.amount);
+                }
+            }
+        }
+        for (addr, delta) in per_addr {
+            *map.entry(addr.clone()).or_default() = map
+                .get(addr)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(*delta);
+        }
+        let mut entries: Vec<AddressAmountEntry> = map
+            .into_iter()
+            .map(|(address, amount)| AddressAmountEntry { address, amount })
+            .collect();
+        sort_address_amount_entries(&mut entries);
+        if let Ok(buf) = encode_address_amount_vec(&entries) {
+            puts.push((key, buf));
+        }
+    }
+
+    if !address_activity_transfer_delta.is_empty() || !address_activity_received_delta.is_empty() {
+        let mut addr_keys: HashSet<String> = HashSet::new();
+        addr_keys.extend(address_activity_transfer_delta.keys().cloned());
+        addr_keys.extend(address_activity_received_delta.keys().cloned());
+        for addr in addr_keys {
+            let key = table.address_activity_key(&addr);
+            let current = provider.get_raw_value(GetRawValueParams { key: key.clone() })?.value;
+            let mut entry = match current {
+                Some(bytes) => decode_address_activity_entry(&bytes).unwrap_or_default(),
+                None => AddressActivityEntry::default(),
+            };
+            if let Some(per_alk) = address_activity_transfer_delta.get(&addr) {
+                for (alk, delta) in per_alk {
+                    *entry.transfer_volume.entry(*alk).or_default() = entry
+                        .transfer_volume
+                        .get(alk)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*delta);
+                }
+            }
+            if let Some(per_alk) = address_activity_received_delta.get(&addr) {
+                for (alk, delta) in per_alk {
+                    *entry.total_received.entry(*alk).or_default() = entry
+                        .total_received
+                        .get(alk)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(*delta);
+                }
+            }
+            if let Ok(buf) = encode_address_activity_entry(&entry) {
+                puts.push((key, buf));
+            }
         }
     }
 
@@ -2934,6 +3096,66 @@ pub fn get_holders_for_alkane(
     let end = (off + l).min(total);
     let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
     Ok((total, supply, slice))
+}
+
+pub fn get_transfer_volume_for_alkane(
+    provider: &EssentialsProvider,
+    alk: SchemaAlkaneId,
+    page: usize,
+    limit: usize,
+) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    let table = provider.table();
+    let key = table.transfer_volume_key(&alk);
+    let cur = provider.get_raw_value(GetRawValueParams { key })?.value;
+    let mut all = match cur {
+        Some(bytes) => decode_address_amount_vec(&bytes).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    sort_address_amount_entries(&mut all);
+    let total = all.len();
+    let p = page.max(1);
+    let l = limit.max(1);
+    let off = l.saturating_mul(p - 1);
+    let end = (off + l).min(total);
+    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
+    Ok((total, slice))
+}
+
+pub fn get_total_received_for_alkane(
+    provider: &EssentialsProvider,
+    alk: SchemaAlkaneId,
+    page: usize,
+    limit: usize,
+) -> Result<(usize, Vec<AddressAmountEntry>)> {
+    let table = provider.table();
+    let key = table.total_received_key(&alk);
+    let cur = provider.get_raw_value(GetRawValueParams { key })?.value;
+    let mut all = match cur {
+        Some(bytes) => decode_address_amount_vec(&bytes).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    sort_address_amount_entries(&mut all);
+    let total = all.len();
+    let p = page.max(1);
+    let l = limit.max(1);
+    let off = l.saturating_mul(p - 1);
+    let end = (off + l).min(total);
+    let slice = if off >= total { vec![] } else { all[off..end].to_vec() };
+    Ok((total, slice))
+}
+
+pub fn get_address_activity_for_address(
+    provider: &EssentialsProvider,
+    address: &str,
+) -> Result<AddressActivityEntry> {
+    let table = provider.table();
+    let key = table.address_activity_key(address);
+    let cur = provider.get_raw_value(GetRawValueParams { key })?.value;
+    let entry = match cur {
+        Some(bytes) => decode_address_activity_entry(&bytes).unwrap_or_default(),
+        None => AddressActivityEntry::default(),
+    };
+    Ok(entry)
 }
 
 pub fn get_scriptpubkey_for_address(

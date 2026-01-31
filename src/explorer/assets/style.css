@@ -1027,6 +1027,20 @@ a:hover {
     text-align: right;
     justify-self: end;
   }
+
+  .alkane-activity-card .holders_table tbody tr {
+    grid-template-areas:
+      "holder holder"
+      "amount amount";
+  }
+  .alkane-activity-card .holders_table td:nth-child(2) {
+    grid-area: amount;
+    text-align: left;
+    justify-self: start;
+  }
+  .alkane-activity-card .holders_table td:nth-child(2) .alk-line {
+    justify-content: flex-start;
+  }
 }
 
 .ellipsis {
@@ -1300,6 +1314,20 @@ a:hover {
 }
 .alkane-holders-card th:nth-child(3) {
   text-align: right;
+}
+
+.alkane-activity-card col:nth-child(2),
+.alkane-activity-card col:last-child {
+  width: 240px !important;
+}
+.alkane-activity-card td:nth-child(2),
+.alkane-activity-card th:nth-child(2) {
+  text-align: right;
+}
+.alkane-activity-card td:nth-child(2) .alk-line {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  max-width: 100%;
 }
 
 .io-amount {

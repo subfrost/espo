@@ -20,7 +20,10 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
 };
-use crate::modules::essentials::utils::balances::{get_alkane_balances, get_holders_for_alkane};
+use crate::modules::essentials::utils::balances::{
+    get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
+    get_transfer_volume_for_alkane,
+};
 use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
@@ -41,12 +44,16 @@ pub struct PageQuery {
 enum AlkaneTab {
     Holders,
     Inspect,
+    TransferVolume,
+    TotalReceived,
 }
 
 impl AlkaneTab {
     fn from_query(raw: Option<&str>) -> Self {
         match raw {
             Some("inspect") => AlkaneTab::Inspect,
+            Some("transfer_volume") => AlkaneTab::TransferVolume,
+            Some("total_received") => AlkaneTab::TotalReceived,
             _ => AlkaneTab::Holders,
         }
     }
@@ -200,6 +207,72 @@ pub async fn alkane_page(
         }
     };
 
+    let (activity_total, activity_entries, activity_label) = match tab {
+        AlkaneTab::TransferVolume => {
+            let (total, entries) =
+                get_transfer_volume_for_alkane(&state.essentials_provider(), alk, page, limit)
+                    .unwrap_or((0, Vec::new()));
+            (total, entries, "Transfer volume")
+        }
+        AlkaneTab::TotalReceived => {
+            let (total, entries) =
+                get_total_received_for_alkane(&state.essentials_provider(), alk, page, limit)
+                    .unwrap_or((0, Vec::new()));
+            (total, entries, "Total received")
+        }
+        _ => (0, Vec::new(), "Transfer volume"),
+    };
+    let activity_off = limit.saturating_mul(page.saturating_sub(1));
+    let activity_len = activity_entries.len();
+    let activity_has_prev = page > 1;
+    let activity_has_next = activity_off + activity_len < activity_total;
+    let activity_display_start =
+        if activity_total > 0 && activity_off < activity_total { activity_off + 1 } else { 0 };
+    let activity_display_end = (activity_off + activity_len).min(activity_total);
+    let activity_last_page = if activity_total > 0 {
+        (activity_total + limit - 1) / limit
+    } else {
+        1
+    };
+
+    let activity_rows: Vec<Vec<Markup>> = activity_entries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let rank = activity_off + idx + 1;
+            let (addr_prefix, addr_suffix) = addr_prefix_suffix(&entry.address);
+            vec![
+                html! {
+                    a class="link mono addr-inline" href=(explorer_path(&format!("/address/{}", entry.address))) {
+                        span class="addr-rank" { (format!("{rank}.")) }
+                        span class="addr-prefix" { (addr_prefix) }
+                        span class="addr-suffix" { (addr_suffix) }
+                    }
+                },
+                html! {
+                    div class="alk-line" {
+                        div class="alk-icon-wrap" aria-hidden="true" {
+                            span class="alk-icon-img" style=(icon_bg_style(&icon_url)) {}
+                            span class="alk-icon-letter" { (fallback_letter) }
+                        }
+                        span class="alk-amt mono" { (fmt_activity_amount(entry.amount)) }
+                        a class="alk-sym link mono" href=(explorer_path(&format!("/alkane/{alk_str}"))) { (coin_label.clone()) }
+                    }
+                },
+            ]
+        })
+        .collect();
+
+    let activity_table_markup = if activity_rows.is_empty() {
+        html! { div class="alkane-panel" { p class="muted" { "No activity yet." } } }
+    } else {
+        html! {
+            div class="alkane-panel alkane-holders-card alkane-activity-card" {
+                (holders_table(&["Address", activity_label], activity_rows))
+            }
+        }
+    };
+
     let balances_markup = if balance_entries.is_empty() {
         html! { p class="muted" { "No alkanes tracked for this alkane." } }
     } else {
@@ -322,6 +395,10 @@ pub async fn alkane_page(
                         div class="alkane-tab-list" {
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Holders { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?page={page}&limit={limit}"))) { "Holders" }
+                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::TransferVolume { " active" } else { "" }))
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=transfer_volume&page={page}&limit={limit}"))) { "Transfer Volume" }
+                            a class=(format!("alkane-tab{}", if tab == AlkaneTab::TotalReceived { " active" } else { "" }))
+                                href=(explorer_path(&format!("/alkane/{alk_str}?tab=total_received&page={page}&limit={limit}"))) { "Total Received" }
                             a class=(format!("alkane-tab{}", if tab == AlkaneTab::Inspect { " active" } else { "" }))
                                 href=(explorer_path(&format!("/alkane/{alk_str}?tab=inspect&page={page}&limit={limit}"))) { "Inspect contract" }
                         }
@@ -361,6 +438,47 @@ pub async fn alkane_page(
                                     }
                                     @if has_next {
                                         a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?page={}&limit={limit}", last_page))) aria-label="Last page" {
+                                            (icon_skip_right())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_right()) }
+                                    }
+                                }
+                            } @else if tab == AlkaneTab::TransferVolume || tab == AlkaneTab::TotalReceived {
+                                (activity_table_markup)
+                                div class="pager" {
+                                    @if activity_has_prev {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page=1&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }))) aria-label="First page" {
+                                            (icon_skip_left())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_skip_left()) }
+                                    }
+                                    @if activity_has_prev {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, page - 1))) aria-label="Previous page" {
+                                            (icon_left())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_left()) }
+                                    }
+                                    span class="pager-meta muted" { "Showing "
+                                        (if activity_total > 0 { activity_display_start } else { 0 })
+                                        @if activity_total > 0 {
+                                            "-"
+                                            (activity_display_end)
+                                        }
+                                        " / "
+                                        (activity_total)
+                                    }
+                                    @if activity_has_next {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, page + 1))) aria-label="Next page" {
+                                            (icon_right())
+                                        }
+                                    } @else {
+                                        span class="pill disabled iconbtn" aria-hidden="true" { (icon_right()) }
+                                    }
+                                    @if activity_has_next {
+                                        a class="pill iconbtn" href=(explorer_path(&format!("/alkane/{alk_str}?tab={}&page={}&limit={limit}", match tab { AlkaneTab::TransferVolume => "transfer_volume", AlkaneTab::TotalReceived => "total_received", _ => "transfer_volume" }, activity_last_page))) aria-label="Last page" {
                                             (icon_skip_right())
                                         }
                                     } @else {
@@ -478,6 +596,37 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     let prefix = addr[..split_at].to_string();
     let suffix = addr[split_at..].to_string();
     (prefix, suffix)
+}
+
+fn fmt_activity_amount(raw: u128) -> String {
+    const MILLION: u128 = 1_000_000;
+    const BILLION: u128 = 1_000_000_000;
+    const TRILLION: u128 = 1_000_000_000_000;
+    const QUADRILLION: u128 = 1_000_000_000_000_000;
+
+    let units = raw / crate::explorer::pages::common::ALKANE_SCALE;
+    if units < MILLION {
+        return fmt_alkane_amount(raw);
+    }
+
+    let (unit, suffix) = if units >= QUADRILLION {
+        (QUADRILLION, "Q")
+    } else if units >= TRILLION {
+        (TRILLION, "T")
+    } else if units >= BILLION {
+        (BILLION, "B")
+    } else {
+        (MILLION, "M")
+    };
+
+    let whole = units / unit;
+    let rem = units % unit;
+    let dec = (rem * 10) / unit;
+    if dec == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{dec}{suffix}")
+    }
 }
 
 fn split_methods(
