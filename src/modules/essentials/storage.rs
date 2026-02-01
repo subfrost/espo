@@ -1,5 +1,8 @@
-use crate::alkanes::trace::{EspoSandshrewLikeTrace, prettyify_protobuf_trace_json};
-use crate::config::{get_metashrew, get_network};
+use crate::alkanes::trace::{
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
+};
+use bitcoincore_rpc::RpcApi;
+use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew, get_network};
 use crate::modules::essentials::utils::balances::{
     SignedU128, get_address_activity_for_address, get_alkane_balances, get_balance_for_address,
     get_holders_for_alkane, get_outpoint_balances as get_outpoint_balances_index,
@@ -8,14 +11,20 @@ use crate::modules::essentials::utils::balances::{
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
+use alkanes_support::proto::alkanes::AlkanesTrace;
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, Network, ScriptBuf, Txid};
+use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::{Address, AddressType, Network, ScriptBuf, Transaction, Txid};
 use borsh::{BorshDeserialize, BorshSerialize};
+use ordinals::{Artifact, Runestone};
+use protorune_support::protostone::Protostone;
 use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_for_address,
+    MempoolEntry, decode_seen_key, get_mempool_mdb, get_tx_from_mempool, pending_by_txid,
+    pending_for_address,
 };
+use crate::utils::electrum_like::AddressHistoryEntry;
 use anyhow::{Result, anyhow};
 use hex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -2700,6 +2709,324 @@ impl EssentialsProvider {
         })
     }
 
+    pub fn rpc_get_address_transactions(
+        &self,
+        params: RpcGetAddressTransactionsParams,
+    ) -> Result<RpcGetAddressTransactionsResult> {
+        const DEFAULT_PAGE_LIMIT: usize = 25;
+        const MAX_PAGE_LIMIT: usize = 200;
+        let Some(address_raw) = params.address.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        else {
+            return Ok(RpcGetAddressTransactionsResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_address"}),
+            });
+        };
+        let Some(address) = normalize_address(address_raw) else {
+            return Ok(RpcGetAddressTransactionsResult {
+                value: json!({"ok": false, "error": "invalid_address_format"}),
+            });
+        };
+
+        let page = params.page.unwrap_or(1).max(1);
+        let limit = params
+            .limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT as u64)
+            .max(1)
+            .min(MAX_PAGE_LIMIT as u64) as usize;
+        let only_alkane_txs = params.only_alkane_txs.unwrap_or(true);
+        let network = get_network();
+        let page_offset = page.saturating_sub(1).try_into().unwrap_or(usize::MAX);
+        let off = limit.saturating_mul(page_offset);
+
+        let electrum_like = get_electrum_like();
+        let address_obj = match Address::from_str(&address)
+            .and_then(|addr| addr.require_network(network))
+        {
+            Ok(addr) => addr,
+            Err(_) => {
+                return Ok(RpcGetAddressTransactionsResult {
+                    value: json!({"ok": false, "error": "invalid_address_format"}),
+                });
+            }
+        };
+
+        let mut pending_entries = pending_for_address(&address);
+        pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
+        let pending_filtered: Vec<MempoolEntry> = pending_entries
+            .into_iter()
+            .filter(|entry| {
+                !only_alkane_txs
+                    || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
+            })
+            .collect();
+        let pending_total = pending_filtered.len();
+        let pending_slice_start = off.min(pending_total);
+        let pending_slice_end = (off + limit).min(pending_total);
+        let pending_set: HashSet<Txid> =
+            pending_filtered.iter().map(|entry| entry.txid).collect();
+
+        let mut tx_renders: Vec<AddressTxRender> = Vec::new();
+        for entry in pending_filtered
+            .iter()
+            .skip(pending_slice_start)
+            .take(pending_slice_end.saturating_sub(pending_slice_start))
+        {
+            tx_renders.push(AddressTxRender {
+                txid: entry.txid,
+                tx: entry.tx.clone(),
+                traces: entry.traces.clone(),
+                confirmations: None,
+                is_mempool: true,
+                summary: None,
+            });
+        }
+
+        let remaining_slots = limit.saturating_sub(tx_renders.len());
+        let chain_tip = get_bitcoind_rpc_client()
+            .get_blockchain_info()
+            .ok()
+            .map(|info| info.blocks as u64);
+        let table = self.table();
+
+        let mut confirmed_total = if only_alkane_txs {
+            self
+                .get_raw_value(GetRawValueParams { key: table.alkane_address_len_key(&address) })
+                .ok()
+                .and_then(|resp| resp.value)
+                .and_then(|b| {
+                    if b.len() == 8 {
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&b);
+                        Some(u64::from_le_bytes(arr) as usize)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        if only_alkane_txs {
+            let confirmed_offset = off.saturating_sub(pending_total);
+            if remaining_slots > 0 {
+                let confirmed_slice_start = confirmed_offset.min(confirmed_total);
+                let confirmed_slice_end =
+                    (confirmed_offset + remaining_slots).min(confirmed_total);
+
+                if confirmed_slice_end > confirmed_slice_start {
+                    let mut txid_keys: Vec<Vec<u8>> = Vec::new();
+                    for idx in confirmed_slice_start..confirmed_slice_end {
+                        let rev_idx = confirmed_total - 1 - idx;
+                        txid_keys.push(table.alkane_address_txid_key(&address, rev_idx as u64));
+                    }
+                    let txid_vals = self
+                        .get_multi_values(GetMultiValuesParams { keys: txid_keys })
+                        .ok()
+                        .map(|resp| resp.values)
+                        .unwrap_or_default();
+                    let mut txids: Vec<Txid> = Vec::new();
+                    for bytes in txid_vals {
+                        if let Some(b) = bytes {
+                            if b.len() == 32 {
+                                if let Ok(txid) = Txid::from_slice(&b) {
+                                    txids.push(txid);
+                                }
+                            }
+                        }
+                    }
+
+                    if !txids.is_empty() {
+                        let summary_keys: Vec<Vec<u8>> = txids
+                            .iter()
+                            .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
+                            .collect();
+                        let summary_vals = self
+                            .get_multi_values(GetMultiValuesParams { keys: summary_keys })
+                            .ok()
+                            .map(|resp| resp.values)
+                            .unwrap_or_default();
+                        let raw_txs =
+                            electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+
+                        for (idx, txid) in txids.iter().enumerate() {
+                            let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                            if raw.is_empty() {
+                                continue;
+                            }
+                            let tx: Transaction = match deserialize(&raw) {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[rpc_get_address_transactions] failed to decode tx {}: {e}",
+                                        txid
+                                    );
+                                    continue;
+                                }
+                            };
+                            let summary = summary_vals
+                                .get(idx)
+                                .and_then(|v| v.as_ref())
+                                .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                            let confirmations = summary.as_ref().and_then(|s| {
+                                let h = s.height as u64;
+                                chain_tip.and_then(|tip| {
+                                    if tip >= h {
+                                        Some(tip - h + 1)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            });
+                            let traces = summary
+                                .as_ref()
+                                .map(|s| traces_from_summary(txid, s))
+                                .filter(|v| !v.is_empty());
+                            tx_renders.push(AddressTxRender {
+                                txid: *txid,
+                                tx,
+                                traces,
+                                confirmations,
+                                is_mempool: false,
+                                summary,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            let confirmed_offset = off.saturating_sub(pending_total);
+            let fetch_limit = remaining_slots.max(1);
+            match electrum_like.address_history_page(&address_obj, confirmed_offset, fetch_limit)
+            {
+                Ok(hist_page) => {
+                    let mut entries: Vec<AddressHistoryEntry> = hist_page
+                        .entries
+                        .into_iter()
+                        .filter(|entry| !pending_set.contains(&entry.txid))
+                        .collect();
+                    confirmed_total = hist_page
+                        .total
+                        .unwrap_or(confirmed_offset + entries.len())
+                        .max(entries.len());
+                    if remaining_slots > 0 {
+                        let to_take = remaining_slots.min(entries.len());
+                        let entries_for_page = entries.drain(..to_take).collect::<Vec<_>>();
+                        let txids: Vec<Txid> =
+                            entries_for_page.iter().map(|e| e.txid).collect();
+                        if !txids.is_empty() {
+                            let summary_keys: Vec<Vec<u8>> = txids
+                                .iter()
+                                .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
+                                .collect();
+                            let summary_vals = self
+                                .get_multi_values(GetMultiValuesParams { keys: summary_keys })
+                                .ok()
+                                .map(|resp| resp.values)
+                                .unwrap_or_default();
+                            let raw_txs =
+                                electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+                            for (idx, txid) in txids.iter().enumerate() {
+                                let raw = raw_txs.get(idx).cloned().unwrap_or_default();
+                                if raw.is_empty() {
+                                    continue;
+                                }
+                                let tx: Transaction = match deserialize(&raw) {
+                                    Ok(value) => value,
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[rpc_get_address_transactions] failed to decode tx {}: {e}",
+                                            txid
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let summary = summary_vals
+                                    .get(idx)
+                                    .and_then(|v| v.as_ref())
+                                    .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                                let confirmations = entries_for_page[idx]
+                                    .height
+                                    .and_then(|h| {
+                                        chain_tip.and_then(|tip| {
+                                            if tip >= h {
+                                                Some(tip - h + 1)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    });
+                                let traces = summary
+                                    .as_ref()
+                                    .map(|s| traces_from_summary(txid, s))
+                                    .filter(|v| !v.is_empty());
+                                tx_renders.push(AddressTxRender {
+                                    txid: *txid,
+                                    tx,
+                                    traces,
+                                    confirmations,
+                                    is_mempool: false,
+                                    summary,
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[rpc_get_address_transactions] failed to fetch history for {}: {e}",
+                        address
+                    );
+                }
+            }
+        }
+        let tx_total = pending_total + confirmed_total;
+        let mut prev_txids: Vec<Txid> = Vec::new();
+        for render in &tx_renders {
+            for vin in &render.tx.input {
+                if !vin.previous_output.is_null() {
+                    prev_txids.push(vin.previous_output.txid);
+                }
+            }
+        }
+        prev_txids.sort();
+        prev_txids.dedup();
+        let mut prev_map: HashMap<Txid, Transaction> = HashMap::new();
+        if !prev_txids.is_empty() {
+            let raw_prev = electrum_like.batch_transaction_get_raw(&prev_txids).unwrap_or_default();
+            for (i, raw) in raw_prev.into_iter().enumerate() {
+                if raw.is_empty() {
+                    if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
+                        prev_map.insert(prev_txids[i], mempool_prev.tx);
+                    }
+                    continue;
+                }
+                if let Ok(prev_tx) = deserialize::<Transaction>(&raw) {
+                    prev_map.insert(prev_txids[i], prev_tx);
+                } else if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
+                    prev_map.insert(prev_txids[i], mempool_prev.tx);
+                }
+            }
+        }
+
+        let transactions: Vec<Value> = tx_renders
+            .iter()
+            .map(|render| enriched_transaction_json(render, &prev_map, network))
+            .collect();
+
+        Ok(RpcGetAddressTransactionsResult {
+            value: json!({
+                "ok": true,
+                "address": address,
+                "page": page,
+                "limit": limit,
+                "total": tx_total,
+                "has_more": (off + tx_renders.len()) < tx_total,
+                "transactions": transactions,
+            }),
+        })
+    }
+
     pub fn rpc_get_alkane_latest_traces(
         &self,
         _params: RpcGetAlkaneLatestTracesParams,
@@ -3154,6 +3481,17 @@ pub struct RpcGetAlkaneAddressTxsResult {
     pub value: Value,
 }
 
+pub struct RpcGetAddressTransactionsParams {
+    pub address: Option<String>,
+    pub page: Option<u64>,
+    pub limit: Option<u64>,
+    pub only_alkane_txs: Option<bool>,
+}
+
+pub struct RpcGetAddressTransactionsResult {
+    pub value: Value,
+}
+
 pub struct RpcGetAlkaneLatestTracesParams;
 
 pub struct RpcGetAlkaneLatestTracesResult {
@@ -3555,6 +3893,217 @@ fn normalize_address(s: &str) -> Option<String> {
         .ok()
         .and_then(|a| a.require_network(network).ok())
         .map(|a| a.to_string())
+}
+
+struct AddressTxRender {
+    txid: Txid,
+    tx: Transaction,
+    traces: Option<Vec<EspoTrace>>,
+    confirmations: Option<u64>,
+    is_mempool: bool,
+    summary: Option<AlkaneTxSummary>,
+}
+
+fn enriched_transaction_json(
+    render: &AddressTxRender,
+    prev_map: &HashMap<Txid, Transaction>,
+    network: Network,
+) -> Value {
+    let tx = &render.tx;
+    let mut input_sum: u64 = 0;
+    let mut inputs: Vec<Value> = Vec::new();
+
+    for vin in &tx.input {
+        let mut obj = Map::new();
+        obj.insert("txid".to_string(), json!(vin.previous_output.txid.to_string()));
+        obj.insert("vout".to_string(), json!(vin.previous_output.vout));
+        if vin.previous_output.is_null() {
+            obj.insert("isCoinbase".to_string(), json!(true));
+        } else if let Some(prev_tx) = prev_map.get(&vin.previous_output.txid) {
+            if let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) {
+                input_sum = input_sum.saturating_add(prev_out.value.to_sat());
+                obj.insert("amount".to_string(), json!(prev_out.value.to_sat()));
+                if let Ok(addr) =
+                    Address::from_script(prev_out.script_pubkey.as_script(), network)
+                {
+                    obj.insert("address".to_string(), json!(addr.to_string()));
+                }
+            }
+        }
+        inputs.push(Value::Object(obj));
+    }
+
+    let mut output_sum: u64 = 0;
+    let mut outputs: Vec<Value> = Vec::new();
+    for out in &tx.output {
+        let mut obj = Map::new();
+        obj.insert("amount".to_string(), json!(out.value.to_sat()));
+        obj.insert(
+            "scriptPubKey".to_string(),
+            json!(hex::encode(out.script_pubkey.as_bytes())),
+        );
+        if let Ok(addr) = Address::from_script(out.script_pubkey.as_script(), network) {
+            obj.insert("address".to_string(), json!(addr.to_string()));
+        }
+        if let Some(script_type) = script_type_label(&out.script_pubkey, network) {
+            obj.insert("scriptPubKeyType".to_string(), json!(script_type));
+        }
+        outputs.push(Value::Object(obj));
+        output_sum = output_sum.saturating_add(out.value.to_sat());
+    }
+
+    let fee = if tx.is_coinbase() || input_sum < output_sum {
+        None
+    } else {
+        Some(input_sum - output_sum)
+    };
+    let (runestone, protostones) = runestone_data(tx);
+    let has_protostones = !protostones.is_empty();
+    let alkanes_traces = render.traces.as_ref().and_then(|traces| {
+        let vals = traces.iter().map(enriched_trace_to_value).collect::<Vec<_>>();
+        if vals.is_empty() { None } else { Some(Value::Array(vals)) }
+    });
+
+    let mut out = Map::new();
+    out.insert("txid".to_string(), json!(render.txid.to_string()));
+    out.insert(
+        "blockHeight".to_string(),
+        json!(render.summary.as_ref().map(|s| s.height as u64)),
+    );
+    out.insert("confirmations".to_string(), json!(render.confirmations));
+    out.insert("blockTime".to_string(), Value::Null);
+    out.insert("confirmed".to_string(), json!(!render.is_mempool));
+    out.insert("fee".to_string(), fee.map(|value| json!(value)).unwrap_or(Value::Null));
+    out.insert("weight".to_string(), json!(tx.weight().to_wu()));
+    out.insert("size".to_string(), json!(serialize(tx).len() as u64));
+    out.insert("inputs".to_string(), Value::Array(inputs));
+    out.insert("outputs".to_string(), Value::Array(outputs));
+    out.insert("hasOpReturn".to_string(), json!(tx_has_op_return(tx)));
+    out.insert("hasProtostones".to_string(), json!(has_protostones));
+    out.insert("isRbf".to_string(), json!(tx.is_explicitly_rbf()));
+    out.insert("isCoinbase".to_string(), json!(tx.is_coinbase()));
+    if let Some(runestone) = runestone {
+        out.insert("runestone".to_string(), runestone);
+    }
+    if let Some(alkane_traces) = alkanes_traces {
+        out.insert("alkanesTraces".to_string(), alkane_traces);
+    }
+
+    Value::Object(out)
+}
+
+fn runestone_data(tx: &Transaction) -> (Option<Value>, Vec<Value>) {
+    if let Some(Artifact::Runestone(runestone)) = Runestone::decipher(tx) {
+        let protostones = Protostone::from_runestone(&runestone).unwrap_or_default();
+        let protos_json = protostones.iter().map(protostone_to_value).collect::<Vec<_>>();
+        if let Value::Object(mut map) = serde_json::to_value(&runestone).unwrap_or(Value::Null) {
+            map.insert("protostones".to_string(), Value::Array(protos_json.clone()));
+            return (Some(Value::Object(map)), protos_json);
+        }
+        let mut map = Map::new();
+        map.insert("protostones".to_string(), Value::Array(protos_json.clone()));
+        return (Some(Value::Object(map)), protos_json);
+    }
+    (None, Vec::new())
+}
+
+fn protostone_to_value(protostone: &Protostone) -> Value {
+    let edicts = protostone
+        .edicts
+        .iter()
+        .map(|edict| {
+            json!({
+                "id": {
+                    "block": edict.id.block,
+                    "tx": edict.id.tx,
+                },
+                "amount": edict.amount,
+                "output": edict.output,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "burn": protostone.burn,
+        "message": hex::encode(&protostone.message),
+        "edicts": edicts,
+        "refund": protostone.refund,
+        "pointer": protostone.pointer,
+        "from": protostone.from,
+        "protocol_tag": protostone.protocol_tag,
+    })
+}
+
+fn enriched_trace_to_value(trace: &EspoTrace) -> Value {
+    let txid = Txid::from_slice(&trace.outpoint.txid)
+        .map(|t| t.to_string())
+        .unwrap_or_default();
+    let protostone_index = trace
+        .sandshrew_trace
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            EspoSandshrewLikeTraceEvent::Invoke(inv) => Some(inv.context.vout),
+            _ => None,
+        })
+        .next()
+        .unwrap_or(0);
+    let trace_events = if trace.protobuf_trace.events.is_empty() {
+        serde_json::to_value(&trace.sandshrew_trace.events).unwrap_or(Value::Null)
+    } else {
+        serde_json::to_value(&trace.protobuf_trace.events).unwrap_or(Value::Null)
+    };
+    json!({
+        "vout": trace.outpoint.vout,
+        "outpoint": format!("{txid}:{}", trace.outpoint.vout),
+        "protostone_index": protostone_index,
+        "trace": {
+            "events": trace_events,
+        },
+    })
+}
+
+fn script_type_label(spk: &ScriptBuf, network: Network) -> Option<&'static str> {
+    Address::from_script(spk.as_script(), network)
+        .ok()
+        .and_then(|a| match a.address_type() {
+        Some(AddressType::P2pkh) => Some("P2PKH"),
+        Some(AddressType::P2sh) => Some("P2SH"),
+        Some(AddressType::P2wpkh) => Some("P2WPKH"),
+            Some(AddressType::P2wsh) => Some("P2WSH"),
+            Some(AddressType::P2tr) => Some("P2TR"),
+            _ => None,
+        })
+}
+
+fn tx_has_op_return(tx: &Transaction) -> bool {
+    tx.output.iter().any(|out| {
+        let bytes = out.script_pubkey.as_bytes();
+        !bytes.is_empty() && bytes[0] == bitcoin::opcodes::all::OP_RETURN.to_u8()
+    })
+}
+
+fn traces_from_summary(txid: &Txid, summary: &AlkaneTxSummary) -> Vec<EspoTrace> {
+    summary
+        .traces
+        .iter()
+        .filter_map(|trace| sandshrew_to_espo_trace(txid, trace))
+        .collect()
+}
+
+fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Option<EspoTrace> {
+    let (txid_hex, vout_s) = trace.outpoint.split_once(':')?;
+    let vout = vout_s.parse::<u32>().ok()?;
+    let trace_txid = Txid::from_str(txid_hex).unwrap_or(*txid);
+    Some(EspoTrace {
+        sandshrew_trace: trace.clone(),
+        protobuf_trace: AlkanesTrace::default(),
+        storage_changes: HashMap::new(),
+        outpoint: EspoOutpoint {
+            txid: trace_txid.to_byte_array().to_vec(),
+            vout,
+            tx_spent: None,
+        },
+    })
 }
 
 fn parse_alkane_from_str(s: &str) -> Option<SchemaAlkaneId> {

@@ -1,12 +1,13 @@
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::essentials::storage::{
     EssentialsProvider, RpcGetAddressActivityParams, RpcGetAddressBalancesParams,
-    RpcGetAddressOutpointsParams, RpcGetAlkaneAddressTxsParams, RpcGetAlkaneBalanceMetashrewParams,
-    RpcGetAlkaneBalanceTxsByTokenParams, RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams,
-    RpcGetAlkaneBlockTxsParams, RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams,
-    RpcGetAlkaneTxSummaryParams, RpcGetAllAlkanesParams, RpcGetBlockSummaryParams,
-    RpcGetBlockTracesParams, RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams,
-    RpcGetHoldersParams, RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
+    RpcGetAddressOutpointsParams, RpcGetAddressTransactionsParams, RpcGetAlkaneAddressTxsParams,
+    RpcGetAlkaneBalanceMetashrewParams, RpcGetAlkaneBalanceTxsByTokenParams,
+    RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
+    RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
+    RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
+    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams,
+    RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
     RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams,
 };
 use serde_json::{Value, json};
@@ -549,6 +550,32 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
                         mdb.rpc_get_alkane_address_txs(params)
+                            .map(|resp| resp.value)
+                            .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                    }
+                })
+                .await;
+        });
+    }
+
+    {
+        let reg_addr_txs = reg.clone();
+        let mdb_addr_txs = Arc::clone(&mdb);
+        tokio::spawn(async move {
+            reg_addr_txs
+                .register("get_address_transactions", move |_cx, payload| {
+                    let mdb = Arc::clone(&mdb_addr_txs);
+                    async move {
+                        let params = RpcGetAddressTransactionsParams {
+                            address: payload
+                                .get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            page: payload.get("page").and_then(|v| v.as_u64()),
+                            limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            only_alkane_txs: payload.get("only_alkane_txs").and_then(|v| v.as_bool()),
+                        };
+                        mdb.rpc_get_address_transactions(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
