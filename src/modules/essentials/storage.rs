@@ -132,6 +132,7 @@ pub struct EssentialsTable<'a> {
     pub ALKANE_INFO: MdbPointer<'a>,
     pub ALKANE_NAME_INDEX: MdbPointer<'a>,
     pub ALKANE_SYMBOL_INDEX: MdbPointer<'a>,
+    pub ORBITAL_COLLECTION_NAME: MdbPointer<'a>,
     pub ALKANE_CREATION_BY_ID: MdbPointer<'a>,
     pub ALKANE_CREATION_ORDERED: MdbPointer<'a>,
     pub ALKANE_CREATION_COUNT: MdbPointer<'a>,
@@ -179,6 +180,7 @@ impl<'a> EssentialsTable<'a> {
             ALKANE_INFO: root.keyword("/alkane_info/"),
             ALKANE_NAME_INDEX: root.keyword("/alkanes/name/"),
             ALKANE_SYMBOL_INDEX: root.keyword("/alkanes/symbol/"),
+            ORBITAL_COLLECTION_NAME: root.keyword("/orbitals/collection/name/"),
             ALKANE_CREATION_BY_ID: root.keyword("/alkanes/creation/id/"),
             ALKANE_CREATION_ORDERED: root.keyword("/alkanes/creation/ordered/"),
             ALKANE_CREATION_COUNT: root.keyword("/alkanes/creation/count"),
@@ -402,6 +404,13 @@ impl<'a> EssentialsTable<'a> {
 
     pub fn alkane_symbol_index_prefix(&self, symbol_prefix: &str) -> Vec<u8> {
         self.ALKANE_SYMBOL_INDEX.select(symbol_prefix.as_bytes()).key().to_vec()
+    }
+
+    pub fn orbital_collection_name_key(&self, factory: &SchemaAlkaneId) -> Vec<u8> {
+        let mut suffix = Vec::with_capacity(12);
+        suffix.extend_from_slice(&factory.block.to_be_bytes());
+        suffix.extend_from_slice(&factory.tx.to_be_bytes());
+        self.ORBITAL_COLLECTION_NAME.select(&suffix).key().to_vec()
     }
 
     pub fn alkane_holders_ordered_key(&self, count: u64, alkane: &SchemaAlkaneId) -> Vec<u8> {

@@ -176,6 +176,12 @@ impl CandleCache {
     }
 }
 
+impl Default for CandleCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /* ---------- public reader for RPC ---------- */
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -297,6 +297,12 @@ impl ActivityWriteAcc {
     }
 }
 
+impl Default for ActivityWriteAcc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Accumulator for secondary index writes and per-pool count deltas.
 #[derive(Clone)]
 pub struct ActivityIndexAcc {
@@ -333,6 +339,12 @@ impl ActivityIndexAcc {
     }
     pub fn per_pool_group_delta(self) -> HashMap<(u32, u64, ActivityGroup), u64> {
         self.per_pool_group_delta
+    }
+}
+
+impl Default for ActivityIndexAcc {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
