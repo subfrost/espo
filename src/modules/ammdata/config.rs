@@ -5,6 +5,7 @@ use serde_json::Value;
 #[derive(Clone, Debug)]
 pub enum DerivedMergeStrategy {
     Neutral,
+    NeutralVwap,
     Optimistic,
     Pessimistic,
 }
@@ -34,7 +35,7 @@ pub struct AmmDataConfig {
 
 impl AmmDataConfig {
     pub fn spec() -> &'static str {
-        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|optimistic|pessimistic\" } ] }"
+        "{ \"eth_rpc\": \"<url>\", \"eth_call_throttle\": <ms>, \"search_index_enabled\": <bool>, \"search_prefix_min\": <2>, \"search_prefix_max\": <6>, \"search_fallback_scan_cap\": <num>, \"search_limit_cap\": <num>, \"derived_liquidity\": [ { \"alkane\": \"2:0\", \"strategy\": \"neutral|neutral-vwap|optimistic|pessimistic\" } ] }"
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -134,11 +135,12 @@ impl AmmDataConfig {
                         })?;
                     let strategy = match strategy_str.trim().to_ascii_lowercase().as_str() {
                         "neutral" => DerivedMergeStrategy::Neutral,
+                        "neutral-vwap" | "neutral_vwap" => DerivedMergeStrategy::NeutralVwap,
                         "optimistic" => DerivedMergeStrategy::Optimistic,
                         "pessimistic" => DerivedMergeStrategy::Pessimistic,
                         _ => {
                             return Err(anyhow!(
-                                "ammdata.derived_liquidity[].strategy must be neutral|optimistic|pessimistic; got {}",
+                                "ammdata.derived_liquidity[].strategy must be neutral|neutral-vwap|optimistic|pessimistic; got {}",
                                 strategy_str
                             ));
                         }

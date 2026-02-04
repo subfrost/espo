@@ -56,6 +56,7 @@ fn init_global_config() {
         let config = espo::config::AppConfig {
             debug_backup: None,
             debug_ignore_ms: 0,
+            safe_tip_hook_script: None,
             readonly_metashrew_db_dir: metashrew_db.to_str().unwrap().to_string(),
             electrum_rpc_url: Some(String::from("127.0.0.1:50001")),
             metashrew_rpc_url: String::from("http://127.0.0.1:9999"),

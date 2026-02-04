@@ -370,6 +370,7 @@ pub async fn alkane_page(
                                 }
                             }
                             div class="alkane-market-tabs" {
+                                button class="alkane-market-tab" type="button" data-range="4h" { "4H" }
                                 button class="alkane-market-tab" type="button" data-range="1d" { "1D" }
                                 button class="alkane-market-tab" type="button" data-range="1w" { "1W" }
                                 button class="alkane-market-tab" type="button" data-range="1m" { "1M" }
@@ -920,6 +921,8 @@ fn chart_scripts() -> Markup {
 
   const rangeLabel = (range) => {
     switch (range) {
+      case '4h':
+        return 'Past 4 hours';
       case '1d':
         return 'Past 24 hours';
       case '1w':

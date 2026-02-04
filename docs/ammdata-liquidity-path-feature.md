@@ -42,6 +42,7 @@ using the configured `strategy` **and write the result only to** `T-derived_Q-us
 - **Optimistic:** max of open/high/low/close
 - **Pessimistic:** min of open/high/low/close
 - **Neutral:** average of open/high/low/close
+- **Neutral-vwap:** volume-weighted average of open/high/low/close
 
 **Volume:** always taken from the derived path (T/Q volume converted to USD).
 

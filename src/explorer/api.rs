@@ -1193,6 +1193,7 @@ fn hex_string(bytes: &[u8]) -> String {
 
 fn normalize_chart_range(raw: Option<&str>) -> String {
     match raw.unwrap_or("3m").trim().to_ascii_lowercase().as_str() {
+        "4h" => "4h".to_string(),
         "1d" | "24h" => "1d".to_string(),
         "1w" | "7d" => "1w".to_string(),
         "1m" | "30d" => "1m".to_string(),
@@ -1203,6 +1204,7 @@ fn normalize_chart_range(raw: Option<&str>) -> String {
 
 fn chart_range_params(range: &str) -> (&'static str, u64) {
     match range {
+        "4h" => ("4h", 1),
         "1d" => ("1h", 24),
         "1w" => ("1h", 24 * 7),
         "1m" => ("1d", 30),

@@ -66,6 +66,7 @@ pub struct IndexState {
 
     pub btc_usd_price: Option<u128>,
     pub btc_usd_price_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub btc_usd_line_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub canonical_pool_writes: Vec<(Vec<u8>, Vec<u8>)>,
 
     pub candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
@@ -73,6 +74,7 @@ pub struct IndexState {
     pub token_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_mcusd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
     pub token_derived_usd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub token_derived_mcusd_candle_writes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl IndexState {
@@ -131,12 +133,14 @@ impl IndexState {
             derived_search_index_deletes: Vec::new(),
             btc_usd_price: None,
             btc_usd_price_writes: Vec::new(),
+            btc_usd_line_writes: Vec::new(),
             canonical_pool_writes: Vec::new(),
             candle_writes: Vec::new(),
             pool_candle_overrides: HashMap::new(),
             token_usd_candle_writes: Vec::new(),
             token_mcusd_candle_writes: Vec::new(),
             token_derived_usd_candle_writes: Vec::new(),
+            token_derived_mcusd_candle_writes: Vec::new(),
         }
     }
 }

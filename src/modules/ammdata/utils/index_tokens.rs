@@ -80,6 +80,25 @@ pub fn derive_token_data(
             }
         }
         state.btc_usd_price = price;
+
+        if let Some(p) = price {
+            let tfs = [
+                Timeframe::M10,
+                Timeframe::H1,
+                Timeframe::H4,
+                Timeframe::D1,
+                Timeframe::W1,
+                Timeframe::M1,
+            ];
+            for tf in tfs {
+                let bucket_ts = bucket_start_for(block_ts, tf);
+                if let Ok(encoded) = encode_u128_value(p) {
+                    state
+                        .btc_usd_line_writes
+                        .push((table.btc_usd_line_key(tf, bucket_ts), encoded));
+                }
+            }
+        }
     }
 
     let mut canonical_pools_by_token: HashMap<SchemaAlkaneId, Vec<SchemaCanonicalPoolEntry>> =
@@ -148,6 +167,10 @@ pub fn derive_token_data(
     let mut token_mcusd_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaCandleV1> =
         HashMap::new();
     let mut token_derived_usd_candle_overrides: HashMap<
+        (SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64),
+        SchemaCandleV1,
+    > = HashMap::new();
+    let mut token_derived_mcusd_candle_overrides: HashMap<
         (SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64),
         SchemaCandleV1,
     > = HashMap::new();
@@ -499,6 +522,18 @@ pub fn derive_token_data(
                 best
             };
 
+            let load_token_usd_candle =
+                |token: &SchemaAlkaneId, tf: Timeframe, bucket_ts: u64| -> Result<Option<SchemaCandleV1>> {
+                    if let Some(c) = token_usd_candle_overrides.get(&(*token, tf, bucket_ts)) {
+                        return Ok(Some(*c));
+                    }
+                    let key = table.token_usd_candle_key(token, tf, bucket_ts);
+                    if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value {
+                        return Ok(Some(decode_candle_v1(&raw)?));
+                    }
+                    Ok(None)
+                };
+
             let mut derived_buckets: HashSet<(SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64)> =
                 HashSet::new();
             for ((pool, tf, bucket), _candle) in state.pool_candle_overrides.iter() {
@@ -611,19 +646,32 @@ pub fn derive_token_data(
                 let token_usd_active =
                     token_usd_candle_overrides.get(&(token, tf, bucket_ts)).copied();
 
+                let pool_bucket_candle = if let Some(c) = pool_active {
+                    Some(c)
+                } else {
+                    load_pool_candle(&info.pool_id, tf, bucket_ts)?
+                };
+                let token_usd_bucket_candle = if let Some(c) = token_usd_active {
+                    Some(c)
+                } else {
+                    load_token_usd_candle(&token, tf, bucket_ts)?
+                };
+
                 let prev_bucket = bucket_ts.saturating_sub(tf.duration_secs());
-                let last_derived_close = latest_derived_candle(
+                let last_derived_candle = latest_derived_candle(
                     &derived_overrides_by_token_quote_tf,
                     &token,
                     &quote,
                     tf,
                     prev_bucket,
                 )
-                .map(|(_ts, c)| c.close)
-                .unwrap_or(0);
+                .map(|(_ts, c)| c);
+                let last_derived_close = last_derived_candle.map(|c| c.close).unwrap_or(0);
 
                 let last_quote_usd_close =
                     latest_token_usd_candle(&quote, tf, bucket_ts).map(|(_ts, c)| c.close);
+                let prev_quote_usd_close =
+                    latest_token_usd_candle(&quote, tf, prev_bucket).map(|(_ts, c)| c.close);
 
                 let last_pool_q_per_t_close = latest_pool_candle(&info.pool_id, tf, bucket_ts)
                     .and_then(|(_ts, pool_candle)| {
@@ -632,7 +680,7 @@ pub fn derive_token_data(
                     });
 
                 let q_per_t_const = if last_derived_close != 0 {
-                    last_quote_usd_close.and_then(|q_usd| {
+                    prev_quote_usd_close.and_then(|q_usd| {
                         if q_usd == 0 {
                             None
                         } else {
@@ -652,7 +700,7 @@ pub fn derive_token_data(
                     _ => None,
                 };
 
-                let path_b = match (pool_active, last_quote_usd_close) {
+                let path_b = match (pool_bucket_candle, last_quote_usd_close) {
                     (Some(pool_candle), Some(q_close)) => derived_from_pool_with_quote_close(
                         pool_candle,
                         info.token_is_base,
@@ -661,9 +709,9 @@ pub fn derive_token_data(
                     _ => None,
                 };
 
-                let path_c = token_usd_active;
+                let path_c = token_usd_bucket_candle;
 
-                let path_d = if pool_active.is_some() && token_usd_active.is_some() {
+                let path_d = if pool_bucket_candle.is_some() && token_usd_bucket_candle.is_some() {
                     if let (Some(b), Some(c)) = (path_b, path_c) {
                         let mut merged = crate::modules::ammdata::merge_candles(b, c, strategy);
                         merged.volume = b.volume.saturating_add(c.volume);
@@ -675,6 +723,34 @@ pub fn derive_token_data(
                     None
                 };
 
+                let merge_with_anchor = |anchor_close: u128, candle: SchemaCandleV1| -> SchemaCandleV1 {
+                    let anchor = SchemaCandleV1 {
+                        open: anchor_close,
+                        high: anchor_close,
+                        low: anchor_close,
+                        close: anchor_close,
+                        volume: 0,
+                    };
+                    let mut merged = crate::modules::ammdata::merge_candles(anchor, candle, strategy);
+                    merged.volume = candle.volume;
+                    merged
+                };
+
+                let only_token_usd_active = token_usd_active.is_some()
+                    && pool_active.is_none()
+                    && quote_usd_active.is_none();
+                let only_pool_active = pool_active.is_some()
+                    && token_usd_active.is_none()
+                    && quote_usd_active.is_none();
+                let only_quote_usd_active = quote_usd_active.is_some()
+                    && token_usd_active.is_none()
+                    && pool_active.is_none();
+
+                let use_anchor = matches!(
+                    strategy,
+                    DerivedMergeStrategy::Neutral | DerivedMergeStrategy::NeutralVwap
+                );
+
                 let token_derived = if path_d.is_some() {
                     path_d
                 } else if path_b.is_some() {
@@ -683,6 +759,21 @@ pub fn derive_token_data(
                     path_c
                 } else {
                     None
+                };
+
+                let token_derived =
+                    if use_anchor && only_token_usd_active && last_derived_close != 0 {
+                    token_derived.map(|c| merge_with_anchor(last_derived_close, c))
+                } else if use_anchor && only_pool_active && last_derived_close != 0 {
+                    token_derived.map(|c| merge_with_anchor(last_derived_close, c))
+                } else {
+                    token_derived
+                };
+
+                let path_a = if use_anchor && only_quote_usd_active && last_derived_close != 0 {
+                    path_a.map(|c| merge_with_anchor(last_derived_close, c))
+                } else {
+                    path_a
                 };
 
                 let mut final_candle = if quote_usd_active.is_some() && token_derived.is_some() {
@@ -729,6 +820,34 @@ pub fn derive_token_data(
             }
         }
 
+        for ((token, quote, tf, bucket_ts), candle) in token_derived_usd_candle_overrides.iter() {
+            let supply = if let Some(v) = supply_cache.get(token) {
+                *v
+            } else {
+                let table_e = essentials.table();
+                let key = table_e.circulating_supply_latest_key(token);
+                let v = essentials
+                    .get_raw_value(EssentialsGetRawValueParams { key })?
+                    .value
+                    .and_then(|raw| crate::modules::essentials::storage::decode_u128_value(&raw).ok())
+                    .unwrap_or(0);
+                supply_cache.insert(*token, v);
+                v
+            };
+            if supply == 0 {
+                continue;
+            }
+            let scale = |p: u128| -> u128 { p.saturating_mul(supply) / PRICE_SCALE };
+            let mc_candle = SchemaCandleV1 {
+                open: scale(candle.open),
+                high: scale(candle.high),
+                low: scale(candle.low),
+                close: scale(candle.close),
+                volume: candle.volume,
+            };
+            token_derived_mcusd_candle_overrides.insert((*token, *quote, *tf, *bucket_ts), mc_candle);
+        }
+
         for ((token, tf, bucket_ts), candle) in token_usd_candle_overrides.iter() {
             let supply = if let Some(v) = supply_cache.get(token) {
                 *v
@@ -767,6 +886,12 @@ pub fn derive_token_data(
             let key = table.token_mcusd_candle_key(token, *tf, *bucket_ts);
             let encoded = encode_candle_v1(candle)?;
             state.token_mcusd_candle_writes.push((key, encoded));
+        }
+
+        for ((token, quote, tf, bucket_ts), candle) in token_derived_mcusd_candle_overrides.iter() {
+            let key = table.token_derived_mcusd_candle_key(token, quote, *tf, *bucket_ts);
+            let encoded = encode_candle_v1(candle)?;
+            state.token_derived_mcusd_candle_writes.push((key, encoded));
         }
 
         let mut tokens_for_metrics: HashSet<SchemaAlkaneId> = HashSet::new();

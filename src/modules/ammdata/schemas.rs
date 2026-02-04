@@ -149,6 +149,7 @@ impl SchemaCandleV1 {
 pub enum Timeframe {
     M10,
     H1,
+    H4,
     D1,
     W1,
     M1,
@@ -160,6 +161,7 @@ impl Timeframe {
         match self {
             Timeframe::M10 => 10 * 60,
             Timeframe::H1 => 60 * 60,
+            Timeframe::H4 => 4 * 60 * 60,
             Timeframe::D1 => 24 * 60 * 60,
             Timeframe::W1 => 7 * 24 * 60 * 60,
             Timeframe::M1 => 30 * 24 * 60 * 60, // simple month bucket (30d)
@@ -171,6 +173,7 @@ impl Timeframe {
         match self {
             Timeframe::M10 => "10m",
             Timeframe::H1 => "1h",
+            Timeframe::H4 => "4h",
             Timeframe::D1 => "1d",
             Timeframe::W1 => "1w",
             Timeframe::M1 => "1M",
@@ -178,7 +181,14 @@ impl Timeframe {
     }
 }
 pub fn active_timeframes() -> Vec<Timeframe> {
-    vec![Timeframe::M10, Timeframe::H1, Timeframe::D1, Timeframe::W1, Timeframe::M1]
+    vec![
+        Timeframe::M10,
+        Timeframe::H1,
+        Timeframe::H4,
+        Timeframe::D1,
+        Timeframe::W1,
+        Timeframe::M1,
+    ]
 }
 /// One entry per pool: latest reserves + the token IDs,
 /// so callers never need to hit /pools to learn base/quote.

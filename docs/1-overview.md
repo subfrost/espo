@@ -195,7 +195,7 @@ Index metadata:
 Candles (per pool/timeframe/bucket):
 
 - `fc1:{pool_block_hex}:{pool_tx_hex}:{tf_code}:{bucket_ts}` -> `borsh(SchemaFullCandleV1)`
-  - `tf_code` = `10m|1h|1d|1w|1M`
+- `tf_code` = `10m|1h|4h|1d|1w|1M`
   - `bucket_ts` = bucket start timestamp in seconds (decimal string)
   - `pool_*_hex` are lowercase hex (no `0x`)
 

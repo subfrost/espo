@@ -103,6 +103,8 @@ pub struct AmmDataTable<'a> {
     pub TOKEN_DERIVED_USD_CANDLES: MdbPointer<'a>,
     pub TOKEN_MCAP_USD_CANDLES: MdbPointer<'a>,
     pub BTC_USD_PRICE: MdbPointer<'a>,
+    pub BTC_USD_LINE: MdbPointer<'a>,
+    pub TOKEN_DERIVED_MCAP_USD_CANDLES: MdbPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
     pub ACTIVITY: MdbPointer<'a>,
     pub ACTIVITY_INDEX: MdbPointer<'a>,
@@ -154,6 +156,8 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_DERIVED_USD_CANDLES: root.keyword("tud1:"),
             TOKEN_MCAP_USD_CANDLES: root.keyword("tmc1:"),
             BTC_USD_PRICE: root.keyword("/btc_usd_price/v1/"),
+            BTC_USD_LINE: root.keyword("btu1:"),
+            TOKEN_DERIVED_MCAP_USD_CANDLES: root.keyword("tdmc1:"),
             ACTIVITY: root.keyword("activity:v1:"),
             ACTIVITY_INDEX: root.keyword("activity:idx:"),
             CANONICAL_POOL: root.keyword("/canonical_pool/v1/"),
@@ -418,6 +422,32 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn token_derived_mcusd_candle_ns_prefix(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+        tf: Timeframe,
+    ) -> Vec<u8> {
+        let blk_hex = format!("{:x}", token.block);
+        let tx_hex = format!("{:x}", token.tx);
+        let q_blk_hex = format!("{:x}", quote.block);
+        let q_tx_hex = format!("{:x}", quote.tx);
+        let suffix = format!("{}:{}:{}:{}:{}:", blk_hex, tx_hex, q_blk_hex, q_tx_hex, tf.code());
+        self.TOKEN_DERIVED_MCAP_USD_CANDLES.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn token_derived_mcusd_candle_key(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+        tf: Timeframe,
+        bucket_ts: u64,
+    ) -> Vec<u8> {
+        let mut k = self.token_derived_mcusd_candle_ns_prefix(token, quote, tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
+        k
+    }
+
     pub fn btc_usd_price_prefix(&self) -> Vec<u8> {
         self.BTC_USD_PRICE.key().to_vec()
     }
@@ -425,6 +455,17 @@ impl<'a> AmmDataTable<'a> {
     pub fn btc_usd_price_key(&self, height: u64) -> Vec<u8> {
         let mut k = self.btc_usd_price_prefix();
         k.extend_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    pub fn btc_usd_line_ns_prefix(&self, tf: Timeframe) -> Vec<u8> {
+        let suffix = format!("{}:", tf.code());
+        self.BTC_USD_LINE.select(suffix.as_bytes()).key().to_vec()
+    }
+
+    pub fn btc_usd_line_key(&self, tf: Timeframe, bucket_ts: u64) -> Vec<u8> {
+        let mut k = self.btc_usd_line_ns_prefix(tf);
+        k.extend_from_slice(bucket_ts.to_string().as_bytes());
         k
     }
 
@@ -2309,60 +2350,105 @@ impl AmmDataProvider {
             }
         };
 
+        let parse_token_or_derived = |raw: &str| -> Result<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
+            if let Some((token_part, quote_part)) = raw.split_once("-derived_") {
+                match (parse_id_from_str(token_part), parse_id_from_str(quote_part)) {
+                    (Some(p), Some(q)) => Ok((p, Some(q))),
+                    _ => Err(anyhow!("invalid_pool")),
+                }
+            } else {
+                match parse_id_from_str(raw) {
+                    Some(p) => Ok((p, None)),
+                    None => Err(anyhow!("invalid_pool")),
+                }
+            }
+        };
+
         let mut derived_quote: Option<SchemaAlkaneId> = None;
-        let (pool, is_usd, is_mcusd) = if let Some(stripped) = pool_raw.strip_suffix("-mcusd") {
-            match parse_id_from_str(stripped) {
-                Some(p) => (p, false, true),
-                None => {
+        let mut is_usd = false;
+        let mut is_mcusd = false;
+        let mut is_sats = false;
+        let mut is_mcsats = false;
+
+        let pool = if let Some(stripped) = pool_raw.strip_suffix("-mcsats") {
+            match parse_token_or_derived(stripped) {
+                Ok((p, q)) => {
+                    derived_quote = q;
+                    is_mcsats = true;
+                    is_mcusd = true;
+                    p
+                }
+                Err(_) => {
                     return Ok(RpcGetCandlesResult {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                        }),
+                    });
+                }
+            }
+        } else if let Some(stripped) = pool_raw.strip_suffix("-sats") {
+            match parse_token_or_derived(stripped) {
+                Ok((p, q)) => {
+                    derived_quote = q;
+                    is_sats = true;
+                    is_usd = true;
+                    p
+                }
+                Err(_) => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                        }),
+                    });
+                }
+            }
+        } else if let Some(stripped) = pool_raw.strip_suffix("-mcusd") {
+            match parse_token_or_derived(stripped) {
+                Ok((p, q)) => {
+                    derived_quote = q;
+                    is_mcusd = true;
+                    p
+                }
+                Err(_) => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
             }
         } else if let Some(stripped) = pool_raw.strip_suffix("-usd") {
-            if let Some((token_part, quote_part)) = stripped.split_once("-derived_") {
-                match (parse_id_from_str(token_part), parse_id_from_str(quote_part)) {
-                    (Some(p), Some(q)) => {
-                        derived_quote = Some(q);
-                        (p, true, false)
-                    }
-                    _ => {
-                        return Ok(RpcGetCandlesResult {
-                            value: json!({
-                                "ok": false,
-                                "error": "missing_or_invalid_pool",
-                                "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
-                            }),
-                        });
-                    }
+            match parse_token_or_derived(stripped) {
+                Ok((p, q)) => {
+                    derived_quote = q;
+                    is_usd = true;
+                    p
                 }
-            } else {
-                match parse_id_from_str(stripped) {
-                    Some(p) => (p, true, false),
-                    None => {
-                        return Ok(RpcGetCandlesResult {
-                            value: json!({
-                                "ok": false,
-                                "error": "missing_or_invalid_pool",
-                                "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
-                            }),
-                        });
-                    }
+                Err(_) => {
+                    return Ok(RpcGetCandlesResult {
+                        value: json!({
+                            "ok": false,
+                            "error": "missing_or_invalid_pool",
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
+                        }),
+                    });
                 }
             }
         } else {
             match parse_id_from_str(pool_raw) {
-                Some(p) => (p, false, false),
+                Some(p) => p,
                 None => {
                     return Ok(RpcGetCandlesResult {
                         value: json!({
                             "ok": false,
                             "error": "missing_or_invalid_pool",
-                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-mcusd\", or \"2:0-derived_2:1-usd\""
+                            "hint": "pool should be a string like \"2:68441\", \"2:0-usd\", \"2:0-sats\", \"2:0-mcusd\", \"2:0-mcsats\", or \"2:0-derived_2:1-usd\""
                         }),
                     });
                 }
@@ -2370,7 +2456,11 @@ impl AmmDataProvider {
         };
 
         let slice = if is_mcusd {
-            read_token_mcusd_candles_v1(self, pool, tf, now)
+            if let Some(quote) = derived_quote {
+                read_token_derived_mcusd_candles_v1(self, pool, quote, tf, now)
+            } else {
+                read_token_mcusd_candles_v1(self, pool, tf, now)
+            }
         } else if is_usd {
             if let Some(quote) = derived_quote {
                 read_token_derived_usd_candles_v1(self, pool, quote, tf, now)
@@ -2395,33 +2485,100 @@ impl AmmDataProvider {
                     &slice.candles_newest_first[offset..end]
                 };
 
+                let btc_slice = if is_sats || is_mcsats {
+                    read_btc_usd_line_v1(self, tf, now).ok()
+                } else {
+                    None
+                };
+
+                let btc_price_for_ts =
+                    |slice: &CandleSlice, ts: u64, dur: u64| -> u128 {
+                        if slice.candles_newest_first.is_empty() {
+                            return 0;
+                        }
+                        let newest_ts = slice.newest_ts;
+                        if ts > newest_ts {
+                            return slice.candles_newest_first[0].close;
+                        }
+                        let offset = ((newest_ts.saturating_sub(ts)) / dur) as usize;
+                        if offset < slice.candles_newest_first.len() {
+                            slice.candles_newest_first[offset].close
+                        } else {
+                            slice.candles_newest_first
+                                .last()
+                                .map(|c| c.close)
+                                .unwrap_or(0)
+                        }
+                    };
+
+                let usd_to_sats_scaled = |usd_scaled: u128, btc_usd_scaled: u128| -> u128 {
+                    if btc_usd_scaled == 0 {
+                        return 0;
+                    }
+                    usd_scaled
+                        .saturating_mul(PRICE_SCALE)
+                        .saturating_mul(PRICE_SCALE)
+                        / btc_usd_scaled
+                };
+
                 let arr: Vec<Value> = page_slice
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
                         let global_idx = offset + i;
                         let ts = newest_ts.saturating_sub((global_idx as u64) * dur);
+                        let mut candle = *c;
+                        if is_sats || is_mcsats {
+                            let btc_price = btc_slice
+                                .as_ref()
+                                .map(|slice| btc_price_for_ts(slice, ts, dur))
+                                .unwrap_or(0);
+                            candle.open = usd_to_sats_scaled(candle.open, btc_price);
+                            candle.high = usd_to_sats_scaled(candle.high, btc_price);
+                            candle.low = usd_to_sats_scaled(candle.low, btc_price);
+                            candle.close = usd_to_sats_scaled(candle.close, btc_price);
+                            candle.volume = usd_to_sats_scaled(candle.volume, btc_price);
+                        }
                         json!({
                             "ts":     ts,
-                            "open":   scale_u128(c.open),
-                            "high":   scale_u128(c.high),
-                            "low":    scale_u128(c.low),
-                            "close":  scale_u128(c.close),
-                            "volume": scale_u128(c.volume),
+                            "open":   scale_u128(candle.open),
+                            "high":   scale_u128(candle.high),
+                            "low":    scale_u128(candle.low),
+                            "close":  scale_u128(candle.close),
+                            "volume": scale_u128(candle.volume),
                         })
                     })
                     .collect();
 
+                let pool_label = if is_usd || is_mcusd {
+                    if let Some(q) = derived_quote {
+                        let suffix = if is_mcsats {
+                            "mcsats"
+                        } else if is_sats {
+                            "sats"
+                        } else if is_mcusd {
+                            "mcusd"
+                        } else {
+                            "usd"
+                        };
+                        format!("{}-derived_{}-{}", id_str(&pool), id_str(&q), suffix)
+                    } else if is_mcsats {
+                        format!("{}-mcsats", id_str(&pool))
+                    } else if is_sats {
+                        format!("{}-sats", id_str(&pool))
+                    } else if is_mcusd {
+                        format!("{}-mcusd", id_str(&pool))
+                    } else {
+                        format!("{}-usd", id_str(&pool))
+                    }
+                } else {
+                    id_str(&pool)
+                };
+
                 Ok(RpcGetCandlesResult {
                     value: json!({
                         "ok": true,
-                        "pool": if is_usd {
-                            format!("{}-usd", id_str(&pool))
-                        } else if is_mcusd {
-                            format!("{}-mcusd", id_str(&pool))
-                        } else {
-                            id_str(&pool)
-                        },
+                        "pool": pool_label,
                         "timeframe": tf.code(),
                         "side": if is_usd || is_mcusd {
                             "base"
@@ -3784,6 +3941,102 @@ fn read_token_derived_usd_candles_v1(
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
+fn read_token_derived_mcusd_candles_v1(
+    provider: &AmmDataProvider,
+    token: SchemaAlkaneId,
+    quote: SchemaAlkaneId,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<CandleSlice> {
+    let dur = tf.duration_secs();
+    let table = provider.table();
+    let logical = table.token_derived_mcusd_candle_ns_prefix(&token, &quote, tf);
+    let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    for (k, v) in provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .entries
+    {
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                if let Ok(ts) = ts_str.parse::<u64>() {
+                    if !per_bucket.contains_key(&ts) {
+                        if let Ok(c) = decode_candle_v1(&v) {
+                            per_bucket.insert(ts, c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut last_close: u128 = 0;
+    let mut have_prev: bool = false;
+    let mut forward: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    let mut bts = start_bucket;
+
+    while bts <= newest_bucket_with_data {
+        if let Some(candle) = per_bucket.get(&bts) {
+            let mut c = *candle;
+            if have_prev {
+                c.open = last_close;
+                if c.open > c.high {
+                    c.high = c.open;
+                }
+                if c.open < c.low {
+                    c.low = c.open;
+                }
+            }
+            last_close = c.close;
+            have_prev = true;
+            forward.insert(bts, c);
+        } else {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            have_prev = true;
+            forward.insert(bts, c);
+        }
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            let c = SchemaCandleV1 {
+                open: last_close,
+                high: last_close,
+                low: last_close,
+                close: last_close,
+                volume: 0,
+            };
+            forward.insert(t, c);
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
+
+    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+}
+
 fn read_token_mcusd_candles_v1(
     provider: &AmmDataProvider,
     token: SchemaAlkaneId,
@@ -3879,10 +4132,121 @@ fn read_token_mcusd_candles_v1(
     Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
 }
 
+fn read_btc_usd_line_v1(
+    provider: &AmmDataProvider,
+    tf: Timeframe,
+    now_ts: u64,
+) -> Result<CandleSlice> {
+    let dur = tf.duration_secs();
+    let table = provider.table();
+    let logical = table.btc_usd_line_ns_prefix(tf);
+    let mut per_bucket: BTreeMap<u64, u128> = BTreeMap::new();
+    for (k, v) in provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .entries
+    {
+        if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
+            if let Ok(ts_str) = std::str::from_utf8(ts_bytes) {
+                if let Ok(ts) = ts_str.parse::<u64>() {
+                    if !per_bucket.contains_key(&ts) {
+                        if let Ok(p) = decode_u128_value(&v) {
+                            per_bucket.insert(ts, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if per_bucket.is_empty() {
+        return Ok(CandleSlice { candles_newest_first: vec![], newest_ts: 0 });
+    }
+
+    let start_bucket = *per_bucket.keys().next().unwrap();
+    let newest_bucket_with_data = *per_bucket.keys().last().unwrap();
+    let newest_bucket_now = (now_ts / dur) * dur;
+
+    let mut last_price: u128 = 0;
+    let mut have_prev: bool = false;
+    let mut forward: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
+    let mut bts = start_bucket;
+
+    while bts <= newest_bucket_with_data {
+        if let Some(price) = per_bucket.get(&bts) {
+            let p = *price;
+            last_price = p;
+            have_prev = true;
+            forward.insert(
+                bts,
+                SchemaCandleV1 {
+                    open: p,
+                    high: p,
+                    low: p,
+                    close: p,
+                    volume: 0,
+                },
+            );
+        } else if have_prev {
+            let p = last_price;
+            forward.insert(
+                bts,
+                SchemaCandleV1 {
+                    open: p,
+                    high: p,
+                    low: p,
+                    close: p,
+                    volume: 0,
+                },
+            );
+        } else {
+            forward.insert(
+                bts,
+                SchemaCandleV1 {
+                    open: 0,
+                    high: 0,
+                    low: 0,
+                    close: 0,
+                    volume: 0,
+                },
+            );
+        }
+        bts = match bts.checked_add(dur) {
+            Some(n) => n,
+            None => break,
+        };
+    }
+
+    if newest_bucket_now > newest_bucket_with_data {
+        let mut t = newest_bucket_with_data.saturating_add(dur);
+        while t <= newest_bucket_now {
+            let p = last_price;
+            forward.insert(
+                t,
+                SchemaCandleV1 {
+                    open: p,
+                    high: p,
+                    low: p,
+                    close: p,
+                    volume: 0,
+                },
+            );
+            t = match t.checked_add(dur) {
+                Some(n) => n,
+                None => break,
+            };
+        }
+    }
+
+    let newest_first: Vec<SchemaCandleV1> = forward.into_iter().rev().map(|(_ts, c)| c).collect();
+
+    Ok(CandleSlice { candles_newest_first: newest_first, newest_ts: newest_bucket_now })
+}
+
 fn parse_timeframe(s: &str) -> Option<Timeframe> {
     match s {
         "10m" | "m10" => Some(Timeframe::M10),
         "1h" | "h1" => Some(Timeframe::H1),
+        "4h" | "h4" => Some(Timeframe::H4),
         "1d" | "d1" => Some(Timeframe::D1),
         "1w" | "w1" => Some(Timeframe::W1),
         "1M" | "m1" => Some(Timeframe::M1),

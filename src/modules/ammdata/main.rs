@@ -113,6 +113,19 @@ pub(crate) fn merge_candles(
             DerivedMergeStrategy::Optimistic => a.max(b),
             DerivedMergeStrategy::Pessimistic => a.min(b),
             DerivedMergeStrategy::Neutral => (a.saturating_add(b)) / 2,
+            DerivedMergeStrategy::NeutralVwap => {
+                let va = base.volume;
+                let vb = other.volume;
+                let denom = va.saturating_add(vb);
+                if denom == 0 {
+                    (a.saturating_add(b)) / 2
+                } else {
+                    let num = a
+                        .saturating_mul(va)
+                        .saturating_add(b.saturating_mul(vb));
+                    num / denom
+                }
+            }
         }
     };
     let volume = if base.volume == 0 { other.volume } else { base.volume };
@@ -653,12 +666,13 @@ impl EspoModule for AmmData {
         let finalize =
             crate::modules::ammdata::utils::index_finalize::prepare_batch(provider, &mut state)?;
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = finalize.stats.candle_writes,
             tc_cnt = finalize.stats.token_usd_candles,
             tmc_cnt = finalize.stats.token_mcusd_candles,
             tdc_cnt = finalize.stats.token_derived_usd_candles,
+            tdmc_cnt = finalize.stats.token_derived_mcusd_candles,
             tm_cnt = finalize.stats.token_metrics,
             tmi_cnt = finalize.stats.token_metrics_index,
             tsi_cnt = finalize.stats.token_search_index,
@@ -666,6 +680,7 @@ impl EspoModule for AmmData {
             tdmi_cnt = finalize.stats.derived_metrics_index,
             tdsi_cnt = finalize.stats.derived_search_index,
             btc_cnt = finalize.stats.btc_usd_price,
+            btcl_cnt = finalize.stats.btc_usd_line,
             cp_cnt = finalize.stats.canonical_pools,
             pn_cnt = finalize.stats.pool_name_index,
             af_cnt = finalize.stats.amm_factories,
