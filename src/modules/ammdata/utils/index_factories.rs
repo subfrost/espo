@@ -29,22 +29,23 @@ pub fn prepare_factories(
                 if amm_factories.contains(&rec.alkane) {
                     continue;
                 }
-                let mut is_factory =
-                    rec.inspection.as_ref().map(crate::modules::ammdata::inspection_is_amm_factory)
-                        .unwrap_or(false);
+                let mut is_factory = rec
+                    .inspection
+                    .as_ref()
+                    .map(crate::modules::ammdata::inspection_is_amm_factory)
+                    .unwrap_or(false);
                 if !is_factory {
                     if let Some(proxy_target) =
                         crate::modules::ammdata::lookup_proxy_target(essentials, rec.alkane)
                     {
-                        if let Ok(resp) =
-                            essentials.get_creation_record(GetCreationRecordParams {
-                                alkane: proxy_target,
-                            })
+                        if let Ok(resp) = essentials
+                            .get_creation_record(GetCreationRecordParams { alkane: proxy_target })
                         {
                             if let Some(rec) = resp.record {
                                 if let Some(inspection) = rec.inspection.as_ref() {
-                                    if crate::modules::ammdata::inspection_is_amm_factory(inspection)
-                                    {
+                                    if crate::modules::ammdata::inspection_is_amm_factory(
+                                        inspection,
+                                    ) {
                                         is_factory = true;
                                     }
                                 }
@@ -98,7 +99,8 @@ pub fn prepare_factories(
             }
         }
         if !is_factory {
-            if let Some(proxy_target) = crate::modules::ammdata::lookup_proxy_target(essentials, alk)
+            if let Some(proxy_target) =
+                crate::modules::ammdata::lookup_proxy_target(essentials, alk)
             {
                 if let Ok(resp) =
                     essentials.get_creation_record(GetCreationRecordParams { alkane: proxy_target })

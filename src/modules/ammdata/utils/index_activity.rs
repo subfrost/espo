@@ -1,12 +1,14 @@
 use crate::modules::ammdata::consts::CanonicalQuoteUnit;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, Timeframe};
 use crate::modules::ammdata::storage::AmmDataProvider;
-use crate::modules::ammdata::utils::candles::{bucket_start_for, price_base_per_quote, price_quote_per_base};
+use crate::modules::ammdata::utils::candles::{
+    bucket_start_for, price_base_per_quote, price_quote_per_base,
+};
 use crate::modules::ammdata::utils::index_state::IndexState;
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::schemas::SchemaAlkaneId;
-use bitcoin::hashes::Hash;
 use bitcoin::Txid;
+use bitcoin::hashes::Hash;
 use std::collections::HashMap;
 
 pub fn process_balance_deltas(
@@ -20,7 +22,8 @@ pub fn process_balance_deltas(
     state: &mut IndexState,
 ) {
     let table = provider.table();
-    let balance_txs = match crate::modules::ammdata::load_balance_txs_by_height(essentials, height) {
+    let balance_txs = match crate::modules::ammdata::load_balance_txs_by_height(essentials, height)
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!("[AMMDATA] failed to load balance txs for height {height}: {e:?}");
@@ -34,9 +37,8 @@ pub fn process_balance_deltas(
         let Some(snapshot) = state.reserves_snapshot.get_mut(&owner) else { continue };
 
         for entry in entries {
-            let base_delta = crate::modules::ammdata::signed_from_delta(
-                entry.outflow.get(&defs.base_alkane_id),
-            );
+            let base_delta =
+                crate::modules::ammdata::signed_from_delta(entry.outflow.get(&defs.base_alkane_id));
             let quote_delta = crate::modules::ammdata::signed_from_delta(
                 entry.outflow.get(&defs.quote_alkane_id),
             );

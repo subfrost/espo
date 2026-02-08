@@ -24,8 +24,8 @@ use crate::modules::essentials::storage::{
     encode_address_amount_vec, encode_u128_value, encode_vec, mk_outpoint, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
-    EssentialsProvider, GetMultiValuesParams, GetRawValueParams, GetScanPrefixParams,
-    SetBatchParams,
+    EssentialsProvider, GetIterPrefixRevParams, GetMultiValuesParams, GetRawValueParams,
+    GetScanPrefixParams, SetBatchParams,
 };
 use crate::runtime::mdb::Mdb;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
@@ -1345,7 +1345,6 @@ pub fn bulk_update_balances_for_block(
         let mut local_alkane_delta: HashMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>> =
             HashMap::new();
         let mut tx_mint_deltas: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
-        let mut trace_failed = false;
 
         let mut add_holder_delta =
             |alk: SchemaAlkaneId,
@@ -1501,6 +1500,15 @@ pub fn bulk_update_balances_for_block(
         let traces_for_tx: Vec<EspoTrace> = atx.traces.clone().unwrap_or_default();
         if !traces_for_tx.is_empty() {
             for t in &traces_for_tx {
+                let (ok, deltas) = accumulate_alkane_balance_deltas(
+                    &t.sandshrew_trace,
+                    &txid,
+                    &block.host_function_values,
+                );
+                if !ok {
+                    // Trace-level failure should not discard deltas from other traces in this tx.
+                    continue;
+                }
                 if let Some(mints) =
                     mint_deltas_from_trace(&t.sandshrew_trace, &block.host_function_values)
                 {
@@ -1511,18 +1519,6 @@ pub fn bulk_update_balances_for_block(
                         *tx_mint_deltas.entry(alkane).or_default() =
                             tx_mint_deltas.get(&alkane).copied().unwrap_or(0).saturating_add(delta);
                     }
-                }
-                let (ok, deltas) = accumulate_alkane_balance_deltas(
-                    &t.sandshrew_trace,
-                    &txid,
-                    &block.host_function_values,
-                );
-                if !ok {
-                    local_alkane_delta.clear();
-                    holder_alkanes_changed.clear();
-                    tx_mint_deltas.clear();
-                    trace_failed = true;
-                    break;
                 }
                 for (owner, per_token) in deltas {
                     let entry = local_alkane_delta.entry(owner).or_default();
@@ -1536,7 +1532,7 @@ pub fn bulk_update_balances_for_block(
                 }
             }
         }
-        if !trace_failed && !tx_mint_deltas.is_empty() {
+        if !tx_mint_deltas.is_empty() {
             for (alkane, delta) in tx_mint_deltas {
                 *minted_delta_by_alk.entry(alkane).or_default() =
                     minted_delta_by_alk.get(&alkane).copied().unwrap_or(0).saturating_add(delta);
@@ -2876,6 +2872,57 @@ pub fn get_alkane_balances(
     }
 
     Ok(agg)
+}
+
+pub fn get_alkane_balances_at_or_before(
+    provider: &EssentialsProvider,
+    owner: &SchemaAlkaneId,
+    height: u32,
+) -> Result<(HashMap<SchemaAlkaneId, u128>, Option<u32>)> {
+    let table = provider.table();
+
+    let decode_agg = |bytes: &[u8]| -> HashMap<SchemaAlkaneId, u128> {
+        let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+        if let Ok(bals) = decode_balances_vec(bytes) {
+            for be in bals {
+                if be.amount == 0 {
+                    continue;
+                }
+                *agg.entry(be.alkane).or_default() =
+                    agg.get(&be.alkane).copied().unwrap_or(0).saturating_add(be.amount);
+            }
+        }
+        agg
+    };
+
+    let exact_key = table.alkane_balances_by_height_key(owner, height);
+    if let Some(bytes) = provider.get_raw_value(GetRawValueParams { key: exact_key })?.value {
+        return Ok((decode_agg(&bytes), Some(height)));
+    }
+
+    let prefix = table.alkane_balances_by_height_prefix(owner);
+    let entries = provider
+        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+        .entries;
+
+    for (key, value) in entries {
+        if !key.starts_with(&prefix) {
+            continue;
+        }
+        let suffix = &key[prefix.len()..];
+        if suffix.len() != 4 {
+            continue;
+        }
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(suffix);
+        let snapshot_height = u32::from_be_bytes(arr);
+        if snapshot_height > height {
+            continue;
+        }
+        return Ok((decode_agg(&value), Some(snapshot_height)));
+    }
+
+    Ok((HashMap::new(), None))
 }
 
 #[derive(Default, Clone, Debug)]

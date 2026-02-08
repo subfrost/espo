@@ -6,9 +6,9 @@ use crate::modules::essentials::storage::{
     RpcGetAlkaneBalanceTxsParams, RpcGetAlkaneBalancesParams, RpcGetAlkaneBlockTxsParams,
     RpcGetAlkaneInfoParams, RpcGetAlkaneLatestTracesParams, RpcGetAlkaneTxSummaryParams,
     RpcGetAllAlkanesParams, RpcGetBlockSummaryParams, RpcGetBlockTracesParams,
-    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams,
-    RpcGetKeysParams, RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams,
-    RpcGetTotalReceivedParams, RpcGetTransferVolumeParams, RpcPingParams,
+    RpcGetCirculatingSupplyParams, RpcGetHoldersCountParams, RpcGetHoldersParams, RpcGetKeysParams,
+    RpcGetMempoolTracesParams, RpcGetOutpointBalancesParams, RpcGetTotalReceivedParams,
+    RpcGetTransferVolumeParams, RpcPingParams,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -304,6 +304,8 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .get("alkane")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            height: payload.get("height").and_then(|v| v.as_u64()),
+                            height_present: payload.get("height").is_some(),
                         };
                         mdb.rpc_get_alkane_balances(params)
                             .map(|resp| resp.value)
@@ -573,7 +575,9 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
-                            only_alkane_txs: payload.get("only_alkane_txs").and_then(|v| v.as_bool()),
+                            only_alkane_txs: payload
+                                .get("only_alkane_txs")
+                                .and_then(|v| v.as_bool()),
                         };
                         mdb.rpc_get_address_transactions(params)
                             .map(|resp| resp.value)

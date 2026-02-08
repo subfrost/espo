@@ -7,8 +7,8 @@ use crate::modules::essentials::consts::{
 };
 use crate::modules::essentials::rpc;
 use crate::modules::essentials::storage::{
-    BlockSummary, EssentialsProvider, cache_block_summary, encode_creation_record,
-    GetRawValueParams,
+    BlockSummary, EssentialsProvider, GetRawValueParams, cache_block_summary,
+    encode_creation_record,
 };
 use crate::modules::essentials::utils::creation_meta::{get_cap, get_value_per_mint};
 use crate::modules::essentials::utils::inspections::{
@@ -431,22 +431,21 @@ impl EspoModule for Essentials {
                 if is_orbital_instance(inspection) {
                     rec.symbols.clear();
                     let factory_id = inspection.factory_alkane.unwrap_or(rec.alkane);
-                    let mut base_name = if let Some(cached) =
-                        orbital_collection_name_cache.get(&factory_id)
-                    {
-                        cached.clone()
-                    } else {
-                        let key = table.orbital_collection_name_key(&factory_id);
-                        let name = provider
-                            .get_raw_value(GetRawValueParams { key })
-                            .ok()
-                            .and_then(|resp| resp.value)
-                            .and_then(|bytes| String::from_utf8(bytes).ok())
-                            .map(|s| s.trim_matches('\0').trim().to_string())
-                            .filter(|s| !s.is_empty());
-                        orbital_collection_name_cache.insert(factory_id, name.clone());
-                        name
-                    };
+                    let mut base_name =
+                        if let Some(cached) = orbital_collection_name_cache.get(&factory_id) {
+                            cached.clone()
+                        } else {
+                            let key = table.orbital_collection_name_key(&factory_id);
+                            let name = provider
+                                .get_raw_value(GetRawValueParams { key })
+                                .ok()
+                                .and_then(|resp| resp.value)
+                                .and_then(|bytes| String::from_utf8(bytes).ok())
+                                .map(|s| s.trim_matches('\0').trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            orbital_collection_name_cache.insert(factory_id, name.clone());
+                            name
+                        };
                     let mut name_from_simulate: Option<String> = None;
 
                     if base_name.is_none() {

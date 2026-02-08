@@ -486,6 +486,12 @@ pub async fn alkane_page(
                                         span class="alkane-inspect-name" { (inspect_name.clone()) }
                                         span class="alkane-inspect-id mono" { (inspect_id_label.clone()) }
                                     }
+                                    div class="alkane-inspect-block-control" {
+                                        span class="alkane-inspect-block-label" { "View as block:" }
+                                        div class="hero-search-input alkane-inspect-block-input-wrap" {
+                                            input class="hero-search-field alkane-inspect-block-input mono" type="text" value="latest" placeholder="latest" data-sim-block-input="" aria-label="View as block" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false";
+                                        }
+                                    }
                                     @if view_methods.is_empty() && write_methods.is_empty() {
                                         p class="muted" { "No contract methods found." }
                                     } @else {
@@ -729,6 +735,11 @@ fn inspect_scripts() -> Markup {
   const alkaneId = root.dataset.alkaneId || '';
   if (!alkaneId) return;
   const writeDefault = 'Providing inputs to simulate methods is not currently supported on espo';
+  const blockInput = root.querySelector('[data-sim-block-input]');
+  const currentBlockTag = () => {
+    const value = blockInput && typeof blockInput.value === 'string' ? blockInput.value.trim() : '';
+    return value || 'latest';
+  };
   const clearValueNode = (node) => {
     if (!node) return;
     node.removeAttribute('data-cards');
@@ -827,7 +838,7 @@ fn inspect_scripts() -> Markup {
     setValueText(valueNode, 'Loading...');
 
     try {
-      const payload = { alkane: alkaneId, opcode: Number(opcode) };
+      const payload = { alkane: alkaneId, opcode: Number(opcode), block: currentBlockTag() };
       if (returnsType) {
         payload.returns = returnsType;
       }

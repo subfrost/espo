@@ -181,14 +181,7 @@ impl Timeframe {
     }
 }
 pub fn active_timeframes() -> Vec<Timeframe> {
-    vec![
-        Timeframe::M10,
-        Timeframe::H1,
-        Timeframe::H4,
-        Timeframe::D1,
-        Timeframe::W1,
-        Timeframe::M1,
-    ]
+    vec![Timeframe::M10, Timeframe::H1, Timeframe::H4, Timeframe::D1, Timeframe::W1, Timeframe::M1]
 }
 /// One entry per pool: latest reserves + the token IDs,
 /// so callers never need to hit /pools to learn base/quote.

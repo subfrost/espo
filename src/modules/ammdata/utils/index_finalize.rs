@@ -1,4 +1,6 @@
-use crate::modules::ammdata::storage::{AmmDataProvider, GetRawValueParams, encode_reserves_snapshot};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetRawValueParams, encode_reserves_snapshot,
+};
 use crate::modules::ammdata::utils::activity::{
     decode_u64_be, encode_u64_be, idx_count_key, idx_count_key_group,
 };

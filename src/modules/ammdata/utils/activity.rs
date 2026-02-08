@@ -1,4 +1,4 @@
-use crate::modules::ammdata::consts::PRICE_SCALE;
+use crate::modules::ammdata::consts::AMOUNT_SCALE;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, SchemaActivityV1};
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
@@ -365,7 +365,7 @@ pub struct ActivityRow {
     /// derived from chosen side + delta sign
     pub side: ActivityUiSide,
 
-    /// absolute volume on the chosen side (scaled by 1e8)
+    /// absolute volume on the chosen side (scaled by AMOUNT_SCALE)
     pub amount: f64,
 }
 
@@ -386,7 +386,7 @@ impl ActivityRow {
 
     #[inline]
     fn scale_u128(x: u128) -> f64 {
-        (x as f64) / (PRICE_SCALE as f64)
+        (x as f64) / (AMOUNT_SCALE as f64)
     }
 
     fn kind_str(kind: ActivityKind, side: &ActivityUiSide) -> &'static str {

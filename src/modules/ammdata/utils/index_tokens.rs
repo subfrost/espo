@@ -1,5 +1,5 @@
 use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
-use crate::modules::ammdata::consts::{CanonicalQuoteUnit, PRICE_SCALE};
+use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
 use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::schemas::{
     SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaTokenMetricsV1, Timeframe,
@@ -33,6 +33,11 @@ pub fn derive_token_data(
     state: &mut IndexState,
 ) -> Result<()> {
     let table = provider.table();
+    // Essentials circulating supply is amount-scaled (1e8). Market-cap outputs are price-scaled
+    // (1e16), so we multiply by supply and divide by AMOUNT_SCALE.
+    let scale_price_by_supply = |price_scaled: u128, supply_amount_scaled: u128| -> u128 {
+        price_scaled.saturating_mul(supply_amount_scaled).saturating_div(AMOUNT_SCALE)
+    };
 
     // ---------- btc/usd price ----------
     if state.has_trades {
@@ -105,14 +110,16 @@ pub fn derive_token_data(
         HashMap::new();
     for (pool, defs) in state.pools_map.iter() {
         if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
-            canonical_pools_by_token.entry(defs.base_alkane_id).or_default().push(
-                SchemaCanonicalPoolEntry { pool_id: *pool, quote_id: defs.quote_alkane_id },
-            );
+            canonical_pools_by_token
+                .entry(defs.base_alkane_id)
+                .or_default()
+                .push(SchemaCanonicalPoolEntry { pool_id: *pool, quote_id: defs.quote_alkane_id });
         }
         if canonical_quote_units.contains_key(&defs.base_alkane_id) {
-            canonical_pools_by_token.entry(defs.quote_alkane_id).or_default().push(
-                SchemaCanonicalPoolEntry { pool_id: *pool, quote_id: defs.base_alkane_id },
-            );
+            canonical_pools_by_token
+                .entry(defs.quote_alkane_id)
+                .or_default()
+                .push(SchemaCanonicalPoolEntry { pool_id: *pool, quote_id: defs.base_alkane_id });
         }
     }
 
@@ -121,9 +128,7 @@ pub fn derive_token_data(
     state.candle_writes = candle_writes;
     state.pool_candle_overrides.clear();
     for (pool, tf, bucket_ts, candle) in candle_entries {
-        state
-            .pool_candle_overrides
-            .insert((pool, tf, bucket_ts), candle);
+        state.pool_candle_overrides.insert((pool, tf, bucket_ts), candle);
     }
 
     let load_pool_candle = |pool: &SchemaAlkaneId,
@@ -164,8 +169,10 @@ pub fn derive_token_data(
 
     let mut token_usd_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaCandleV1> =
         HashMap::new();
-    let mut token_mcusd_candle_overrides: HashMap<(SchemaAlkaneId, Timeframe, u64), SchemaCandleV1> =
-        HashMap::new();
+    let mut token_mcusd_candle_overrides: HashMap<
+        (SchemaAlkaneId, Timeframe, u64),
+        SchemaCandleV1,
+    > = HashMap::new();
     let mut token_derived_usd_candle_overrides: HashMap<
         (SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64),
         SchemaCandleV1,
@@ -187,7 +194,8 @@ pub fn derive_token_data(
                     let Some(unit) = canonical_quote_units.get(&entry.quote_id) else {
                         continue;
                     };
-                    let Some(pool_candle) = load_pool_candle(&entry.pool_id, *tf, *bucket_ts)? else {
+                    let Some(pool_candle) = load_pool_candle(&entry.pool_id, *tf, *bucket_ts)?
+                    else {
                         continue;
                     };
                     let Some(defs) = state.pools_map.get(&entry.pool_id) else {
@@ -280,7 +288,8 @@ pub fn derive_token_data(
                     _ => continue,
                 };
 
-                let existing = if let Some(c) = token_usd_candle_overrides.get(&(*token, *tf, *bucket_ts))
+                let existing = if let Some(c) =
+                    token_usd_candle_overrides.get(&(*token, *tf, *bucket_ts))
                 {
                     Some(*c)
                 } else {
@@ -295,7 +304,8 @@ pub fn derive_token_data(
                 let mut open = if let Some(prev) = existing {
                     prev.open
                 } else {
-                    let prev_bucket = bucket_ts.checked_sub(tf.duration_secs()).unwrap_or(*bucket_ts);
+                    let prev_bucket =
+                        bucket_ts.checked_sub(tf.duration_secs()).unwrap_or(*bucket_ts);
                     if let Some(c) = token_usd_candle_overrides.get(&(*token, *tf, prev_bucket)) {
                         c.close
                     } else {
@@ -361,10 +371,8 @@ pub fn derive_token_data(
                                 || (pool.block == existing.pool_id.block
                                     && pool.tx < existing.pool_id.tx);
                             if prefer || (existing.token_is_base == token_is_base && smaller) {
-                                derived_pool_by_token_quote.insert(
-                                    key,
-                                    DerivedPoolInfo { pool_id: pool, token_is_base },
-                                );
+                                derived_pool_by_token_quote
+                                    .insert(key, DerivedPoolInfo { pool_id: pool, token_is_base });
                             }
                         }
                     }
@@ -383,15 +391,14 @@ pub fn derive_token_data(
                 SchemaAlkaneId,
                 Vec<(SchemaAlkaneId, SchemaAlkaneId, bool)>,
             > = HashMap::new();
-            let mut quote_to_tokens: HashMap<SchemaAlkaneId, Vec<SchemaAlkaneId>> =
-                HashMap::new();
-            let mut token_to_quotes: HashMap<SchemaAlkaneId, Vec<SchemaAlkaneId>> =
-                HashMap::new();
+            let mut quote_to_tokens: HashMap<SchemaAlkaneId, Vec<SchemaAlkaneId>> = HashMap::new();
+            let mut token_to_quotes: HashMap<SchemaAlkaneId, Vec<SchemaAlkaneId>> = HashMap::new();
             for ((token, quote), info) in derived_pool_by_token_quote.iter() {
-                pool_to_edges
-                    .entry(info.pool_id)
-                    .or_default()
-                    .push((*token, *quote, info.token_is_base));
+                pool_to_edges.entry(info.pool_id).or_default().push((
+                    *token,
+                    *quote,
+                    info.token_is_base,
+                ));
                 quote_to_tokens.entry(*quote).or_default().push(*token);
                 token_to_quotes.entry(*token).or_default().push(*quote);
             }
@@ -522,17 +529,19 @@ pub fn derive_token_data(
                 best
             };
 
-            let load_token_usd_candle =
-                |token: &SchemaAlkaneId, tf: Timeframe, bucket_ts: u64| -> Result<Option<SchemaCandleV1>> {
-                    if let Some(c) = token_usd_candle_overrides.get(&(*token, tf, bucket_ts)) {
-                        return Ok(Some(*c));
-                    }
-                    let key = table.token_usd_candle_key(token, tf, bucket_ts);
-                    if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value {
-                        return Ok(Some(decode_candle_v1(&raw)?));
-                    }
-                    Ok(None)
-                };
+            let load_token_usd_candle = |token: &SchemaAlkaneId,
+                                         tf: Timeframe,
+                                         bucket_ts: u64|
+             -> Result<Option<SchemaCandleV1>> {
+                if let Some(c) = token_usd_candle_overrides.get(&(*token, tf, bucket_ts)) {
+                    return Ok(Some(*c));
+                }
+                let key = table.token_usd_candle_key(token, tf, bucket_ts);
+                if let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value {
+                    return Ok(Some(decode_candle_v1(&raw)?));
+                }
+                Ok(None)
+            };
 
             let mut derived_buckets: HashSet<(SchemaAlkaneId, SchemaAlkaneId, Timeframe, u64)> =
                 HashSet::new();
@@ -557,71 +566,84 @@ pub fn derive_token_data(
                     }
                 }
             }
-
-            let q_per_t_from_pool =
-                |pool_candle: SchemaFullCandleV1, token_is_base: bool|
-                 -> Option<((u128, u128, u128, u128), u128)> {
-                    if token_is_base {
-                        Some((
-                            (
-                                pool_candle.base_candle.open,
-                                pool_candle.base_candle.high,
-                                pool_candle.base_candle.low,
-                                pool_candle.base_candle.close,
-                            ),
-                            pool_candle.base_candle.volume,
-                        ))
-                    } else {
-                        let inv_open =
-                            crate::modules::ammdata::invert_price_value(pool_candle.base_candle.open)?;
-                        let inv_close =
-                            crate::modules::ammdata::invert_price_value(pool_candle.base_candle.close)?;
-                        let inv_high =
-                            crate::modules::ammdata::invert_price_value(pool_candle.base_candle.low)?;
-                        let inv_low =
-                            crate::modules::ammdata::invert_price_value(pool_candle.base_candle.high)?;
-                        Some(((inv_open, inv_high, inv_low, inv_close), pool_candle.quote_candle.volume))
+            for ((token, tf, bucket), _candle) in token_usd_candle_overrides.iter() {
+                for quote in derived_quote_set.iter() {
+                    if token != quote {
+                        derived_buckets.insert((*token, *quote, *tf, *bucket));
                     }
-                };
+                }
+            }
 
-            let derived_from_pool_with_quote_close =
-                |pool_candle: SchemaFullCandleV1,
-                 token_is_base: bool,
-                 quote_close: u128|
-                 -> Option<SchemaCandleV1> {
-                    let ((q_open, q_high, q_low, q_close), token_volume) =
-                        q_per_t_from_pool(pool_candle, token_is_base)?;
-                    let conv = |q_usd: u128, q_per_t: u128| -> Option<u128> {
-                        if q_per_t == 0 {
-                            None
-                        } else {
-                            Some(q_usd.saturating_mul(q_per_t) / PRICE_SCALE)
-                        }
-                    };
-                    let open = conv(quote_close, q_open)?;
-                    let high = conv(quote_close, q_high)?;
-                    let low = conv(quote_close, q_low)?;
-                    let close = conv(quote_close, q_close)?;
-                    let volume = token_volume.saturating_mul(close) / PRICE_SCALE;
-                    Some(SchemaCandleV1 { open, high, low, close, volume })
-                };
+            let q_per_t_from_pool = |pool_candle: SchemaFullCandleV1,
+                                     token_is_base: bool|
+             -> Option<((u128, u128, u128, u128), u128)> {
+                if token_is_base {
+                    Some((
+                        (
+                            pool_candle.base_candle.open,
+                            pool_candle.base_candle.high,
+                            pool_candle.base_candle.low,
+                            pool_candle.base_candle.close,
+                        ),
+                        pool_candle.base_candle.volume,
+                    ))
+                } else {
+                    let inv_open =
+                        crate::modules::ammdata::invert_price_value(pool_candle.base_candle.open)?;
+                    let inv_close =
+                        crate::modules::ammdata::invert_price_value(pool_candle.base_candle.close)?;
+                    let inv_high =
+                        crate::modules::ammdata::invert_price_value(pool_candle.base_candle.low)?;
+                    let inv_low =
+                        crate::modules::ammdata::invert_price_value(pool_candle.base_candle.high)?;
+                    Some((
+                        (inv_open, inv_high, inv_low, inv_close),
+                        pool_candle.quote_candle.volume,
+                    ))
+                }
+            };
 
-            let derived_from_quote_with_q_per_t =
-                |quote_candle: SchemaCandleV1, q_per_t: u128| -> Option<SchemaCandleV1> {
+            let derived_from_pool_with_quote_close = |pool_candle: SchemaFullCandleV1,
+                                                      token_is_base: bool,
+                                                      quote_close: u128|
+             -> Option<SchemaCandleV1> {
+                let ((q_open, q_high, q_low, q_close), token_volume) =
+                    q_per_t_from_pool(pool_candle, token_is_base)?;
+                let conv = |q_usd: u128, q_per_t: u128| -> Option<u128> {
                     if q_per_t == 0 {
-                        return None;
+                        None
+                    } else {
+                        Some(q_usd.saturating_mul(q_per_t) / PRICE_SCALE)
                     }
-                    let conv = |q_usd: u128| -> u128 { q_usd.saturating_mul(q_per_t) / PRICE_SCALE };
-                    Some(SchemaCandleV1 {
-                        open: conv(quote_candle.open),
-                        high: conv(quote_candle.high),
-                        low: conv(quote_candle.low),
-                        close: conv(quote_candle.close),
-                        volume: 0,
-                    })
                 };
+                let open = conv(quote_close, q_open)?;
+                let high = conv(quote_close, q_high)?;
+                let low = conv(quote_close, q_low)?;
+                let close = conv(quote_close, q_close)?;
+                let volume = token_volume.saturating_mul(close) / PRICE_SCALE;
+                Some(SchemaCandleV1 { open, high, low, close, volume })
+            };
+
+            let derived_from_quote_with_q_per_t = |quote_candle: SchemaCandleV1,
+                                                   q_per_t: u128|
+             -> Option<SchemaCandleV1> {
+                if q_per_t == 0 {
+                    return None;
+                }
+                let conv = |q_usd: u128| -> u128 { q_usd.saturating_mul(q_per_t) / PRICE_SCALE };
+                Some(SchemaCandleV1 {
+                    open: conv(quote_candle.open),
+                    high: conv(quote_candle.high),
+                    low: conv(quote_candle.low),
+                    close: conv(quote_candle.close),
+                    volume: 0,
+                })
+            };
 
             let apply_open = |mut candle: SchemaCandleV1, open: u128| -> SchemaCandleV1 {
+                if open == 0 {
+                    return candle;
+                }
                 candle.open = open;
                 if candle.open > candle.high {
                     candle.high = candle.open;
@@ -633,14 +655,11 @@ pub fn derive_token_data(
             };
 
             for (token, quote, tf, bucket_ts) in derived_buckets.into_iter() {
-                let Some(info) = derived_pool_by_token_quote.get(&(token, quote)) else {
-                    continue;
-                };
+                let info = derived_pool_by_token_quote.get(&(token, quote)).copied();
 
-                let pool_active = state
-                    .pool_candle_overrides
-                    .get(&(info.pool_id, tf, bucket_ts))
-                    .copied();
+                let pool_active = info.and_then(|i| {
+                    state.pool_candle_overrides.get(&(i.pool_id, tf, bucket_ts)).copied()
+                });
                 let quote_usd_active =
                     token_usd_candle_overrides.get(&(quote, tf, bucket_ts)).copied();
                 let token_usd_active =
@@ -648,8 +667,10 @@ pub fn derive_token_data(
 
                 let pool_bucket_candle = if let Some(c) = pool_active {
                     Some(c)
-                } else {
+                } else if let Some(info) = info {
                     load_pool_candle(&info.pool_id, tf, bucket_ts)?
+                } else {
+                    None
                 };
                 let token_usd_bucket_candle = if let Some(c) = token_usd_active {
                     Some(c)
@@ -667,6 +688,37 @@ pub fn derive_token_data(
                 )
                 .map(|(_ts, c)| c);
                 let last_derived_close = last_derived_candle.map(|c| c.close).unwrap_or(0);
+
+                if info.is_none() {
+                    let mut final_candle = token_usd_bucket_candle.or_else(|| {
+                        if last_derived_close != 0 {
+                            Some(SchemaCandleV1 {
+                                open: last_derived_close,
+                                high: last_derived_close,
+                                low: last_derived_close,
+                                close: last_derived_close,
+                                volume: 0,
+                            })
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some(derived) = final_candle.as_mut() {
+                        *derived = apply_open(*derived, last_derived_close);
+                    }
+
+                    if let Some(derived) = final_candle {
+                        token_derived_usd_candle_overrides
+                            .insert((token, quote, tf, bucket_ts), derived);
+                        derived_overrides_by_token_quote_tf
+                            .entry((token, quote, tf))
+                            .or_default()
+                            .insert(bucket_ts, derived);
+                    }
+                    continue;
+                }
+                let info = info.expect("checked above");
 
                 let last_quote_usd_close =
                     latest_token_usd_candle(&quote, tf, bucket_ts).map(|(_ts, c)| c.close);
@@ -691,9 +743,8 @@ pub fn derive_token_data(
                     last_pool_q_per_t_close
                 };
 
-                let strategy = derived_quote_strategies
-                    .get(&quote)
-                    .unwrap_or(&DerivedMergeStrategy::Neutral);
+                let strategy =
+                    derived_quote_strategies.get(&quote).unwrap_or(&DerivedMergeStrategy::Neutral);
 
                 let path_a = match (quote_usd_active, q_per_t_const) {
                     (Some(q_usd), Some(q_per_t)) => derived_from_quote_with_q_per_t(q_usd, q_per_t),
@@ -701,11 +752,9 @@ pub fn derive_token_data(
                 };
 
                 let path_b = match (pool_bucket_candle, last_quote_usd_close) {
-                    (Some(pool_candle), Some(q_close)) => derived_from_pool_with_quote_close(
-                        pool_candle,
-                        info.token_is_base,
-                        q_close,
-                    ),
+                    (Some(pool_candle), Some(q_close)) => {
+                        derived_from_pool_with_quote_close(pool_candle, info.token_is_base, q_close)
+                    }
                     _ => None,
                 };
 
@@ -723,18 +772,20 @@ pub fn derive_token_data(
                     None
                 };
 
-                let merge_with_anchor = |anchor_close: u128, candle: SchemaCandleV1| -> SchemaCandleV1 {
-                    let anchor = SchemaCandleV1 {
-                        open: anchor_close,
-                        high: anchor_close,
-                        low: anchor_close,
-                        close: anchor_close,
-                        volume: 0,
+                let merge_with_anchor =
+                    |anchor_close: u128, candle: SchemaCandleV1| -> SchemaCandleV1 {
+                        let anchor = SchemaCandleV1 {
+                            open: anchor_close,
+                            high: anchor_close,
+                            low: anchor_close,
+                            close: anchor_close,
+                            volume: 0,
+                        };
+                        let mut merged =
+                            crate::modules::ammdata::merge_candles(anchor, candle, strategy);
+                        merged.volume = candle.volume;
+                        merged
                     };
-                    let mut merged = crate::modules::ammdata::merge_candles(anchor, candle, strategy);
-                    merged.volume = candle.volume;
-                    merged
-                };
 
                 let only_token_usd_active = token_usd_active.is_some()
                     && pool_active.is_none()
@@ -763,12 +814,12 @@ pub fn derive_token_data(
 
                 let token_derived =
                     if use_anchor && only_token_usd_active && last_derived_close != 0 {
-                    token_derived.map(|c| merge_with_anchor(last_derived_close, c))
-                } else if use_anchor && only_pool_active && last_derived_close != 0 {
-                    token_derived.map(|c| merge_with_anchor(last_derived_close, c))
-                } else {
-                    token_derived
-                };
+                        token_derived.map(|c| merge_with_anchor(last_derived_close, c))
+                    } else if use_anchor && only_pool_active && last_derived_close != 0 {
+                        token_derived.map(|c| merge_with_anchor(last_derived_close, c))
+                    } else {
+                        token_derived
+                    };
 
                 let path_a = if use_anchor && only_quote_usd_active && last_derived_close != 0 {
                     path_a.map(|c| merge_with_anchor(last_derived_close, c))
@@ -805,7 +856,8 @@ pub fn derive_token_data(
                 }
 
                 if let Some(derived) = final_candle {
-                    token_derived_usd_candle_overrides.insert((token, quote, tf, bucket_ts), derived);
+                    token_derived_usd_candle_overrides
+                        .insert((token, quote, tf, bucket_ts), derived);
                     derived_overrides_by_token_quote_tf
                         .entry((token, quote, tf))
                         .or_default()
@@ -813,7 +865,8 @@ pub fn derive_token_data(
                 }
             }
 
-            for ((token, quote, tf, bucket_ts), candle) in token_derived_usd_candle_overrides.iter() {
+            for ((token, quote, tf, bucket_ts), candle) in token_derived_usd_candle_overrides.iter()
+            {
                 let key = table.token_derived_usd_candle_key(token, quote, *tf, *bucket_ts);
                 let encoded = encode_candle_v1(candle)?;
                 state.token_derived_usd_candle_writes.push((key, encoded));
@@ -829,7 +882,9 @@ pub fn derive_token_data(
                 let v = essentials
                     .get_raw_value(EssentialsGetRawValueParams { key })?
                     .value
-                    .and_then(|raw| crate::modules::essentials::storage::decode_u128_value(&raw).ok())
+                    .and_then(|raw| {
+                        crate::modules::essentials::storage::decode_u128_value(&raw).ok()
+                    })
                     .unwrap_or(0);
                 supply_cache.insert(*token, v);
                 v
@@ -837,7 +892,7 @@ pub fn derive_token_data(
             if supply == 0 {
                 continue;
             }
-            let scale = |p: u128| -> u128 { p.saturating_mul(supply) / PRICE_SCALE };
+            let scale = |p: u128| -> u128 { scale_price_by_supply(p, supply) };
             let mc_candle = SchemaCandleV1 {
                 open: scale(candle.open),
                 high: scale(candle.high),
@@ -845,7 +900,8 @@ pub fn derive_token_data(
                 close: scale(candle.close),
                 volume: candle.volume,
             };
-            token_derived_mcusd_candle_overrides.insert((*token, *quote, *tf, *bucket_ts), mc_candle);
+            token_derived_mcusd_candle_overrides
+                .insert((*token, *quote, *tf, *bucket_ts), mc_candle);
         }
 
         for ((token, tf, bucket_ts), candle) in token_usd_candle_overrides.iter() {
@@ -857,7 +913,9 @@ pub fn derive_token_data(
                 let v = essentials
                     .get_raw_value(EssentialsGetRawValueParams { key })?
                     .value
-                    .and_then(|raw| crate::modules::essentials::storage::decode_u128_value(&raw).ok())
+                    .and_then(|raw| {
+                        crate::modules::essentials::storage::decode_u128_value(&raw).ok()
+                    })
                     .unwrap_or(0);
                 supply_cache.insert(*token, v);
                 v
@@ -865,7 +923,7 @@ pub fn derive_token_data(
             if supply == 0 {
                 continue;
             }
-            let scale = |p: u128| -> u128 { p.saturating_mul(supply) / PRICE_SCALE };
+            let scale = |p: u128| -> u128 { scale_price_by_supply(p, supply) };
             let mc_candle = SchemaCandleV1 {
                 open: scale(candle.open),
                 high: scale(candle.high),
@@ -908,8 +966,10 @@ pub fn derive_token_data(
             }
         }
 
-        let mut pool_trade_window_cache: HashMap<SchemaAlkaneId, crate::modules::ammdata::PoolTradeWindows> =
-            HashMap::new();
+        let mut pool_trade_window_cache: HashMap<
+            SchemaAlkaneId,
+            crate::modules::ammdata::PoolTradeWindows,
+        > = HashMap::new();
 
         for token in tokens_for_metrics.iter() {
             let prefix = table.token_usd_candle_ns_prefix(token, Timeframe::M10);
@@ -969,16 +1029,6 @@ pub fn derive_token_data(
                 close_at(target)
             };
 
-            let percent_change = |prev: u128, now: u128| -> String {
-                if prev == 0 {
-                    return "0".to_string();
-                }
-                let prev_f = prev as f64;
-                let now_f = now as f64;
-                let pct = (now_f - prev_f) / prev_f * 100.0;
-                format!("{:.4}", pct)
-            };
-
             let supply = {
                 let table_e = essentials.table();
                 let key = table_e.circulating_supply_latest_key(token);
@@ -990,11 +1040,12 @@ pub fn derive_token_data(
             };
 
             let price_usd = latest_close;
-            let fdv_usd = price_usd.saturating_mul(supply) / PRICE_SCALE;
+            let fdv_usd = scale_price_by_supply(price_usd, supply);
             let marketcap_usd = fdv_usd;
 
             let metrics_key = table.token_metrics_key(token);
-            let prev_raw = provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
+            let prev_raw =
+                provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
             let prev_metrics =
                 prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
@@ -1012,14 +1063,14 @@ pub fn derive_token_data(
                 Err(_) => crate::modules::ammdata::TokenTradeWindows::default(),
             };
 
-            let volume_1d = token_trade.amount_1d.saturating_mul(price_usd) / PRICE_SCALE;
-            let volume_7d = token_trade.amount_7d.saturating_mul(price_usd) / PRICE_SCALE;
-            let volume_30d = token_trade.amount_30d.saturating_mul(price_usd) / PRICE_SCALE;
+            let volume_1d = token_trade.amount_1d.saturating_mul(price_usd) / AMOUNT_SCALE;
+            let volume_7d = token_trade.amount_7d.saturating_mul(price_usd) / AMOUNT_SCALE;
+            let volume_30d = token_trade.amount_30d.saturating_mul(price_usd) / AMOUNT_SCALE;
             let volume_all_time = if token_trade.has_all_time {
-                token_trade.amount_all.saturating_mul(price_usd) / PRICE_SCALE
+                token_trade.amount_all.saturating_mul(price_usd) / AMOUNT_SCALE
             } else {
                 let prev = prev_metrics.as_ref().map(|m| m.volume_all_time).unwrap_or(0);
-                let block_usd = token_trade.block_amount.saturating_mul(price_usd) / PRICE_SCALE;
+                let block_usd = token_trade.block_amount.saturating_mul(price_usd) / AMOUNT_SCALE;
                 prev.saturating_add(block_usd)
             };
 
@@ -1031,10 +1082,22 @@ pub fn derive_token_data(
                 volume_1d,
                 volume_7d,
                 volume_30d,
-                change_1d: percent_change(window_close(24 * 60 * 60), latest_close),
-                change_7d: percent_change(window_close(7 * 24 * 60 * 60), latest_close),
-                change_30d: percent_change(window_close(30 * 24 * 60 * 60), latest_close),
-                change_all_time: percent_change(first_close, latest_close),
+                change_1d: crate::modules::ammdata::percent_change_str(
+                    window_close(24 * 60 * 60),
+                    latest_close,
+                ),
+                change_7d: crate::modules::ammdata::percent_change_str(
+                    window_close(7 * 24 * 60 * 60),
+                    latest_close,
+                ),
+                change_30d: crate::modules::ammdata::percent_change_str(
+                    window_close(30 * 24 * 60 * 60),
+                    latest_close,
+                ),
+                change_all_time: crate::modules::ammdata::percent_change_str(
+                    first_close,
+                    latest_close,
+                ),
             };
             if prev_raw.value.is_none() {
                 state.token_metrics_index_new = state.token_metrics_index_new.saturating_add(1);
@@ -1331,16 +1394,6 @@ pub fn derive_token_data(
                 close_at(target)
             };
 
-            let percent_change = |prev: u128, now: u128| -> String {
-                if prev == 0 {
-                    return "0".to_string();
-                }
-                let prev_f = prev as f64;
-                let now_f = now as f64;
-                let pct = (now_f - prev_f) / prev_f * 100.0;
-                format!("{:.4}", pct)
-            };
-
             let supply = if let Some(v) = supply_cache.get(token) {
                 *v
             } else {
@@ -1349,18 +1402,21 @@ pub fn derive_token_data(
                 let v = essentials
                     .get_raw_value(EssentialsGetRawValueParams { key })?
                     .value
-                    .and_then(|raw| crate::modules::essentials::storage::decode_u128_value(&raw).ok())
+                    .and_then(|raw| {
+                        crate::modules::essentials::storage::decode_u128_value(&raw).ok()
+                    })
                     .unwrap_or(0);
                 supply_cache.insert(*token, v);
                 v
             };
 
             let price_usd = latest_close;
-            let fdv_usd = price_usd.saturating_mul(supply) / PRICE_SCALE;
+            let fdv_usd = scale_price_by_supply(price_usd, supply);
             let marketcap_usd = fdv_usd;
 
             let metrics_key = table.token_derived_metrics_key(token, quote);
-            let prev_raw = provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
+            let prev_raw =
+                provider.get_raw_value(GetRawValueParams { key: metrics_key.clone() })?;
             let prev_metrics =
                 prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
@@ -1378,14 +1434,14 @@ pub fn derive_token_data(
                 Err(_) => crate::modules::ammdata::TokenTradeWindows::default(),
             };
 
-            let volume_1d = token_trade.amount_1d.saturating_mul(price_usd) / PRICE_SCALE;
-            let volume_7d = token_trade.amount_7d.saturating_mul(price_usd) / PRICE_SCALE;
-            let volume_30d = token_trade.amount_30d.saturating_mul(price_usd) / PRICE_SCALE;
+            let volume_1d = token_trade.amount_1d.saturating_mul(price_usd) / AMOUNT_SCALE;
+            let volume_7d = token_trade.amount_7d.saturating_mul(price_usd) / AMOUNT_SCALE;
+            let volume_30d = token_trade.amount_30d.saturating_mul(price_usd) / AMOUNT_SCALE;
             let volume_all_time = if token_trade.has_all_time {
-                token_trade.amount_all.saturating_mul(price_usd) / PRICE_SCALE
+                token_trade.amount_all.saturating_mul(price_usd) / AMOUNT_SCALE
             } else {
                 let prev = prev_metrics.as_ref().map(|m| m.volume_all_time).unwrap_or(0);
-                let block_usd = token_trade.block_amount.saturating_mul(price_usd) / PRICE_SCALE;
+                let block_usd = token_trade.block_amount.saturating_mul(price_usd) / AMOUNT_SCALE;
                 prev.saturating_add(block_usd)
             };
 
@@ -1397,10 +1453,22 @@ pub fn derive_token_data(
                 volume_1d,
                 volume_7d,
                 volume_30d,
-                change_1d: percent_change(window_close(24 * 60 * 60), latest_close),
-                change_7d: percent_change(window_close(7 * 24 * 60 * 60), latest_close),
-                change_30d: percent_change(window_close(30 * 24 * 60 * 60), latest_close),
-                change_all_time: percent_change(first_close, latest_close),
+                change_1d: crate::modules::ammdata::percent_change_str(
+                    window_close(24 * 60 * 60),
+                    latest_close,
+                ),
+                change_7d: crate::modules::ammdata::percent_change_str(
+                    window_close(7 * 24 * 60 * 60),
+                    latest_close,
+                ),
+                change_30d: crate::modules::ammdata::percent_change_str(
+                    window_close(30 * 24 * 60 * 60),
+                    latest_close,
+                ),
+                change_all_time: crate::modules::ammdata::percent_change_str(
+                    first_close,
+                    latest_close,
+                ),
             };
             if prev_raw.value.is_none() {
                 let entry = state.derived_metrics_index_new.entry(*quote).or_insert(0);
@@ -1510,9 +1578,7 @@ pub fn derive_token_data(
                     if let Some((_pf, prev_key)) = prev_keys.get(idx) {
                         if prev_key != new_key {
                             state.derived_metrics_index_deletes.push(prev_key.clone());
-                            state
-                                .derived_metrics_index_writes
-                                .push((new_key.clone(), Vec::new()));
+                            state.derived_metrics_index_writes.push((new_key.clone(), Vec::new()));
                         }
                     }
                 }

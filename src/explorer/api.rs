@@ -644,6 +644,7 @@ pub struct SimulateRequest {
     pub alkane: String,
     pub opcode: u128,
     pub returns: Option<String>,
+    pub block: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -672,6 +673,29 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
             error: Some("invalid_alkane_id".to_string()),
         });
     };
+    let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
+    let block_tag = req
+        .block
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("latest");
+    let (metashrew_block, simulate_height, block_id_suffix) =
+        if block_tag.eq_ignore_ascii_case("latest") {
+            (Value::String("latest".to_string()), espo_tip, "latest".to_string())
+        } else if let Some(height) = parse_u64_any(block_tag) {
+            (json!(height), height, height.to_string())
+        } else {
+            return Json(SimulateResponse {
+                ok: false,
+                status: None,
+                data: None,
+                alkanes: None,
+                alkanes_overflow: None,
+                addresses: None,
+                error: Some("invalid_block_tag".to_string()),
+            });
+        };
 
     let cellpack = Cellpack {
         target: SupportAlkaneId { block: alk.block as u128, tx: alk.tx as u128 },
@@ -733,12 +757,11 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
         });
     }
 
-    let espo_tip = get_espo_next_height().saturating_sub(1) as u64;
     let parcel = MessageContextParcel {
         alkanes: vec![],
         transaction: tx_bytes,
         block: vec![],
-        height: espo_tip,
+        height: simulate_height,
         txindex: 0,
         calldata,
         vout: 0,
@@ -761,12 +784,12 @@ pub async fn simulate_contract(Json(req): Json<SimulateRequest>) -> Json<Simulat
 
     let body = json!({
         "jsonrpc": "2.0",
-        "id": format!("simulate:{}:{}", alk.block, alk.tx),
+        "id": format!("simulate:{}:{}:{}", alk.block, alk.tx, block_id_suffix),
         "method": "metashrew_view",
         "params": [
             "simulate",
             format!("0x{}", hex::encode(parcel_bytes)),
-            espo_tip,
+            metashrew_block,
         ],
     });
 

@@ -1,10 +1,16 @@
 use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
 use crate::config::get_electrum_like;
 use crate::modules::ammdata::consts::CanonicalQuoteUnit;
-use crate::modules::ammdata::schemas::{ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaPoolCreationInfoV1};
-use crate::modules::ammdata::storage::{AmmDataProvider, encode_pool_creation_info, encode_u128_value};
+use crate::modules::ammdata::schemas::{
+    ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaPoolCreationInfoV1,
+};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, encode_pool_creation_info, encode_u128_value,
+};
 use crate::modules::ammdata::utils::index_state::IndexState;
-use crate::modules::ammdata::utils::reserves::{NewPoolInfo, extract_new_pools_from_espo_transaction};
+use crate::modules::ammdata::utils::reserves::{
+    NewPoolInfo, extract_new_pools_from_espo_transaction,
+};
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationRecordParams, GetLatestCirculatingSupplyParams,
 };
@@ -80,7 +86,10 @@ pub fn discover_new_pools(
                     match ev {
                         EspoSandshrewLikeTraceEvent::Invoke(inv) => {
                             if let Some(factory) =
-                                crate::modules::ammdata::parse_factory_create_call(inv, amm_factories)
+                                crate::modules::ammdata::parse_factory_create_call(
+                                    inv,
+                                    amm_factories,
+                                )
                             {
                                 pending_factory = Some(factory);
                             }
@@ -120,49 +129,61 @@ pub fn discover_new_pools(
                 if let Ok(encoded_defs) = borsh::to_vec(&defs) {
                     state.pool_defs_writes.push((table.pools_key(&pool_id), encoded_defs));
                 }
-                state.token_pools_writes
+                state
+                    .token_pools_writes
                     .push((table.token_pools_key(&defs.base_alkane_id, &pool_id), Vec::new()));
-                state.token_pools_writes
+                state
+                    .token_pools_writes
                     .push((table.token_pools_key(&defs.quote_alkane_id, &pool_id), Vec::new()));
-                state.reserves_snapshot.entry(pool_id).or_insert(crate::modules::ammdata::schemas::SchemaPoolSnapshot {
-                    base_reserve: 0,
-                    quote_reserve: 0,
-                    base_id: defs.base_alkane_id,
-                    quote_id: defs.quote_alkane_id,
-                });
+                state.reserves_snapshot.entry(pool_id).or_insert(
+                    crate::modules::ammdata::schemas::SchemaPoolSnapshot {
+                        base_reserve: 0,
+                        quote_reserve: 0,
+                        base_id: defs.base_alkane_id,
+                        quote_id: defs.quote_alkane_id,
+                    },
+                );
                 if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
-                    state.canonical_pool_updates.entry(defs.base_alkane_id).or_default().push(
-                        SchemaCanonicalPoolEntry { pool_id, quote_id: defs.quote_alkane_id },
-                    );
+                    state
+                        .canonical_pool_updates
+                        .entry(defs.base_alkane_id)
+                        .or_default()
+                        .push(SchemaCanonicalPoolEntry { pool_id, quote_id: defs.quote_alkane_id });
                 }
                 if canonical_quote_units.contains_key(&defs.base_alkane_id) {
-                    state.canonical_pool_updates.entry(defs.quote_alkane_id).or_default().push(
-                        SchemaCanonicalPoolEntry { pool_id, quote_id: defs.base_alkane_id },
-                    );
+                    state
+                        .canonical_pool_updates
+                        .entry(defs.quote_alkane_id)
+                        .or_default()
+                        .push(SchemaCanonicalPoolEntry { pool_id, quote_id: defs.base_alkane_id });
                 }
 
-                let pool_label = get_alkane_label(essentials, &mut state.alkane_label_cache, &pool_id);
+                let pool_label =
+                    get_alkane_label(essentials, &mut state.alkane_label_cache, &pool_id);
                 let pool_name = crate::modules::ammdata::strip_lp_suffix(&pool_label);
                 let pool_name_norm = pool_name.trim().to_ascii_lowercase();
                 if !pool_name_norm.is_empty() {
-                    state.pool_name_index_writes.push((
-                        table.pool_name_index_key(&pool_name_norm, &pool_id),
-                        Vec::new(),
-                    ));
+                    state
+                        .pool_name_index_writes
+                        .push((table.pool_name_index_key(&pool_name_norm, &pool_id), Vec::new()));
                 }
 
                 if let Some(factory_id) = factory_id {
-                    state.factory_pools_writes
+                    state
+                        .factory_pools_writes
                         .push((table.factory_pools_key(&factory_id, &pool_id), Vec::new()));
                     let mut factory_bytes = Vec::with_capacity(12);
                     factory_bytes.extend_from_slice(&factory_id.block.to_be_bytes());
                     factory_bytes.extend_from_slice(&factory_id.tx.to_be_bytes());
-                    state.pool_factory_writes.push((table.pool_factory_key(&pool_id), factory_bytes));
+                    state
+                        .pool_factory_writes
+                        .push((table.pool_factory_key(&pool_id), factory_bytes));
                 }
 
                 // Pool creation info
-                let mut creator_spk =
-                    crate::modules::ammdata::pool_creator_spk_from_protostone(&transaction.transaction);
+                let mut creator_spk = crate::modules::ammdata::pool_creator_spk_from_protostone(
+                    &transaction.transaction,
+                );
                 if creator_spk.is_none() {
                     let mut lowest_spk: Option<ScriptBuf> = None;
                     let mut lowest_value: Option<u64> = None;
@@ -203,9 +224,9 @@ pub fn discover_new_pools(
                     creator_spk = lowest_spk;
                 }
 
-                let mut pool_balances = get_alkane_balances(essentials, &pool_id).unwrap_or_default();
-                let initial_token0_amount =
-                    pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
+                let mut pool_balances =
+                    get_alkane_balances(essentials, &pool_id).unwrap_or_default();
+                let initial_token0_amount = pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
                 let initial_token1_amount =
                     pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
                 let initial_lp_supply = essentials
@@ -227,9 +248,7 @@ pub fn discover_new_pools(
                     initial_token1_amount,
                     initial_lp_supply,
                 };
-                state
-                    .pool_creation_info_cache
-                    .insert(pool_id, creation_info.clone());
+                state.pool_creation_info_cache.insert(pool_id, creation_info.clone());
                 state.pool_creation_info_writes.push((
                     table.pool_creation_info_key(&pool_id),
                     encode_pool_creation_info(&creation_info)?,

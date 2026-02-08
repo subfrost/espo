@@ -5,7 +5,7 @@ use super::schemas::{
 };
 use crate::config::get_network;
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, canonical_quotes,
+    CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, canonical_quotes,
 };
 use crate::modules::ammdata::schemas::SchemaFullCandleV1;
 use crate::modules::ammdata::utils::activity::{
@@ -300,18 +300,83 @@ impl SearchIndexField {
 }
 
 pub fn parse_change_basis_points(change: &str) -> i64 {
-    let parsed = change.parse::<f64>().unwrap_or(0.0);
-    let scaled = (parsed * 10_000.0).round();
-    if scaled.is_nan() {
+    let raw = change.trim();
+    if raw.is_empty() {
         return 0;
     }
-    if scaled > i64::MAX as f64 {
+
+    let (neg, body) = if let Some(rest) = raw.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = raw.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, raw)
+    };
+    if body.is_empty() {
+        return 0;
+    }
+
+    let (whole_s, frac_s) = match body.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (body, ""),
+    };
+
+    if !whole_s.chars().all(|c| c.is_ascii_digit()) || !frac_s.chars().all(|c| c.is_ascii_digit()) {
+        return 0;
+    }
+
+    let whole =
+        if whole_s.is_empty() { 0u128 } else { whole_s.parse::<u128>().unwrap_or(u128::MAX) };
+
+    let mut frac4 = 0u128;
+    let mut count = 0usize;
+    let mut round_up = false;
+    for (idx, ch) in frac_s.chars().enumerate() {
+        if idx < 4 {
+            frac4 = frac4.saturating_mul(10).saturating_add((ch as u8 - b'0') as u128);
+            count += 1;
+        } else {
+            round_up = ch >= '5';
+            break;
+        }
+    }
+    while count < 4 {
+        frac4 = frac4.saturating_mul(10);
+        count += 1;
+    }
+
+    let mut scaled = whole.saturating_mul(10_000).saturating_add(frac4);
+    if round_up {
+        scaled = scaled.saturating_add(1);
+    }
+
+    if neg {
+        let min_mag = (i64::MAX as u128).saturating_add(1);
+        if scaled >= min_mag { i64::MIN } else { -(scaled as i64) }
+    } else if scaled > i64::MAX as u128 {
         i64::MAX
-    } else if scaled < i64::MIN as f64 {
-        i64::MIN
     } else {
         scaled as i64
     }
+}
+
+pub fn format_change_basis_points(value: i64) -> String {
+    let neg = value < 0;
+    let mag = if neg {
+        value
+            .checked_abs()
+            .map(|v| v as u64)
+            .unwrap_or((i64::MAX as u64).saturating_add(1))
+    } else {
+        value as u64
+    };
+    let whole = mag / 10_000;
+    let frac = mag % 10_000;
+    if neg { format!("-{whole}.{frac:04}") } else { format!("{whole}.{frac:04}") }
+}
+
+pub fn change_basis_points_to_f64(value: i64) -> f64 {
+    (value as f64) / 10_000.0
 }
 
 pub fn encode_i64_be_ordered(value: i64) -> [u8; 8] {
@@ -2350,19 +2415,20 @@ impl AmmDataProvider {
             }
         };
 
-        let parse_token_or_derived = |raw: &str| -> Result<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
-            if let Some((token_part, quote_part)) = raw.split_once("-derived_") {
-                match (parse_id_from_str(token_part), parse_id_from_str(quote_part)) {
-                    (Some(p), Some(q)) => Ok((p, Some(q))),
-                    _ => Err(anyhow!("invalid_pool")),
+        let parse_token_or_derived =
+            |raw: &str| -> Result<(SchemaAlkaneId, Option<SchemaAlkaneId>)> {
+                if let Some((token_part, quote_part)) = raw.split_once("-derived_") {
+                    match (parse_id_from_str(token_part), parse_id_from_str(quote_part)) {
+                        (Some(p), Some(q)) => Ok((p, Some(q))),
+                        _ => Err(anyhow!("invalid_pool")),
+                    }
+                } else {
+                    match parse_id_from_str(raw) {
+                        Some(p) => Ok((p, None)),
+                        None => Err(anyhow!("invalid_pool")),
+                    }
                 }
-            } else {
-                match parse_id_from_str(raw) {
-                    Some(p) => Ok((p, None)),
-                    None => Err(anyhow!("invalid_pool")),
-                }
-            }
-        };
+            };
 
         let mut derived_quote: Option<SchemaAlkaneId> = None;
         let mut is_usd = false;
@@ -2491,34 +2557,32 @@ impl AmmDataProvider {
                     None
                 };
 
-                let btc_price_for_ts =
-                    |slice: &CandleSlice, ts: u64, dur: u64| -> u128 {
-                        if slice.candles_newest_first.is_empty() {
-                            return 0;
-                        }
-                        let newest_ts = slice.newest_ts;
-                        if ts > newest_ts {
-                            return slice.candles_newest_first[0].close;
-                        }
-                        let offset = ((newest_ts.saturating_sub(ts)) / dur) as usize;
-                        if offset < slice.candles_newest_first.len() {
-                            slice.candles_newest_first[offset].close
-                        } else {
-                            slice.candles_newest_first
-                                .last()
-                                .map(|c| c.close)
-                                .unwrap_or(0)
-                        }
-                    };
+                let btc_price_for_ts = |slice: &CandleSlice, ts: u64, dur: u64| -> u128 {
+                    if slice.candles_newest_first.is_empty() {
+                        return 0;
+                    }
+                    let newest_ts = slice.newest_ts;
+                    if ts > newest_ts {
+                        return slice.candles_newest_first[0].close;
+                    }
+                    let offset = ((newest_ts.saturating_sub(ts)) / dur) as usize;
+                    if offset < slice.candles_newest_first.len() {
+                        slice.candles_newest_first[offset].close
+                    } else {
+                        slice.candles_newest_first.last().map(|c| c.close).unwrap_or(0)
+                    }
+                };
 
                 let usd_to_sats_scaled = |usd_scaled: u128, btc_usd_scaled: u128| -> u128 {
                     if btc_usd_scaled == 0 {
                         return 0;
                     }
-                    usd_scaled
+                    let usd_sats = usd_scaled.saturating_mul(SATS_PER_BTC);
+                    let whole = usd_sats / btc_usd_scaled;
+                    let rem = usd_sats % btc_usd_scaled;
+                    whole
                         .saturating_mul(PRICE_SCALE)
-                        .saturating_mul(PRICE_SCALE)
-                        / btc_usd_scaled
+                        .saturating_add(rem.saturating_mul(PRICE_SCALE) / btc_usd_scaled)
                 };
 
                 let arr: Vec<Value> = page_slice
@@ -2533,19 +2597,37 @@ impl AmmDataProvider {
                                 .as_ref()
                                 .map(|slice| btc_price_for_ts(slice, ts, dur))
                                 .unwrap_or(0);
-                            candle.open = usd_to_sats_scaled(candle.open, btc_price);
                             candle.high = usd_to_sats_scaled(candle.high, btc_price);
                             candle.low = usd_to_sats_scaled(candle.low, btc_price);
                             candle.close = usd_to_sats_scaled(candle.close, btc_price);
                             candle.volume = usd_to_sats_scaled(candle.volume, btc_price);
+                            candle.open = if global_idx + 1 < total {
+                                let prev_ts =
+                                    newest_ts.saturating_sub(((global_idx + 1) as u64) * dur);
+                                let prev_close_usd =
+                                    slice.candles_newest_first[global_idx + 1].close;
+                                let prev_btc_price = btc_slice
+                                    .as_ref()
+                                    .map(|slice| btc_price_for_ts(slice, prev_ts, dur))
+                                    .unwrap_or(0);
+                                usd_to_sats_scaled(prev_close_usd, prev_btc_price)
+                            } else {
+                                usd_to_sats_scaled(candle.open, btc_price)
+                            };
+                            if candle.open > candle.high {
+                                candle.high = candle.open;
+                            }
+                            if candle.open < candle.low {
+                                candle.low = candle.open;
+                            }
                         }
                         json!({
                             "ts":     ts,
-                            "open":   scale_u128(candle.open),
-                            "high":   scale_u128(candle.high),
-                            "low":    scale_u128(candle.low),
-                            "close":  scale_u128(candle.close),
-                            "volume": scale_u128(candle.volume),
+                            "open":   candle.open.to_string(),
+                            "high":   candle.high.to_string(),
+                            "low":    candle.low.to_string(),
+                            "close":  candle.close.to_string(),
+                            "volume": candle.volume.to_string(),
                         })
                     })
                     .collect();
@@ -4176,39 +4258,12 @@ fn read_btc_usd_line_v1(
             let p = *price;
             last_price = p;
             have_prev = true;
-            forward.insert(
-                bts,
-                SchemaCandleV1 {
-                    open: p,
-                    high: p,
-                    low: p,
-                    close: p,
-                    volume: 0,
-                },
-            );
+            forward.insert(bts, SchemaCandleV1 { open: p, high: p, low: p, close: p, volume: 0 });
         } else if have_prev {
             let p = last_price;
-            forward.insert(
-                bts,
-                SchemaCandleV1 {
-                    open: p,
-                    high: p,
-                    low: p,
-                    close: p,
-                    volume: 0,
-                },
-            );
+            forward.insert(bts, SchemaCandleV1 { open: p, high: p, low: p, close: p, volume: 0 });
         } else {
-            forward.insert(
-                bts,
-                SchemaCandleV1 {
-                    open: 0,
-                    high: 0,
-                    low: 0,
-                    close: 0,
-                    volume: 0,
-                },
-            );
+            forward.insert(bts, SchemaCandleV1 { open: 0, high: 0, low: 0, close: 0, volume: 0 });
         }
         bts = match bts.checked_add(dur) {
             Some(n) => n,
@@ -4220,16 +4275,7 @@ fn read_btc_usd_line_v1(
         let mut t = newest_bucket_with_data.saturating_add(dur);
         while t <= newest_bucket_now {
             let p = last_price;
-            forward.insert(
-                t,
-                SchemaCandleV1 {
-                    open: p,
-                    high: p,
-                    low: p,
-                    close: p,
-                    volume: 0,
-                },
-            );
+            forward.insert(t, SchemaCandleV1 { open: p, high: p, low: p, close: p, volume: 0 });
             t = match t.checked_add(dur) {
                 Some(n) => n,
                 None => break,
@@ -4338,8 +4384,4 @@ fn parse_u128_arg(v: Option<&Value>) -> Option<u128> {
 
 fn id_str(id: &SchemaAlkaneId) -> String {
     format!("{}:{}", id.block, id.tx)
-}
-
-fn scale_u128(x: u128) -> f64 {
-    (x as f64) / (PRICE_SCALE as f64)
 }

@@ -1906,6 +1906,25 @@ a:hover {
   font-weight: 700;
   border-radius: 6px;
 }
+.alkane-inspect-block-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.alkane-inspect-block-label {
+  color: var(--muted2);
+  font-size: 14px;
+  font-weight: 600;
+}
+.alkane-inspect-block-input-wrap {
+  width: min(220px, 100%);
+  padding: 6px 10px;
+  border-radius: 50px;
+}
+.alkane-inspect-block-input {
+  font-size: 14px;
+}
 .alkane-inspect-name {
   font-size: 18px;
 }

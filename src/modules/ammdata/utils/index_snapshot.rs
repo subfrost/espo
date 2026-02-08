@@ -1,5 +1,7 @@
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
-use crate::modules::ammdata::storage::{AmmDataProvider, GetRawValueParams, decode_reserves_snapshot};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetRawValueParams, decode_reserves_snapshot,
+};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use std::collections::HashMap;

@@ -23,6 +23,7 @@ use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
 use super::storage::{
     GetIndexHeightParams as PizzafunGetIndexHeightParams, PizzafunProvider, SeriesEntry,
+    series_id_base_from_name,
 };
 
 fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
@@ -184,6 +185,7 @@ impl EspoModule for Pizzafun {
             if !by_name.is_empty() {
                 let priority_index = Self::priority_index_map();
                 for (name, mut new_entries) in by_name {
+                    let Some(series_base) = series_id_base_from_name(&name) else { continue };
                     let existing = self.provider().get_series_entries_by_name(&name)?;
                     if !existing.is_empty() {
                         let mut existing_ids: HashSet<SchemaAlkaneId> =
@@ -200,8 +202,11 @@ impl EspoModule for Pizzafun {
 
                     let mut updated: Vec<SeriesEntry> = Vec::with_capacity(combined.len());
                     for (idx, entry) in combined.into_iter().enumerate() {
-                        let series_id =
-                            if idx == 0 { name.clone() } else { format!("{}-{}", name, idx + 1) };
+                        let series_id = if idx == 0 {
+                            series_base.clone()
+                        } else {
+                            format!("{}-{}", series_base, idx + 1)
+                        };
                         updated.push(SeriesEntry {
                             series_id,
                             alkane_id: entry.alkane_id,

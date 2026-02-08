@@ -10,7 +10,7 @@ use crate::config::{debug_enabled, get_espo_db, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
@@ -120,9 +120,7 @@ pub(crate) fn merge_candles(
                 if denom == 0 {
                     (a.saturating_add(b)) / 2
                 } else {
-                    let num = a
-                        .saturating_mul(va)
-                        .saturating_add(b.saturating_mul(vb));
+                    let num = a.saturating_mul(va).saturating_add(b.saturating_mul(vb));
                     num / denom
                 }
             }
@@ -216,8 +214,45 @@ pub(crate) fn scale_price_u128(value: u128) -> f64 {
 }
 
 #[inline]
+pub(crate) fn percent_change_basis_points(prev: u128, now: u128) -> i64 {
+    if prev == 0 {
+        return 0;
+    }
+    let (neg, delta) = if now >= prev { (false, now - prev) } else { (true, prev - now) };
+    let scaled = delta.saturating_mul(1_000_000).saturating_div(prev);
+    let mag = if scaled > i64::MAX as u128 { i64::MAX } else { scaled as i64 };
+    if neg { -mag } else { mag }
+}
+
+#[inline]
+pub(crate) fn percent_change_str(prev: u128, now: u128) -> String {
+    crate::modules::ammdata::storage::format_change_basis_points(percent_change_basis_points(
+        prev, now,
+    ))
+}
+
+#[inline]
+pub(crate) fn apr_basis_points_30d(pool_volume_30d_usd: u128, pool_tvl_usd: u128) -> i64 {
+    if pool_tvl_usd == 0 {
+        return 0;
+    }
+    let scaled = pool_volume_30d_usd.saturating_mul(36_000).saturating_div(pool_tvl_usd);
+    if scaled > i64::MAX as u128 { i64::MAX } else { scaled as i64 }
+}
+
+#[inline]
+pub(crate) fn apr_30d_str(pool_volume_30d_usd: u128, pool_tvl_usd: u128) -> String {
+    crate::modules::ammdata::storage::format_change_basis_points(apr_basis_points_30d(
+        pool_volume_30d_usd,
+        pool_tvl_usd,
+    ))
+}
+
+#[inline]
 pub(crate) fn parse_change_f64(raw: &str) -> f64 {
-    raw.parse::<f64>().unwrap_or(0.0)
+    crate::modules::ammdata::storage::change_basis_points_to_f64(
+        crate::modules::ammdata::storage::parse_change_basis_points(raw),
+    )
 }
 
 #[inline]
@@ -449,10 +484,10 @@ pub(crate) fn canonical_quote_amount_tvl_usd(
     btc_price_usd: Option<u128>,
 ) -> Option<u128> {
     match unit {
-        CanonicalQuoteUnit::Usd => Some(amount),
+        CanonicalQuoteUnit::Usd => Some(amount.saturating_mul(PRICE_SCALE) / AMOUNT_SCALE),
         CanonicalQuoteUnit::Btc => {
             let btc_price = btc_price_usd?;
-            Some(amount.saturating_mul(btc_price) / PRICE_SCALE)
+            Some(amount.saturating_mul(btc_price) / AMOUNT_SCALE)
         }
     }
 }
@@ -708,10 +743,8 @@ impl EspoModule for AmmData {
         );
 
         if finalize.should_write {
-            let _ = provider.set_batch(SetBatchParams {
-                puts: finalize.puts,
-                deletes: finalize.deletes,
-            });
+            let _ = provider
+                .set_batch(SetBatchParams { puts: finalize.puts, deletes: finalize.deletes });
         }
 
         debug::log_elapsed(module, "write_batch", timer);

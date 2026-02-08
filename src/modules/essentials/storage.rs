@@ -1,20 +1,21 @@
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
-use bitcoincore_rpc::RpcApi;
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew, get_network};
 use crate::modules::essentials::utils::balances::{
-    SignedU128, get_address_activity_for_address, get_alkane_balances, get_balance_for_address,
-    get_holders_for_alkane, get_outpoint_balances as get_outpoint_balances_index,
-    get_total_received_for_alkane, get_transfer_volume_for_alkane,
+    SignedU128, get_address_activity_for_address, get_alkane_balances,
+    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
+    get_outpoint_balances as get_outpoint_balances_index, get_total_received_for_alkane,
+    get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_support::proto::alkanes::AlkanesTrace;
-use bitcoin::hashes::Hash;
 use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::hashes::Hash;
 use bitcoin::{Address, AddressType, Network, ScriptBuf, Transaction, Txid};
+use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
@@ -1915,12 +1916,42 @@ impl EssentialsProvider {
             });
         };
 
-        let agg = match get_alkane_balances(self, &alk) {
-            Ok(m) => m,
-            Err(_) => {
-                return Ok(RpcGetAlkaneBalancesResult {
-                    value: json!({"ok": false, "error": "internal_error"}),
-                });
+        if params.height_present && params.height.is_none() {
+            return Ok(RpcGetAlkaneBalancesResult {
+                value: json!({"ok": false, "error": "missing_or_invalid_height"}),
+            });
+        }
+
+        let mut resolved_height: Option<u32> = None;
+        let agg = if params.height_present {
+            let height_val = params.height.unwrap();
+            let height_u32 = match u32::try_from(height_val) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(RpcGetAlkaneBalancesResult {
+                        value: json!({"ok": false, "error": "height_out_of_range"}),
+                    });
+                }
+            };
+            match get_alkane_balances_at_or_before(self, &alk, height_u32) {
+                Ok((m, found_height)) => {
+                    resolved_height = found_height;
+                    m
+                }
+                Err(_) => {
+                    return Ok(RpcGetAlkaneBalancesResult {
+                        value: json!({"ok": false, "error": "internal_error"}),
+                    });
+                }
+            }
+        } else {
+            match get_alkane_balances(self, &alk) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Ok(RpcGetAlkaneBalancesResult {
+                        value: json!({"ok": false, "error": "internal_error"}),
+                    });
+                }
             }
         };
 
@@ -1929,13 +1960,19 @@ impl EssentialsProvider {
             balances.insert(format!("{}:{}", id.block, id.tx), Value::String(amt.to_string()));
         }
 
-        Ok(RpcGetAlkaneBalancesResult {
-            value: json!({
-                "ok": true,
-                "alkane": format!("{}:{}", alk.block, alk.tx),
-                "balances": Value::Object(balances),
-            }),
-        })
+        let mut body = Map::new();
+        body.insert("ok".to_string(), Value::Bool(true));
+        body.insert("alkane".to_string(), Value::String(format!("{}:{}", alk.block, alk.tx)));
+        body.insert("balances".to_string(), Value::Object(balances));
+        if params.height_present {
+            body.insert("requested_height".to_string(), json!(params.height.unwrap()));
+            body.insert(
+                "resolved_height".to_string(),
+                resolved_height.map(|h| json!(h)).unwrap_or(Value::Null),
+            );
+        }
+
+        Ok(RpcGetAlkaneBalancesResult { value: Value::Object(body) })
     }
 
     pub fn rpc_get_alkane_balance_metashrew(
@@ -2748,31 +2785,28 @@ impl EssentialsProvider {
         let off = limit.saturating_mul(page_offset);
 
         let electrum_like = get_electrum_like();
-        let address_obj = match Address::from_str(&address)
-            .and_then(|addr| addr.require_network(network))
-        {
-            Ok(addr) => addr,
-            Err(_) => {
-                return Ok(RpcGetAddressTransactionsResult {
-                    value: json!({"ok": false, "error": "invalid_address_format"}),
-                });
-            }
-        };
+        let address_obj =
+            match Address::from_str(&address).and_then(|addr| addr.require_network(network)) {
+                Ok(addr) => addr,
+                Err(_) => {
+                    return Ok(RpcGetAddressTransactionsResult {
+                        value: json!({"ok": false, "error": "invalid_address_format"}),
+                    });
+                }
+            };
 
         let mut pending_entries = pending_for_address(&address);
         pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
         let pending_filtered: Vec<MempoolEntry> = pending_entries
             .into_iter()
             .filter(|entry| {
-                !only_alkane_txs
-                    || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
+                !only_alkane_txs || entry.traces.as_ref().map_or(false, |t| !t.is_empty())
             })
             .collect();
         let pending_total = pending_filtered.len();
         let pending_slice_start = off.min(pending_total);
         let pending_slice_end = (off + limit).min(pending_total);
-        let pending_set: HashSet<Txid> =
-            pending_filtered.iter().map(|entry| entry.txid).collect();
+        let pending_set: HashSet<Txid> = pending_filtered.iter().map(|entry| entry.txid).collect();
 
         let mut tx_renders: Vec<AddressTxRender> = Vec::new();
         for entry in pending_filtered
@@ -2798,8 +2832,7 @@ impl EssentialsProvider {
         let table = self.table();
 
         let mut confirmed_total = if only_alkane_txs {
-            self
-                .get_raw_value(GetRawValueParams { key: table.alkane_address_len_key(&address) })
+            self.get_raw_value(GetRawValueParams { key: table.alkane_address_len_key(&address) })
                 .ok()
                 .and_then(|resp| resp.value)
                 .and_then(|b| {
@@ -2820,8 +2853,7 @@ impl EssentialsProvider {
             let confirmed_offset = off.saturating_sub(pending_total);
             if remaining_slots > 0 {
                 let confirmed_slice_start = confirmed_offset.min(confirmed_total);
-                let confirmed_slice_end =
-                    (confirmed_offset + remaining_slots).min(confirmed_total);
+                let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
                 if confirmed_slice_end > confirmed_slice_start {
                     let mut txid_keys: Vec<Vec<u8>> = Vec::new();
@@ -2877,16 +2909,13 @@ impl EssentialsProvider {
                                 .get(idx)
                                 .and_then(|v| v.as_ref())
                                 .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
-                            let confirmations = summary.as_ref().and_then(|s| {
-                                let h = s.height as u64;
-                                chain_tip.and_then(|tip| {
-                                    if tip >= h {
-                                        Some(tip - h + 1)
-                                    } else {
-                                        None
-                                    }
-                                })
-                            });
+                            let confirmations =
+                                summary.as_ref().and_then(|s| {
+                                    let h = s.height as u64;
+                                    chain_tip.and_then(|tip| {
+                                        if tip >= h { Some(tip - h + 1) } else { None }
+                                    })
+                                });
                             let traces = summary
                                 .as_ref()
                                 .map(|s| traces_from_summary(txid, s))
@@ -2906,8 +2935,7 @@ impl EssentialsProvider {
         } else {
             let confirmed_offset = off.saturating_sub(pending_total);
             let fetch_limit = remaining_slots.max(1);
-            match electrum_like.address_history_page(&address_obj, confirmed_offset, fetch_limit)
-            {
+            match electrum_like.address_history_page(&address_obj, confirmed_offset, fetch_limit) {
                 Ok(hist_page) => {
                     let mut entries: Vec<AddressHistoryEntry> = hist_page
                         .entries
@@ -2921,8 +2949,7 @@ impl EssentialsProvider {
                     if remaining_slots > 0 {
                         let to_take = remaining_slots.min(entries.len());
                         let entries_for_page = entries.drain(..to_take).collect::<Vec<_>>();
-                        let txids: Vec<Txid> =
-                            entries_for_page.iter().map(|e| e.txid).collect();
+                        let txids: Vec<Txid> = entries_for_page.iter().map(|e| e.txid).collect();
                         if !txids.is_empty() {
                             let summary_keys: Vec<Vec<u8>> = txids
                                 .iter()
@@ -2954,17 +2981,11 @@ impl EssentialsProvider {
                                     .get(idx)
                                     .and_then(|v| v.as_ref())
                                     .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
-                                let confirmations = entries_for_page[idx]
-                                    .height
-                                    .and_then(|h| {
-                                        chain_tip.and_then(|tip| {
-                                            if tip >= h {
-                                                Some(tip - h + 1)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                    });
+                                let confirmations = entries_for_page[idx].height.and_then(|h| {
+                                    chain_tip.and_then(|tip| {
+                                        if tip >= h { Some(tip - h + 1) } else { None }
+                                    })
+                                });
                                 let traces = summary
                                     .as_ref()
                                     .map(|s| traces_from_summary(txid, s))
@@ -3392,6 +3413,8 @@ pub struct RpcGetAddressBalancesResult {
 
 pub struct RpcGetAlkaneBalancesParams {
     pub alkane: Option<String>,
+    pub height: Option<u64>,
+    pub height_present: bool,
 }
 
 pub struct RpcGetAlkaneBalancesResult {
@@ -3932,8 +3955,7 @@ fn enriched_transaction_json(
             if let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) {
                 input_sum = input_sum.saturating_add(prev_out.value.to_sat());
                 obj.insert("amount".to_string(), json!(prev_out.value.to_sat()));
-                if let Ok(addr) =
-                    Address::from_script(prev_out.script_pubkey.as_script(), network)
+                if let Ok(addr) = Address::from_script(prev_out.script_pubkey.as_script(), network)
                 {
                     obj.insert("address".to_string(), json!(addr.to_string()));
                 }
@@ -3947,10 +3969,7 @@ fn enriched_transaction_json(
     for out in &tx.output {
         let mut obj = Map::new();
         obj.insert("amount".to_string(), json!(out.value.to_sat()));
-        obj.insert(
-            "scriptPubKey".to_string(),
-            json!(hex::encode(out.script_pubkey.as_bytes())),
-        );
+        obj.insert("scriptPubKey".to_string(), json!(hex::encode(out.script_pubkey.as_bytes())));
         if let Ok(addr) = Address::from_script(out.script_pubkey.as_script(), network) {
             obj.insert("address".to_string(), json!(addr.to_string()));
         }
@@ -3975,10 +3994,7 @@ fn enriched_transaction_json(
 
     let mut out = Map::new();
     out.insert("txid".to_string(), json!(render.txid.to_string()));
-    out.insert(
-        "blockHeight".to_string(),
-        json!(render.summary.as_ref().map(|s| s.height as u64)),
-    );
+    out.insert("blockHeight".to_string(), json!(render.summary.as_ref().map(|s| s.height as u64)));
     out.insert("confirmations".to_string(), json!(render.confirmations));
     out.insert("blockTime".to_string(), Value::Null);
     out.insert("confirmed".to_string(), json!(!render.is_mempool));
@@ -4075,9 +4091,9 @@ fn script_type_label(spk: &ScriptBuf, network: Network) -> Option<&'static str> 
     Address::from_script(spk.as_script(), network)
         .ok()
         .and_then(|a| match a.address_type() {
-        Some(AddressType::P2pkh) => Some("P2PKH"),
-        Some(AddressType::P2sh) => Some("P2SH"),
-        Some(AddressType::P2wpkh) => Some("P2WPKH"),
+            Some(AddressType::P2pkh) => Some("P2PKH"),
+            Some(AddressType::P2sh) => Some("P2SH"),
+            Some(AddressType::P2wpkh) => Some("P2WPKH"),
             Some(AddressType::P2wsh) => Some("P2WSH"),
             Some(AddressType::P2tr) => Some("P2TR"),
             _ => None,
@@ -4107,11 +4123,7 @@ fn sandshrew_to_espo_trace(txid: &Txid, trace: &EspoSandshrewLikeTrace) -> Optio
         sandshrew_trace: trace.clone(),
         protobuf_trace: AlkanesTrace::default(),
         storage_changes: HashMap::new(),
-        outpoint: EspoOutpoint {
-            txid: trace_txid.to_byte_array().to_vec(),
-            vout,
-            tx_spent: None,
-        },
+        outpoint: EspoOutpoint { txid: trace_txid.to_byte_array().to_vec(), vout, tx_spent: None },
     })
 }
 

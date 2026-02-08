@@ -19,8 +19,11 @@ pub fn get_amm_contract(network: Network) -> Result<SchemaAlkaneId> {
 pub const KEY_INDEX_HEIGHT: &[u8] = b"/index_height";
 pub const GET_RESERVES_OPCODE: u8 = 0x61;
 pub const DEPLOY_AMM_OPCODE: u8 = 0x01;
-pub const PRICE_SCALE: u128 = 100_000_000; // 1e18
-pub const K_TOLERANCE: f64 = 0.001; // 0.1%
+pub const PRICE_SCALE_DECIMALS: u32 = 16;
+pub const PRICE_SCALE: u128 = 10_000_000_000_000_000; // 1e16
+pub const AMOUNT_SCALE: u128 = 100_000_000; // on-chain token amount precision (1e8)
+pub const SATS_PER_BTC: u128 = AMOUNT_SCALE;
+pub const K_TOLERANCE_BPS: u128 = 10; // 0.1%
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalQuoteUnit {

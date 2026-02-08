@@ -2,6 +2,7 @@ use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use borsh::{BorshDeserialize, BorshSerialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -17,6 +18,15 @@ pub fn normalize_series_id(s: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_ascii_lowercase())
+}
+
+pub fn series_id_base_from_name(name_norm: &str) -> Option<String> {
+    let trimmed = name_norm.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    Some(lowered.split_whitespace().collect::<Vec<_>>().join("-"))
 }
 
 fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
@@ -232,19 +242,29 @@ impl PizzafunProvider {
     pub fn get_series_entries_by_name(&self, name_norm: &str) -> Result<Vec<SeriesEntry>> {
         let table = self.table();
         let base_prefix = table.series_by_id_prefix();
-        let mut prefix = base_prefix.clone();
-        prefix.extend_from_slice(name_norm.as_bytes());
-        let keys = self.mdb.scan_prefix(&prefix)?;
+        let mut lookup_names: Vec<String> = vec![name_norm.to_string()];
+        if let Some(series_base) = series_id_base_from_name(name_norm) {
+            if series_base != name_norm {
+                lookup_names.push(series_base);
+            }
+        }
 
         let mut filtered_keys: Vec<Vec<u8>> = Vec::new();
-        for key in keys {
-            if !key.starts_with(base_prefix.as_slice()) {
-                continue;
-            }
-            let raw_id = &key[base_prefix.len()..];
-            let Ok(series_id) = std::str::from_utf8(raw_id) else { continue };
-            if series_id_matches_name(series_id, name_norm) {
-                filtered_keys.push(key);
+        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        for lookup_name in lookup_names {
+            let mut prefix = base_prefix.clone();
+            prefix.extend_from_slice(lookup_name.as_bytes());
+            let keys = self.mdb.scan_prefix(&prefix)?;
+            for key in keys {
+                if !key.starts_with(base_prefix.as_slice()) {
+                    continue;
+                }
+                let raw_id = &key[base_prefix.len()..];
+                let Ok(series_id) = std::str::from_utf8(raw_id) else { continue };
+                if series_id_matches_name(series_id, &lookup_name) && seen_keys.insert(key.clone())
+                {
+                    filtered_keys.push(key);
+                }
             }
         }
 
@@ -319,5 +339,29 @@ impl PizzafunProvider {
                 wb.put(table.INDEX_HEIGHT.key(), &height.to_le_bytes());
             })
             .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_series_id, series_id_base_from_name, series_id_matches_name};
+
+    #[test]
+    fn normalize_series_id_preserves_spacing_for_backcompat() {
+        assert_eq!(normalize_series_id("  Love Bomb  ").as_deref(), Some("love bomb"));
+        assert_eq!(normalize_series_id("   "), None);
+    }
+
+    #[test]
+    fn series_id_base_from_name_matches_expected_slug() {
+        assert_eq!(series_id_base_from_name("love bomb").as_deref(), Some("love-bomb"));
+    }
+
+    #[test]
+    fn series_id_matching_supports_base_and_numbered_suffix() {
+        assert!(series_id_matches_name("love-bomb", "love-bomb"));
+        assert!(series_id_matches_name("love-bomb-2", "love-bomb"));
+        assert!(!series_id_matches_name("love-bomb-two", "love-bomb"));
+        assert!(!series_id_matches_name("love-bomb-2a", "love-bomb"));
     }
 }

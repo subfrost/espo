@@ -1,6 +1,7 @@
 use super::defs::PriceFeed;
 use crate::config::get_bitcoind_rpc_client;
 use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::consts::PRICE_SCALE_DECIMALS;
 use anyhow::{Result, anyhow};
 use bitcoincore_rpc::RpcApi;
 use reqwest::blocking::Client;
@@ -220,7 +221,7 @@ impl UniswapPriceFeed {
         token1: Address,
     ) -> Result<u128> {
         let scale = 10u128
-            .checked_pow((8 + WBTC_DECIMALS - USDC_DECIMALS) as u32)
+            .checked_pow((PRICE_SCALE_DECIMALS + WBTC_DECIMALS - USDC_DECIMALS) as u32)
             .ok_or_else(|| anyhow!("price scale overflow"))?;
         let scale = U512::from(scale);
         let sqrt = U512::from(sqrt_price_x96);

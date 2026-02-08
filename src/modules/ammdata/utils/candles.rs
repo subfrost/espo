@@ -1,4 +1,4 @@
-use crate::modules::ammdata::consts::PRICE_SCALE;
+use crate::modules::ammdata::consts::{AMOUNT_SCALE, PRICE_SCALE};
 use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timeframe};
 use crate::schemas::SchemaAlkaneId;
 
@@ -72,17 +72,21 @@ impl DualCandle {
     }
 
     fn update(&mut self, p_base: u128, p_quote: u128, base_in: u128, quote_out: u128) {
+        let scale_amount = |amount: u128| -> u128 {
+            amount.saturating_mul(PRICE_SCALE).saturating_div(AMOUNT_SCALE)
+        };
+
         // base side
         self.base.high = self.base.high.max(p_base);
         self.base.low = self.base.low.min(p_base);
         self.base.close = p_base;
-        self.base.volume = self.base.volume.saturating_add(base_in);
+        self.base.volume = self.base.volume.saturating_add(scale_amount(base_in));
 
         // quote side
         self.quote.high = self.quote.high.max(p_quote);
         self.quote.low = self.quote.low.min(p_quote);
         self.quote.close = p_quote;
-        self.quote.volume = self.quote.volume.saturating_add(quote_out);
+        self.quote.volume = self.quote.volume.saturating_add(scale_amount(quote_out));
     }
 }
 

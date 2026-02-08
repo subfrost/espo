@@ -1,18 +1,16 @@
-use crate::modules::ammdata::consts::{CanonicalQuoteUnit, PRICE_SCALE};
+use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
 use crate::modules::ammdata::schemas::{
     SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe,
 };
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetIterPrefixRevParams, GetPoolCreationInfoParams, GetPoolMetricsV2Params,
-    GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField, decode_full_candle_v1,
-    encode_pool_details_snapshot, encode_pool_metrics, encode_pool_metrics_v2, encode_u128_value,
-    parse_change_basis_points,
+    GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField,
+    decode_full_candle_v1, encode_pool_details_snapshot, encode_pool_metrics,
+    encode_pool_metrics_v2, encode_u128_value, parse_change_basis_points,
 };
 use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::index_state::IndexState;
-use crate::modules::essentials::storage::{
-    EssentialsProvider, GetLatestCirculatingSupplyParams,
-};
+use crate::modules::essentials::storage::{EssentialsProvider, GetLatestCirculatingSupplyParams};
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::Network;
@@ -34,22 +32,28 @@ pub fn derive_pool_metrics(
 
     let table = provider.table();
 
-    let load_pool_candle = |pool: &SchemaAlkaneId,
-                            tf: Timeframe,
-                            bucket_ts: u64|
-     -> Result<Option<crate::modules::ammdata::schemas::SchemaFullCandleV1>> {
-        if let Some(c) = state.pool_candle_overrides.get(&(*pool, tf, bucket_ts)) {
-            return Ok(Some(*c));
-        }
-        let key = table.candle_key(pool, tf, bucket_ts);
-        if let Some(raw) = provider.get_raw_value(crate::modules::ammdata::storage::GetRawValueParams { key })?.value {
-            return Ok(Some(decode_full_candle_v1(&raw)?));
-        }
-        Ok(None)
-    };
+    let load_pool_candle =
+        |pool: &SchemaAlkaneId,
+         tf: Timeframe,
+         bucket_ts: u64|
+         -> Result<Option<crate::modules::ammdata::schemas::SchemaFullCandleV1>> {
+            if let Some(c) = state.pool_candle_overrides.get(&(*pool, tf, bucket_ts)) {
+                return Ok(Some(*c));
+            }
+            let key = table.candle_key(pool, tf, bucket_ts);
+            if let Some(raw) = provider
+                .get_raw_value(crate::modules::ammdata::storage::GetRawValueParams { key })?
+                .value
+            {
+                return Ok(Some(decode_full_candle_v1(&raw)?));
+            }
+            Ok(None)
+        };
 
-    let mut canonical_pools_by_token: HashMap<SchemaAlkaneId, Vec<crate::modules::ammdata::schemas::SchemaCanonicalPoolEntry>> =
-        HashMap::new();
+    let mut canonical_pools_by_token: HashMap<
+        SchemaAlkaneId,
+        Vec<crate::modules::ammdata::schemas::SchemaCanonicalPoolEntry>,
+    > = HashMap::new();
     for (pool, defs) in state.pools_map.iter() {
         if canonical_quote_units.contains_key(&defs.quote_alkane_id) {
             canonical_pools_by_token.entry(defs.base_alkane_id).or_default().push(
@@ -126,7 +130,8 @@ pub fn derive_pool_metrics(
                     };
                 } else {
                     let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
-                    if let Ok(res) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                    if let Ok(res) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+                    {
                         if let Some((_k, v)) = res.entries.into_iter().next() {
                             if let Ok(candle) = decode_full_candle_v1(&v) {
                                 price = if use_base_price {
@@ -145,31 +150,28 @@ pub fn derive_pool_metrics(
         price
     };
 
-    let percent_change = |prev: u128, now: u128| -> String {
-        if prev == 0 {
-            return "0".to_string();
-        }
-        let prev_f = prev as f64;
-        let now_f = now as f64;
-        let pct = (now_f - prev_f) / prev_f * 100.0;
-        format!("{:.4}", pct)
-    };
-
     let tvl_at_height = |pool: &SchemaAlkaneId, h: u32| -> u128 {
         provider
-            .get_tvl_versioned_at_or_before(GetTvlVersionedAtOrBeforeParams { pool: *pool, height: h })
+            .get_tvl_versioned_at_or_before(GetTvlVersionedAtOrBeforeParams {
+                pool: *pool,
+                height: h,
+            })
             .ok()
             .and_then(|res| res.value)
             .unwrap_or(0)
     };
 
-    let mut pool_trade_window_cache: HashMap<SchemaAlkaneId, crate::modules::ammdata::PoolTradeWindows> =
-        HashMap::new();
+    let mut pool_trade_window_cache: HashMap<
+        SchemaAlkaneId,
+        crate::modules::ammdata::PoolTradeWindows,
+    > = HashMap::new();
 
     for pool in state.pools_touched.iter() {
         let Some(defs) = state.pools_map.get(pool) else { continue };
 
-        let mut balances = crate::modules::essentials::utils::balances::get_alkane_balances(essentials, pool).unwrap_or_default();
+        let mut balances =
+            crate::modules::essentials::utils::balances::get_alkane_balances(essentials, pool)
+                .unwrap_or_default();
         let token0_amount = balances.remove(&defs.base_alkane_id).unwrap_or(0);
         let token1_amount = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
@@ -178,22 +180,26 @@ pub fn derive_pool_metrics(
         let token0_price_sats = get_token_price_sats(&defs.base_alkane_id);
         let token1_price_sats = get_token_price_sats(&defs.quote_alkane_id);
 
-        let mut token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / PRICE_SCALE;
-        let mut token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / PRICE_SCALE;
-        let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / PRICE_SCALE;
-        let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / PRICE_SCALE;
+        let mut token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / AMOUNT_SCALE;
+        let mut token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / AMOUNT_SCALE;
+        let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / AMOUNT_SCALE;
+        let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / AMOUNT_SCALE;
 
         if let Some(unit) = canonical_quote_units.get(&defs.base_alkane_id) {
-            if let Some(value) =
-                crate::modules::ammdata::canonical_quote_amount_tvl_usd(token0_amount, *unit, state.btc_usd_price)
-            {
+            if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_usd(
+                token0_amount,
+                *unit,
+                state.btc_usd_price,
+            ) {
                 token0_tvl_usd = value;
             }
         }
         if let Some(unit) = canonical_quote_units.get(&defs.quote_alkane_id) {
-            if let Some(value) =
-                crate::modules::ammdata::canonical_quote_amount_tvl_usd(token1_amount, *unit, state.btc_usd_price)
-            {
+            if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_usd(
+                token1_amount,
+                *unit,
+                state.btc_usd_price,
+            ) {
                 token1_tvl_usd = value;
             }
         }
@@ -227,72 +233,65 @@ pub fn derive_pool_metrics(
 
         let pool_volume_1d_usd = token0_volume_1d
             .saturating_mul(token0_price_usd)
-            .saturating_div(PRICE_SCALE)
+            .saturating_div(AMOUNT_SCALE)
             .saturating_add(
-                token1_volume_1d
-                    .saturating_mul(token1_price_usd)
-                    .saturating_div(PRICE_SCALE),
+                token1_volume_1d.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
             );
         let pool_volume_30d_usd = token0_volume_30d
             .saturating_mul(token0_price_usd)
-            .saturating_div(PRICE_SCALE)
+            .saturating_div(AMOUNT_SCALE)
             .saturating_add(
-                token1_volume_30d
-                    .saturating_mul(token1_price_usd)
-                    .saturating_div(PRICE_SCALE),
+                token1_volume_30d.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
             );
         let pool_volume_1d_sats = token0_volume_1d
             .saturating_mul(token0_price_sats)
-            .saturating_div(PRICE_SCALE)
+            .saturating_div(AMOUNT_SCALE)
             .saturating_add(
-                token1_volume_1d
-                    .saturating_mul(token1_price_sats)
-                    .saturating_div(PRICE_SCALE),
+                token1_volume_1d.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
             );
         let pool_volume_30d_sats = token0_volume_30d
             .saturating_mul(token0_price_sats)
-            .saturating_div(PRICE_SCALE)
+            .saturating_div(AMOUNT_SCALE)
             .saturating_add(
-                token1_volume_30d
-                    .saturating_mul(token1_price_sats)
-                    .saturating_div(PRICE_SCALE),
+                token1_volume_30d.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
             );
         let pool_volume_7d_usd = token0_volume_7d
             .saturating_mul(token0_price_usd)
-            .saturating_div(PRICE_SCALE)
+            .saturating_div(AMOUNT_SCALE)
             .saturating_add(
-                token1_volume_7d
-                    .saturating_mul(token1_price_usd)
-                    .saturating_div(PRICE_SCALE),
+                token1_volume_7d.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
             );
         let pool_volume_7d_sats = token0_volume_7d
             .saturating_mul(token0_price_sats)
-            .saturating_div(PRICE_SCALE)
+            .saturating_div(AMOUNT_SCALE)
             .saturating_add(
-                token1_volume_7d
-                    .saturating_mul(token1_price_sats)
-                    .saturating_div(PRICE_SCALE),
+                token1_volume_7d.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
             );
-        let (block_base, block_quote) = state.in_block_trade_volumes.get(pool).copied().unwrap_or((0, 0));
+        let (block_base, block_quote) =
+            state.in_block_trade_volumes.get(pool).copied().unwrap_or((0, 0));
         let block_volume_usd = block_base
             .saturating_mul(token0_price_usd)
-            .saturating_div(PRICE_SCALE)
-            .saturating_add(block_quote.saturating_mul(token1_price_usd).saturating_div(PRICE_SCALE));
+            .saturating_div(AMOUNT_SCALE)
+            .saturating_add(
+                block_quote.saturating_mul(token1_price_usd).saturating_div(AMOUNT_SCALE),
+            );
         let block_volume_sats = block_base
             .saturating_mul(token0_price_sats)
-            .saturating_div(PRICE_SCALE)
-            .saturating_add(block_quote.saturating_mul(token1_price_sats).saturating_div(PRICE_SCALE));
+            .saturating_div(AMOUNT_SCALE)
+            .saturating_add(
+                block_quote.saturating_mul(token1_price_sats).saturating_div(AMOUNT_SCALE),
+            );
 
         let pool_volume_all_time_usd = if trade_windows.has_all_time {
             trade_windows
                 .token0_all
                 .saturating_mul(token0_price_usd)
-                .saturating_div(PRICE_SCALE)
+                .saturating_div(AMOUNT_SCALE)
                 .saturating_add(
                     trade_windows
                         .token1_all
                         .saturating_mul(token1_price_usd)
-                        .saturating_div(PRICE_SCALE),
+                        .saturating_div(AMOUNT_SCALE),
                 )
         } else {
             prev_pool_metrics
@@ -305,12 +304,12 @@ pub fn derive_pool_metrics(
             trade_windows
                 .token0_all
                 .saturating_mul(token0_price_sats)
-                .saturating_div(PRICE_SCALE)
+                .saturating_div(AMOUNT_SCALE)
                 .saturating_add(
                     trade_windows
                         .token1_all
                         .saturating_mul(token1_price_sats)
-                        .saturating_div(PRICE_SCALE),
+                        .saturating_div(AMOUNT_SCALE),
                 )
         } else {
             prev_pool_metrics
@@ -322,16 +321,10 @@ pub fn derive_pool_metrics(
 
         let prev_1d = tvl_at_height(pool, height.saturating_sub(144));
         let prev_7d = tvl_at_height(pool, height.saturating_sub(1008));
-        let tvl_change_24h = percent_change(prev_1d, pool_tvl_usd);
-        let tvl_change_7d = percent_change(prev_7d, pool_tvl_usd);
+        let tvl_change_24h = crate::modules::ammdata::percent_change_str(prev_1d, pool_tvl_usd);
+        let tvl_change_7d = crate::modules::ammdata::percent_change_str(prev_7d, pool_tvl_usd);
 
-        let pool_apr = if pool_tvl_usd == 0 {
-            "0".to_string()
-        } else {
-            let fees = (pool_volume_30d_usd as f64) * 0.003;
-            let apr = fees / (pool_tvl_usd as f64) * 12.0 * 100.0;
-            format!("{:.4}", apr)
-        };
+        let pool_apr = crate::modules::ammdata::apr_30d_str(pool_volume_30d_usd, pool_tvl_usd);
 
         let metrics = SchemaPoolMetricsV1 {
             token0_volume_1d,
@@ -466,15 +459,14 @@ pub fn derive_pool_metrics(
             .pool_lp_supply_writes
             .push((table.pool_lp_supply_latest_key(pool), encode_u128_value(lp_supply)?));
 
-        let pool_label = crate::modules::ammdata::pool_name_display(
-            &crate::modules::ammdata::strip_lp_suffix(
+        let pool_label =
+            crate::modules::ammdata::pool_name_display(&crate::modules::ammdata::strip_lp_suffix(
                 &crate::modules::ammdata::utils::index_pools::get_alkane_label(
                     essentials,
                     &mut state.alkane_label_cache,
                     pool,
                 ),
-            ),
-        );
+            ));
 
         let creation_info = state.pool_creation_info_cache.get(pool).cloned().or_else(|| {
             provider
@@ -500,7 +492,8 @@ pub fn derive_pool_metrics(
                 (None, None, 0, 0)
             };
 
-        let lp_value_sats = if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
+        let lp_value_sats =
+            if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
         let lp_value_usd = if lp_supply == 0 { 0 } else { pool_tvl_usd.saturating_div(lp_supply) };
 
         let pool_apr = crate::modules::ammdata::parse_change_f64(&metrics.pool_apr);

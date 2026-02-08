@@ -1,4 +1,4 @@
-use super::super::consts::K_TOLERANCE;
+use super::super::consts::K_TOLERANCE_BPS;
 use crate::alkanes::trace::{EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoTrace};
 use crate::schemas::SchemaAlkaneId;
 use crate::{
@@ -433,13 +433,30 @@ pub fn extract_reserves_from_espo_transaction<'a>(
             (nb, nq, 0u128, 0u128)
         };
 
-        // sanity: K ratio (should be ~1 within tolerance)
-        let k_ratio = if prev_base != 0 && prev_quote != 0 {
-            ((new_base as f64) * (new_quote as f64)) / ((prev_base as f64) * (prev_quote as f64))
-        } else {
-            f64::INFINITY
+        // sanity: K ratio (should be ~1 within tolerance), checked with integer bps math.
+        let k_new = match new_base.checked_mul(new_quote) {
+            Some(v) => v,
+            None => {
+                i = r2 + 1;
+                continue;
+            }
         };
-        if (k_ratio - 1.0).abs() > K_TOLERANCE {
+        let k_diff = k_new.abs_diff(k_prev);
+        let lhs = match k_diff.checked_mul(10_000u128) {
+            Some(v) => v,
+            None => {
+                i = r2 + 1;
+                continue;
+            }
+        };
+        let rhs = match k_prev.checked_mul(K_TOLERANCE_BPS) {
+            Some(v) => v,
+            None => {
+                i = r2 + 1;
+                continue;
+            }
+        };
+        if lhs > rhs {
             i = r2 + 1;
             continue;
         }
@@ -451,7 +468,7 @@ pub fn extract_reserves_from_espo_transaction<'a>(
             prev_reserves: (prev_base, prev_quote),
             new_reserves: (new_base, new_quote),
             volume: (base_in_res, quote_out_res),
-            k_ratio_approx: if k_ratio.is_finite() { Some(k_ratio) } else { None },
+            k_ratio_approx: None,
         });
 
         // continue after this anchor’s twin returns
