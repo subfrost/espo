@@ -1393,6 +1393,23 @@ impl AmmDataProvider {
         AmmDataTable::new(self.mdb.as_ref())
     }
 
+    /// Load the most recent BTC/USD price recorded by the ammdata indexer.
+    /// This is intended for read-paths (RPC / API), so it never calls external price feeds.
+    pub fn get_latest_btc_usd_price(&self) -> Result<Option<u128>> {
+        let table = self.table();
+        let rel_prefix = table.btc_usd_price_prefix();
+        let full_prefix = self.mdb.prefixed(&rel_prefix);
+        for res in self.mdb.iter_prefix_rev(&full_prefix) {
+            let (_k_full, v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
+            if let Ok(price) = decode_u128_value(&v) {
+                if price > 0 {
+                    return Ok(Some(price));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn essentials(&self) -> &EssentialsProvider {
         self.essentials.as_ref()
     }

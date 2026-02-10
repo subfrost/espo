@@ -261,8 +261,7 @@ impl UniswapPriceFeed {
 }
 
 impl PriceFeed for UniswapPriceFeed {
-    fn get_bitcoin_price_usd_at_block_height(&self, height: u64) -> u128 {
+    fn get_bitcoin_price_usd_at_block_height(&self, height: u64) -> Result<u128> {
         self.price_at_bitcoin_height(height)
-            .unwrap_or_else(|e| panic!("failed to fetch price at height {height}: {e:?}"))
     }
 }

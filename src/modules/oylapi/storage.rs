@@ -1,8 +1,7 @@
-use crate::config::{debug_enabled, get_config, get_electrum_like, get_last_safe_tip, get_network};
+use crate::config::{debug_enabled, get_config, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::consts::{CanonicalQuoteUnit, PRICE_SCALE, canonical_quotes};
-use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
 use crate::modules::ammdata::schemas::{
     ActivityKind, SchemaActivityV1, SchemaMarketDefs, SchemaPoolCreationInfoV1,
     SchemaPoolDetailsSnapshot, SchemaPoolSnapshot, SchemaTokenMetricsV1, Timeframe,
@@ -52,9 +51,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 
@@ -190,9 +188,9 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
     json!({ "statusCode": 200, "data": out })
 }
 
-pub async fn get_bitcoin_price(_state: &OylApiState) -> Value {
+pub async fn get_bitcoin_price(state: &OylApiState) -> Value {
     crate::debug_timer_log!("get_bitcoin_price");
-    match btc_price_usd_cached() {
+    match btc_price_usd_cached(state) {
         Ok(price) => json!({
             "statusCode": 200,
             "data": {
@@ -2944,52 +2942,13 @@ fn internal_error<E: std::fmt::Display>(err: E) -> Value {
     json!({ "statusCode": 500, "error": err.to_string() })
 }
 
-#[derive(Default, Clone, Copy)]
-struct BtcPriceCache {
-    tip: u32,
-    price_usd: u128,
-}
-
-static BTC_PRICE_CACHE: OnceLock<Mutex<BtcPriceCache>> = OnceLock::new();
-
-fn btc_price_usd_cached() -> Result<u128> {
-    let tip = get_last_safe_tip().ok_or_else(|| anyhow!("safe tip unavailable"))?;
-    let cache = BTC_PRICE_CACHE.get_or_init(|| Mutex::new(BtcPriceCache::default()));
-    let (cached_tip, cached_price) = {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        (guard.tip, guard.price_usd)
-    };
-
-    if cached_price > 0 && cached_tip >= tip {
-        return Ok(cached_price);
-    }
-
-    let fetch = || -> Result<u128> {
-        let feed = UniswapPriceFeed::from_global_config()?;
-        let price = catch_unwind(AssertUnwindSafe(|| {
-            feed.get_bitcoin_price_usd_at_block_height(tip as u64)
-        }))
-        .map_err(|_| anyhow!("btc price feed panicked"))?;
-        if price == 0 { Err(anyhow!("btc price unavailable")) } else { Ok(price) }
-    };
-
-    match fetch() {
-        Ok(price) => {
-            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-            if tip >= guard.tip {
-                guard.tip = tip;
-                guard.price_usd = price;
-            }
-            Ok(price)
-        }
-        Err(err) => {
-            if cached_price > 0 {
-                Ok(cached_price)
-            } else {
-                Err(err)
-            }
-        }
-    }
+fn btc_price_usd_cached(state: &OylApiState) -> Result<u128> {
+    // Read-paths must never call external ETH RPC. Use the latest indexed BTC/USD price.
+    state
+        .ammdata
+        .get_latest_btc_usd_price()
+        .map_err(|e| anyhow!("failed to load btc/usd price from ammdata index: {e}"))?
+        .ok_or_else(|| anyhow!("btc/usd price unavailable (ammdata index empty)"))
 }
 
 fn now_ts() -> u64 {
@@ -3153,11 +3112,15 @@ fn latest_total_minted(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u1
         .map(|res| res.total_minted)
 }
 
-fn canonical_quote_amount_tvl_usd(amount: u128, unit: CanonicalQuoteUnit) -> Result<u128> {
+fn canonical_quote_amount_tvl_usd(
+    state: &OylApiState,
+    amount: u128,
+    unit: CanonicalQuoteUnit,
+) -> Result<u128> {
     match unit {
         CanonicalQuoteUnit::Usd => Ok(amount),
         CanonicalQuoteUnit::Btc => {
-            let btc_price = btc_price_usd_cached()?;
+            let btc_price = btc_price_usd_cached(state)?;
             Ok(amount.saturating_mul(btc_price) / PRICE_SCALE)
         }
     }
@@ -4479,10 +4442,10 @@ fn build_pool_details(
         local_units.as_ref().unwrap()
     };
     if let Some(unit) = canonical_units.get(&token0) {
-        token0_tvl_usd = canonical_quote_amount_tvl_usd(token0_amount, *unit)?;
+        token0_tvl_usd = canonical_quote_amount_tvl_usd(state, token0_amount, *unit)?;
     }
     if let Some(unit) = canonical_units.get(&token1) {
-        token1_tvl_usd = canonical_quote_amount_tvl_usd(token1_amount, *unit)?;
+        token1_tvl_usd = canonical_quote_amount_tvl_usd(state, token1_amount, *unit)?;
     }
 
     let pool_tvl_usd = token0_tvl_usd.saturating_add(token1_tvl_usd);

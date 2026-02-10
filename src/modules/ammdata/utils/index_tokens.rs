@@ -43,22 +43,13 @@ pub fn derive_token_data(
     if state.has_trades {
         let mut price: Option<u128> = None;
         match UniswapPriceFeed::from_global_config() {
-            Ok(feed) => {
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    feed.get_bitcoin_price_usd_at_block_height(height as u64)
-                }));
-                match res {
-                    Ok(v) => price = Some(v),
-                    Err(_) => {
-                        eprintln!(
-                            "[AMMDATA] btc/usd price_feed panicked at height {height}; using cached price"
-                        );
-                    }
+            Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
+                Ok(v) => price = Some(v),
+                Err(e) => {
+                    eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
                 }
-            }
-            Err(e) => {
-                eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
-            }
+            },
+            Err(e) => eprintln!("[AMMDATA] btc/usd price_feed init failed at height {height}: {e:?}"),
         }
 
         if price.is_none() {
