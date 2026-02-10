@@ -17,6 +17,9 @@ use crate::explorer::components::tx_view::{
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{explorer_base_path, explorer_path};
+use crate::modules::ammdata::config::AmmDataConfig;
+use crate::modules::ammdata::schemas::Timeframe;
+use crate::modules::ammdata::storage::AmmDataTable;
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
 };
@@ -25,8 +28,11 @@ use crate::modules::essentials::utils::balances::{
     get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
+use crate::modules::pizzafun::storage::PizzafunProvider;
+use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 const ADDR_SUFFIX_LEN: usize = 8;
 const KV_KEY_IMPLEMENTATION: &[u8] = b"/implementation";
@@ -117,6 +123,55 @@ pub async fn alkane_page(
     let coin_label = meta.name.value.clone();
     let holders_count = total;
     let supply_f64 = circulating_supply as f64;
+
+    let tv_iframe_src: Option<String> = {
+        let db = crate::config::get_espo_db();
+
+        let series_id = {
+            let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
+            let pizzafun = PizzafunProvider::new(pizzafun_mdb);
+            pizzafun.get_series_by_alkane(&alk).ok().flatten().map(|e| e.series_id)
+        };
+
+        let has_market_chart = {
+            // Special-case: 2:0 is the derived liquidity quote token itself, so it won't have
+            // token-derived series. Show its chart if the plain 2:0-usd candle series exists.
+            let is_derived_quote_token = alk.block == 2 && alk.tx == 0;
+
+            let derived_quotes: Vec<SchemaAlkaneId> = AmmDataConfig::load_from_global_config()
+                .ok()
+                .and_then(|c| c.derived_liquidity)
+                .map(|dl| dl.derived_quotes.into_iter().map(|q| q.alkane).collect())
+                .unwrap_or_default();
+
+            let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
+            let table = AmmDataTable::new(&amm_mdb);
+
+            let has_prefix = |rel_prefix: Vec<u8>| -> bool {
+                amm_mdb
+                    .iter_prefix_rev(&amm_mdb.prefixed(&rel_prefix))
+                    .next()
+                    .and_then(|r| r.ok())
+                    .is_some()
+            };
+
+            if is_derived_quote_token {
+                has_prefix(table.token_usd_candle_ns_prefix(&alk, Timeframe::D1))
+            } else if derived_quotes.is_empty() {
+                false
+            } else {
+                derived_quotes.iter().any(|quote| {
+                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(&alk, quote, Timeframe::D1))
+                })
+            }
+        };
+
+        match (series_id, has_market_chart) {
+            (Some(series_id), true) => Some(pizza_tv_iframe_src(&series_id)),
+            _ => None,
+        }
+    };
+    let chart_hidden = if tv_iframe_src.is_some() { "0" } else { "1" };
 
     let inspection = creation_record.as_ref().and_then(|r| r.inspection.as_ref());
     let mut inspect_source = inspection.cloned();
@@ -290,11 +345,11 @@ pub async fn alkane_page(
                 }
 
                 section class="alkane-section" data-alkane-overview="" {
-                    div class="alkane-overview-head" data-alkane-chart-head="" {
+                    div class="alkane-overview-head" data-chart-hidden=(chart_hidden) {
                         h2 class="section-title" { "Overview" }
-                        h2 class="section-title alkane-market-title" data-alkane-chart-title="" { "Market" }
+                        h2 class="section-title alkane-market-title" { "Market" }
                     }
-                    div class="alkane-overview-grid" data-alkane-chart-grid="" {
+                    div class="alkane-overview-grid" data-chart-hidden=(chart_hidden) {
                         div class="alkane-overview-card" {
                             div class="alkane-stat" {
                                 span class="alkane-stat-label" { "Symbol" }
@@ -353,28 +408,11 @@ pub async fn alkane_page(
                                 }
                             }
                         }
-                        div class="alkane-market-card" data-alkane-chart="" data-alkane-id=(alk_str.clone()) data-default-range="3m" {
-                            div class="alkane-market-chart" data-alkane-chart-root="" {
-                                div class="alkane-market-loading" data-alkane-loading="" { "Loading chart..." }
-                            }
-                            div class="alkane-market-content" {
-                                div class="alkane-market-header" {
-                                    div {
-                                        div class="alkane-market-price" data-alkane-price="" { "$0.00" }
-                                        div class="alkane-market-sub" { "USD price" }
-                                    }
-                                    div {
-                                        div class="alkane-market-change" data-alkane-change="" { "0.00%" }
-                                        div class="alkane-market-range" data-alkane-range="" { "Past 3 months" }
-                                    }
+                        @if let Some(src) = tv_iframe_src.as_ref() {
+                            div class="alkane-market-card alkane-market-tv" {
+                                iframe class="alkane-market-iframe" src=(src) title="Market chart" {
+                                    "Market chart"
                                 }
-                            }
-                            div class="alkane-market-tabs" {
-                                button class="alkane-market-tab" type="button" data-range="4h" { "4H" }
-                                button class="alkane-market-tab" type="button" data-range="1d" { "1D" }
-                                button class="alkane-market-tab" type="button" data-range="1w" { "1W" }
-                                button class="alkane-market-tab" type="button" data-range="1m" { "1M" }
-                                button class="alkane-market-tab active" type="button" data-range="3m" { "3M" }
                             }
                         }
                     }
@@ -550,7 +588,6 @@ pub async fn alkane_page(
                 }
             }
             (header_scripts())
-            (chart_scripts())
             @if tab == AlkaneTab::Inspect {
                 (inspect_scripts())
             }
@@ -597,6 +634,27 @@ fn addr_prefix_suffix(addr: &str) -> (String, String) {
     let prefix = addr[..split_at].to_string();
     let suffix = addr[split_at..].to_string();
     (prefix, suffix)
+}
+
+fn url_escape_component(raw: &str) -> String {
+    // Minimal percent-encoding for URL query components.
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+fn pizza_tv_iframe_src(series_id: &str) -> String {
+    let symbol = url_escape_component(series_id);
+    format!(
+        "https://tv.pizza.fun/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
+    )
 }
 
 fn fmt_activity_amount(raw: u128) -> String {
@@ -901,6 +959,7 @@ fn inspect_scripts() -> Markup {
     PreEscaped(script.replace("__BASE_PATH__", &base_path_js))
 }
 
+#[allow(dead_code)]
 fn chart_scripts() -> Markup {
     let base_path_js = format!("{:?}", explorer_base_path());
     let script = r#"

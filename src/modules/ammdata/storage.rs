@@ -2543,6 +2543,33 @@ impl AmmDataProvider {
                 let dur = tf.duration_secs();
                 let newest_ts = slice.newest_ts;
 
+                // Low-risk chart fix: for token-derived USD/MCUSD series, force the newest
+                // (active/unresolved) candle `close` to match the current spot close from the 10m
+                // series. This avoids cross-timeframe close drift without changing indexing.
+                let spot_close_10m: Option<u128> = if tf != Timeframe::M10 && (is_usd || is_mcusd)
+                {
+                    let spot_tf = Timeframe::M10;
+                    let spot_slice = if is_mcusd {
+                        if let Some(quote) = derived_quote {
+                            read_token_derived_mcusd_candles_v1(self, pool, quote, spot_tf, now)
+                        } else {
+                            read_token_mcusd_candles_v1(self, pool, spot_tf, now)
+                        }
+                    } else {
+                        if let Some(quote) = derived_quote {
+                            read_token_derived_usd_candles_v1(self, pool, quote, spot_tf, now)
+                        } else {
+                            read_token_usd_candles_v1(self, pool, spot_tf, now)
+                        }
+                    };
+                    spot_slice
+                        .ok()
+                        .and_then(|slice| slice.candles_newest_first.first().copied())
+                        .map(|c| c.close)
+                } else {
+                    None
+                };
+
                 let offset = limit.saturating_mul(page.saturating_sub(1));
                 let end = (offset + limit).min(total);
                 let page_slice = if offset >= total {
@@ -2592,6 +2619,13 @@ impl AmmDataProvider {
                         let global_idx = offset + i;
                         let ts = newest_ts.saturating_sub((global_idx as u64) * dur);
                         let mut candle = *c;
+                        if global_idx == 0 {
+                            if let Some(spot_close) = spot_close_10m {
+                                candle.close = spot_close;
+                                candle.high = candle.high.max(candle.open).max(candle.close);
+                                candle.low = candle.low.min(candle.open).min(candle.close);
+                            }
+                        }
                         if is_sats || is_mcsats {
                             let btc_price = btc_slice
                                 .as_ref()
