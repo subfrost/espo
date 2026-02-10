@@ -1691,26 +1691,34 @@ a:hover {
 .alkane-overview-grid {
   display: grid;
   grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+  grid-template-areas: "overview market";
   gap: 14px;
   align-items: stretch;
 }
-.alkane-overview-head {
-  display: grid;
-  grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
-  gap: 14px;
-  align-items: baseline;
+.alkane-market-pane {
+  grid-area: market;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
 }
-.alkane-overview-head[data-chart-hidden="1"] {
-  grid-template-columns: minmax(0, 1fr);
+.alkane-overview-pane {
+  grid-area: overview;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
 }
-.alkane-overview-head[data-chart-hidden="1"] .alkane-market-title {
-  display: none;
+.alkane-overview-pane .alkane-overview-card {
+  flex: 1;
+}
+.alkane-market-pane .alkane-market-card {
+  flex: 1;
+  height: auto;
 }
 .alkane-overview-grid[data-chart-hidden="1"] {
   grid-template-columns: minmax(0, 1fr);
-}
-.alkane-overview-grid[data-chart-hidden="1"] .alkane-overview-card {
-  grid-column: 1 / -1;
+  grid-template-areas: "overview";
 }
 .alkane-market-card {
   position: relative;
@@ -2018,9 +2026,13 @@ button:hover {
 @media (max-width: 980px) {
   .alkane-overview-grid {
     grid-template-columns: 1fr;
+    grid-template-areas: "market" "overview";
   }
-  .alkane-overview-head {
-    grid-template-columns: 1fr;
+  .alkane-overview-grid[data-chart-hidden="1"] {
+    grid-template-areas: "overview";
+  }
+  .alkane-market-card.alkane-market-tv {
+    min-height: clamp(460px, 60vh, 600px);
   }
 }
 @media (max-width: 720px) {

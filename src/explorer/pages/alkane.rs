@@ -345,73 +345,75 @@ pub async fn alkane_page(
                 }
 
                 section class="alkane-section" data-alkane-overview="" {
-                    div class="alkane-overview-head" data-chart-hidden=(chart_hidden) {
-                        h2 class="section-title" { "Overview" }
-                        h2 class="section-title alkane-market-title" { "Market" }
-                    }
                     div class="alkane-overview-grid" data-chart-hidden=(chart_hidden) {
-                        div class="alkane-overview-card" {
-                            div class="alkane-stat" {
-                                span class="alkane-stat-label" { "Symbol" }
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value" { (meta.symbol.clone()) }
-                                }
-                            }
-                            div class="alkane-stat" {
-                                span class="alkane-stat-label" { "Circulating supply" }
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value" { (fmt_alkane_amount(circulating_supply)) }
-                                    span class="alkane-stat-sub" { "(with 8 decimals)" }
-                                }
-                            }
-                            div class="alkane-stat" {
-                                span class="alkane-stat-label" { "Holders" }
-                                div class="alkane-stat-line" {
-                                    span class="alkane-stat-value" { (holders_count) }
-                                }
-                            }
-                            div class="alkane-stat" {
-                                span class="alkane-stat-label" { "Deploy date" }
-                                @if let Some(ts) = creation_ts {
-                                    div class="alkane-stat-line" data-ts-group="" {
-                                        span class="alkane-stat-value" data-header-ts=(ts) { (ts) }
-                                        span class="alkane-stat-sub" data-header-ts-rel { "" }
-                                    }
-                                } @else {
-                                    div class="alkane-stat-line" {
-                                        span class="alkane-stat-value muted" { "Unknown" }
-                                    }
-                                }
-                            }
-                            div class="alkane-stat" {
-                                span class="alkane-stat-label" { "Deploy transaction" }
-                                @if let Some(txid) = creation_txid.as_ref() {
-                                    div class="alkane-stat-line" {
-                                        a class="alkane-stat-value link mono" href=(explorer_path(&format!("/tx/{txid}"))) { (short_hex(txid)) }
-                                    }
-                                } @else {
-                                    div class="alkane-stat-line" {
-                                        span class="alkane-stat-value muted" { "Unknown" }
-                                    }
-                                }
-                            }
-                            div class="alkane-stat" {
-                                span class="alkane-stat-label" { "Deploy block" }
-                                @if let Some(h) = creation_height {
-                                    div class="alkane-stat-line" {
-                                        a class="alkane-stat-value link" href=(explorer_path(&format!("/block/{h}"))) { (h) }
-                                    }
-                                } @else {
-                                    div class="alkane-stat-line" {
-                                        span class="alkane-stat-value muted" { "Unknown" }
+                        @if let Some(src) = tv_iframe_src.as_ref() {
+                            div class="alkane-market-pane" {
+                                h2 class="section-title alkane-market-title" { "Market" }
+                                div class="alkane-market-card alkane-market-tv" {
+                                    iframe class="alkane-market-iframe" src=(src) title="Market chart" {
+                                        "Market chart"
                                     }
                                 }
                             }
                         }
-                        @if let Some(src) = tv_iframe_src.as_ref() {
-                            div class="alkane-market-card alkane-market-tv" {
-                                iframe class="alkane-market-iframe" src=(src) title="Market chart" {
-                                    "Market chart"
+                        div class="alkane-overview-pane" {
+                            h2 class="section-title" { "Overview" }
+                            div class="alkane-overview-card" {
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Symbol" }
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value" { (meta.symbol.clone()) }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Circulating supply" }
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value" { (fmt_alkane_amount(circulating_supply)) }
+                                        span class="alkane-stat-sub" { "(with 8 decimals)" }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Holders" }
+                                    div class="alkane-stat-line" {
+                                        span class="alkane-stat-value" { (holders_count) }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Deploy date" }
+                                    @if let Some(ts) = creation_ts {
+                                        div class="alkane-stat-line" data-ts-group="" {
+                                            span class="alkane-stat-value" data-header-ts=(ts) { (ts) }
+                                            span class="alkane-stat-sub" data-header-ts-rel { "" }
+                                        }
+                                    } @else {
+                                        div class="alkane-stat-line" {
+                                            span class="alkane-stat-value muted" { "Unknown" }
+                                        }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Deploy transaction" }
+                                    @if let Some(txid) = creation_txid.as_ref() {
+                                        div class="alkane-stat-line" {
+                                            a class="alkane-stat-value link mono" href=(explorer_path(&format!("/tx/{txid}"))) { (short_hex(txid)) }
+                                        }
+                                    } @else {
+                                        div class="alkane-stat-line" {
+                                            span class="alkane-stat-value muted" { "Unknown" }
+                                        }
+                                    }
+                                }
+                                div class="alkane-stat" {
+                                    span class="alkane-stat-label" { "Deploy block" }
+                                    @if let Some(h) = creation_height {
+                                        div class="alkane-stat-line" {
+                                            a class="alkane-stat-value link" href=(explorer_path(&format!("/block/{h}"))) { (h) }
+                                        }
+                                    } @else {
+                                        div class="alkane-stat-line" {
+                                            span class="alkane-stat-value muted" { "Unknown" }
+                                        }
+                                    }
                                 }
                             }
                         }
