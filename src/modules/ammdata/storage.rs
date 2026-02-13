@@ -1603,17 +1603,24 @@ impl AmmDataProvider {
             return Ok(Vec::new());
         }
 
+        let existing_values = self.raw_multi_get(keys)?;
+        let mut new_keys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        for (key, existing_value) in keys.iter().zip(existing_values.into_iter()) {
+            if existing_value.is_none() {
+                new_keys.push(key.clone());
+            }
+        }
+        if new_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let chunk_size = get_chunk_size() as usize;
         let len_key = list_length_key_for_root(family_root);
         let mut len = self.read_list_len_u64(&len_key)?;
         let original_len = len;
         let mut chunk_updates: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
 
-        for key in keys {
-            if self.raw_get(key)?.is_some() {
-                continue;
-            }
-
+        for key in &new_keys {
             let chunk_id = len / chunk_size as u64;
             if let std::collections::btree_map::Entry::Vacant(entry) = chunk_updates.entry(chunk_id)
             {
@@ -1678,10 +1685,10 @@ impl AmmDataProvider {
                 continue;
             }
             let family = AMMDATA_LIST_FAMILIES[idx];
-            let mut put_keys = puts_by_family[idx].clone();
+            let mut put_keys = std::mem::take(&mut puts_by_family[idx]);
             put_keys.sort();
             put_keys.dedup();
-            let mut delete_keys = deletes_by_family[idx].clone();
+            let mut delete_keys = std::mem::take(&mut deletes_by_family[idx]);
             delete_keys.sort();
             delete_keys.dedup();
 

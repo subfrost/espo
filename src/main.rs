@@ -26,7 +26,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::config::{DebugBackupConfig, init_block_source};
@@ -160,6 +160,25 @@ fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
     });
 }
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c().context("failed to wait for shutdown signal")?;
+    Ok(())
+}
+
 async fn run_indexer_loop(
     mods: ModuleRegistry,
     start_height: u32,
@@ -167,6 +186,7 @@ async fn run_indexer_loop(
     network: bitcoin::Network,
     metashrew_sdb: std::sync::Arc<crate::runtime::sdb::SDB>,
     cfg: crate::config::AppConfig,
+    shutdown_requested: Arc<AtomicBool>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
     let mut last_tip: Option<u32> = None;
@@ -191,6 +211,10 @@ async fn run_indexer_loop(
         .unwrap_or_default();
 
     loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
         if let Err(e) = metashrew_sdb.catch_up_now() {
             eprintln!("[indexer] metashrew catch_up before tip fetch: {e:?}");
         }
@@ -224,6 +248,10 @@ async fn run_indexer_loop(
                 next_height, tip, remaining, eta_str
             );
             logged_start = true;
+        }
+
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
         }
 
         if next_height <= tip {
@@ -350,6 +378,10 @@ async fn run_indexer_loop(
             }
             // Caught up; chill then poll again
             tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
         }
 
         if !mempool_started && next_height >= tip.saturating_sub(1) {
@@ -505,24 +537,55 @@ async fn main() -> Result<()> {
         }
     }
 
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let shutdown_for_indexer = shutdown_requested.clone();
     let indexer_handle = std::thread::spawn(move || {
         let rt = TokioBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("build indexer runtime");
-        rt.block_on(run_indexer_loop(mods, start_height, next_height, network, metashrew_sdb, cfg));
-    });
-    std::thread::spawn(move || {
-        if let Err(err) = indexer_handle.join() {
-            eprintln!("[indexer] thread panicked: {err:?}");
-            std::process::abort();
-        }
+        rt.block_on(run_indexer_loop(
+            mods,
+            start_height,
+            next_height,
+            network,
+            metashrew_sdb,
+            cfg,
+            shutdown_for_indexer,
+        ));
     });
 
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        if indexer_handle.is_finished() {
+            if let Err(err) = indexer_handle.join() {
+                eprintln!("[indexer] thread panicked: {err:?}");
+                std::process::abort();
+            }
+            return Ok(());
+        }
+
+        tokio::select! {
+            result = &mut shutdown_signal => {
+                result?;
+                eprintln!("[PROCESS] exit signal received , waiting for modules");
+                shutdown_requested.store(true, Ordering::Relaxed);
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
+
+    let join_result = tokio::task::spawn_blocking(move || indexer_handle.join())
+        .await
+        .context("failed to await indexer thread join task")?;
+    if let Err(err) = join_result {
+        eprintln!("[indexer] thread panicked: {err:?}");
+        std::process::abort();
+    }
+    Ok(())
 }
 
 // Dummy main for WASM builds (should never be called)

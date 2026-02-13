@@ -46,20 +46,68 @@ const LIST_META_V1_PREFIX: &[u8] = b"/_chunked_list/v1/";
 struct ListFamily {
     root: &'static [u8],
     append_only: bool,
+    key_scope: ListFamilyKeyScope,
 }
 
+#[derive(Clone, Copy)]
+enum ListFamilyKeyScope {
+    All,
+    AddressOutpointOnly,
+    TxOutflowOnly,
+}
+
+const ADDRESS_OUTPOINT_SEGMENT: &[u8] = b"/outpoint/";
+const TX_OUTFLOW_SEGMENT: &[u8] = b"/outflow/";
+
 const ESSENTIALS_LIST_FAMILIES: &[ListFamily] = &[
-    ListFamily { root: b"\x03", append_only: true },
-    ListFamily { root: b"/alkanes/name/", append_only: true },
-    ListFamily { root: b"/alkanes/symbol/", append_only: true },
-    ListFamily { root: b"/alkanes/creation/ordered/", append_only: true },
-    ListFamily { root: b"/alkanes/holders/ordered/", append_only: false },
-    ListFamily { root: b"/alkane_block/", append_only: true },
-    ListFamily { root: b"/alkane_addr/", append_only: true },
-    ListFamily { root: b"/address/v2/", append_only: true },
-    ListFamily { root: b"/tx/v2/", append_only: true },
-    ListFamily { root: b"/block_summary/", append_only: true },
+    ListFamily { root: b"\x03", append_only: true, key_scope: ListFamilyKeyScope::All },
+    ListFamily {
+        root: b"/alkanes/name/",
+        append_only: true,
+        key_scope: ListFamilyKeyScope::All,
+    },
+    ListFamily {
+        root: b"/alkanes/symbol/",
+        append_only: true,
+        key_scope: ListFamilyKeyScope::All,
+    },
+    ListFamily {
+        root: b"/alkanes/creation/ordered/",
+        append_only: true,
+        key_scope: ListFamilyKeyScope::All,
+    },
+    ListFamily {
+        root: b"/alkanes/holders/ordered/",
+        append_only: false,
+        key_scope: ListFamilyKeyScope::All,
+    },
+    ListFamily {
+        root: b"/address/v2/",
+        append_only: true,
+        key_scope: ListFamilyKeyScope::AddressOutpointOnly,
+    },
+    ListFamily {
+        root: b"/tx/v2/",
+        append_only: true,
+        key_scope: ListFamilyKeyScope::TxOutflowOnly,
+    },
 ];
+
+fn key_matches_list_family(family: ListFamily, key: &[u8]) -> bool {
+    match family.key_scope {
+        ListFamilyKeyScope::All => true,
+        ListFamilyKeyScope::AddressOutpointOnly => {
+            key[family.root.len()..]
+                .windows(ADDRESS_OUTPOINT_SEGMENT.len())
+                .any(|w| w == ADDRESS_OUTPOINT_SEGMENT)
+        }
+        ListFamilyKeyScope::TxOutflowOnly => {
+            key[family.root.len()..]
+                .windows(TX_OUTFLOW_SEGMENT.len())
+                .any(|w| w == TX_OUTFLOW_SEGMENT)
+        }
+    }
+}
 
 fn encode_alkane_id_be(id: &SchemaAlkaneId) -> [u8; 12] {
     let mut out = [0u8; 12];
@@ -1388,17 +1436,24 @@ impl EssentialsProvider {
             return Ok(Vec::new());
         }
 
+        let existing_values = self.raw_multi_get(keys)?;
+        let mut new_keys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        for (key, existing_value) in keys.iter().zip(existing_values.into_iter()) {
+            if existing_value.is_none() {
+                new_keys.push(key.clone());
+            }
+        }
+        if new_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let chunk_size = get_chunk_size() as usize;
         let len_key = list_length_key_for_root(family_root);
         let mut len = self.read_list_len_u64(&len_key)?;
         let original_len = len;
         let mut chunk_updates: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
 
-        for key in keys {
-            if self.raw_get(key)?.is_some() {
-                continue;
-            }
-
+        for key in &new_keys {
             let chunk_id = len / chunk_size as u64;
             if let std::collections::btree_map::Entry::Vacant(entry) = chunk_updates.entry(chunk_id)
             {
@@ -1444,7 +1499,10 @@ impl EssentialsProvider {
                 continue;
             }
             if let Some(idx) = list_family_index_for_prefix(key) {
-                puts_by_family[idx].push(key.clone());
+                let family = ESSENTIALS_LIST_FAMILIES[idx];
+                if key_matches_list_family(family, key) {
+                    puts_by_family[idx].push(key.clone());
+                }
             }
         }
         for key in deletes {
@@ -1452,7 +1510,10 @@ impl EssentialsProvider {
                 continue;
             }
             if let Some(idx) = list_family_index_for_prefix(key) {
-                deletes_by_family[idx].push(key.clone());
+                let family = ESSENTIALS_LIST_FAMILIES[idx];
+                if key_matches_list_family(family, key) {
+                    deletes_by_family[idx].push(key.clone());
+                }
             }
         }
 
@@ -1464,10 +1525,10 @@ impl EssentialsProvider {
                 continue;
             }
             let family = ESSENTIALS_LIST_FAMILIES[idx];
-            let mut put_keys = puts_by_family[idx].clone();
+            let mut put_keys = std::mem::take(&mut puts_by_family[idx]);
             put_keys.sort();
             put_keys.dedup();
-            let mut delete_keys = deletes_by_family[idx].clone();
+            let mut delete_keys = std::mem::take(&mut deletes_by_family[idx]);
             delete_keys.sort();
             delete_keys.dedup();
 
