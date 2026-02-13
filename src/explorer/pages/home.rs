@@ -18,8 +18,12 @@ use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
-use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load_creation_record};
+use crate::modules::essentials::storage::{
+    AlkaneTxSummary, EssentialsProvider, EssentialsTable, GetHoldersOrderedPageParams,
+    HoldersCountEntry, load_creation_record, load_tx_summary_v2,
+};
 use crate::schemas::EspoOutpoint;
+use std::sync::Arc;
 
 struct AlkaneTxRow {
     txid: Txid,
@@ -36,16 +40,27 @@ fn load_top_alkanes_by_holders(
     }
 
     let table = EssentialsTable::new(mdb);
-    let prefix_full = mdb.prefixed(&table.alkane_holders_ordered_prefix());
-    let it = mdb.iter_prefix_rev(&prefix_full);
-    for res in it {
+    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
+    let ids = provider
+        .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            offset: 0,
+            limit: limit as u64,
+            desc: true,
+        })
+        .map(|res| res.ids)
+        .unwrap_or_default();
+    for alk in ids {
         if rows.len() >= limit {
             break;
         }
-        let Ok((k, _v)) = res else { continue };
-        let rel = &k[mdb.prefix().len()..];
-        let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else { continue };
         let Some(rec) = load_creation_record(mdb, &alk).ok().flatten() else { continue };
+        let holders = mdb
+            .get(&table.holders_count_key(&alk))
+            .ok()
+            .flatten()
+            .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
+            .map(|hc| hc.count)
+            .unwrap_or(0);
 
         let id = format!("{}:{}", rec.alkane.block, rec.alkane.tx);
         let name = rec
@@ -106,26 +121,38 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
     }
 
     let table = EssentialsTable::new(mdb);
-    let list: Vec<[u8; 32]> = mdb
-        .get(&table.alkane_latest_traces_key())
+    let len = mdb
+        .get(&table.latest_traces_length_key())
         .ok()
         .flatten()
-        .and_then(|b| Vec::<[u8; 32]>::try_from_slice(&b).ok())
-        .unwrap_or_default();
-    if list.is_empty() {
+        .and_then(|b| {
+            if b.len() == 4 {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&b);
+                Some(u32::from_le_bytes(arr))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    if len == 0 {
         return out;
     }
 
-    for txid_bytes in list {
+    let mut keys = Vec::with_capacity(len as usize);
+    for idx in 0..len {
+        keys.push(table.latest_traces_idx_key(idx));
+    }
+    let txid_vals = mdb.multi_get(&keys).unwrap_or_default();
+    let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
+
+    for v in txid_vals {
         if out.len() >= limit {
             break;
         }
+        let Some(txid_bytes) = v else { continue };
         let Ok(txid) = Txid::from_slice(&txid_bytes) else { continue };
-        let summary = mdb
-            .get(&table.alkane_tx_summary_key(&txid.to_byte_array()))
-            .ok()
-            .flatten()
-            .and_then(|b| AlkaneTxSummary::try_from_slice(&b).ok());
+        let summary = load_tx_summary_v2(&provider, &txid);
         let Some(summary) = summary else { continue };
         let mut traces = traces_from_summary(&txid, &summary);
         if traces.is_empty() {

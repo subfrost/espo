@@ -3,6 +3,7 @@ use crate::runtime::{
     aof::{AOF_REORG_DEPTH, AofManager},
     dbpaths::get_sdb_path_for_metashrew,
     sdb::SDB,
+    tree_db::init_global_tree_db,
 };
 use crate::utils::electrum_like::{ElectrumLike, ElectrumRpcClient, EsploraElectrumLike};
 use crate::{ESPO_HEIGHT, SAFE_TIP};
@@ -104,6 +105,10 @@ fn default_network() -> String {
 
 fn default_block_source_mode() -> String {
     "rpc".to_string()
+}
+
+fn default_chunk_size() -> u32 {
+    256
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -245,6 +250,8 @@ pub struct ConfigFile {
     pub block_source_mode: String,
     #[serde(default)]
     pub simulate_reorg: bool,
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: u32,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
@@ -279,6 +286,7 @@ pub struct AppConfig {
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
+    pub chunk_size: u32,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -337,6 +345,7 @@ impl AppConfig {
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
+            chunk_size: file.chunk_size.max(1),
             explorer_networks,
             modules: file.modules,
         })
@@ -489,6 +498,8 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
         .set(espo_db.clone())
         .map_err(|_| anyhow::anyhow!("ESPO DB already initialized"))?;
 
+    init_global_tree_db(espo_db.clone())?;
+
     if cfg.enable_aof {
         let aof_path = Path::new(&cfg.db_path).join("aof");
         let mgr = AofManager::new(espo_db.clone(), aof_path, AOF_REORG_DEPTH)?;
@@ -589,6 +600,10 @@ pub fn get_block_source() -> &'static BlkOrRpcBlockSource {
 /// NEW: Global accessor for bitcoin::Network
 pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
+}
+
+pub fn get_chunk_size() -> u32 {
+    get_config().chunk_size.max(1)
 }
 
 pub fn is_strict_mode() -> bool {

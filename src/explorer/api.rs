@@ -12,8 +12,8 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    BlockSummary, EssentialsProvider, EssentialsTable, HoldersCountEntry, get_cached_block_summary,
-    load_creation_record,
+    BlockSummary, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
+    GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -157,6 +157,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
     }
 
     let essentials_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"essentials:"));
+    let essentials_provider = EssentialsProvider::new(essentials_mdb.clone());
     let table = EssentialsTable::new(essentials_mdb.as_ref());
     let mut meta_cache: AlkaneMetaCache = HashMap::new();
     let mut seen_alkanes: HashSet<SchemaAlkaneId> = HashSet::new();
@@ -268,8 +269,8 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         if search_index_enabled && query_len >= search_prefix_min && query_len <= search_prefix_max
         {
             let ammdata_mdb = Arc::new(Mdb::from_db(crate::config::get_espo_db(), b"ammdata:"));
-            let essentials_provider = Arc::new(EssentialsProvider::new(essentials_mdb.clone()));
-            let ammdata_provider = AmmDataProvider::new(ammdata_mdb, essentials_provider);
+            let ammdata_provider =
+                AmmDataProvider::new(ammdata_mdb, Arc::new(essentials_provider.clone()));
             let ids = ammdata_provider
                 .get_token_search_index_page(GetTokenSearchIndexPageParams {
                     field: SearchIndexField::Holders,
@@ -300,12 +301,14 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         }
 
         if !used_search_index {
-            let prefix_full = essentials_mdb.prefixed(&table.alkane_holders_ordered_prefix());
-            let it = essentials_mdb.iter_prefix_rev(&prefix_full);
-            for res in it {
-                let Ok((k, _)) = res else { continue };
-                let rel = &k[essentials_mdb.prefix().len()..];
-                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(rel) else {
+            let entries = essentials_provider
+                .get_list_entries_desc(GetListEntriesDescParams {
+                    prefix: table.alkane_holders_ordered_prefix(),
+                })
+                .map(|res| res.entries)
+                .unwrap_or_default();
+            for (rel, _value) in entries {
+                let Some((holders, alk)) = table.parse_alkane_holders_ordered_key(&rel) else {
                     continue;
                 };
                 let Some(rec) = load_creation_record(&essentials_mdb, &alk).ok().flatten() else {
@@ -337,14 +340,15 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         }
 
         if matches < 5 {
-            let prefix = table.alkane_name_index_prefix(&query_norm);
-            for res in essentials_mdb.iter_from(&prefix) {
-                let Ok((k, _)) = res else { continue };
-                let rel = &k[essentials_mdb.prefix().len()..];
-                if !rel.starts_with(&prefix) {
-                    break;
-                }
-                let Some((_name, alk)) = table.parse_alkane_name_index_key(rel) else { continue };
+            let ids = essentials_provider
+                .get_alkane_ids_by_name_prefix_page(GetAlkaneIdsByNamePrefixPageParams {
+                    prefix: query_norm.clone(),
+                    offset: 0,
+                    limit: 5,
+                })
+                .map(|res| res.ids)
+                .unwrap_or_default();
+            for alk in ids {
                 if push_alkane_item(
                     &table,
                     &mut seen_alkanes,

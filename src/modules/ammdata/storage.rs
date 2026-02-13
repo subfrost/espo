@@ -3,7 +3,7 @@ use super::schemas::{
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
     SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
-use crate::config::get_network;
+use crate::config::{get_chunk_size, get_network};
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, canonical_quotes,
 };
@@ -21,6 +21,8 @@ use crate::modules::ammdata::utils::pathfinder::{
 };
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::mdb::{Mdb, MdbBatch};
+use crate::runtime::pointers::{KvPointer, ListPointer};
+use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -28,169 +30,203 @@ use serde_json::{Value, json, map::Map};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use bitcoin::BlockHash;
 
-#[derive(Clone)]
-pub struct MdbPointer<'a> {
-    mdb: &'a Mdb,
-    key: Vec<u8>,
+const LIST_META_V1_PREFIX: &[u8] = b"/_chunked_list/v1/";
+
+#[derive(Clone, Copy)]
+struct ListFamily {
+    root: &'static [u8],
+    append_only: bool,
 }
 
-impl<'a> MdbPointer<'a> {
-    pub fn root(mdb: &'a Mdb) -> Self {
-        Self { mdb, key: Vec::new() }
-    }
+const AMMDATA_LIST_FAMILIES: &[ListFamily] = &[
+    ListFamily { root: b"/reserves_snapshot/v2/pool/", append_only: false },
+    ListFamily { root: b"fc1:", append_only: true },
+    ListFamily { root: b"tuc1:", append_only: true },
+    ListFamily { root: b"tud1:", append_only: true },
+    ListFamily { root: b"tmc1:", append_only: true },
+    ListFamily { root: b"tdmc1:", append_only: true },
+    ListFamily { root: b"/btc_usd_price/v1/", append_only: true },
+    ListFamily { root: b"btu1:", append_only: true },
+    ListFamily { root: b"activity:v1:", append_only: true },
+    ListFamily { root: b"activity:idx:", append_only: true },
+    ListFamily { root: b"/canonical_pool/v2/", append_only: false },
+    ListFamily { root: b"/token_metrics/index/", append_only: false },
+    ListFamily { root: b"/token_metrics/derived/index/", append_only: false },
+    ListFamily { root: b"/pool_metrics/index/", append_only: false },
+    ListFamily { root: b"/token_search_index/v1/", append_only: false },
+    ListFamily { root: b"/token_search_index/derived/v1/", append_only: false },
+    ListFamily { root: b"/pool_name_index/", append_only: false },
+    ListFamily { root: b"/amm_factories/v1/", append_only: true },
+    ListFamily { root: b"/factory_pools/v1/", append_only: true },
+    ListFamily { root: b"/token_swaps/v1/", append_only: true },
+    ListFamily { root: b"/pool_creations/v1/", append_only: true },
+    ListFamily { root: b"/address_pool_swaps/v1/", append_only: true },
+    ListFamily { root: b"/address_token_swaps/v1/", append_only: true },
+    ListFamily { root: b"/address_pool_creations/v1/", append_only: true },
+    ListFamily { root: b"/address_pool_mints/v1/", append_only: true },
+    ListFamily { root: b"/address_pool_burns/v1/", append_only: true },
+    ListFamily { root: b"/address_amm_history/v1/", append_only: true },
+    ListFamily { root: b"/amm_history_all/v1/", append_only: true },
+    ListFamily { root: b"/token_pools/v1/", append_only: true },
+    ListFamily { root: b"/tvlVersioned/", append_only: true },
+];
 
-    pub fn key(&self) -> &[u8] {
-        &self.key
+fn list_family_index_for_prefix(prefix: &[u8]) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for (idx, family) in AMMDATA_LIST_FAMILIES.iter().enumerate() {
+        if prefix.starts_with(family.root) {
+            let len = family.root.len();
+            if best.map(|(_, best_len)| len > best_len).unwrap_or(true) {
+                best = Some((idx, len));
+            }
+        }
     }
+    best.map(|(idx, _)| idx)
+}
 
-    pub fn keyword(&self, suffix: &str) -> Self {
-        self.select(suffix.as_bytes())
-    }
+fn list_meta_prefix_for_root(root: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(LIST_META_V1_PREFIX.len() + root.len() * 2 + 1);
+    key.extend_from_slice(LIST_META_V1_PREFIX);
+    key.extend_from_slice(hex::encode(root).as_bytes());
+    key.push(b'/');
+    key
+}
 
-    pub fn select(&self, suffix: &[u8]) -> Self {
-        let mut key = self.key.clone();
-        key.extend_from_slice(suffix);
-        Self { mdb: self.mdb, key }
-    }
+fn list_length_key_for_root(root: &[u8]) -> Vec<u8> {
+    let mut key = list_meta_prefix_for_root(root);
+    key.extend_from_slice(b"length");
+    key
+}
 
-    pub fn get(&self) -> Result<Option<Vec<u8>>> {
-        self.mdb.get(&self.key).map_err(|e| anyhow!("mdb.get failed: {e}"))
-    }
+fn list_chunk_key_for_root(root: &[u8], chunk_id: u64) -> Vec<u8> {
+    let mut key = list_meta_prefix_for_root(root);
+    key.extend_from_slice(b"chunk/");
+    key.extend_from_slice(&chunk_id.to_be_bytes());
+    key
+}
 
-    pub fn put(&self, value: &[u8]) -> Result<()> {
-        self.mdb.put(&self.key, value).map_err(|e| anyhow!("mdb.put failed: {e}"))
-    }
+fn decode_key_chunk(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    Ok(Vec::<Vec<u8>>::try_from_slice(bytes)?)
+}
 
-    pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
-        let full_keys: Vec<Vec<u8>> = keys
-            .iter()
-            .map(|k| {
-                let mut key = self.key.clone();
-                key.extend_from_slice(k);
-                key
-            })
-            .collect();
-        self.mdb.multi_get(&full_keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))
-    }
+fn encode_key_chunk(keys: &[Vec<u8>]) -> Result<Vec<u8>> {
+    Ok(borsh::to_vec(&keys.to_vec())?)
+}
 
-    pub fn scan_prefix(&self) -> Result<Vec<Vec<u8>>> {
-        self.mdb
-            .scan_prefix(&self.key)
-            .map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))
+fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
     }
-
-    pub fn bulk_write<F>(&self, build: F) -> Result<()>
-    where
-        F: FnOnce(&mut MdbBatch<'_>),
-    {
-        self.mdb.bulk_write(build).map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
-    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Some(u64::from_le_bytes(arr))
 }
 
 #[allow(non_snake_case)]
 #[derive(Clone)]
 pub struct AmmDataTable<'a> {
-    pub ROOT: MdbPointer<'a>,
+    pub ROOT: KvPointer<'a>,
     // Core index height for the ammdata module.
-    pub INDEX_HEIGHT: MdbPointer<'a>,
+    pub INDEX_HEIGHT: KvPointer<'a>,
     // Reserve snapshots and pool summaries.
-    pub RESERVES_SNAPSHOT: MdbPointer<'a>,
-    pub POOLS: MdbPointer<'a>,
+    pub RESERVES_SNAPSHOT: ListPointer<'a>,
+    pub POOLS: KvPointer<'a>,
     // Candle series (fc1:<blk>:<tx>:<tf>:...).
-    pub CANDLES: MdbPointer<'a>,
-    pub TOKEN_USD_CANDLES: MdbPointer<'a>,
-    pub TOKEN_DERIVED_USD_CANDLES: MdbPointer<'a>,
-    pub TOKEN_MCAP_USD_CANDLES: MdbPointer<'a>,
-    pub BTC_USD_PRICE: MdbPointer<'a>,
-    pub BTC_USD_LINE: MdbPointer<'a>,
-    pub TOKEN_DERIVED_MCAP_USD_CANDLES: MdbPointer<'a>,
+    pub CANDLES: ListPointer<'a>,
+    pub TOKEN_USD_CANDLES: ListPointer<'a>,
+    pub TOKEN_DERIVED_USD_CANDLES: ListPointer<'a>,
+    pub TOKEN_MCAP_USD_CANDLES: ListPointer<'a>,
+    pub BTC_USD_PRICE: KvPointer<'a>,
+    pub BTC_USD_LINE: ListPointer<'a>,
+    pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
-    pub ACTIVITY: MdbPointer<'a>,
-    pub ACTIVITY_INDEX: MdbPointer<'a>,
+    pub ACTIVITY: ListPointer<'a>,
+    pub ACTIVITY_INDEX: ListPointer<'a>,
     // Token-level indices.
-    pub CANONICAL_POOL: MdbPointer<'a>,
-    pub TOKEN_METRICS: MdbPointer<'a>,
-    pub TOKEN_DERIVED_METRICS: MdbPointer<'a>,
-    pub TOKEN_METRICS_INDEX: MdbPointer<'a>,
-    pub TOKEN_DERIVED_METRICS_INDEX: MdbPointer<'a>,
-    pub TOKEN_METRICS_INDEX_COUNT: MdbPointer<'a>,
-    pub TOKEN_DERIVED_METRICS_INDEX_COUNT: MdbPointer<'a>,
-    pub POOL_METRICS_INDEX: MdbPointer<'a>,
-    pub POOL_METRICS_INDEX_COUNT: MdbPointer<'a>,
-    pub TOKEN_SEARCH_INDEX: MdbPointer<'a>,
-    pub TOKEN_DERIVED_SEARCH_INDEX: MdbPointer<'a>,
-    pub POOL_NAME_INDEX: MdbPointer<'a>,
+    pub CANONICAL_POOL: ListPointer<'a>,
+    pub TOKEN_METRICS: KvPointer<'a>,
+    pub TOKEN_DERIVED_METRICS: KvPointer<'a>,
+    pub TOKEN_METRICS_INDEX: ListPointer<'a>,
+    pub TOKEN_DERIVED_METRICS_INDEX: ListPointer<'a>,
+    pub TOKEN_METRICS_INDEX_COUNT: KvPointer<'a>,
+    pub TOKEN_DERIVED_METRICS_INDEX_COUNT: KvPointer<'a>,
+    pub POOL_METRICS_INDEX: ListPointer<'a>,
+    pub POOL_METRICS_INDEX_COUNT: KvPointer<'a>,
+    pub TOKEN_SEARCH_INDEX: ListPointer<'a>,
+    pub TOKEN_DERIVED_SEARCH_INDEX: ListPointer<'a>,
+    pub POOL_NAME_INDEX: ListPointer<'a>,
     // Factory + pool indices.
-    pub AMM_FACTORIES: MdbPointer<'a>,
-    pub FACTORY_POOLS: MdbPointer<'a>,
-    pub POOL_FACTORY: MdbPointer<'a>,
-    pub POOL_METRICS: MdbPointer<'a>,
-    pub POOL_METRICS_V2: MdbPointer<'a>,
-    pub POOL_CREATION_INFO: MdbPointer<'a>,
-    pub POOL_LP_SUPPLY: MdbPointer<'a>,
-    pub POOL_DETAILS_SNAPSHOT: MdbPointer<'a>,
-    pub TVL_VERSIONED: MdbPointer<'a>,
-    pub TOKEN_SWAPS: MdbPointer<'a>,
-    pub POOL_CREATIONS: MdbPointer<'a>,
-    pub ADDRESS_POOL_SWAPS: MdbPointer<'a>,
-    pub ADDRESS_TOKEN_SWAPS: MdbPointer<'a>,
-    pub ADDRESS_POOL_CREATIONS: MdbPointer<'a>,
-    pub ADDRESS_POOL_MINTS: MdbPointer<'a>,
-    pub ADDRESS_POOL_BURNS: MdbPointer<'a>,
-    pub ADDRESS_AMM_HISTORY: MdbPointer<'a>,
-    pub AMM_HISTORY_ALL: MdbPointer<'a>,
-    pub TOKEN_POOLS: MdbPointer<'a>,
+    pub AMM_FACTORIES: ListPointer<'a>,
+    pub FACTORY_POOLS: ListPointer<'a>,
+    pub POOL_FACTORY: KvPointer<'a>,
+    pub POOL_METRICS: KvPointer<'a>,
+    pub POOL_METRICS_V2: KvPointer<'a>,
+    pub POOL_CREATION_INFO: KvPointer<'a>,
+    pub POOL_LP_SUPPLY: KvPointer<'a>,
+    pub POOL_DETAILS_SNAPSHOT: KvPointer<'a>,
+    pub TVL_VERSIONED: KvPointer<'a>,
+    pub TOKEN_SWAPS: ListPointer<'a>,
+    pub POOL_CREATIONS: ListPointer<'a>,
+    pub ADDRESS_POOL_SWAPS: ListPointer<'a>,
+    pub ADDRESS_TOKEN_SWAPS: ListPointer<'a>,
+    pub ADDRESS_POOL_CREATIONS: ListPointer<'a>,
+    pub ADDRESS_POOL_MINTS: ListPointer<'a>,
+    pub ADDRESS_POOL_BURNS: ListPointer<'a>,
+    pub ADDRESS_AMM_HISTORY: ListPointer<'a>,
+    pub AMM_HISTORY_ALL: ListPointer<'a>,
+    pub TOKEN_POOLS: ListPointer<'a>,
 }
 
 impl<'a> AmmDataTable<'a> {
     pub fn new(mdb: &'a Mdb) -> Self {
-        let root = MdbPointer::root(mdb);
+        let root = KvPointer::root(mdb);
         AmmDataTable {
             ROOT: root.clone(),
             INDEX_HEIGHT: root.select(KEY_INDEX_HEIGHT),
-            RESERVES_SNAPSHOT: root.keyword("/reserves_snapshot_v1"),
+            RESERVES_SNAPSHOT: root.list_keyword("/reserves_snapshot/v2/pool/"),
             POOLS: root.keyword("/pools/"),
-            CANDLES: root.keyword("fc1:"),
-            TOKEN_USD_CANDLES: root.keyword("tuc1:"),
-            TOKEN_DERIVED_USD_CANDLES: root.keyword("tud1:"),
-            TOKEN_MCAP_USD_CANDLES: root.keyword("tmc1:"),
+            CANDLES: root.list_keyword("fc1:"),
+            TOKEN_USD_CANDLES: root.list_keyword("tuc1:"),
+            TOKEN_DERIVED_USD_CANDLES: root.list_keyword("tud1:"),
+            TOKEN_MCAP_USD_CANDLES: root.list_keyword("tmc1:"),
             BTC_USD_PRICE: root.keyword("/btc_usd_price/v1/"),
-            BTC_USD_LINE: root.keyword("btu1:"),
-            TOKEN_DERIVED_MCAP_USD_CANDLES: root.keyword("tdmc1:"),
-            ACTIVITY: root.keyword("activity:v1:"),
-            ACTIVITY_INDEX: root.keyword("activity:idx:"),
-            CANONICAL_POOL: root.keyword("/canonical_pool/v1/"),
+            BTC_USD_LINE: root.list_keyword("btu1:"),
+            TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
+            ACTIVITY: root.list_keyword("activity:v1:"),
+            ACTIVITY_INDEX: root.list_keyword("activity:idx:"),
+            CANONICAL_POOL: root.list_keyword("/canonical_pool/v2/"),
             TOKEN_METRICS: root.keyword("/token_metrics/v1/"),
             TOKEN_DERIVED_METRICS: root.keyword("/token_metrics/derived/v1/"),
-            TOKEN_METRICS_INDEX: root.keyword("/token_metrics/index/"),
-            TOKEN_DERIVED_METRICS_INDEX: root.keyword("/token_metrics/derived/index/"),
+            TOKEN_METRICS_INDEX: root.list_keyword("/token_metrics/index/"),
+            TOKEN_DERIVED_METRICS_INDEX: root.list_keyword("/token_metrics/derived/index/"),
             TOKEN_METRICS_INDEX_COUNT: root.keyword("/token_metrics/index_count"),
             TOKEN_DERIVED_METRICS_INDEX_COUNT: root.keyword("/token_metrics/derived/index_count"),
-            POOL_METRICS_INDEX: root.keyword("/pool_metrics/index/"),
+            POOL_METRICS_INDEX: root.list_keyword("/pool_metrics/index/"),
             POOL_METRICS_INDEX_COUNT: root.keyword("/pool_metrics/index_count"),
-            TOKEN_SEARCH_INDEX: root.keyword("/token_search_index/v1/"),
-            TOKEN_DERIVED_SEARCH_INDEX: root.keyword("/token_search_index/derived/v1/"),
-            POOL_NAME_INDEX: root.keyword("/pool_name_index/"),
-            AMM_FACTORIES: root.keyword("/amm_factories/v1/"),
-            FACTORY_POOLS: root.keyword("/factory_pools/v1/"),
+            TOKEN_SEARCH_INDEX: root.list_keyword("/token_search_index/v1/"),
+            TOKEN_DERIVED_SEARCH_INDEX: root.list_keyword("/token_search_index/derived/v1/"),
+            POOL_NAME_INDEX: root.list_keyword("/pool_name_index/"),
+            AMM_FACTORIES: root.list_keyword("/amm_factories/v1/"),
+            FACTORY_POOLS: root.list_keyword("/factory_pools/v1/"),
             POOL_FACTORY: root.keyword("/pool_factory/v1/"),
             POOL_METRICS: root.keyword("/pool_metrics/v1/"),
             POOL_METRICS_V2: root.keyword("/pool_metrics/v2/"),
             POOL_CREATION_INFO: root.keyword("/pool_creation_info/v1/"),
             POOL_LP_SUPPLY: root.keyword("/pool_lp_supply/latest/"),
-            POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details_snapshot/v1/"),
+            POOL_DETAILS_SNAPSHOT: root.keyword("/pool_details/v2/"),
             TVL_VERSIONED: root.keyword("/tvlVersioned/"),
-            TOKEN_SWAPS: root.keyword("/token_swaps/v1/"),
-            POOL_CREATIONS: root.keyword("/pool_creations/v1/"),
-            ADDRESS_POOL_SWAPS: root.keyword("/address_pool_swaps/v1/"),
-            ADDRESS_TOKEN_SWAPS: root.keyword("/address_token_swaps/v1/"),
-            ADDRESS_POOL_CREATIONS: root.keyword("/address_pool_creations/v1/"),
-            ADDRESS_POOL_MINTS: root.keyword("/address_pool_mints/v1/"),
-            ADDRESS_POOL_BURNS: root.keyword("/address_pool_burns/v1/"),
-            ADDRESS_AMM_HISTORY: root.keyword("/address_amm_history/v1/"),
-            AMM_HISTORY_ALL: root.keyword("/amm_history_all/v1/"),
-            TOKEN_POOLS: root.keyword("/token_pools/v1/"),
+            TOKEN_SWAPS: root.list_keyword("/token_swaps/v1/"),
+            POOL_CREATIONS: root.list_keyword("/pool_creations/v1/"),
+            ADDRESS_POOL_SWAPS: root.list_keyword("/address_pool_swaps/v1/"),
+            ADDRESS_TOKEN_SWAPS: root.list_keyword("/address_token_swaps/v1/"),
+            ADDRESS_POOL_CREATIONS: root.list_keyword("/address_pool_creations/v1/"),
+            ADDRESS_POOL_MINTS: root.list_keyword("/address_pool_mints/v1/"),
+            ADDRESS_POOL_BURNS: root.list_keyword("/address_pool_burns/v1/"),
+            ADDRESS_AMM_HISTORY: root.list_keyword("/address_amm_history/v1/"),
+            AMM_HISTORY_ALL: root.list_keyword("/amm_history_all/v1/"),
+            TOKEN_POOLS: root.list_keyword("/token_pools/v1/"),
         }
     }
 }
@@ -723,11 +759,23 @@ impl<'a> AmmDataTable<'a> {
         })
     }
 
-    pub fn canonical_pool_key(&self, token: &SchemaAlkaneId) -> Vec<u8> {
-        let mut suffix = Vec::with_capacity(12);
-        suffix.extend_from_slice(&token.block.to_be_bytes());
-        suffix.extend_from_slice(&token.tx.to_be_bytes());
-        self.CANONICAL_POOL.select(&suffix).key().to_vec()
+    pub fn canonical_pool_token_prefix(&self, token: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.CANONICAL_POOL.key().to_vec();
+        k.extend_from_slice(&token.block.to_be_bytes());
+        k.extend_from_slice(&token.tx.to_be_bytes());
+        k.push(b'/');
+        k
+    }
+
+    pub fn canonical_pool_quote_key(
+        &self,
+        token: &SchemaAlkaneId,
+        quote: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut k = self.canonical_pool_token_prefix(token);
+        k.extend_from_slice(&quote.block.to_be_bytes());
+        k.extend_from_slice(&quote.tx.to_be_bytes());
+        k
     }
 
     pub fn token_metrics_key(&self, token: &SchemaAlkaneId) -> Vec<u8> {
@@ -988,10 +1036,21 @@ impl<'a> AmmDataTable<'a> {
     }
 
     pub fn pool_details_snapshot_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
-        let mut suffix = Vec::with_capacity(12);
+        let mut suffix = Vec::with_capacity(13);
         suffix.extend_from_slice(&pool.block.to_be_bytes());
         suffix.extend_from_slice(&pool.tx.to_be_bytes());
+        suffix.push(b'/');
         self.POOL_DETAILS_SNAPSHOT.select(&suffix).key().to_vec()
+    }
+
+    pub fn pool_details_snapshot_field_key(&self, pool: &SchemaAlkaneId, field: &str) -> Vec<u8> {
+        let mut k = self.pool_details_snapshot_key(pool);
+        k.extend_from_slice(field.as_bytes());
+        k
+    }
+
+    pub fn pool_details_snapshot_fields_prefix(&self) -> Vec<u8> {
+        self.POOL_DETAILS_SNAPSHOT.key().to_vec()
     }
 
     pub fn tvl_versioned_prefix(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
@@ -1224,8 +1283,15 @@ impl<'a> AmmDataTable<'a> {
         self.POOLS.select(&suffix).key().to_vec()
     }
 
-    pub fn reserves_snapshot_key(&self) -> Vec<u8> {
+    pub fn reserves_snapshot_pool_prefix(&self) -> Vec<u8> {
         self.RESERVES_SNAPSHOT.key().to_vec()
+    }
+
+    pub fn reserves_snapshot_pool_key(&self, pool: &SchemaAlkaneId) -> Vec<u8> {
+        let mut k = self.reserves_snapshot_pool_prefix();
+        k.extend_from_slice(&pool.block.to_be_bytes());
+        k.extend_from_slice(&pool.tx.to_be_bytes());
+        k
     }
 }
 
@@ -1285,7 +1351,7 @@ fn read_address_pool_events(
     limit: usize,
 ) -> Result<GetAddressPoolEventsPageResult> {
     let entries =
-        match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+        match provider.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() }) {
             Ok(v) => v.entries,
             Err(_) => Vec::new(),
         };
@@ -1327,7 +1393,7 @@ fn read_amm_history(
     kind_filter: Option<ActivityKind>,
 ) -> Result<GetAmmHistoryPageResult> {
     let entries =
-        match provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+        match provider.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() }) {
             Ok(v) => v.entries,
             Err(_) => Vec::new(),
         };
@@ -1382,11 +1448,39 @@ fn read_amm_history(
 pub struct AmmDataProvider {
     mdb: Arc<Mdb>,
     essentials: Arc<EssentialsProvider>,
+    view_blockhash: Option<BlockHash>,
 }
 
 impl AmmDataProvider {
     pub fn new(mdb: Arc<Mdb>, essentials: Arc<EssentialsProvider>) -> Self {
-        Self { mdb, essentials }
+        Self { mdb, essentials, view_blockhash: None }
+    }
+
+    pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
+        Self {
+            mdb: Arc::clone(&self.mdb),
+            essentials: Arc::new(self.essentials.with_view_blockhash(blockhash)),
+            view_blockhash: blockhash,
+        }
+    }
+
+    pub fn with_height(&self, height: Option<u64>, height_present: bool) -> Result<Self> {
+        if !height_present {
+            return Ok(self.with_view_blockhash(None));
+        }
+        let Some(height) = height else {
+            return Err(anyhow!("missing_or_invalid_height"));
+        };
+        let height_u32 = u32::try_from(height).map_err(|_| anyhow!("height_out_of_range"))?;
+        let Some(tree) = get_global_tree_db() else {
+            return Err(anyhow!("versioned_tree_unavailable"));
+        };
+        let Some(blockhash) =
+            tree.blockhash_for_height(height_u32).map_err(|e| anyhow!("tree lookup failed: {e}"))?
+        else {
+            return Err(anyhow!("height_not_indexed"));
+        };
+        Ok(self.with_view_blockhash(Some(blockhash)))
     }
 
     pub fn table(&self) -> AmmDataTable<'_> {
@@ -1398,9 +1492,11 @@ impl AmmDataProvider {
     pub fn get_latest_btc_usd_price(&self) -> Result<Option<u128>> {
         let table = self.table();
         let rel_prefix = table.btc_usd_price_prefix();
-        let full_prefix = self.mdb.prefixed(&rel_prefix);
-        for res in self.mdb.iter_prefix_rev(&full_prefix) {
-            let (_k_full, v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
+        let entries = self
+            .get_list_entries_desc(GetListEntriesDescParams { prefix: rel_prefix })
+            .map(|resp| resp.entries)
+            .unwrap_or_default();
+        for (_k, v) in entries {
             if let Ok(price) = decode_u128_value(&v) {
                 if price > 0 {
                     return Ok(Some(price));
@@ -1414,64 +1510,266 @@ impl AmmDataProvider {
         self.essentials.as_ref()
     }
 
+    fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .get_at_blockhash(&blockhash, key)
+                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
+            None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
+        }
+    }
+
+    fn raw_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        match self.view_blockhash {
+            Some(_) => {
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    out.push(self.raw_get(key)?);
+                }
+                Ok(out)
+            }
+            None => self.mdb.multi_get(keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}")),
+        }
+    }
+
+    fn read_list_len_u64(&self, key: &[u8]) -> Result<u64> {
+        Ok(self.raw_get(key)?.and_then(|v| decode_u64_le(&v)).unwrap_or(0))
+    }
+
+    fn read_family_keys(&self, family_root: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let len_key = list_length_key_for_root(family_root);
+        let len = self.read_list_len_u64(&len_key)? as usize;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chunk_size = get_chunk_size() as usize;
+        let chunk_count = len.div_ceil(chunk_size);
+        let mut chunk_keys = Vec::with_capacity(chunk_count);
+        for chunk_id in 0..chunk_count {
+            chunk_keys.push(list_chunk_key_for_root(family_root, chunk_id as u64));
+        }
+
+        let chunk_values = self.raw_multi_get(&chunk_keys)?;
+        let mut out = Vec::with_capacity(len);
+        for raw in chunk_values {
+            let Some(raw) = raw else { continue };
+            let mut chunk = decode_key_chunk(&raw)?;
+            out.append(&mut chunk);
+        }
+        if out.len() > len {
+            out.truncate(len);
+        }
+        Ok(out)
+    }
+
+    fn rewrite_family_keys(
+        &self,
+        family_root: &[u8],
+        keys: &[Vec<u8>],
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
+        let chunk_size = get_chunk_size() as usize;
+        let len_key = list_length_key_for_root(family_root);
+        let old_len = self.read_list_len_u64(&len_key)? as usize;
+        let old_chunk_count = if old_len == 0 { 0 } else { old_len.div_ceil(chunk_size) };
+        let new_chunk_count = if keys.is_empty() { 0 } else { keys.len().div_ceil(chunk_size) };
+
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut deletes: Vec<Vec<u8>> = Vec::new();
+        puts.push((len_key, (keys.len() as u64).to_le_bytes().to_vec()));
+
+        for chunk_id in 0..new_chunk_count {
+            let start = chunk_id * chunk_size;
+            let end = (start + chunk_size).min(keys.len());
+            let chunk_key = list_chunk_key_for_root(family_root, chunk_id as u64);
+            let chunk_value = encode_key_chunk(&keys[start..end])?;
+            puts.push((chunk_key, chunk_value));
+        }
+
+        for chunk_id in new_chunk_count..old_chunk_count {
+            deletes.push(list_chunk_key_for_root(family_root, chunk_id as u64));
+        }
+
+        Ok((puts, deletes))
+    }
+
+    fn append_family_keys(
+        &self,
+        family_root: &[u8],
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chunk_size = get_chunk_size() as usize;
+        let len_key = list_length_key_for_root(family_root);
+        let mut len = self.read_list_len_u64(&len_key)?;
+        let original_len = len;
+        let mut chunk_updates: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
+
+        for key in keys {
+            if self.raw_get(key)?.is_some() {
+                continue;
+            }
+
+            let chunk_id = len / chunk_size as u64;
+            if let std::collections::btree_map::Entry::Vacant(entry) = chunk_updates.entry(chunk_id)
+            {
+                let chunk_key = list_chunk_key_for_root(family_root, chunk_id);
+                let existing = self
+                    .raw_get(&chunk_key)?
+                    .map(|raw| decode_key_chunk(&raw))
+                    .transpose()?
+                    .unwrap_or_default();
+                entry.insert(existing);
+            }
+            if let Some(chunk) = chunk_updates.get_mut(&chunk_id) {
+                chunk.push(key.clone());
+            }
+            len = len.saturating_add(1);
+        }
+
+        if len == original_len {
+            return Ok(Vec::new());
+        }
+
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (chunk_id, chunk) in chunk_updates {
+            let chunk_key = list_chunk_key_for_root(family_root, chunk_id);
+            puts.push((chunk_key, encode_key_chunk(&chunk)?));
+        }
+        puts.push((len_key, len.to_le_bytes().to_vec()));
+        Ok(puts)
+    }
+
+    fn build_list_index_updates(
+        &self,
+        puts: &[(Vec<u8>, Vec<u8>)],
+        deletes: &[Vec<u8>],
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
+        let mut puts_by_family: Vec<Vec<Vec<u8>>> = vec![Vec::new(); AMMDATA_LIST_FAMILIES.len()];
+        let mut deletes_by_family: Vec<Vec<Vec<u8>>> =
+            vec![Vec::new(); AMMDATA_LIST_FAMILIES.len()];
+
+        for (key, _value) in puts {
+            if key.starts_with(LIST_META_V1_PREFIX) {
+                continue;
+            }
+            if let Some(idx) = list_family_index_for_prefix(key) {
+                puts_by_family[idx].push(key.clone());
+            }
+        }
+        for key in deletes {
+            if key.starts_with(LIST_META_V1_PREFIX) {
+                continue;
+            }
+            if let Some(idx) = list_family_index_for_prefix(key) {
+                deletes_by_family[idx].push(key.clone());
+            }
+        }
+
+        let mut extra_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut extra_deletes: Vec<Vec<u8>> = Vec::new();
+
+        for idx in 0..AMMDATA_LIST_FAMILIES.len() {
+            if puts_by_family[idx].is_empty() && deletes_by_family[idx].is_empty() {
+                continue;
+            }
+            let family = AMMDATA_LIST_FAMILIES[idx];
+            let mut put_keys = puts_by_family[idx].clone();
+            put_keys.sort();
+            put_keys.dedup();
+            let mut delete_keys = deletes_by_family[idx].clone();
+            delete_keys.sort();
+            delete_keys.dedup();
+
+            if family.append_only && delete_keys.is_empty() {
+                extra_puts.extend(self.append_family_keys(family.root, &put_keys)?);
+                continue;
+            }
+
+            let mut keys: std::collections::BTreeSet<Vec<u8>> =
+                self.read_family_keys(family.root)?.into_iter().collect();
+            for key in delete_keys {
+                keys.remove(&key);
+            }
+            for key in put_keys {
+                keys.insert(key);
+            }
+            let keys_vec: Vec<Vec<u8>> = keys.into_iter().collect();
+            let (mut rewrite_puts, mut rewrite_deletes) =
+                self.rewrite_family_keys(family.root, &keys_vec)?;
+            extra_puts.append(&mut rewrite_puts);
+            extra_deletes.append(&mut rewrite_deletes);
+        }
+
+        Ok((extra_puts, extra_deletes))
+    }
+
     pub fn get_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
-        let value = self.mdb.get(&params.key).map_err(|e| anyhow!("mdb.get failed: {e}"))?;
+        let value = self.raw_get(&params.key)?;
         Ok(GetRawValueResult { value })
     }
 
     pub fn get_multi_values(&self, params: GetMultiValuesParams) -> Result<GetMultiValuesResult> {
-        let values = self
-            .mdb
-            .multi_get(&params.keys)
-            .map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self.raw_multi_get(&params.keys)?;
         Ok(GetMultiValuesResult { values })
     }
 
-    pub fn get_scan_prefix(&self, params: GetScanPrefixParams) -> Result<GetScanPrefixResult> {
-        let keys = self
-            .mdb
-            .scan_prefix(&params.prefix)
-            .map_err(|e| anyhow!("mdb.scan_prefix failed: {e}"))?;
-        Ok(GetScanPrefixResult { keys })
+    pub fn get_list_keys_by_prefix(&self, params: GetListKeysByPrefixParams) -> Result<GetListKeysByPrefixResult> {
+        let Some(idx) = list_family_index_for_prefix(&params.prefix) else {
+            return Ok(GetListKeysByPrefixResult { keys: Vec::new() });
+        };
+        let family = AMMDATA_LIST_FAMILIES[idx];
+        let mut keys = self.read_family_keys(family.root)?;
+        keys.retain(|k| k.starts_with(&params.prefix));
+        Ok(GetListKeysByPrefixResult { keys })
     }
 
-    pub fn get_iter_prefix_rev(
+    pub fn get_list_entries_desc(
         &self,
-        params: GetIterPrefixRevParams,
-    ) -> Result<GetIterPrefixRevResult> {
-        let full_prefix = self.mdb.prefixed(&params.prefix);
+        params: GetListEntriesDescParams,
+    ) -> Result<GetListEntriesDescResult> {
+        let Some(idx) = list_family_index_for_prefix(&params.prefix) else {
+            return Ok(GetListEntriesDescResult { entries: Vec::new() });
+        };
+        let family = AMMDATA_LIST_FAMILIES[idx];
+        let mut keys = self.read_family_keys(family.root)?;
+        keys.retain(|k| k.starts_with(&params.prefix));
+        keys.reverse();
+        let values = self.raw_multi_get(&keys)?;
         let mut entries = Vec::new();
-        for res in self.mdb.iter_prefix_rev(&full_prefix) {
-            let (k_full, v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
-            let rel = &k_full[self.mdb.prefix().len()..];
-            entries.push((rel.to_vec(), v));
+        for (key, value) in keys.into_iter().zip(values.into_iter()) {
+            if let Some(value) = value {
+                entries.push((key, value));
+            }
         }
-        Ok(GetIterPrefixRevResult { entries })
-    }
-
-    pub fn get_iter_from(&self, params: GetIterFromParams) -> Result<GetIterFromResult> {
-        let mut entries = Vec::new();
-        for res in self.mdb.iter_from(&params.start) {
-            let (k_full, v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
-            let rel = &k_full[self.mdb.prefix().len()..];
-            entries.push((rel.to_vec(), v));
-        }
-        Ok(GetIterFromResult { entries })
+        Ok(GetListEntriesDescResult { entries })
     }
 
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
-        self.mdb
-            .put(&params.key, &params.value)
-            .map_err(|e| anyhow!("mdb.put failed: {e}"))
+        self.set_batch(SetBatchParams { puts: vec![(params.key, params.value)], deletes: Vec::new() })
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
+        if self.view_blockhash.is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
+        let (mut list_puts, mut list_deletes) =
+            self.build_list_index_updates(&params.puts, &params.deletes)?;
+        let mut all_puts = params.puts;
+        let mut all_deletes = params.deletes;
+        all_puts.append(&mut list_puts);
+        all_deletes.append(&mut list_deletes);
+
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
-                for key in &params.deletes {
+                for key in &all_deletes {
                     wb.delete(key);
                 }
-                for (key, value) in &params.puts {
+                for (key, value) in &all_puts {
                     wb.put(key, value);
                 }
             })
@@ -1481,7 +1779,7 @@ impl AmmDataProvider {
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
-        let Some(bytes) = table.INDEX_HEIGHT.get()? else {
+        let Some(bytes) = self.raw_get(table.INDEX_HEIGHT.key())? else {
             return Ok(GetIndexHeightResult { height: None });
         };
         if bytes.len() != 4 {
@@ -1504,18 +1802,51 @@ impl AmmDataProvider {
     ) -> Result<GetReservesSnapshotResult> {
         crate::debug_timer_log!("get_reserves_snapshot");
         let table = self.table();
-        let snapshot = match table.RESERVES_SNAPSHOT.get()? {
-            Some(bytes) => decode_reserves_snapshot(&bytes).ok(),
-            None => None,
-        };
-        Ok(GetReservesSnapshotResult { snapshot })
+        let prefix = table.reserves_snapshot_pool_prefix();
+        let keys = self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+            .map(|v| v.keys)
+            .unwrap_or_default();
+        if keys.is_empty() {
+            return Ok(GetReservesSnapshotResult { snapshot: None });
+        }
+
+        let values = self
+            .get_multi_values(GetMultiValuesParams { keys: keys.clone() })
+            .map(|v| v.values)
+            .unwrap_or_default();
+
+        let mut out: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
+        for (key, value) in keys.into_iter().zip(values.into_iter()) {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let Some(pool) = decode_alkane_id_be(&key[prefix.len()..]) else {
+                continue;
+            };
+            let Some(raw) = value else {
+                continue;
+            };
+            if let Ok(snapshot) = decode_pool_snapshot(&raw) {
+                out.insert(pool, snapshot);
+            }
+        }
+        if out.is_empty() {
+            return Ok(GetReservesSnapshotResult { snapshot: None });
+        }
+        Ok(GetReservesSnapshotResult { snapshot: Some(out) })
     }
 
     pub fn set_reserves_snapshot(&self, params: SetReservesSnapshotParams) -> Result<()> {
         crate::debug_timer_log!("set_reserves_snapshot");
         let table = self.table();
-        let encoded = encode_reserves_snapshot(&params.snapshot)?;
-        table.RESERVES_SNAPSHOT.put(&encoded)
+        let mut puts = Vec::new();
+        for (pool, snap) in &params.snapshot {
+            if let Ok(enc) = encode_pool_snapshot(snap) {
+                puts.push((table.reserves_snapshot_pool_key(pool), enc));
+            }
+        }
+        self.set_batch(SetBatchParams { puts, deletes: Vec::new() })
     }
 
     pub fn get_canonical_pools(
@@ -1524,12 +1855,36 @@ impl AmmDataProvider {
     ) -> Result<GetCanonicalPoolsResult> {
         crate::debug_timer_log!("get_canonical_pools");
         let table = self.table();
-        let pools = self
-            .get_raw_value(GetRawValueParams { key: table.canonical_pool_key(&params.token) })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|raw| decode_canonical_pools(&raw).ok())
+        let prefix = table.canonical_pool_token_prefix(&params.token);
+        let keys = self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+            .map(|v| v.keys)
             .unwrap_or_default();
+        if keys.is_empty() {
+            return Ok(GetCanonicalPoolsResult { pools: Vec::new() });
+        }
+        let values = self
+            .get_multi_values(GetMultiValuesParams { keys: keys.clone() })
+            .map(|v| v.values)
+            .unwrap_or_default();
+
+        let mut pools: Vec<SchemaCanonicalPoolEntry> = Vec::new();
+        for (key, value) in keys.into_iter().zip(values.into_iter()) {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let Some(quote_id) = decode_alkane_id_be(&key[prefix.len()..]) else {
+                continue;
+            };
+            let Some(raw) = value else {
+                continue;
+            };
+            let Some(pool_id) = decode_alkane_id_be(&raw) else {
+                continue;
+            };
+            pools.push(SchemaCanonicalPoolEntry { pool_id, quote_id });
+        }
+        pools.sort_by_key(|e| (e.quote_id.block, e.quote_id.tx, e.pool_id.block, e.pool_id.tx));
         Ok(GetCanonicalPoolsResult { pools })
     }
 
@@ -1541,7 +1896,7 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.token_usd_candle_ns_prefix(&params.token, params.timeframe);
         let entries = self
-            .get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+            .get_list_entries_desc(GetListEntriesDescParams { prefix })
             .ok()
             .map(|resp| resp.entries)
             .unwrap_or_default();
@@ -1592,7 +1947,7 @@ impl AmmDataProvider {
         let table = self.table();
         let keys: Vec<Vec<u8>> =
             params.tokens.iter().map(|token| table.token_metrics_key(token)).collect();
-        let values = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self.raw_multi_get(&keys)?;
         let mut metrics = Vec::with_capacity(values.len());
         for val in values {
             if let Some(bytes) = val {
@@ -1615,7 +1970,7 @@ impl AmmDataProvider {
             .iter()
             .map(|token| table.token_derived_metrics_key(token, &params.quote))
             .collect();
-        let values = self.mdb.multi_get(&keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))?;
+        let values = self.raw_multi_get(&keys)?;
         let mut metrics = Vec::with_capacity(values.len());
         for val in values {
             if let Some(bytes) = val {
@@ -1634,45 +1989,28 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_metrics_index_page");
         let table = self.table();
         let prefix = table.token_metrics_index_prefix(params.field);
+        let keys = if params.desc {
+            self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })
+                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+                .unwrap_or_default()
+        } else {
+            self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .map(|resp| resp.keys)
+                .unwrap_or_default()
+        };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
-
-        if params.desc {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_prefix_rev(&full_prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) = table.parse_token_metrics_index_key(params.field, rel) else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+        for key in keys {
+            let Some(id) = table.parse_token_metrics_index_key(params.field, &key) else {
+                continue;
+            };
+            if skipped < params.offset {
+                skipped += 1;
+                continue;
             }
-        } else {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_from(&prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
-                if !k_full.starts_with(&full_prefix) {
-                    break;
-                }
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) = table.parse_token_metrics_index_key(params.field, rel) else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+            out.push(id);
+            if out.len() >= params.limit as usize {
+                break;
             }
         }
 
@@ -1686,49 +2024,30 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_derived_metrics_index_page");
         let table = self.table();
         let prefix = table.token_derived_metrics_index_prefix(&params.quote, params.field);
+        let keys = if params.desc {
+            self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })
+                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+                .unwrap_or_default()
+        } else {
+            self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .map(|resp| resp.keys)
+                .unwrap_or_default()
+        };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
-
-        if params.desc {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_prefix_rev(&full_prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) =
-                    table.parse_token_derived_metrics_index_key(&params.quote, params.field, rel)
-                else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+        for key in keys {
+            let Some(id) =
+                table.parse_token_derived_metrics_index_key(&params.quote, params.field, &key)
+            else {
+                continue;
+            };
+            if skipped < params.offset {
+                skipped += 1;
+                continue;
             }
-        } else {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_from(&prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
-                if !k_full.starts_with(&full_prefix) {
-                    break;
-                }
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) =
-                    table.parse_token_derived_metrics_index_key(&params.quote, params.field, rel)
-                else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+            out.push(id);
+            if out.len() >= params.limit as usize {
+                break;
             }
         }
 
@@ -1789,45 +2108,28 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_search_index_page");
         let table = self.table();
         let prefix = table.token_search_index_prefix(params.field, &params.prefix);
+        let keys = if params.desc {
+            self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })
+                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+                .unwrap_or_default()
+        } else {
+            self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .map(|resp| resp.keys)
+                .unwrap_or_default()
+        };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
-
-        if params.desc {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_prefix_rev(&full_prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) = table.parse_token_search_index_key(params.field, rel) else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+        for key in keys {
+            let Some(id) = table.parse_token_search_index_key(params.field, &key) else {
+                continue;
+            };
+            if skipped < params.offset {
+                skipped += 1;
+                continue;
             }
-        } else {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_from(&prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
-                if !k_full.starts_with(&full_prefix) {
-                    break;
-                }
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) = table.parse_token_search_index_key(params.field, rel) else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+            out.push(id);
+            if out.len() >= params.limit as usize {
+                break;
             }
         }
 
@@ -1842,49 +2144,30 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix =
             table.token_derived_search_index_prefix(&params.quote, params.field, &params.prefix);
+        let keys = if params.desc {
+            self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })
+                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+                .unwrap_or_default()
+        } else {
+            self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .map(|resp| resp.keys)
+                .unwrap_or_default()
+        };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
-
-        if params.desc {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_prefix_rev(&full_prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_prefix_rev failed: {e}"))?;
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) =
-                    table.parse_token_derived_search_index_key(&params.quote, params.field, rel)
-                else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+        for key in keys {
+            let Some(id) =
+                table.parse_token_derived_search_index_key(&params.quote, params.field, &key)
+            else {
+                continue;
+            };
+            if skipped < params.offset {
+                skipped += 1;
+                continue;
             }
-        } else {
-            let full_prefix = self.mdb.prefixed(&prefix);
-            for res in self.mdb.iter_from(&prefix) {
-                let (k_full, _v) = res.map_err(|e| anyhow!("mdb.iter_from failed: {e}"))?;
-                if !k_full.starts_with(&full_prefix) {
-                    break;
-                }
-                let rel = &k_full[self.mdb.prefix().len()..];
-                let Some(id) =
-                    table.parse_token_derived_search_index_key(&params.quote, params.field, rel)
-                else {
-                    continue;
-                };
-                if skipped < params.offset {
-                    skipped += 1;
-                    continue;
-                }
-                out.push(id);
-                if out.len() >= params.limit as usize {
-                    break;
-                }
+            out.push(id);
+            if out.len() >= params.limit as usize {
+                break;
             }
         }
 
@@ -1897,7 +2180,7 @@ impl AmmDataProvider {
     ) -> Result<GetPoolIdsByNamePrefixResult> {
         crate::debug_timer_log!("get_pool_ids_by_name_prefix");
         let table = self.table();
-        let keys = match self.get_scan_prefix(GetScanPrefixParams {
+        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
             prefix: table.pool_name_index_prefix(&params.prefix),
         }) {
             Ok(v) => v.keys,
@@ -1922,7 +2205,7 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_amm_factories");
         let table = self.table();
         let keys = match self
-            .get_scan_prefix(GetScanPrefixParams { prefix: table.AMM_FACTORIES.key().to_vec() })
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: table.AMM_FACTORIES.key().to_vec() })
         {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
@@ -1943,7 +2226,7 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_factory_pools");
         let table = self.table();
         let prefix = table.factory_pools_prefix(&params.factory);
-        let keys = match self.get_scan_prefix(GetScanPrefixParams { prefix: prefix.clone() }) {
+        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() }) {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -2039,11 +2322,54 @@ impl AmmDataProvider {
     ) -> Result<GetPoolDetailsSnapshotResult> {
         crate::debug_timer_log!("get_pool_details_snapshot");
         let table = self.table();
-        let snapshot = self
-            .get_raw_value(GetRawValueParams { key: table.pool_details_snapshot_key(&params.pool) })
+        let keys = vec![
+            table.pool_details_snapshot_field_key(&params.pool, "token0_tvl_usd"),
+            table.pool_details_snapshot_field_key(&params.pool, "token1_tvl_usd"),
+            table.pool_details_snapshot_field_key(&params.pool, "token0_tvl_sats"),
+            table.pool_details_snapshot_field_key(&params.pool, "token1_tvl_sats"),
+            table.pool_details_snapshot_field_key(&params.pool, "pool_tvl_usd"),
+            table.pool_details_snapshot_field_key(&params.pool, "pool_volume_1d_usd"),
+            table.pool_details_snapshot_field_key(&params.pool, "pool_volume_30d_usd"),
+            table.pool_details_snapshot_field_key(&params.pool, "pool_apr"),
+            table.pool_details_snapshot_field_key(&params.pool, "tvl_change_24h"),
+            table.pool_details_snapshot_field_key(&params.pool, "lp_supply"),
+        ];
+        let values = self
+            .get_multi_values(GetMultiValuesParams { keys: keys.clone() })
             .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|raw| decode_pool_details_snapshot(&raw).ok());
+            .map(|resp| resp.values)
+            .unwrap_or_default();
+        let snapshot = if values.len() == keys.len() && values.iter().all(|v| v.is_some()) {
+            let get_u128 = |idx: usize| -> u128 {
+                values
+                    .get(idx)
+                    .and_then(|v| v.as_ref())
+                    .and_then(|raw| decode_u128_value(raw).ok())
+                    .unwrap_or(0)
+            };
+            let get_f64 = |idx: usize| -> f64 {
+                values
+                    .get(idx)
+                    .and_then(|v| v.as_ref())
+                    .and_then(|raw| decode_f64_value(raw).ok())
+                    .unwrap_or(0.0)
+            };
+            Some(SchemaPoolDetailsSnapshot {
+                value_json: Vec::new(),
+                token0_tvl_usd: get_u128(0),
+                token1_tvl_usd: get_u128(1),
+                token0_tvl_sats: get_u128(2),
+                token1_tvl_sats: get_u128(3),
+                pool_tvl_usd: get_u128(4),
+                pool_volume_1d_usd: get_u128(5),
+                pool_volume_30d_usd: get_u128(6),
+                pool_apr: get_f64(7),
+                tvl_change_24h: get_f64(8),
+                lp_supply: get_u128(9),
+            })
+        } else {
+            None
+        };
         Ok(GetPoolDetailsSnapshotResult { snapshot })
     }
 
@@ -2054,7 +2380,7 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_pool_activity_entries");
         let table = self.table();
         let prefix = table.activity_ns_prefix(&params.pool);
-        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+        let entries = match self.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
             Ok(v) => v.entries,
             Err(_) => Vec::new(),
         };
@@ -2118,7 +2444,7 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.token_swaps_prefix(&params.token);
         let entries =
-            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+            match self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() }) {
                 Ok(v) => v.entries,
                 Err(_) => Vec::new(),
             };
@@ -2159,7 +2485,7 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.pool_creations_prefix();
         let entries =
-            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+            match self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() }) {
                 Ok(v) => v.entries,
                 Err(_) => Vec::new(),
             };
@@ -2200,7 +2526,7 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.address_pool_swaps_prefix(&params.address_spk, &params.pool);
         let entries =
-            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+            match self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() }) {
                 Ok(v) => v.entries,
                 Err(_) => Vec::new(),
             };
@@ -2234,7 +2560,7 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.address_token_swaps_prefix(&params.address_spk, &params.token);
         let entries =
-            match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() }) {
+            match self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() }) {
                 Ok(v) => v.entries,
                 Err(_) => Vec::new(),
             };
@@ -2322,7 +2648,7 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_pools");
         let table = self.table();
         let prefix = table.token_pools_prefix(&params.token);
-        let keys = match self.get_scan_prefix(GetScanPrefixParams { prefix: prefix.clone() }) {
+        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() }) {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -2346,7 +2672,7 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_tvl_versioned_at_or_before");
         let table = self.table();
         let prefix = table.tvl_versioned_prefix(&params.pool);
-        let entries = match self.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+        let entries = match self.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
             Ok(v) => v.entries,
             Err(_) => Vec::new(),
         };
@@ -2563,8 +2889,7 @@ impl AmmDataProvider {
                 // Low-risk chart fix: for token-derived USD/MCUSD series, force the newest
                 // (active/unresolved) candle `close` to match the current spot close from the 10m
                 // series. This avoids cross-timeframe close drift without changing indexing.
-                let spot_close_10m: Option<u128> = if tf != Timeframe::M10 && (is_usd || is_mcusd)
-                {
+                let spot_close_10m: Option<u128> = if tf != Timeframe::M10 && (is_usd || is_mcusd) {
                     let spot_tf = Timeframe::M10;
                     let spot_slice = if is_mcusd {
                         if let Some(quote) = derived_quote {
@@ -3209,27 +3534,19 @@ pub struct GetMultiValuesResult {
     pub values: Vec<Option<Vec<u8>>>,
 }
 
-pub struct GetScanPrefixParams {
+pub struct GetListKeysByPrefixParams {
     pub prefix: Vec<u8>,
 }
 
-pub struct GetScanPrefixResult {
+pub struct GetListKeysByPrefixResult {
     pub keys: Vec<Vec<u8>>,
 }
 
-pub struct GetIterPrefixRevParams {
+pub struct GetListEntriesDescParams {
     pub prefix: Vec<u8>,
 }
 
-pub struct GetIterPrefixRevResult {
-    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-pub struct GetIterFromParams {
-    pub start: Vec<u8>,
-}
-
-pub struct GetIterFromResult {
+pub struct GetListEntriesDescResult {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -3788,15 +4105,6 @@ pub fn encode_pool_creation_info(v: &SchemaPoolCreationInfoV1) -> anyhow::Result
     Ok(borsh::to_vec(v)?)
 }
 
-pub fn decode_pool_details_snapshot(bytes: &[u8]) -> anyhow::Result<SchemaPoolDetailsSnapshot> {
-    use borsh::BorshDeserialize;
-    Ok(SchemaPoolDetailsSnapshot::try_from_slice(bytes)?)
-}
-
-pub fn encode_pool_details_snapshot(v: &SchemaPoolDetailsSnapshot) -> anyhow::Result<Vec<u8>> {
-    Ok(borsh::to_vec(v)?)
-}
-
 pub fn decode_u128_value(bytes: &[u8]) -> anyhow::Result<u128> {
     if bytes.len() != 16 {
         return Err(anyhow!("invalid u128 length {}", bytes.len()));
@@ -3808,6 +4116,28 @@ pub fn decode_u128_value(bytes: &[u8]) -> anyhow::Result<u128> {
 
 pub fn encode_u128_value(value: u128) -> anyhow::Result<Vec<u8>> {
     Ok(value.to_le_bytes().to_vec())
+}
+
+pub fn decode_f64_value(bytes: &[u8]) -> anyhow::Result<f64> {
+    if bytes.len() != 8 {
+        return Err(anyhow!("invalid f64 length {}", bytes.len()));
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&bytes[..8]);
+    Ok(f64::from_le_bytes(arr))
+}
+
+pub fn encode_f64_value(value: f64) -> anyhow::Result<Vec<u8>> {
+    Ok(value.to_le_bytes().to_vec())
+}
+
+pub fn decode_pool_snapshot(bytes: &[u8]) -> anyhow::Result<SchemaPoolSnapshot> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaPoolSnapshot::try_from_slice(bytes)?)
+}
+
+pub fn encode_pool_snapshot(v: &SchemaPoolSnapshot) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
 }
 
 // Encode Snapshot -> BORSH (deterministic order via BTreeMap)
@@ -3865,6 +4195,13 @@ fn decode_alkane_id_be(bytes: &[u8]) -> Option<SchemaAlkaneId> {
     Some(SchemaAlkaneId { block: u32::from_be_bytes(block_arr), tx: u64::from_be_bytes(tx_arr) })
 }
 
+pub fn encode_alkane_id_be(id: &SchemaAlkaneId) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[..4].copy_from_slice(&id.block.to_be_bytes());
+    out[4..].copy_from_slice(&id.tx.to_be_bytes());
+    out
+}
+
 fn parse_alkane_id_from_prefixed_key(prefix: &[u8], key: &[u8]) -> Option<SchemaAlkaneId> {
     if !key.starts_with(prefix) {
         return None;
@@ -3894,7 +4231,7 @@ fn read_token_usd_candles_v1(
     let logical = table.token_usd_candle_ns_prefix(&token, tf);
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: logical })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -3990,7 +4327,7 @@ fn read_token_derived_usd_candles_v1(
     let logical = table.token_derived_usd_candle_ns_prefix(&token, &quote, tf);
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: logical })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4086,7 +4423,7 @@ fn read_token_derived_mcusd_candles_v1(
     let logical = table.token_derived_mcusd_candle_ns_prefix(&token, &quote, tf);
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: logical })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4181,7 +4518,7 @@ fn read_token_mcusd_candles_v1(
     let logical = table.token_mcusd_candle_ns_prefix(&token, tf);
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: logical })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4275,7 +4612,7 @@ fn read_btc_usd_line_v1(
     let logical = table.btc_usd_line_ns_prefix(tf);
     let mut per_bucket: BTreeMap<u64, u128> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: logical })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {

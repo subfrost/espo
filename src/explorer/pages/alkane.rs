@@ -19,7 +19,7 @@ use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::{explorer_base_path, explorer_path};
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::schemas::Timeframe;
-use crate::modules::ammdata::storage::AmmDataTable;
+use crate::modules::ammdata::storage::{AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams};
 use crate::modules::essentials::storage::{
     BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
 };
@@ -146,13 +146,14 @@ pub async fn alkane_page(
 
             let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
             let table = AmmDataTable::new(&amm_mdb);
+            let amm_provider =
+                AmmDataProvider::new(Arc::new(amm_mdb.clone()), Arc::new(state.essentials_provider()));
 
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
-                amm_mdb
-                    .iter_prefix_rev(&amm_mdb.prefixed(&rel_prefix))
-                    .next()
-                    .and_then(|r| r.ok())
-                    .is_some()
+                amm_provider
+                    .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: rel_prefix })
+                    .map(|res| !res.keys.is_empty())
+                    .unwrap_or(false)
             };
 
             if is_derived_quote_token {
@@ -161,7 +162,11 @@ pub async fn alkane_page(
                 false
             } else {
                 derived_quotes.iter().any(|quote| {
-                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(&alk, quote, Timeframe::D1))
+                    has_prefix(table.token_derived_mcusd_candle_ns_prefix(
+                        &alk,
+                        quote,
+                        Timeframe::D1,
+                    ))
                 })
             }
         };

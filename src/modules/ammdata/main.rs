@@ -1,6 +1,6 @@
 use super::schemas::{ActivityKind, SchemaCandleV1, SchemaMarketDefs, active_timeframes};
 use super::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetPoolDefsParams, GetRawValueParams,
+    AmmDataProvider, GetListEntriesDescParams, GetPoolDefsParams, GetRawValueParams,
     GetTokenPoolsParams, SetBatchParams,
 };
 use super::utils::activity::decode_activity_v1;
@@ -352,7 +352,7 @@ pub(crate) fn pool_trade_windows(
     let mut out = PoolTradeWindows::default();
 
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })?
         .entries
     {
         let Some((ts, seq)) = decode_ts_seq_from_index(prefix_len, &k, &v) else {

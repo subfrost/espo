@@ -48,6 +48,7 @@ impl TestConfigBuilder {
             safe_tip_hook_script: None,
             block_source_mode: BlockFetchMode::RpcOnly,
             simulate_reorg: false,
+            chunk_size: 256,
             explorer_networks: None,
             modules: HashMap::new(),
         };

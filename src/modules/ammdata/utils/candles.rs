@@ -3,7 +3,7 @@ use crate::modules::ammdata::schemas::{SchemaCandleV1, SchemaFullCandleV1, Timef
 use crate::schemas::SchemaAlkaneId;
 
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
+    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams,
 };
 use crate::modules::ammdata::storage::{decode_full_candle_v1, encode_full_candle_v1};
 use anyhow::Result;
@@ -215,7 +215,7 @@ pub fn read_candles_v1(
     let logical = table.candle_ns_prefix(&pool, tf);
     let mut per_bucket: BTreeMap<u64, SchemaFullCandleV1> = BTreeMap::new();
     for (k, v) in provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: logical })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: logical })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {

@@ -10,7 +10,7 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
     GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams,
     GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams,
-    GetFactoryPoolsParams, GetIterPrefixRevParams, GetLatestTokenUsdCloseParams,
+    GetFactoryPoolsParams, GetListEntriesDescParams, GetLatestTokenUsdCloseParams,
     GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
     GetPoolDefsParams, GetPoolDetailsSnapshotParams, GetPoolFactoryParams,
     GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
@@ -2060,6 +2060,8 @@ pub async fn get_address_wrap_history(
         offset,
         limit,
         successful,
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2109,6 +2111,8 @@ pub async fn get_address_unwrap_history(
         offset,
         limit,
         successful,
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2153,6 +2157,8 @@ pub async fn get_all_wrap_history(
         offset,
         limit,
         successful,
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2197,6 +2203,8 @@ pub async fn get_all_unwrap_history(
         offset,
         limit,
         successful,
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2243,7 +2251,11 @@ pub async fn get_total_unwrap_amount(
     } else {
         match state
             .subfrost
-            .get_unwrap_total_latest(GetUnwrapTotalLatestParams { successful })
+            .get_unwrap_total_latest(GetUnwrapTotalLatestParams {
+                successful,
+                height: None,
+                height_present: false,
+            })
         {
             Ok(res) => res.total,
             Err(err) => return internal_error(err),
@@ -2284,6 +2296,8 @@ pub async fn get_all_address_amm_tx_history(
             offset,
             limit,
             successful: if successful_only { Some(true) } else { None },
+            height: None,
+            height_present: false,
         }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
@@ -2310,6 +2324,8 @@ pub async fn get_all_address_amm_tx_history(
                 offset,
                 limit,
                 successful: if successful_only { Some(true) } else { None },
+                height: None,
+                height_present: false,
             }) {
                 Ok(res) => res,
                 Err(err) => return internal_error(err),
@@ -2383,6 +2399,8 @@ pub async fn get_all_address_amm_tx_history(
         offset: 0,
         limit: combined_limit,
         successful: if successful_only { Some(true) } else { None },
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2393,6 +2411,8 @@ pub async fn get_all_address_amm_tx_history(
             offset: 0,
             limit: combined_limit,
             successful: if successful_only { Some(true) } else { None },
+            height: None,
+            height_present: false,
         }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
@@ -2452,6 +2472,8 @@ pub async fn get_all_amm_tx_history(
             offset,
             limit,
             successful: if successful_only { Some(true) } else { None },
+            height: None,
+            height_present: false,
         }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
@@ -2476,6 +2498,8 @@ pub async fn get_all_amm_tx_history(
             offset,
             limit,
             successful: if successful_only { Some(true) } else { None },
+            height: None,
+            height_present: false,
         }) {
             Ok(res) => res,
             Err(err) => return internal_error(err),
@@ -2548,6 +2572,8 @@ pub async fn get_all_amm_tx_history(
         offset: 0,
         limit: combined_limit,
         successful: if successful_only { Some(true) } else { None },
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2556,6 +2582,8 @@ pub async fn get_all_amm_tx_history(
         offset: 0,
         limit: combined_limit,
         successful: if successful_only { Some(true) } else { None },
+        height: None,
+        height_present: false,
     }) {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -2969,7 +2997,7 @@ fn pool_candle_volume_sums(
     let window_start = bucket_now.saturating_sub(6 * Timeframe::D1.duration_secs());
     let table = state.ammdata.table();
     let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
-    let entries = state.ammdata.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?.entries;
+    let entries = state.ammdata.get_list_entries_desc(GetListEntriesDescParams { prefix })?.entries;
 
     let mut token0_volume_7d = 0u128;
     let mut token1_volume_7d = 0u128;
@@ -3218,7 +3246,7 @@ fn collect_amm_history_items(
     };
     let entries = state
         .ammdata
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })?
         .entries;
 
     let mut total = 0usize;

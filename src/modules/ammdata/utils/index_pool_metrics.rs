@@ -1,12 +1,10 @@
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
-use crate::modules::ammdata::schemas::{
-    SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe,
-};
+use crate::modules::ammdata::schemas::{SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetPoolCreationInfoParams, GetPoolMetricsV2Params,
+    AmmDataProvider, GetListEntriesDescParams, GetPoolCreationInfoParams, GetPoolMetricsV2Params,
     GetTokenMetricsParams, GetTvlVersionedAtOrBeforeParams, PoolMetricsIndexField,
-    decode_full_candle_v1, encode_pool_details_snapshot, encode_pool_metrics,
-    encode_pool_metrics_v2, encode_u128_value, parse_change_basis_points,
+    decode_full_candle_v1, encode_f64_value, encode_pool_metrics, encode_pool_metrics_v2,
+    encode_u128_value, parse_change_basis_points,
 };
 use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::index_state::IndexState;
@@ -130,7 +128,7 @@ pub fn derive_pool_metrics(
                     };
                 } else {
                     let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
-                    if let Ok(res) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })
+                    if let Ok(res) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix })
                     {
                         if let Some((_k, v)) = res.entries.into_iter().next() {
                             if let Ok(candle) = decode_full_candle_v1(&v) {
@@ -500,7 +498,7 @@ pub fn derive_pool_metrics(
         let tvl_change_24h = crate::modules::ammdata::parse_change_f64(&metrics.tvl_change_24h);
         let tvl_change_7d = crate::modules::ammdata::parse_change_f64(&metrics.tvl_change_7d);
 
-        let value = json!({
+        let _value = json!({
             "token0": crate::modules::ammdata::alkane_id_json(&defs.base_alkane_id),
             "token1": crate::modules::ammdata::alkane_id_json(&defs.quote_alkane_id),
             "token0Amount": token0_amount.to_string(),
@@ -541,23 +539,45 @@ pub fn derive_pool_metrics(
             "tvlChange": tvl_change_24h,
         });
 
-        let snapshot = SchemaPoolDetailsSnapshot {
-            value_json: serde_json::to_vec(&value)?,
-            token0_tvl_usd,
-            token1_tvl_usd,
-            token0_tvl_sats,
-            token1_tvl_sats,
-            pool_tvl_usd,
-            pool_volume_1d_usd: metrics.pool_volume_1d_usd,
-            pool_volume_30d_usd: metrics.pool_volume_30d_usd,
-            pool_apr,
-            tvl_change_24h,
-            lp_supply,
-        };
-
         state.pool_details_snapshot_writes.push((
-            table.pool_details_snapshot_key(pool),
-            encode_pool_details_snapshot(&snapshot)?,
+            table.pool_details_snapshot_field_key(pool, "token0_tvl_usd"),
+            encode_u128_value(token0_tvl_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "token1_tvl_usd"),
+            encode_u128_value(token1_tvl_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "token0_tvl_sats"),
+            encode_u128_value(token0_tvl_sats)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "token1_tvl_sats"),
+            encode_u128_value(token1_tvl_sats)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_tvl_usd"),
+            encode_u128_value(pool_tvl_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_volume_1d_usd"),
+            encode_u128_value(metrics.pool_volume_1d_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_volume_30d_usd"),
+            encode_u128_value(metrics.pool_volume_30d_usd)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "pool_apr"),
+            encode_f64_value(pool_apr)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "tvl_change_24h"),
+            encode_f64_value(tvl_change_24h)?,
+        ));
+        state.pool_details_snapshot_writes.push((
+            table.pool_details_snapshot_field_key(pool, "lp_supply"),
+            encode_u128_value(lp_supply)?,
         ));
 
         state

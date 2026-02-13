@@ -57,6 +57,7 @@ use crate::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
     },
     runtime::rpc::run_rpc,
+    runtime::tree_db::get_global_tree_db,
 };
 use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
@@ -91,51 +92,49 @@ fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> st
 }
 
 fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
-    let Some(aof) = get_aof_manager() else { return None };
     if !should_watch_for_reorg(next_height, safe_tip) {
         return None;
     }
-
-    let logs = match aof.recent_blocks(AOF_REORG_DEPTH as usize) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[aof] failed to load recent blocks: {e:?}");
-            return None;
-        }
-    };
-    if logs.is_empty() {
-        return None;
-    }
+    let Some(tree) = get_global_tree_db() else { return None };
 
     let rpc = get_bitcoind_rpc_client();
-    let mut mismatch = false;
-    for log in &logs {
-        match rpc.get_block_hash(log.height as u64) {
-            Ok(h) => {
-                if h.to_string() != log.block_hash {
-                    mismatch = true;
-                    break;
-                }
-            }
+    let from_height = safe_tip.saturating_sub(AOF_REORG_DEPTH.saturating_sub(1));
+    let mut mismatch_from: Option<u32> = None;
+    for h in from_height..=safe_tip {
+        let chain_hash = match rpc.get_block_hash(h as u64) {
+            Ok(hash) => hash,
             Err(e) => {
-                eprintln!("[aof] failed to fetch block hash for {}: {e:?}", log.height);
+                eprintln!("[tree] failed to fetch block hash for {}: {e:?}", h);
                 return None;
+            }
+        };
+        let indexed_hash = match tree.blockhash_for_height(h) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[tree] failed to fetch indexed hash for {}: {e:?}", h);
+                return None;
+            }
+        };
+        match indexed_hash {
+            Some(stored) if stored == chain_hash => {}
+            _ => {
+                mismatch_from = Some(h);
+                break;
             }
         }
     }
-
-    if !mismatch {
+    let Some(rewind_height) = mismatch_from else {
         return None;
-    }
+    };
 
-    let revert_count = logs.len().min(AOF_REORG_DEPTH as usize);
+    let old_tip = next_height.saturating_sub(1);
     eprintln!(
-        "[aof] detected reorg near height {} (safe tip {}); reverting {} blocks",
-        next_height, safe_tip, revert_count
+        "[tree] detected reorg near height {} (safe tip {}); rewinding to {}",
+        next_height, safe_tip, rewind_height
     );
 
-    if let Err(e) = aof.revert_last_blocks(revert_count) {
-        eprintln!("[aof] rollback failed: {e:?}");
+    if let Err(e) = tree.pin_active_root_until_height(old_tip) {
+        eprintln!("[tree] failed to pin active root through height {}: {e:?}", old_tip);
         return None;
     }
 
@@ -143,7 +142,7 @@ fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
         eprintln!("[mempool] failed to reset store after reorg: {e:?}");
     }
 
-    Some(next_height.saturating_sub(revert_count as u32))
+    Some(rewind_height)
 }
 
 fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
@@ -259,11 +258,17 @@ async fn run_indexer_loop(
 
                     let block_hash = espo_block.block_header.block_hash();
 
-                    // Only capture AOF changes when we're near the safe tip; skip during deep catch-up.
-                    let aof_for_block =
-                        get_aof_manager().filter(|_| should_watch_for_reorg(next_height, tip));
-                    if let Some(aof) = &aof_for_block {
-                        aof.start_block(next_height, &block_hash);
+                    if let Some(tree) = get_global_tree_db() {
+                        if let Err(e) = tree.begin_block(
+                            next_height,
+                            &block_hash,
+                            &espo_block.block_header.prev_blockhash,
+                        ) {
+                            eprintln!(
+                                "[tree] failed to begin block {} ({}): {e:?}",
+                                next_height, block_hash
+                            );
+                        }
                     }
 
                     for m in mods.modules() {
@@ -293,12 +298,9 @@ async fn run_indexer_loop(
                         ),
                     }
 
-                    if let Some(aof) = &aof_for_block {
-                        if let Err(e) = aof.finish_block() {
-                            eprintln!(
-                                "[aof] failed to persist block {} changes: {e:?}",
-                                next_height
-                            );
+                    if let Some(tree) = get_global_tree_db() {
+                        if let Err(e) = tree.finish_block() {
+                            eprintln!("[tree] failed to finish block {}: {e:?}", next_height);
                         }
                     }
 

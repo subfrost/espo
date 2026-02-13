@@ -1,7 +1,7 @@
 use crate::modules::ammdata::consts::AMOUNT_SCALE;
 use crate::modules::ammdata::schemas::{ActivityDirection, ActivityKind, SchemaActivityV1};
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams,
+    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams,
 };
 use crate::modules::ammdata::utils::candles::PriceSide;
 use crate::schemas::SchemaAlkaneId;
@@ -488,7 +488,7 @@ pub fn read_activity_for_pool(
     // Collect newest → oldest
     let mut all: Vec<(u64, SchemaActivityV1)> = Vec::new();
     let prefix = activity_ns_prefix(&pool);
-    for (k, v) in provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix })?.entries {
+    for (k, v) in provider.get_list_entries_desc(GetListEntriesDescParams { prefix })?.entries {
         let ts = parse_ts_from_key_tail(&k).unwrap_or_default();
         let a = decode_activity_v1(&v)?;
         if let Some(group) = group_from_filter(activity_type) {
@@ -604,7 +604,7 @@ fn total_for_pool_index(
         }
     }
     let entries = provider
-        .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.to_vec() })?
+        .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.to_vec() })?
         .entries;
     Ok(entries.len())
 }
@@ -682,7 +682,7 @@ pub fn read_activity_for_pool_sorted(
     // scan index keys and decode (ts, seq) from value (preferred) or key tail
     let read_pairs_from_prefix = |prefix: &[u8]| -> Result<Vec<(u64, u32)>> {
         let mut entries = provider
-            .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.to_vec() })?
+            .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.to_vec() })?
             .entries;
         if matches!(dir, SortDir::Asc) {
             entries.reverse();

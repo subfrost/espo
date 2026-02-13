@@ -16,7 +16,7 @@
   "explorer_host": "0.0.0.0:5081",
   "network": "mainnet",
   "debug": true,
-  "debug_ignore_ms": 50,
+  "debug_ignore_ms": 1,
   "debug_backup": {
     "blocks": [
       880100, 900000, 903500, 908368, 913765, 916290, 920000, 925000, 930000,
@@ -44,8 +44,8 @@
     },
     "subfrost": {},
     "ammdata": {
-      "eth_rpc": "https://eth-mainnet.g.alchemy.com/v2/THWHjh0GMbRvWxCzc865L",
-      "eth_call_throttle": 50,
+      "eth_rpc": "https://tame-frequent-fog.quiknode.pro/774f0081965a0e9378059e0622c2a584fb8859f2",
+      "eth_call_throttle": 200,
       "derived_liquidity": [{ "alkane": "2:0", "strategy": "neutral-vwap" }],
       "search_index_enabled": true,
       "search_prefix_min": 2,

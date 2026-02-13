@@ -80,6 +80,7 @@ fn init_global_config() {
             debug: false,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             simulate_reorg: false,
+            chunk_size: 256,
             explorer_networks: None,
             modules: std::collections::HashMap::new(),
         };

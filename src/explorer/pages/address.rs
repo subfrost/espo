@@ -6,7 +6,6 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
-use borsh::BorshDeserialize;
 use maud::html;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -27,7 +26,7 @@ use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::BalanceEntry;
-use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable};
+use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load_tx_summary_v2};
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_balances_with_spent_batch,
 };
@@ -147,6 +146,7 @@ pub async fn address_page(
     let electrum_like = get_electrum_like();
     let address_str = address.to_string();
     let table = EssentialsTable::new(&state.essentials_mdb);
+    let essentials_provider = state.essentials_provider();
     let address_stats = electrum_like
         .address_stats(&address)
         .map_err(|e| {
@@ -239,9 +239,6 @@ pub async fn address_page(
                 }
             }
 
-            let summary_keys: Vec<Vec<u8>> =
-                txids.iter().map(|t| table.alkane_tx_summary_key(&t.to_byte_array())).collect();
-            let summary_vals = state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
             let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
             for (idx, txid) in txids.iter().enumerate() {
@@ -256,10 +253,7 @@ pub async fn address_page(
                         continue;
                     }
                 };
-                let summary = summary_vals
-                    .get(idx)
-                    .and_then(|v| v.as_ref())
-                    .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                let summary = load_tx_summary_v2(&essentials_provider, txid);
                 let confirmations = summary.as_ref().and_then(|s| {
                     let h = s.height as u64;
                     chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
@@ -307,12 +301,6 @@ pub async fn address_page(
                             hist_page.total.unwrap_or(entries.len()).max(entries.len());
                         let txids: Vec<Txid> =
                             entries.iter().take(remaining_slots).map(|h| h.txid).collect();
-                        let summary_keys: Vec<Vec<u8>> = txids
-                            .iter()
-                            .map(|t| table.alkane_tx_summary_key(&t.to_byte_array()))
-                            .collect();
-                        let summary_vals =
-                            state.essentials_mdb.multi_get(&summary_keys).unwrap_or_default();
                         let raw_txs =
                             electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
 
@@ -331,10 +319,7 @@ pub async fn address_page(
                                     continue;
                                 }
                             };
-                            let summary = summary_vals
-                                .get(idx)
-                                .and_then(|v| v.as_ref())
-                                .and_then(|b| AlkaneTxSummary::try_from_slice(b).ok());
+                            let summary = load_tx_summary_v2(&essentials_provider, &entry.txid);
                             let traces = summary
                                 .as_ref()
                                 .map(|s| traces_from_summary(&entry.txid, s))

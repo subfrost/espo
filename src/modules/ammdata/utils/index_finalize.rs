@@ -1,6 +1,4 @@
-use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetRawValueParams, encode_reserves_snapshot,
-};
+use crate::modules::ammdata::storage::{AmmDataProvider, GetRawValueParams, encode_pool_snapshot};
 use crate::modules::ammdata::utils::activity::{
     decode_u64_be, encode_u64_be, idx_count_key, idx_count_key_group,
 };
@@ -162,8 +160,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         }
     }
 
-    let reserves_blob = encode_reserves_snapshot(&state.reserves_snapshot)?;
-    let reserves_key_rel = table.reserves_snapshot_key();
+    let reserves_cnt = state.reserves_snapshot.len();
 
     let c_cnt = state.candle_writes.len();
     let tc_cnt = state.token_usd_candle_writes.len();
@@ -245,7 +242,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.amm_history_all_writes.is_empty()
         || !activity_writes.is_empty()
         || !index_writes.is_empty()
-        || !reserves_blob.is_empty();
+        || reserves_cnt > 0;
 
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     puts.extend(std::mem::take(&mut state.candle_writes));
@@ -285,7 +282,11 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.amm_history_all_writes));
     puts.extend(activity_writes);
     puts.extend(index_writes);
-    puts.push((reserves_key_rel, reserves_blob));
+    for (pool, snapshot) in &state.reserves_snapshot {
+        if let Ok(enc) = encode_pool_snapshot(snapshot) {
+            puts.push((table.reserves_snapshot_pool_key(pool), enc));
+        }
+    }
 
     let mut deletes: Vec<Vec<u8>> = Vec::new();
     deletes.extend(std::mem::take(&mut state.token_metrics_index_deletes));

@@ -13,6 +13,21 @@ use crate::modules::essentials::storage::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+fn resolve_view(provider: &EssentialsProvider, payload: &Value) -> Result<EssentialsProvider, Value> {
+    provider
+        .with_height(
+            payload.get("height").and_then(|v| v.as_u64()),
+            payload.get("height").is_some(),
+        )
+        .map_err(|e| {
+            json!({
+                "ok": false,
+                "error": "missing_or_invalid_height",
+                "detail": e.to_string()
+            })
+        })
+}
+
 pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
     let mdb = Arc::clone(&provider);
 
@@ -26,6 +41,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_mempool_traces", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_mem);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetMempoolTracesParams {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
@@ -35,7 +54,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty()),
                         };
-                        mdb.rpc_get_mempool_traces(params)
+                        view.rpc_get_mempool_traces(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -52,6 +71,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_keys", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_get);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let keys = payload.get("keys").and_then(|v| v.as_array()).map(|arr| {
                             arr.iter()
                                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -69,7 +92,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             keys,
                         };
-                        mdb.rpc_get_keys(params)
+                        view.rpc_get_keys(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -86,11 +109,15 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_all_alkanes", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_all);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAllAlkanesParams {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_all_alkanes(params)
+                        view.rpc_get_all_alkanes(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -107,13 +134,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_info", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_info);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneInfoParams {
                             alkane: payload
                                 .get("alkane")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        mdb.rpc_get_alkane_info(params)
+                        view.rpc_get_alkane_info(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -130,10 +161,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_block_summary", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_summary);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetBlockSummaryParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_block_summary(params)
+                        view.rpc_get_block_summary(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -150,6 +185,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_holders", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_holders);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetHoldersParams {
                             alkane: payload
                                 .get("alkane")
@@ -158,7 +197,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_holders(params)
+                        view.rpc_get_holders(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -175,6 +214,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_transfer_volume", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_transfer);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetTransferVolumeParams {
                             alkane: payload
                                 .get("alkane")
@@ -183,7 +226,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_transfer_volume(params)
+                        view.rpc_get_transfer_volume(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -200,6 +243,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_total_received", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_received);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetTotalReceivedParams {
                             alkane: payload
                                 .get("alkane")
@@ -208,7 +255,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_total_received(params)
+                        view.rpc_get_total_received(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -225,6 +272,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_circulating_supply", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_supply);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetCirculatingSupplyParams {
                             alkane: payload
                                 .get("alkane")
@@ -233,7 +284,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             height_present: payload.get("height").is_some(),
                         };
-                        mdb.rpc_get_circulating_supply(params)
+                        view.rpc_get_circulating_supply(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -250,13 +301,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_address_activity", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_activity);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAddressActivityParams {
                             address: payload
                                 .get("address")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        mdb.rpc_get_address_activity(params)
+                        view.rpc_get_address_activity(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -273,6 +328,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_address_balances", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_addr_bal);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAddressBalancesParams {
                             address: payload
                                 .get("address")
@@ -282,7 +341,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .get("include_outpoints")
                                 .and_then(|v| v.as_bool()),
                         };
-                        mdb.rpc_get_address_balances(params)
+                        view.rpc_get_address_balances(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -299,6 +358,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_balances", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_alk_bal);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneBalancesParams {
                             alkane: payload
                                 .get("alkane")
@@ -307,7 +370,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             height_present: payload.get("height").is_some(),
                         };
-                        mdb.rpc_get_alkane_balances(params)
+                        view.rpc_get_alkane_balances(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -324,6 +387,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_balance_metashrew", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_live_bal);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let height_present = payload.get("height").is_some();
                         let params = RpcGetAlkaneBalanceMetashrewParams {
                             owner: payload
@@ -338,7 +405,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             height_present,
                         };
-                        mdb.rpc_get_alkane_balance_metashrew(params)
+                        view.rpc_get_alkane_balance_metashrew(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -355,6 +422,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_balance_txs", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_bal_txs);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneBalanceTxsParams {
                             alkane: payload
                                 .get("alkane")
@@ -363,7 +434,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_alkane_balance_txs(params)
+                        view.rpc_get_alkane_balance_txs(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -380,6 +451,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_balance_txs_by_token", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_bal_txs_tok);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneBalanceTxsByTokenParams {
                             owner: payload
                                 .get("owner")
@@ -392,7 +467,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_alkane_balance_txs_by_token(params)
+                        view.rpc_get_alkane_balance_txs_by_token(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -409,13 +484,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_outpoint_balances", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_op_bal);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetOutpointBalancesParams {
                             outpoint: payload
                                 .get("outpoint")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        mdb.rpc_get_outpoint_balances(params)
+                        view.rpc_get_outpoint_balances(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -432,10 +511,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_block_traces", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_traces);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetBlockTracesParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_block_traces(params)
+                        view.rpc_get_block_traces(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -452,13 +535,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_holders_count", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_holders_count);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetHoldersCountParams {
                             alkane: payload
                                 .get("alkane")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        mdb.rpc_get_holders_count(params)
+                        view.rpc_get_holders_count(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -475,13 +562,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_address_outpoints", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_addr_ops);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAddressOutpointsParams {
                             address: payload
                                 .get("address")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        mdb.rpc_get_address_outpoints(params)
+                        view.rpc_get_address_outpoints(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -498,13 +589,17 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_tx_summary", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_tx_summary);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneTxSummaryParams {
                             txid: payload
                                 .get("txid")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
                         };
-                        mdb.rpc_get_alkane_tx_summary(params)
+                        view.rpc_get_alkane_tx_summary(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -521,12 +616,16 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_block_txs", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_block_txs);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneBlockTxsParams {
                             height: payload.get("height").and_then(|v| v.as_u64()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_alkane_block_txs(params)
+                        view.rpc_get_alkane_block_txs(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -543,6 +642,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_alkane_address_txs", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_addr_txs);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAlkaneAddressTxsParams {
                             address: payload
                                 .get("address")
@@ -551,7 +654,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
                         };
-                        mdb.rpc_get_alkane_address_txs(params)
+                        view.rpc_get_alkane_address_txs(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -568,6 +671,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                 .register("get_address_transactions", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_addr_txs);
                     async move {
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
                         let params = RpcGetAddressTransactionsParams {
                             address: payload
                                 .get("address")
@@ -579,7 +686,7 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .get("only_alkane_txs")
                                 .and_then(|v| v.as_bool()),
                         };
-                        mdb.rpc_get_address_transactions(params)
+                        view.rpc_get_address_transactions(params)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -593,10 +700,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
         let mdb_latest_traces = Arc::clone(&mdb);
         tokio::spawn(async move {
             reg_latest_traces
-                .register("get_alkane_latest_traces", move |_cx, _payload| {
+                .register("get_alkane_latest_traces", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_latest_traces);
                     async move {
-                        mdb.rpc_get_alkane_latest_traces(RpcGetAlkaneLatestTracesParams)
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        view.rpc_get_alkane_latest_traces(RpcGetAlkaneLatestTracesParams)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                     }
@@ -610,10 +721,14 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
         let mdb_ping = Arc::clone(&mdb);
         tokio::spawn(async move {
             reg_ping
-                .register("ping", move |_cx, _payload| {
+                .register("ping", move |_cx, payload| {
                     let mdb = Arc::clone(&mdb_ping);
                     async move {
-                        mdb.rpc_ping(RpcPingParams)
+                        let view = match resolve_view(mdb.as_ref(), &payload) {
+                            Ok(v) => v,
+                            Err(err) => return err,
+                        };
+                        view.rpc_ping(RpcPingParams)
                             .map(|resp| resp.value)
                             .unwrap_or_else(|_| Value::String("pong".to_string()))
                     }

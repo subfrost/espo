@@ -57,6 +57,17 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                 .register("get_series_id_from_alkane_id", move |_cx, payload| {
                     let provider = Arc::clone(&provider_one);
                     async move {
+                        let height = payload.get("height").and_then(|v| v.as_u64());
+                        let height_present = payload.get("height").is_some();
+                        let view = match provider.with_height(height, height_present) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return json!({
+                                    "ok": false,
+                                    "error": "invalid_height"
+                                });
+                            }
+                        };
                         let alk = match payload
                             .get("alkane_id")
                             .and_then(|v| v.as_str())
@@ -76,7 +87,7 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                             }
                         };
 
-                        let entry = match provider.get_series_by_alkane(&alk) {
+                        let entry = match view.get_series_by_alkane(&alk) {
                             Ok(Some(entry)) => entry,
                             Ok(None) => return json!({"ok": false, "error": "not_found"}),
                             Err(e) => {
@@ -105,6 +116,17 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                 .register("get_series_ids_from_alkane_ids", move |_cx, payload| {
                     let provider = Arc::clone(&provider_batch);
                     async move {
+                        let height = payload.get("height").and_then(|v| v.as_u64());
+                        let height_present = payload.get("height").is_some();
+                        let view = match provider.with_height(height, height_present) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return json!({
+                                    "ok": false,
+                                    "error": "invalid_height"
+                                });
+                            }
+                        };
                         let ids = match payload.get("alkane_ids").and_then(|v| v.as_array()) {
                             Some(v) => v,
                             None => {
@@ -136,7 +158,7 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         }
 
                         let mut out: Vec<Value> = Vec::with_capacity(ids.len());
-                        let results = match provider.get_series_by_alkanes(&lookup) {
+                        let results = match view.get_series_by_alkanes(&lookup) {
                             Ok(res) => res,
                             Err(e) => {
                                 log_rpc(
@@ -179,6 +201,17 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                 .register("get_alkane_id_from_series_id", move |_cx, payload| {
                     let provider = Arc::clone(&provider_one);
                     async move {
+                        let height = payload.get("height").and_then(|v| v.as_u64());
+                        let height_present = payload.get("height").is_some();
+                        let view = match provider.with_height(height, height_present) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return json!({
+                                    "ok": false,
+                                    "error": "invalid_height"
+                                });
+                            }
+                        };
                         let series_id = match payload
                             .get("series_id")
                             .and_then(|v| v.as_str())
@@ -197,7 +230,7 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                             }
                         };
 
-                        let entry = match provider.get_series_by_id(&series_id) {
+                        let entry = match view.get_series_by_id(&series_id) {
                             Ok(Some(entry)) => entry,
                             Ok(None) => return json!({"ok": false, "error": "not_found"}),
                             Err(e) => {
@@ -226,6 +259,17 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                 .register("get_alkane_ids_from_series_ids", move |_cx, payload| {
                     let provider = Arc::clone(&provider_batch);
                     async move {
+                        let height = payload.get("height").and_then(|v| v.as_u64());
+                        let height_present = payload.get("height").is_some();
+                        let view = match provider.with_height(height, height_present) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return json!({
+                                    "ok": false,
+                                    "error": "invalid_height"
+                                });
+                            }
+                        };
                         let ids = match payload.get("series_ids").and_then(|v| v.as_array()) {
                             Some(v) => v,
                             None => {
@@ -257,7 +301,7 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         }
 
                         let mut out: Vec<Value> = Vec::with_capacity(ids.len());
-                        let results = match provider.get_series_by_ids(&lookup) {
+                        let results = match view.get_series_by_ids(&lookup) {
                             Ok(res) => res,
                             Err(e) => {
                                 log_rpc(

@@ -5,10 +5,10 @@ use crate::modules::ammdata::schemas::{
     SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaTokenMetricsV1, Timeframe,
 };
 use crate::modules::ammdata::storage::{
-    AmmDataProvider, GetIterPrefixRevParams, GetRawValueParams, SearchIndexField,
-    TokenMetricsIndexField, decode_candle_v1, decode_canonical_pools, decode_full_candle_v1,
-    decode_token_metrics, decode_u128_value, encode_candle_v1, encode_canonical_pools,
-    encode_token_metrics, encode_u128_value, parse_change_basis_points,
+    AmmDataProvider, GetListEntriesDescParams, GetRawValueParams, SearchIndexField,
+    TokenMetricsIndexField, decode_candle_v1, decode_full_candle_v1, decode_token_metrics,
+    decode_u128_value, encode_alkane_id_be, encode_candle_v1, encode_token_metrics,
+    encode_u128_value, parse_change_basis_points,
 };
 use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::index_state::IndexState;
@@ -49,7 +49,9 @@ pub fn derive_token_data(
                     eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
                 }
             },
-            Err(e) => eprintln!("[AMMDATA] btc/usd price_feed init failed at height {height}: {e:?}"),
+            Err(e) => {
+                eprintln!("[AMMDATA] btc/usd price_feed init failed at height {height}: {e:?}")
+            }
         }
 
         if price.is_none() {
@@ -61,7 +63,7 @@ pub fn derive_token_data(
         }
         if price.is_none() {
             let prefix = table.btc_usd_price_prefix();
-            if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+            if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
                 if let Some((_k, v)) = resp.entries.into_iter().next() {
                     price = decode_u128_value(&v).ok();
                 }
@@ -137,24 +139,11 @@ pub fn derive_token_data(
     };
 
     for (token, new_entries) in state.canonical_pool_updates.iter() {
-        let key = table.canonical_pool_key(token);
-        let mut existing = if let Some(raw) =
-            provider.get_raw_value(GetRawValueParams { key: key.clone() })?.value
-        {
-            decode_canonical_pools(&raw).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut changed = false;
         for entry in new_entries {
-            if !existing.iter().any(|e| e == entry) {
-                existing.push(*entry);
-                changed = true;
-            }
-        }
-        if changed {
-            let encoded = encode_canonical_pools(&existing)?;
-            state.canonical_pool_writes.push((key, encoded));
+            state.canonical_pool_writes.push((
+                table.canonical_pool_quote_key(token, &entry.quote_id),
+                encode_alkane_id_be(&entry.pool_id).to_vec(),
+            ));
         }
     }
 
@@ -439,7 +428,7 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.candle_ns_prefix(pool, tf);
-                if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -468,7 +457,7 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.token_usd_candle_ns_prefix(token, tf);
-                if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -502,7 +491,7 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, tf);
-                if let Ok(resp) = provider.get_iter_prefix_rev(GetIterPrefixRevParams { prefix }) {
+                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -966,7 +955,7 @@ pub fn derive_token_data(
             let prefix = table.token_usd_candle_ns_prefix(token, Timeframe::M10);
             let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
             for (k, v) in provider
-                .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+                .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })?
                 .entries
             {
                 if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -1327,7 +1316,7 @@ pub fn derive_token_data(
             let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, Timeframe::M10);
             let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
             for (k, v) in provider
-                .get_iter_prefix_rev(GetIterPrefixRevParams { prefix: prefix.clone() })?
+                .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })?
                 .entries
             {
                 if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
