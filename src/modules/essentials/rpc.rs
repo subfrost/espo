@@ -13,7 +13,10 @@ use crate::modules::essentials::storage::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-fn resolve_view(provider: &EssentialsProvider, payload: &Value) -> Result<EssentialsProvider, Value> {
+fn resolve_view(
+    provider: &EssentialsProvider,
+    payload: &Value,
+) -> Result<EssentialsProvider, Value> {
     provider
         .with_height(
             payload.get("height").and_then(|v| v.as_u64()),

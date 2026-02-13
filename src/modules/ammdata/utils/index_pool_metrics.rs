@@ -128,7 +128,8 @@ pub fn derive_pool_metrics(
                     };
                 } else {
                     let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
-                    if let Ok(res) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix })
+                    if let Ok(res) =
+                        provider.get_list_entries_desc(GetListEntriesDescParams { prefix })
                     {
                         if let Some((_k, v)) = res.entries.into_iter().next() {
                             if let Ok(candle) = decode_full_candle_v1(&v) {

@@ -1,13 +1,12 @@
 use super::consts::KEY_INDEX_HEIGHT;
 use super::schemas::SchemaWrapEventV1;
-use crate::config::get_chunk_size;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::tree_db::get_global_tree_db;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[allow(non_snake_case)]
@@ -96,10 +95,10 @@ impl<'a> SubfrostTable<'a> {
         k
     }
 
-    pub fn list_chunk_key(&self, list_prefix: &[u8], chunk_id: u64) -> Vec<u8> {
+    pub fn list_item_key(&self, list_prefix: &[u8], idx: u64) -> Vec<u8> {
         let mut k = list_prefix.to_vec();
-        k.extend_from_slice(b"chunk/");
-        k.extend_from_slice(&chunk_id.to_be_bytes());
+        k.extend_from_slice(b"item/");
+        k.extend_from_slice(&idx.to_be_bytes());
         k
     }
 }
@@ -118,26 +117,10 @@ fn encode_wrap_event(event: &SchemaWrapEventV1) -> Result<Vec<u8>> {
     Ok(borsh::to_vec(event)?)
 }
 
-fn decode_wrap_event_chunk(bytes: &[u8]) -> Result<Vec<SchemaWrapEventV1>> {
-    Ok(Vec::<SchemaWrapEventV1>::try_from_slice(bytes)?)
-}
-
-fn encode_wrap_event_chunk(chunk: &[SchemaWrapEventV1]) -> Result<Vec<u8>> {
-    Ok(borsh::to_vec(&chunk.to_vec())?)
-}
-
 #[derive(Clone, Copy, Debug, BorshSerialize, BorshDeserialize)]
 pub struct UnwrapTotalPoint {
     pub height: u32,
     pub total: u128,
-}
-
-fn decode_unwrap_total_point_chunk(bytes: &[u8]) -> Result<Vec<UnwrapTotalPoint>> {
-    Ok(Vec::<UnwrapTotalPoint>::try_from_slice(bytes)?)
-}
-
-fn encode_unwrap_total_point_chunk(chunk: &[UnwrapTotalPoint]) -> Result<Vec<u8>> {
-    Ok(borsh::to_vec(&chunk.to_vec())?)
 }
 
 fn decode_u128_value(bytes: &[u8]) -> Option<u128> {
@@ -160,6 +143,34 @@ fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(bytes);
     Some(u64::from_le_bytes(arr))
+}
+
+fn dedupe_batch_ops(
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+    let mut seen_puts: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_puts_rev: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(puts.len());
+    for (key, value) in puts.into_iter().rev() {
+        if seen_puts.insert(key.clone()) {
+            dedup_puts_rev.push((key, value));
+        }
+    }
+    dedup_puts_rev.reverse();
+
+    let put_keys: HashSet<Vec<u8>> = dedup_puts_rev.iter().map(|(k, _)| k.clone()).collect();
+    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_deletes: Vec<Vec<u8>> = Vec::with_capacity(deletes.len());
+    for key in deletes {
+        if put_keys.contains(&key) {
+            continue;
+        }
+        if seen_deletes.insert(key.clone()) {
+            dedup_deletes.push(key);
+        }
+    }
+
+    (dedup_puts_rev, dedup_deletes)
 }
 
 #[derive(Clone)]
@@ -188,8 +199,9 @@ impl SubfrostProvider {
         let Some(tree) = get_global_tree_db() else {
             return Err(anyhow!("versioned_tree_unavailable"));
         };
-        let Some(blockhash) =
-            tree.blockhash_for_height(height_u32).map_err(|e| anyhow!("tree lookup failed: {e}"))?
+        let Some(blockhash) = tree
+            .blockhash_for_height(height_u32)
+            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
             return Err(anyhow!("height_not_indexed"));
         };
@@ -202,9 +214,10 @@ impl SubfrostProvider {
 
     fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.view_blockhash {
-            Some(blockhash) => {
-                self.mdb.get_at_blockhash(&blockhash, key).map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}"))
-            }
+            Some(blockhash) => self
+                .mdb
+                .get_at_blockhash(&blockhash, key)
+                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
             None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
         }
     }
@@ -234,23 +247,16 @@ impl SubfrostProvider {
             return Ok(Vec::new());
         }
 
-        let chunk_size = get_chunk_size() as usize;
-        let chunk_count = len.div_ceil(chunk_size);
-
-        let mut keys = Vec::with_capacity(chunk_count);
-        for chunk_id in 0..chunk_count {
-            keys.push(table.list_chunk_key(list_prefix, chunk_id as u64));
+        let mut keys = Vec::with_capacity(len);
+        for idx in 0..len {
+            keys.push(table.list_item_key(list_prefix, idx as u64));
         }
 
         let values = self.raw_multi_get(&keys)?;
         let mut out = Vec::with_capacity(len);
         for raw in values {
             let Some(raw) = raw else { continue };
-            let chunk = decode_wrap_event_chunk(&raw)?;
-            out.extend(chunk);
-        }
-        if out.len() > len {
-            out.truncate(len);
+            out.push(decode_wrap_event(&raw)?);
         }
         Ok(out)
     }
@@ -264,23 +270,16 @@ impl SubfrostProvider {
             return Ok(Vec::new());
         }
 
-        let chunk_size = get_chunk_size() as usize;
-        let chunk_count = len.div_ceil(chunk_size);
-
-        let mut keys = Vec::with_capacity(chunk_count);
-        for chunk_id in 0..chunk_count {
-            keys.push(table.list_chunk_key(&list_prefix, chunk_id as u64));
+        let mut keys = Vec::with_capacity(len);
+        for idx in 0..len {
+            keys.push(table.list_item_key(&list_prefix, idx as u64));
         }
 
         let values = self.raw_multi_get(&keys)?;
         let mut out = Vec::with_capacity(len);
         for raw in values {
             let Some(raw) = raw else { continue };
-            let chunk = decode_unwrap_total_point_chunk(&raw)?;
-            out.extend(chunk);
-        }
-        if out.len() > len {
-            out.truncate(len);
+            out.push(UnwrapTotalPoint::try_from_slice(&raw)?);
         }
         Ok(out)
     }
@@ -291,51 +290,35 @@ impl SubfrostProvider {
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
+        let (puts, deletes) = dedupe_batch_ops(params.puts, params.deletes);
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
-                for key in &params.deletes {
+                for key in &deletes {
                     wb.delete(key);
                 }
-                for (key, value) in &params.puts {
+                for (key, value) in &puts {
                     wb.put(key, value);
                 }
             })
             .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
     }
 
-    pub fn build_event_list_appends(&self, params: BuildEventListAppendsParams) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn build_event_list_appends(
+        &self,
+        params: BuildEventListAppendsParams,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if params.events.is_empty() {
             return Ok(Vec::new());
         }
 
         let table = self.table();
-        let chunk_size = get_chunk_size() as usize;
         let len_key = table.list_length_key(&params.list_prefix);
         let mut len = self.read_u64_len(&len_key)?;
 
-        let mut chunks: BTreeMap<u64, Vec<SchemaWrapEventV1>> = BTreeMap::new();
-
+        let mut puts = Vec::with_capacity(params.events.len() + 1);
         for ev in params.events {
-            let chunk_id = len / chunk_size as u64;
-            if let std::collections::btree_map::Entry::Vacant(entry) = chunks.entry(chunk_id) {
-                let chunk_key = table.list_chunk_key(&params.list_prefix, chunk_id);
-                let existing = self
-                    .raw_get(&chunk_key)?
-                    .map(|raw| decode_wrap_event_chunk(&raw))
-                    .transpose()?
-                    .unwrap_or_default();
-                entry.insert(existing);
-            }
-            if let Some(chunk) = chunks.get_mut(&chunk_id) {
-                chunk.push(ev);
-            }
+            puts.push((table.list_item_key(&params.list_prefix, len), encode_wrap_event(&ev)?));
             len = len.saturating_add(1);
-        }
-
-        let mut puts = Vec::new();
-        for (chunk_id, chunk) in chunks {
-            let chunk_key = table.list_chunk_key(&params.list_prefix, chunk_id);
-            puts.push((chunk_key, encode_wrap_event_chunk(&chunk)?));
         }
         puts.push((len_key, encode_u64_le(len).to_vec()));
         Ok(puts)
@@ -351,32 +334,13 @@ impl SubfrostProvider {
 
         let table = self.table();
         let list_prefix = table.unwrap_total_points_prefix(params.successful);
-        let chunk_size = get_chunk_size() as usize;
         let len_key = table.list_length_key(&list_prefix);
         let mut len = self.read_u64_len(&len_key)?;
 
-        let mut chunks: BTreeMap<u64, Vec<UnwrapTotalPoint>> = BTreeMap::new();
+        let mut puts = Vec::with_capacity(params.points.len() + 1);
         for point in params.points {
-            let chunk_id = len / chunk_size as u64;
-            if let std::collections::btree_map::Entry::Vacant(entry) = chunks.entry(chunk_id) {
-                let chunk_key = table.list_chunk_key(&list_prefix, chunk_id);
-                let existing = self
-                    .raw_get(&chunk_key)?
-                    .map(|raw| decode_unwrap_total_point_chunk(&raw))
-                    .transpose()?
-                    .unwrap_or_default();
-                entry.insert(existing);
-            }
-            if let Some(chunk) = chunks.get_mut(&chunk_id) {
-                chunk.push(point);
-            }
+            puts.push((table.list_item_key(&list_prefix, len), borsh::to_vec(&point)?));
             len = len.saturating_add(1);
-        }
-
-        let mut puts = Vec::new();
-        for (chunk_id, chunk) in chunks {
-            let chunk_key = table.list_chunk_key(&list_prefix, chunk_id);
-            puts.push((chunk_key, encode_unwrap_total_point_chunk(&chunk)?));
         }
         puts.push((len_key, encode_u64_le(len).to_vec()));
         Ok(puts)
@@ -482,9 +446,7 @@ impl SubfrostProvider {
         if lo == 0 {
             return Ok(GetUnwrapTotalAtOrBeforeResult { total: None });
         }
-        Ok(GetUnwrapTotalAtOrBeforeResult {
-            total: Some(points[lo - 1].total),
-        })
+        Ok(GetUnwrapTotalAtOrBeforeResult { total: Some(points[lo - 1].total) })
     }
 }
 

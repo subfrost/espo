@@ -94,8 +94,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             });
                         }
                     };
-                    view
-                        .rpc_get_activity(params)
+                    view.rpc_get_activity(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -127,8 +126,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             });
                         }
                     };
-                    view
-                        .rpc_get_pools(params)
+                    view.rpc_get_pools(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -160,8 +158,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             });
                         }
                     };
-                    view
-                        .rpc_get_amm_factories(params)
+                    view.rpc_get_amm_factories(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -207,8 +204,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             });
                         }
                     };
-                    view
-                        .rpc_find_best_swap_path(params)
+                    view.rpc_find_best_swap_path(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }
@@ -241,8 +237,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                             });
                         }
                     };
-                    view
-                        .rpc_get_best_mev_swap(params)
+                    view.rpc_get_best_mev_swap(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

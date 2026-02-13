@@ -207,7 +207,10 @@ pub async fn alkanes_page(
                 .map(|res| res.ids)
                 .unwrap_or_default();
             for alk in ids {
-                let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten() else { continue };
+                let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten()
+                else {
+                    continue;
+                };
                 let holders = holders_for(&rec);
                 rows.push(build_row(&rec, holders));
             }
@@ -222,7 +225,10 @@ pub async fn alkanes_page(
                 .map(|res| res.ids)
                 .unwrap_or_default();
             for alk in ids {
-                let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten() else { continue };
+                let Some(rec) = load_creation_record(&state.essentials_mdb, &alk).ok().flatten()
+                else {
+                    continue;
+                };
                 let holders = holders_for(&rec);
                 rows.push(build_row(&rec, holders));
             }

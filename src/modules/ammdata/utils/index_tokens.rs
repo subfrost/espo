@@ -428,7 +428,9 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.candle_ns_prefix(pool, tf);
-                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
+                if let Ok(resp) =
+                    provider.get_list_entries_desc(GetListEntriesDescParams { prefix })
+                {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -457,7 +459,9 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.token_usd_candle_ns_prefix(token, tf);
-                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
+                if let Ok(resp) =
+                    provider.get_list_entries_desc(GetListEntriesDescParams { prefix })
+                {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -491,7 +495,9 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, tf);
-                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams { prefix }) {
+                if let Ok(resp) =
+                    provider.get_list_entries_desc(GetListEntriesDescParams { prefix })
+                {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {

@@ -178,6 +178,105 @@ impl Mdb {
         self.db.get(full)
     }
 
+    pub fn scan_prefix_entries(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let ns_prefix = self.prefixed(prefix);
+        if let Some(tree) = self.versioned_manager() {
+            let entries = tree.collect_prefixed_entries(&ns_prefix)?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if key.starts_with(&self.prefix) {
+                    out.push((key[self.prefix.len()..].to_vec(), value));
+                }
+            }
+            return Ok(out);
+        }
+
+        let mut out = Vec::new();
+        for res in self.db.iterator(IteratorMode::From(&ns_prefix, Direction::Forward)) {
+            let (key, value) = res?;
+            if !key.starts_with(&ns_prefix) {
+                break;
+            }
+            if key.starts_with(&self.prefix) {
+                out.push((key[self.prefix.len()..].to_vec(), value.to_vec()));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn scan_prefix_entries_at_blockhash(
+        &self,
+        block_hash: &BlockHash,
+        prefix: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let ns_prefix = self.prefixed(prefix);
+        if let Some(tree) = self.versioned_manager() {
+            let Some(root) = tree.root_for_blockhash(block_hash)? else {
+                return Ok(Vec::new());
+            };
+            let entries = tree.collect_prefixed_entries_at_root(root, &ns_prefix)?;
+            let mut out = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                if key.starts_with(&self.prefix) {
+                    out.push((key[self.prefix.len()..].to_vec(), value));
+                }
+            }
+            return Ok(out);
+        }
+        self.scan_prefix_entries(prefix)
+    }
+
+    pub fn scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RocksError> {
+        let ns_prefix = self.prefixed(prefix);
+        if let Some(tree) = self.versioned_manager() {
+            let keys = tree.collect_prefixed_keys(&ns_prefix)?;
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                if key.starts_with(&self.prefix) {
+                    out.push(key[self.prefix.len()..].to_vec());
+                }
+            }
+            return Ok(out);
+        }
+
+        let mut out = Vec::new();
+        for res in self.db.iterator(IteratorMode::From(&ns_prefix, Direction::Forward)) {
+            let (key, _value) = res?;
+            if !key.starts_with(&ns_prefix) {
+                break;
+            }
+            if key.starts_with(&self.prefix) {
+                out.push(key[self.prefix.len()..].to_vec());
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn scan_prefix_keys_at_blockhash(
+        &self,
+        block_hash: &BlockHash,
+        prefix: &[u8],
+    ) -> Result<Vec<Vec<u8>>, RocksError> {
+        let ns_prefix = self.prefixed(prefix);
+        if let Some(tree) = self.versioned_manager() {
+            let Some(root) = tree.root_for_blockhash(block_hash)? else {
+                return Ok(Vec::new());
+            };
+            let keys = tree.collect_prefixed_keys_at_root(root, &ns_prefix)?;
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                if key.starts_with(&self.prefix) {
+                    out.push(key[self.prefix.len()..].to_vec());
+                }
+            }
+            return Ok(out);
+        }
+        self.scan_prefix_keys(prefix)
+    }
+
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
         if let Some(tree) = self.versioned_manager() {
             let prefixed: Vec<Vec<u8>> = keys.iter().map(|k| self.prefixed(k)).collect();

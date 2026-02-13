@@ -146,8 +146,10 @@ pub async fn alkane_page(
 
             let amm_mdb = Mdb::from_db(Arc::clone(&db), b"ammdata:");
             let table = AmmDataTable::new(&amm_mdb);
-            let amm_provider =
-                AmmDataProvider::new(Arc::new(amm_mdb.clone()), Arc::new(state.essentials_provider()));
+            let amm_provider = AmmDataProvider::new(
+                Arc::new(amm_mdb.clone()),
+                Arc::new(state.essentials_provider()),
+            );
 
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
                 amm_provider

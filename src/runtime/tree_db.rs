@@ -17,7 +17,34 @@ const HEIGHT_BLOCK_PREFIX: &[u8] = b"__espo_tree:height:";
 #[derive(Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
 struct TrieNode {
     value: Option<Vec<u8>>,
+    children: BTreeMap<u8, TrieEdge>,
+}
+
+#[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+struct TrieEdge {
+    label: Vec<u8>,
+    child: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
+struct LegacyTrieNode {
+    value: Option<Vec<u8>>,
     children: BTreeMap<u8, [u8; 32]>,
+}
+
+#[derive(Clone, Copy)]
+struct PrefixCursor {
+    node_id: [u8; 32],
+    key_buf_len: usize,
+}
+
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    let mut i = 0usize;
+    let limit = a.len().min(b.len());
+    while i < limit && a[i] == b[i] {
+        i += 1;
+    }
+    i
 }
 
 #[derive(Clone, Copy)]
@@ -247,12 +274,18 @@ impl VersionedTreeDb {
 
     pub fn get_at_root(&self, root: [u8; 32], key: &[u8]) -> Result<Option<Vec<u8>>, RocksError> {
         let mut current = root;
-        for b in key {
+        let mut depth = 0usize;
+        while depth < key.len() {
             let node = self.load_node(&current)?;
-            let Some(next) = node.children.get(b) else {
-                return Ok(None);
+            let edge = match node.children.get(&key[depth]) {
+                Some(edge) => edge,
+                None => return Ok(None),
             };
-            current = *next;
+            if !key[depth..].starts_with(&edge.label) {
+                return Ok(None);
+            }
+            depth += edge.label.len();
+            current = edge.child;
         }
         let node = self.load_node(&current)?;
         Ok(node.value)
@@ -302,6 +335,14 @@ impl VersionedTreeDb {
 
     pub fn collect_prefixed_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, RocksError> {
         let root = self.active_root();
+        self.collect_prefixed_keys_at_root(root, prefix)
+    }
+
+    pub fn collect_prefixed_keys_at_root(
+        &self,
+        root: [u8; 32],
+        prefix: &[u8],
+    ) -> Result<Vec<Vec<u8>>, RocksError> {
         let entries = self.collect_prefixed_entries_at_root(root, prefix)?;
         Ok(entries.into_iter().map(|(k, _)| k).collect())
     }
@@ -319,12 +360,13 @@ impl VersionedTreeDb {
         root: [u8; 32],
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
-        let Some(prefix_node) = self.find_prefix_node(root, prefix)? else {
+        let mut key = Vec::new();
+        let Some(cursor) = self.find_prefix_cursor(root, prefix, &mut key)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        let mut key = prefix.to_vec();
-        self.collect_entries(prefix_node, &mut key, &mut out)?;
+        key.truncate(cursor.key_buf_len);
+        self.collect_entries(cursor.node_id, &mut key, &mut out)?;
         Ok(out)
     }
 
@@ -370,21 +412,68 @@ impl VersionedTreeDb {
         if depth == key.len() {
             node.value = value.map(|v| v.to_vec());
         } else {
-            let edge = key[depth];
-            let next = if let Some(child_id) = node.children.get(&edge).copied() {
-                self.update_node(child_id, key, depth + 1, value, cache)?
-            } else if value.is_some() {
-                self.build_path(key, depth + 1, value.expect("checked is_some"), cache)?
-            } else {
-                None
-            };
-
-            match next {
-                Some(id) => {
-                    node.children.insert(edge, id);
-                }
+            let remaining = &key[depth..];
+            let edge_key = remaining[0];
+            match node.children.get(&edge_key).cloned() {
                 None => {
-                    node.children.remove(&edge);
+                    if let Some(v) = value {
+                        let edge = self.build_edge(remaining, v, cache)?;
+                        node.children.insert(edge_key, edge);
+                    } else {
+                        return Ok(Some(node_id));
+                    }
+                }
+                Some(existing_edge) => {
+                    let common = common_prefix_len(&existing_edge.label, remaining);
+                    if common == existing_edge.label.len() {
+                        let next = self.update_node(
+                            existing_edge.child,
+                            key,
+                            depth + common,
+                            value,
+                            cache,
+                        )?;
+                        match next {
+                            Some(id) => {
+                                let compact =
+                                    self.compact_edge(existing_edge.label.clone(), id, cache)?;
+                                node.children.insert(edge_key, compact);
+                            }
+                            None => {
+                                node.children.remove(&edge_key);
+                            }
+                        }
+                    } else if value.is_some() {
+                        let mut split = TrieNode::default();
+                        let old_suffix = existing_edge.label[common..].to_vec();
+                        let old_first = old_suffix[0];
+                        split.children.insert(
+                            old_first,
+                            TrieEdge { label: old_suffix, child: existing_edge.child },
+                        );
+
+                        let new_suffix = &remaining[common..];
+                        if new_suffix.is_empty() {
+                            split.value = value.map(|v| v.to_vec());
+                        } else {
+                            let new_edge = self.build_edge(
+                                new_suffix,
+                                value.expect("checked is_some"),
+                                cache,
+                            )?;
+                            split.children.insert(new_edge.label[0], new_edge);
+                        }
+
+                        let split_id = self.store_node_cached(&split, cache)?;
+                        let compact = self.compact_edge(
+                            existing_edge.label[..common].to_vec(),
+                            split_id,
+                            cache,
+                        )?;
+                        node.children.insert(edge_key, compact);
+                    } else {
+                        return Ok(Some(node_id));
+                    }
                 }
             }
         }
@@ -400,40 +489,71 @@ impl VersionedTreeDb {
         Ok(Some(id))
     }
 
-    fn build_path(
+    fn build_edge(
         &self,
-        key: &[u8],
-        depth: usize,
+        suffix: &[u8],
         value: &[u8],
         cache: &mut HashMap<[u8; 32], TrieNode>,
-    ) -> Result<Option<[u8; 32]>, RocksError> {
-        let mut node = TrieNode::default();
-        if depth == key.len() {
-            node.value = Some(value.to_vec());
-            return Ok(Some(self.store_node_cached(&node, cache)?));
-        }
-
-        let edge = key[depth];
-        if let Some(child) = self.build_path(key, depth + 1, value, cache)? {
-            node.children.insert(edge, child);
-        }
-        Ok(Some(self.store_node_cached(&node, cache)?))
+    ) -> Result<TrieEdge, RocksError> {
+        debug_assert!(!suffix.is_empty());
+        let leaf = TrieNode { value: Some(value.to_vec()), children: BTreeMap::new() };
+        let child = self.store_node_cached(&leaf, cache)?;
+        Ok(TrieEdge { label: suffix.to_vec(), child })
     }
 
-    fn find_prefix_node(
+    fn compact_edge(
+        &self,
+        mut label: Vec<u8>,
+        mut child: [u8; 32],
+        cache: &mut HashMap<[u8; 32], TrieNode>,
+    ) -> Result<TrieEdge, RocksError> {
+        loop {
+            let next = self.load_node_cached(child, cache)?;
+            if next.value.is_some() || next.children.len() != 1 {
+                break;
+            }
+            let (_, edge) = next.children.iter().next().expect("checked len");
+            label.extend_from_slice(&edge.label);
+            child = edge.child;
+        }
+        Ok(TrieEdge { label, child })
+    }
+
+    fn find_prefix_cursor(
         &self,
         root: [u8; 32],
         prefix: &[u8],
-    ) -> Result<Option<[u8; 32]>, RocksError> {
+        key_buf: &mut Vec<u8>,
+    ) -> Result<Option<PrefixCursor>, RocksError> {
         let mut current = root;
-        for b in prefix {
+        let mut depth = 0usize;
+        while depth < prefix.len() {
             let node = self.load_node(&current)?;
-            let Some(next) = node.children.get(b).copied() else {
-                return Ok(None);
+            let edge = match node.children.get(&prefix[depth]) {
+                Some(edge) => edge,
+                None => return Ok(None),
             };
-            current = next;
+            let common = common_prefix_len(&edge.label, &prefix[depth..]);
+            if common == 0 {
+                return Ok(None);
+            }
+
+            if common < edge.label.len() {
+                if depth + common == prefix.len() {
+                    key_buf.extend_from_slice(&edge.label);
+                    return Ok(Some(PrefixCursor {
+                        node_id: edge.child,
+                        key_buf_len: key_buf.len(),
+                    }));
+                }
+                return Ok(None);
+            }
+
+            key_buf.extend_from_slice(&edge.label);
+            depth += common;
+            current = edge.child;
         }
-        Ok(Some(current))
+        Ok(Some(PrefixCursor { node_id: current, key_buf_len: key_buf.len() }))
     }
 
     fn collect_entries(
@@ -446,10 +566,10 @@ impl VersionedTreeDb {
         if let Some(v) = node.value {
             out.push((key_buf.clone(), v));
         }
-        for (b, child_id) in node.children {
-            key_buf.push(b);
-            self.collect_entries(child_id, key_buf, out)?;
-            key_buf.pop();
+        for (_, edge) in node.children {
+            key_buf.extend_from_slice(&edge.label);
+            self.collect_entries(edge.child, key_buf, out)?;
+            key_buf.truncate(key_buf.len() - edge.label.len());
         }
         Ok(())
     }
@@ -459,7 +579,20 @@ impl VersionedTreeDb {
         let Some(bytes) = self.db.get(key)? else {
             return Ok(TrieNode::default());
         };
-        Ok(TrieNode::try_from_slice(&bytes).unwrap_or_default())
+        if let Ok(node) = TrieNode::try_from_slice(&bytes) {
+            return Ok(node);
+        }
+
+        // Backward compatibility for legacy one-byte-per-edge trie encoding.
+        if let Ok(old) = LegacyTrieNode::try_from_slice(&bytes) {
+            let mut children = BTreeMap::new();
+            for (k, child) in old.children {
+                children.insert(k, TrieEdge { label: vec![k], child });
+            }
+            return Ok(TrieNode { value: old.value, children });
+        }
+
+        Ok(TrieNode::default())
     }
 
     fn load_node_cached(
@@ -490,4 +623,115 @@ impl VersionedTreeDb {
 
 pub fn is_tree_internal_key(full_key: &[u8]) -> bool {
     full_key.starts_with(ROOT_PREFIX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn new_tree() -> (TempDir, VersionedTreeDb) {
+        let dir = TempDir::new().expect("tempdir");
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = Arc::new(DB::open(&opts, dir.path()).expect("rocksdb open"));
+        let tree = VersionedTreeDb::new(db).expect("tree init");
+        (dir, tree)
+    }
+
+    #[test]
+    fn prefix_lookup_matches_mid_edge() {
+        let (_dir, tree) = new_tree();
+        let key = b"essentials:/address/v2/some-very-long-address/outpoint/txid:vout";
+        let value = b"v1".to_vec();
+        tree.apply_batch(&[(key.to_vec(), Some(value.clone()))]).expect("apply");
+
+        let prefix = b"essentials:/address/v2/some-very-long-address/outpoint/";
+        let entries = tree.collect_prefixed_entries(prefix).expect("collect");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, key.to_vec());
+        assert_eq!(entries[0].1, value);
+    }
+
+    #[test]
+    fn split_and_delete_keep_sibling() {
+        let (_dir, tree) = new_tree();
+        let k1 = b"abcde".to_vec();
+        let k2 = b"abc".to_vec();
+        tree.apply_batch(&[(k1.clone(), Some(vec![1]))]).expect("put k1");
+        tree.apply_batch(&[(k2.clone(), Some(vec![2]))]).expect("put k2");
+
+        assert_eq!(tree.get(&k1).expect("get k1"), Some(vec![1]));
+        assert_eq!(tree.get(&k2).expect("get k2"), Some(vec![2]));
+
+        tree.apply_batch(&[(k2.clone(), None)]).expect("delete k2");
+        assert_eq!(tree.get(&k2).expect("get k2 after delete"), None);
+        assert_eq!(tree.get(&k1).expect("get k1 after delete"), Some(vec![1]));
+    }
+
+    #[test]
+    fn collect_entries_order_is_lexicographic() {
+        let (_dir, tree) = new_tree();
+        let keys = vec![b"a/2".to_vec(), b"a/10".to_vec(), b"a/1".to_vec(), b"a/z".to_vec()];
+        let mut changes = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            changes.push((k.clone(), Some(vec![i as u8])));
+        }
+        tree.apply_batch(&changes).expect("apply");
+
+        let entries = tree.collect_prefixed_entries(b"a/").expect("collect");
+        let observed: Vec<Vec<u8>> = entries.into_iter().map(|(k, _)| k).collect();
+        let mut sorted = observed.clone();
+        sorted.sort();
+        assert_eq!(observed, sorted);
+    }
+
+    #[test]
+    fn legacy_node_encoding_is_readable() {
+        let (_dir, tree) = new_tree();
+
+        let old_leaf = LegacyTrieNode { value: Some(vec![0x99]), children: BTreeMap::new() };
+        let old_leaf_id =
+            sha256::Hash::hash(&borsh::to_vec(&old_leaf).expect("serialize legacy leaf"))
+                .to_byte_array();
+        tree.db
+            .put(node_key(&old_leaf_id), borsh::to_vec(&old_leaf).expect("serialize legacy leaf"))
+            .expect("put legacy leaf");
+
+        let mut root_children = BTreeMap::new();
+        root_children.insert(b'k', old_leaf_id);
+        let old_root = LegacyTrieNode { value: None, children: root_children };
+        let old_root_id =
+            sha256::Hash::hash(&borsh::to_vec(&old_root).expect("serialize legacy root"))
+                .to_byte_array();
+        tree.db
+            .put(node_key(&old_root_id), borsh::to_vec(&old_root).expect("serialize legacy root"))
+            .expect("put legacy root");
+
+        let got = tree.get_at_root(old_root_id, b"k").expect("get_at_root legacy");
+        assert_eq!(got, Some(vec![0x99]));
+    }
+
+    #[test]
+    fn block_roots_preserve_historical_reads() {
+        let (_dir, tree) = new_tree();
+        let key = b"essentials:/k";
+
+        let genesis = BlockHash::from_byte_array([0u8; 32]);
+        let h1 = BlockHash::from_byte_array([1u8; 32]);
+        let h2 = BlockHash::from_byte_array([2u8; 32]);
+
+        tree.begin_block(1, &h1, &genesis).expect("begin block 1");
+        tree.apply_batch(&[(key.to_vec(), Some(vec![1]))]).expect("apply block 1");
+        tree.finish_block().expect("finish block 1");
+
+        tree.begin_block(2, &h2, &h1).expect("begin block 2");
+        tree.apply_batch(&[(key.to_vec(), Some(vec![2]))]).expect("apply block 2");
+        tree.finish_block().expect("finish block 2");
+
+        let r1 = tree.root_for_blockhash(&h1).expect("root h1").expect("root exists");
+        let r2 = tree.root_for_blockhash(&h2).expect("root h2").expect("root exists");
+        assert_eq!(tree.get_at_root(r1, key).expect("get h1"), Some(vec![1]));
+        assert_eq!(tree.get_at_root(r2, key).expect("get h2"), Some(vec![2]));
+    }
 }

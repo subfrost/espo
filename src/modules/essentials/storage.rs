@@ -1,7 +1,6 @@
 use crate::alkanes::trace::{
     EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
-use crate::config::get_chunk_size;
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew, get_network};
 use crate::modules::essentials::utils::balances::{
     SignedU128, get_address_activity_for_address, get_alkane_balances,
@@ -40,74 +39,6 @@ const ALKANE_V2_PREFIX: &[u8] = b"/alkane/v2/";
 const TX_V2_PREFIX: &[u8] = b"/tx/v2/";
 const BALANCE_CHANGES_V2_PREFIX: &[u8] = b"/balance_changes/v2/";
 const ALKANE_LATEST_TRACES_V2_PREFIX: &[u8] = b"/alkane_latest_traces/v2/";
-const LIST_META_V1_PREFIX: &[u8] = b"/_chunked_list/v1/";
-
-#[derive(Clone, Copy)]
-struct ListFamily {
-    root: &'static [u8],
-    append_only: bool,
-    key_scope: ListFamilyKeyScope,
-}
-
-#[derive(Clone, Copy)]
-enum ListFamilyKeyScope {
-    All,
-    AddressOutpointOnly,
-    TxOutflowOnly,
-}
-
-const ADDRESS_OUTPOINT_SEGMENT: &[u8] = b"/outpoint/";
-const TX_OUTFLOW_SEGMENT: &[u8] = b"/outflow/";
-
-const ESSENTIALS_LIST_FAMILIES: &[ListFamily] = &[
-    ListFamily { root: b"\x03", append_only: true, key_scope: ListFamilyKeyScope::All },
-    ListFamily {
-        root: b"/alkanes/name/",
-        append_only: true,
-        key_scope: ListFamilyKeyScope::All,
-    },
-    ListFamily {
-        root: b"/alkanes/symbol/",
-        append_only: true,
-        key_scope: ListFamilyKeyScope::All,
-    },
-    ListFamily {
-        root: b"/alkanes/creation/ordered/",
-        append_only: true,
-        key_scope: ListFamilyKeyScope::All,
-    },
-    ListFamily {
-        root: b"/alkanes/holders/ordered/",
-        append_only: false,
-        key_scope: ListFamilyKeyScope::All,
-    },
-    ListFamily {
-        root: b"/address/v2/",
-        append_only: true,
-        key_scope: ListFamilyKeyScope::AddressOutpointOnly,
-    },
-    ListFamily {
-        root: b"/tx/v2/",
-        append_only: true,
-        key_scope: ListFamilyKeyScope::TxOutflowOnly,
-    },
-];
-
-fn key_matches_list_family(family: ListFamily, key: &[u8]) -> bool {
-    match family.key_scope {
-        ListFamilyKeyScope::All => true,
-        ListFamilyKeyScope::AddressOutpointOnly => {
-            key[family.root.len()..]
-                .windows(ADDRESS_OUTPOINT_SEGMENT.len())
-                .any(|w| w == ADDRESS_OUTPOINT_SEGMENT)
-        }
-        ListFamilyKeyScope::TxOutflowOnly => {
-            key[family.root.len()..]
-                .windows(TX_OUTFLOW_SEGMENT.len())
-                .any(|w| w == TX_OUTFLOW_SEGMENT)
-        }
-    }
-}
 
 fn encode_alkane_id_be(id: &SchemaAlkaneId) -> [u8; 12] {
     let mut out = [0u8; 12];
@@ -174,46 +105,32 @@ fn parse_holder_id_bytes(bytes: &[u8]) -> Option<HolderId> {
     }
 }
 
-fn list_family_index_for_prefix(prefix: &[u8]) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for (idx, family) in ESSENTIALS_LIST_FAMILIES.iter().enumerate() {
-        if prefix.starts_with(family.root) {
-            let len = family.root.len();
-            if best.map(|(_, best_len)| len > best_len).unwrap_or(true) {
-                best = Some((idx, len));
-            }
+fn dedupe_batch_ops(
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+    let mut seen_puts: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_puts_rev: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(puts.len());
+    for (key, value) in puts.into_iter().rev() {
+        if seen_puts.insert(key.clone()) {
+            dedup_puts_rev.push((key, value));
         }
     }
-    best.map(|(idx, _)| idx)
-}
+    dedup_puts_rev.reverse();
 
-fn list_meta_prefix_for_root(root: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(LIST_META_V1_PREFIX.len() + root.len() * 2 + 1);
-    key.extend_from_slice(LIST_META_V1_PREFIX);
-    key.extend_from_slice(hex::encode(root).as_bytes());
-    key.push(b'/');
-    key
-}
+    let put_keys: HashSet<Vec<u8>> = dedup_puts_rev.iter().map(|(k, _)| k.clone()).collect();
+    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_deletes: Vec<Vec<u8>> = Vec::with_capacity(deletes.len());
+    for key in deletes {
+        if put_keys.contains(&key) {
+            continue;
+        }
+        if seen_deletes.insert(key.clone()) {
+            dedup_deletes.push(key);
+        }
+    }
 
-fn list_length_key_for_root(root: &[u8]) -> Vec<u8> {
-    let mut key = list_meta_prefix_for_root(root);
-    key.extend_from_slice(b"length");
-    key
-}
-
-fn list_chunk_key_for_root(root: &[u8], chunk_id: u64) -> Vec<u8> {
-    let mut key = list_meta_prefix_for_root(root);
-    key.extend_from_slice(b"chunk/");
-    key.extend_from_slice(&chunk_id.to_be_bytes());
-    key
-}
-
-fn decode_key_chunk(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    Ok(Vec::<Vec<u8>>::try_from_slice(bytes)?)
-}
-
-fn encode_key_chunk(keys: &[Vec<u8>]) -> Result<Vec<u8>> {
-    Ok(borsh::to_vec(&keys.to_vec())?)
+    (dedup_puts_rev, dedup_deletes)
 }
 
 #[allow(non_snake_case)]
@@ -484,7 +401,11 @@ impl<'a> EssentialsTable<'a> {
         Ok(key)
     }
 
-    pub fn outpoint_balance_list_prefix_from_parts(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
+    pub fn outpoint_balance_list_prefix_from_parts(
+        &self,
+        txid: &[u8],
+        vout: u32,
+    ) -> Result<Vec<u8>> {
         let mut key = self.outpoint_prefix_from_parts(txid, vout)?;
         key.extend_from_slice(b"balance_idx/");
         Ok(key)
@@ -496,7 +417,11 @@ impl<'a> EssentialsTable<'a> {
         Ok(key)
     }
 
-    pub fn outpoint_balance_list_len_key_from_parts(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
+    pub fn outpoint_balance_list_len_key_from_parts(
+        &self,
+        txid: &[u8],
+        vout: u32,
+    ) -> Result<Vec<u8>> {
         let mut key = self.outpoint_balance_list_prefix_from_parts(txid, vout)?;
         key.extend_from_slice(b"length");
         Ok(key)
@@ -1327,8 +1252,9 @@ impl EssentialsProvider {
         let Some(tree) = get_global_tree_db() else {
             return Err(anyhow!("versioned_tree_unavailable"));
         };
-        let Some(blockhash) =
-            tree.blockhash_for_height(height_u32).map_err(|e| anyhow!("tree lookup failed: {e}"))?
+        let Some(blockhash) = tree
+            .blockhash_for_height(height_u32)
+            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
             return Err(anyhow!("height_not_indexed"));
         };
@@ -1366,192 +1292,34 @@ impl EssentialsProvider {
         }
     }
 
-    fn read_list_len_u64(&self, key: &[u8]) -> Result<u64> {
-        Ok(self.raw_get(key)?.and_then(|v| decode_u64_le(&v)).unwrap_or(0))
+    fn raw_scan_prefix_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut entries = match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_prefix_entries_at_blockhash(&blockhash, prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_entries_at_blockhash failed: {e}"))?,
+            None => self
+                .mdb
+                .scan_prefix_entries(prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_entries failed: {e}"))?,
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
     }
 
-    fn read_family_keys(&self, family_root: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let len_key = list_length_key_for_root(family_root);
-        let len = self.read_list_len_u64(&len_key)? as usize;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-
-        let chunk_size = get_chunk_size() as usize;
-        let chunk_count = len.div_ceil(chunk_size);
-        let mut chunk_keys = Vec::with_capacity(chunk_count);
-        for chunk_id in 0..chunk_count {
-            chunk_keys.push(list_chunk_key_for_root(family_root, chunk_id as u64));
-        }
-
-        let chunk_values = self.raw_multi_get(&chunk_keys)?;
-        let mut out = Vec::with_capacity(len);
-        for raw in chunk_values {
-            let Some(raw) = raw else { continue };
-            let mut chunk = decode_key_chunk(&raw)?;
-            out.append(&mut chunk);
-        }
-        if out.len() > len {
-            out.truncate(len);
-        }
-        Ok(out)
-    }
-
-    fn rewrite_family_keys(
-        &self,
-        family_root: &[u8],
-        keys: &[Vec<u8>],
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
-        let chunk_size = get_chunk_size() as usize;
-        let len_key = list_length_key_for_root(family_root);
-        let old_len = self.read_list_len_u64(&len_key)? as usize;
-        let old_chunk_count = if old_len == 0 { 0 } else { old_len.div_ceil(chunk_size) };
-        let new_chunk_count = if keys.is_empty() { 0 } else { keys.len().div_ceil(chunk_size) };
-
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut deletes: Vec<Vec<u8>> = Vec::new();
-        puts.push((len_key, (keys.len() as u64).to_le_bytes().to_vec()));
-
-        for chunk_id in 0..new_chunk_count {
-            let start = chunk_id * chunk_size;
-            let end = (start + chunk_size).min(keys.len());
-            let chunk_key = list_chunk_key_for_root(family_root, chunk_id as u64);
-            let chunk_value = encode_key_chunk(&keys[start..end])?;
-            puts.push((chunk_key, chunk_value));
-        }
-
-        for chunk_id in new_chunk_count..old_chunk_count {
-            deletes.push(list_chunk_key_for_root(family_root, chunk_id as u64));
-        }
-
-        Ok((puts, deletes))
-    }
-
-    fn append_family_keys(
-        &self,
-        family_root: &[u8],
-        keys: &[Vec<u8>],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let existing_values = self.raw_multi_get(keys)?;
-        let mut new_keys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
-        for (key, existing_value) in keys.iter().zip(existing_values.into_iter()) {
-            if existing_value.is_none() {
-                new_keys.push(key.clone());
-            }
-        }
-        if new_keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let chunk_size = get_chunk_size() as usize;
-        let len_key = list_length_key_for_root(family_root);
-        let mut len = self.read_list_len_u64(&len_key)?;
-        let original_len = len;
-        let mut chunk_updates: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
-
-        for key in &new_keys {
-            let chunk_id = len / chunk_size as u64;
-            if let std::collections::btree_map::Entry::Vacant(entry) = chunk_updates.entry(chunk_id)
-            {
-                let chunk_key = list_chunk_key_for_root(family_root, chunk_id);
-                let existing = self
-                    .raw_get(&chunk_key)?
-                    .map(|raw| decode_key_chunk(&raw))
-                    .transpose()?
-                    .unwrap_or_default();
-                entry.insert(existing);
-            }
-
-            if let Some(chunk) = chunk_updates.get_mut(&chunk_id) {
-                chunk.push(key.clone());
-            }
-            len = len.saturating_add(1);
-        }
-
-        if len == original_len {
-            return Ok(Vec::new());
-        }
-
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (chunk_id, chunk) in chunk_updates {
-            let chunk_key = list_chunk_key_for_root(family_root, chunk_id);
-            puts.push((chunk_key, encode_key_chunk(&chunk)?));
-        }
-        puts.push((len_key, len.to_le_bytes().to_vec()));
-        Ok(puts)
-    }
-
-    fn build_list_index_updates(
-        &self,
-        puts: &[(Vec<u8>, Vec<u8>)],
-        deletes: &[Vec<u8>],
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
-        let mut puts_by_family: Vec<Vec<Vec<u8>>> = vec![Vec::new(); ESSENTIALS_LIST_FAMILIES.len()];
-        let mut deletes_by_family: Vec<Vec<Vec<u8>>> =
-            vec![Vec::new(); ESSENTIALS_LIST_FAMILIES.len()];
-
-        for (key, _value) in puts {
-            if key.starts_with(LIST_META_V1_PREFIX) {
-                continue;
-            }
-            if let Some(idx) = list_family_index_for_prefix(key) {
-                let family = ESSENTIALS_LIST_FAMILIES[idx];
-                if key_matches_list_family(family, key) {
-                    puts_by_family[idx].push(key.clone());
-                }
-            }
-        }
-        for key in deletes {
-            if key.starts_with(LIST_META_V1_PREFIX) {
-                continue;
-            }
-            if let Some(idx) = list_family_index_for_prefix(key) {
-                let family = ESSENTIALS_LIST_FAMILIES[idx];
-                if key_matches_list_family(family, key) {
-                    deletes_by_family[idx].push(key.clone());
-                }
-            }
-        }
-
-        let mut extra_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut extra_deletes: Vec<Vec<u8>> = Vec::new();
-
-        for idx in 0..ESSENTIALS_LIST_FAMILIES.len() {
-            if puts_by_family[idx].is_empty() && deletes_by_family[idx].is_empty() {
-                continue;
-            }
-            let family = ESSENTIALS_LIST_FAMILIES[idx];
-            let mut put_keys = std::mem::take(&mut puts_by_family[idx]);
-            put_keys.sort();
-            put_keys.dedup();
-            let mut delete_keys = std::mem::take(&mut deletes_by_family[idx]);
-            delete_keys.sort();
-            delete_keys.dedup();
-
-            if family.append_only && delete_keys.is_empty() {
-                extra_puts.extend(self.append_family_keys(family.root, &put_keys)?);
-                continue;
-            }
-
-            let mut keys: BTreeSet<Vec<u8>> = self.read_family_keys(family.root)?.into_iter().collect();
-            for key in delete_keys {
-                keys.remove(&key);
-            }
-            for key in put_keys {
-                keys.insert(key);
-            }
-            let keys_vec: Vec<Vec<u8>> = keys.into_iter().collect();
-            let (mut rewrite_puts, mut rewrite_deletes) =
-                self.rewrite_family_keys(family.root, &keys_vec)?;
-            extra_puts.append(&mut rewrite_puts);
-            extra_deletes.append(&mut rewrite_deletes);
-        }
-
-        Ok((extra_puts, extra_deletes))
+    fn raw_scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut keys = match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_prefix_keys_at_blockhash(&blockhash, prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys_at_blockhash failed: {e}"))?,
+            None => self
+                .mdb
+                .scan_prefix_keys(prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys failed: {e}"))?,
+        };
+        keys.sort();
+        Ok(keys)
     }
 
     pub fn get_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
@@ -1564,13 +1332,11 @@ impl EssentialsProvider {
         Ok(GetMultiValuesResult { values })
     }
 
-    pub fn get_list_keys_by_prefix(&self, params: GetListKeysByPrefixParams) -> Result<GetListKeysByPrefixResult> {
-        let Some(idx) = list_family_index_for_prefix(&params.prefix) else {
-            return Ok(GetListKeysByPrefixResult { keys: Vec::new() });
-        };
-        let family = ESSENTIALS_LIST_FAMILIES[idx];
-        let mut keys = self.read_family_keys(family.root)?;
-        keys.retain(|k| k.starts_with(&params.prefix));
+    pub fn get_list_keys_by_prefix(
+        &self,
+        params: GetListKeysByPrefixParams,
+    ) -> Result<GetListKeysByPrefixResult> {
+        let keys = self.raw_scan_prefix_keys(&params.prefix)?;
         Ok(GetListKeysByPrefixResult { keys })
     }
 
@@ -1578,37 +1344,23 @@ impl EssentialsProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
-        let Some(idx) = list_family_index_for_prefix(&params.prefix) else {
-            return Ok(GetListEntriesDescResult { entries: Vec::new() });
-        };
-        let family = ESSENTIALS_LIST_FAMILIES[idx];
-        let mut keys = self.read_family_keys(family.root)?;
-        keys.retain(|k| k.starts_with(&params.prefix));
-        keys.reverse();
-        let values = self.raw_multi_get(&keys)?;
-        let mut entries = Vec::new();
-        for (key, value) in keys.into_iter().zip(values.into_iter()) {
-            if let Some(value) = value {
-                entries.push((key, value));
-            }
-        }
+        let mut entries = self.raw_scan_prefix_entries(&params.prefix)?;
+        entries.reverse();
         Ok(GetListEntriesDescResult { entries })
     }
 
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
-        self.set_batch(SetBatchParams { puts: vec![(params.key, params.value)], deletes: Vec::new() })
+        self.set_batch(SetBatchParams {
+            puts: vec![(params.key, params.value)],
+            deletes: Vec::new(),
+        })
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
         if self.view_blockhash.is_some() {
             return Err(anyhow!("cannot_write_historical_view"));
         }
-        let (mut list_puts, mut list_deletes) =
-            self.build_list_index_updates(&params.puts, &params.deletes)?;
-        let mut all_puts = params.puts;
-        let mut all_deletes = params.deletes;
-        all_puts.append(&mut list_puts);
-        all_deletes.append(&mut list_deletes);
+        let (all_puts, all_deletes) = dedupe_batch_ops(params.puts, params.deletes);
 
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
@@ -2154,7 +1906,9 @@ impl EssentialsProvider {
             dedup_sort_keys(v)
         } else {
             let scan_pref = table.dir_list_prefix(&alk);
-            let rel_keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: scan_pref }) {
+            let rel_keys = match self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: scan_pref })
+            {
                 Ok(v) => v.keys,
                 Err(_) => Vec::new(),
             };
@@ -2705,7 +2459,9 @@ impl EssentialsProvider {
         if include_outpoints {
             let addr = resp["address"].as_str().unwrap_or_default().to_string();
             let pref = table.address_outpoint_prefix(&addr);
-            let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() }) {
+            let keys = match self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
+            {
                 Ok(v) => v.keys,
                 Err(_) => Vec::new(),
             };
@@ -3235,7 +2991,9 @@ impl EssentialsProvider {
         let table = self.table();
         let pref = table.address_outpoint_prefix(&address);
 
-        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() }) {
+        let keys = match self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
+        {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -3497,15 +3255,20 @@ impl EssentialsProvider {
 
         if !txid_rows.is_empty() {
             let table = self.table();
-            let chain_tip =
-                get_bitcoind_rpc_client().get_blockchain_info().ok().map(|info| info.blocks as u64);
-            let height_keys: Vec<Vec<u8>> =
-                txid_rows.iter().map(|txid| table.tx_height_key(&txid.to_byte_array())).collect();
+            let chain_tip = get_bitcoind_rpc_client()
+                .get_blockchain_info()
+                .ok()
+                .map(|info| info.blocks as u64);
+            let height_keys: Vec<Vec<u8>> = txid_rows
+                .iter()
+                .map(|txid| table.tx_height_key(&txid.to_byte_array()))
+                .collect();
             let height_vals = self
                 .get_multi_values(GetMultiValuesParams { keys: height_keys })
                 .map(|r| r.values)
                 .unwrap_or_default();
-            let raw_txs = get_electrum_like().batch_transaction_get_raw(&txid_rows).unwrap_or_default();
+            let raw_txs =
+                get_electrum_like().batch_transaction_get_raw(&txid_rows).unwrap_or_default();
 
             for (idx, txid) in txid_rows.iter().enumerate() {
                 let height = height_vals
@@ -4695,6 +4458,43 @@ fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(arr))
 }
 
+const TX_TRACE_ROW_COMPACT_V1: u8 = 1;
+
+#[derive(BorshSerialize, BorshDeserialize)]
+struct CompactTxTraceRowV1 {
+    vout: u32,
+    events: Vec<EspoSandshrewLikeTraceEvent>,
+}
+
+fn parse_trace_outpoint_vout(outpoint: &str) -> Option<u32> {
+    outpoint.rsplit_once(':').and_then(|(_, vout)| vout.parse::<u32>().ok())
+}
+
+pub fn encode_tx_trace_row(trace: &EspoSandshrewLikeTrace, compact: bool) -> Result<Vec<u8>> {
+    if compact {
+        if let Some(vout) = parse_trace_outpoint_vout(&trace.outpoint) {
+            let compact_row = CompactTxTraceRowV1 { vout, events: trace.events.clone() };
+            let mut bytes = Vec::with_capacity(1 + trace.events.len() * 16);
+            bytes.push(TX_TRACE_ROW_COMPACT_V1);
+            bytes.extend_from_slice(&borsh::to_vec(&compact_row)?);
+            return Ok(bytes);
+        }
+    }
+    Ok(borsh::to_vec(trace)?)
+}
+
+fn decode_tx_trace_row(raw: &[u8], txid: &[u8; 32]) -> Option<EspoSandshrewLikeTrace> {
+    if raw.first().copied() == Some(TX_TRACE_ROW_COMPACT_V1) {
+        if let Ok(compact_row) = CompactTxTraceRowV1::try_from_slice(&raw[1..]) {
+            return Some(EspoSandshrewLikeTrace {
+                outpoint: format!("{}:{}", hex::encode(txid), compact_row.vout),
+                events: compact_row.events,
+            });
+        }
+    }
+    EspoSandshrewLikeTrace::try_from_slice(raw).ok()
+}
+
 fn load_tx_outflow_for_owner(
     provider: &EssentialsProvider,
     table: &EssentialsTable<'_>,
@@ -4758,7 +4558,7 @@ pub(crate) fn load_tx_summary_v2(
         }
         if let Ok(resp) = provider.get_multi_values(GetMultiValuesParams { keys }) {
             for raw in resp.values.into_iter().flatten() {
-                if let Ok(trace) = EspoSandshrewLikeTrace::try_from_slice(&raw) {
+                if let Some(trace) = decode_tx_trace_row(&raw, &txid_arr) {
                     traces.push(trace);
                 }
             }

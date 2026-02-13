@@ -10,7 +10,7 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, AmmHistoryEntry, GetActivityEntryParams, GetAddressPoolBurnsPageParams,
     GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams,
     GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams,
-    GetFactoryPoolsParams, GetListEntriesDescParams, GetLatestTokenUsdCloseParams,
+    GetFactoryPoolsParams, GetLatestTokenUsdCloseParams, GetListEntriesDescParams,
     GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
     GetPoolDefsParams, GetPoolDetailsSnapshotParams, GetPoolFactoryParams,
     GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
@@ -2249,14 +2249,11 @@ pub async fn get_total_unwrap_amount(
             Err(err) => return internal_error(err),
         }
     } else {
-        match state
-            .subfrost
-            .get_unwrap_total_latest(GetUnwrapTotalLatestParams {
-                successful,
-                height: None,
-                height_present: false,
-            })
-        {
+        match state.subfrost.get_unwrap_total_latest(GetUnwrapTotalLatestParams {
+            successful,
+            height: None,
+            height_present: false,
+        }) {
             Ok(res) => res.total,
             Err(err) => return internal_error(err),
         }
@@ -2997,7 +2994,10 @@ fn pool_candle_volume_sums(
     let window_start = bucket_now.saturating_sub(6 * Timeframe::D1.duration_secs());
     let table = state.ammdata.table();
     let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
-    let entries = state.ammdata.get_list_entries_desc(GetListEntriesDescParams { prefix })?.entries;
+    let entries = state
+        .ammdata
+        .get_list_entries_desc(GetListEntriesDescParams { prefix })?
+        .entries;
 
     let mut token0_volume_7d = 0u128;
     let mut token1_volume_7d = 0u128;

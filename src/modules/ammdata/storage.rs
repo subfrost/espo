@@ -3,7 +3,7 @@ use super::schemas::{
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
     SchemaPoolSnapshot, SchemaReservesSnapshot, SchemaTokenMetricsV1, Timeframe,
 };
-use crate::config::{get_chunk_size, get_network};
+use crate::config::get_network;
 use crate::modules::ammdata::consts::{
     CanonicalQuoteUnit, KEY_INDEX_HEIGHT, PRICE_SCALE, SATS_PER_BTC, canonical_quotes,
 };
@@ -25,103 +25,39 @@ use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
+use bitcoin::BlockHash;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde_json::{Value, json, map::Map};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use bitcoin::BlockHash;
 
-const LIST_META_V1_PREFIX: &[u8] = b"/_chunked_list/v1/";
-
-#[derive(Clone, Copy)]
-struct ListFamily {
-    root: &'static [u8],
-    append_only: bool,
-}
-
-const AMMDATA_LIST_FAMILIES: &[ListFamily] = &[
-    ListFamily { root: b"/reserves_snapshot/v2/pool/", append_only: false },
-    ListFamily { root: b"fc1:", append_only: true },
-    ListFamily { root: b"tuc1:", append_only: true },
-    ListFamily { root: b"tud1:", append_only: true },
-    ListFamily { root: b"tmc1:", append_only: true },
-    ListFamily { root: b"tdmc1:", append_only: true },
-    ListFamily { root: b"/btc_usd_price/v1/", append_only: true },
-    ListFamily { root: b"btu1:", append_only: true },
-    ListFamily { root: b"activity:v1:", append_only: true },
-    ListFamily { root: b"activity:idx:", append_only: true },
-    ListFamily { root: b"/canonical_pool/v2/", append_only: false },
-    ListFamily { root: b"/token_metrics/index/", append_only: false },
-    ListFamily { root: b"/token_metrics/derived/index/", append_only: false },
-    ListFamily { root: b"/pool_metrics/index/", append_only: false },
-    ListFamily { root: b"/token_search_index/v1/", append_only: false },
-    ListFamily { root: b"/token_search_index/derived/v1/", append_only: false },
-    ListFamily { root: b"/pool_name_index/", append_only: false },
-    ListFamily { root: b"/amm_factories/v1/", append_only: true },
-    ListFamily { root: b"/factory_pools/v1/", append_only: true },
-    ListFamily { root: b"/token_swaps/v1/", append_only: true },
-    ListFamily { root: b"/pool_creations/v1/", append_only: true },
-    ListFamily { root: b"/address_pool_swaps/v1/", append_only: true },
-    ListFamily { root: b"/address_token_swaps/v1/", append_only: true },
-    ListFamily { root: b"/address_pool_creations/v1/", append_only: true },
-    ListFamily { root: b"/address_pool_mints/v1/", append_only: true },
-    ListFamily { root: b"/address_pool_burns/v1/", append_only: true },
-    ListFamily { root: b"/address_amm_history/v1/", append_only: true },
-    ListFamily { root: b"/amm_history_all/v1/", append_only: true },
-    ListFamily { root: b"/token_pools/v1/", append_only: true },
-    ListFamily { root: b"/tvlVersioned/", append_only: true },
-];
-
-fn list_family_index_for_prefix(prefix: &[u8]) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for (idx, family) in AMMDATA_LIST_FAMILIES.iter().enumerate() {
-        if prefix.starts_with(family.root) {
-            let len = family.root.len();
-            if best.map(|(_, best_len)| len > best_len).unwrap_or(true) {
-                best = Some((idx, len));
-            }
+fn dedupe_batch_ops(
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+    let mut seen_puts: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_puts_rev: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(puts.len());
+    for (key, value) in puts.into_iter().rev() {
+        if seen_puts.insert(key.clone()) {
+            dedup_puts_rev.push((key, value));
         }
     }
-    best.map(|(idx, _)| idx)
-}
+    dedup_puts_rev.reverse();
 
-fn list_meta_prefix_for_root(root: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(LIST_META_V1_PREFIX.len() + root.len() * 2 + 1);
-    key.extend_from_slice(LIST_META_V1_PREFIX);
-    key.extend_from_slice(hex::encode(root).as_bytes());
-    key.push(b'/');
-    key
-}
-
-fn list_length_key_for_root(root: &[u8]) -> Vec<u8> {
-    let mut key = list_meta_prefix_for_root(root);
-    key.extend_from_slice(b"length");
-    key
-}
-
-fn list_chunk_key_for_root(root: &[u8], chunk_id: u64) -> Vec<u8> {
-    let mut key = list_meta_prefix_for_root(root);
-    key.extend_from_slice(b"chunk/");
-    key.extend_from_slice(&chunk_id.to_be_bytes());
-    key
-}
-
-fn decode_key_chunk(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
-    Ok(Vec::<Vec<u8>>::try_from_slice(bytes)?)
-}
-
-fn encode_key_chunk(keys: &[Vec<u8>]) -> Result<Vec<u8>> {
-    Ok(borsh::to_vec(&keys.to_vec())?)
-}
-
-fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 8 {
-        return None;
+    let put_keys: HashSet<Vec<u8>> = dedup_puts_rev.iter().map(|(k, _)| k.clone()).collect();
+    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_deletes: Vec<Vec<u8>> = Vec::with_capacity(deletes.len());
+    for key in deletes {
+        if put_keys.contains(&key) {
+            continue;
+        }
+        if seen_deletes.insert(key.clone()) {
+            dedup_deletes.push(key);
+        }
     }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(bytes);
-    Some(u64::from_le_bytes(arr))
+
+    (dedup_puts_rev, dedup_deletes)
 }
 
 #[allow(non_snake_case)]
@@ -1475,8 +1411,9 @@ impl AmmDataProvider {
         let Some(tree) = get_global_tree_db() else {
             return Err(anyhow!("versioned_tree_unavailable"));
         };
-        let Some(blockhash) =
-            tree.blockhash_for_height(height_u32).map_err(|e| anyhow!("tree lookup failed: {e}"))?
+        let Some(blockhash) = tree
+            .blockhash_for_height(height_u32)
+            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
             return Err(anyhow!("height_not_indexed"));
         };
@@ -1533,186 +1470,34 @@ impl AmmDataProvider {
         }
     }
 
-    fn read_list_len_u64(&self, key: &[u8]) -> Result<u64> {
-        Ok(self.raw_get(key)?.and_then(|v| decode_u64_le(&v)).unwrap_or(0))
+    fn raw_scan_prefix_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut entries = match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_prefix_entries_at_blockhash(&blockhash, prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_entries_at_blockhash failed: {e}"))?,
+            None => self
+                .mdb
+                .scan_prefix_entries(prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_entries failed: {e}"))?,
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
     }
 
-    fn read_family_keys(&self, family_root: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let len_key = list_length_key_for_root(family_root);
-        let len = self.read_list_len_u64(&len_key)? as usize;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-
-        let chunk_size = get_chunk_size() as usize;
-        let chunk_count = len.div_ceil(chunk_size);
-        let mut chunk_keys = Vec::with_capacity(chunk_count);
-        for chunk_id in 0..chunk_count {
-            chunk_keys.push(list_chunk_key_for_root(family_root, chunk_id as u64));
-        }
-
-        let chunk_values = self.raw_multi_get(&chunk_keys)?;
-        let mut out = Vec::with_capacity(len);
-        for raw in chunk_values {
-            let Some(raw) = raw else { continue };
-            let mut chunk = decode_key_chunk(&raw)?;
-            out.append(&mut chunk);
-        }
-        if out.len() > len {
-            out.truncate(len);
-        }
-        Ok(out)
-    }
-
-    fn rewrite_family_keys(
-        &self,
-        family_root: &[u8],
-        keys: &[Vec<u8>],
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
-        let chunk_size = get_chunk_size() as usize;
-        let len_key = list_length_key_for_root(family_root);
-        let old_len = self.read_list_len_u64(&len_key)? as usize;
-        let old_chunk_count = if old_len == 0 { 0 } else { old_len.div_ceil(chunk_size) };
-        let new_chunk_count = if keys.is_empty() { 0 } else { keys.len().div_ceil(chunk_size) };
-
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut deletes: Vec<Vec<u8>> = Vec::new();
-        puts.push((len_key, (keys.len() as u64).to_le_bytes().to_vec()));
-
-        for chunk_id in 0..new_chunk_count {
-            let start = chunk_id * chunk_size;
-            let end = (start + chunk_size).min(keys.len());
-            let chunk_key = list_chunk_key_for_root(family_root, chunk_id as u64);
-            let chunk_value = encode_key_chunk(&keys[start..end])?;
-            puts.push((chunk_key, chunk_value));
-        }
-
-        for chunk_id in new_chunk_count..old_chunk_count {
-            deletes.push(list_chunk_key_for_root(family_root, chunk_id as u64));
-        }
-
-        Ok((puts, deletes))
-    }
-
-    fn append_family_keys(
-        &self,
-        family_root: &[u8],
-        keys: &[Vec<u8>],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let existing_values = self.raw_multi_get(keys)?;
-        let mut new_keys: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
-        for (key, existing_value) in keys.iter().zip(existing_values.into_iter()) {
-            if existing_value.is_none() {
-                new_keys.push(key.clone());
-            }
-        }
-        if new_keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let chunk_size = get_chunk_size() as usize;
-        let len_key = list_length_key_for_root(family_root);
-        let mut len = self.read_list_len_u64(&len_key)?;
-        let original_len = len;
-        let mut chunk_updates: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
-
-        for key in &new_keys {
-            let chunk_id = len / chunk_size as u64;
-            if let std::collections::btree_map::Entry::Vacant(entry) = chunk_updates.entry(chunk_id)
-            {
-                let chunk_key = list_chunk_key_for_root(family_root, chunk_id);
-                let existing = self
-                    .raw_get(&chunk_key)?
-                    .map(|raw| decode_key_chunk(&raw))
-                    .transpose()?
-                    .unwrap_or_default();
-                entry.insert(existing);
-            }
-            if let Some(chunk) = chunk_updates.get_mut(&chunk_id) {
-                chunk.push(key.clone());
-            }
-            len = len.saturating_add(1);
-        }
-
-        if len == original_len {
-            return Ok(Vec::new());
-        }
-
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for (chunk_id, chunk) in chunk_updates {
-            let chunk_key = list_chunk_key_for_root(family_root, chunk_id);
-            puts.push((chunk_key, encode_key_chunk(&chunk)?));
-        }
-        puts.push((len_key, len.to_le_bytes().to_vec()));
-        Ok(puts)
-    }
-
-    fn build_list_index_updates(
-        &self,
-        puts: &[(Vec<u8>, Vec<u8>)],
-        deletes: &[Vec<u8>],
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
-        let mut puts_by_family: Vec<Vec<Vec<u8>>> = vec![Vec::new(); AMMDATA_LIST_FAMILIES.len()];
-        let mut deletes_by_family: Vec<Vec<Vec<u8>>> =
-            vec![Vec::new(); AMMDATA_LIST_FAMILIES.len()];
-
-        for (key, _value) in puts {
-            if key.starts_with(LIST_META_V1_PREFIX) {
-                continue;
-            }
-            if let Some(idx) = list_family_index_for_prefix(key) {
-                puts_by_family[idx].push(key.clone());
-            }
-        }
-        for key in deletes {
-            if key.starts_with(LIST_META_V1_PREFIX) {
-                continue;
-            }
-            if let Some(idx) = list_family_index_for_prefix(key) {
-                deletes_by_family[idx].push(key.clone());
-            }
-        }
-
-        let mut extra_puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut extra_deletes: Vec<Vec<u8>> = Vec::new();
-
-        for idx in 0..AMMDATA_LIST_FAMILIES.len() {
-            if puts_by_family[idx].is_empty() && deletes_by_family[idx].is_empty() {
-                continue;
-            }
-            let family = AMMDATA_LIST_FAMILIES[idx];
-            let mut put_keys = std::mem::take(&mut puts_by_family[idx]);
-            put_keys.sort();
-            put_keys.dedup();
-            let mut delete_keys = std::mem::take(&mut deletes_by_family[idx]);
-            delete_keys.sort();
-            delete_keys.dedup();
-
-            if family.append_only && delete_keys.is_empty() {
-                extra_puts.extend(self.append_family_keys(family.root, &put_keys)?);
-                continue;
-            }
-
-            let mut keys: std::collections::BTreeSet<Vec<u8>> =
-                self.read_family_keys(family.root)?.into_iter().collect();
-            for key in delete_keys {
-                keys.remove(&key);
-            }
-            for key in put_keys {
-                keys.insert(key);
-            }
-            let keys_vec: Vec<Vec<u8>> = keys.into_iter().collect();
-            let (mut rewrite_puts, mut rewrite_deletes) =
-                self.rewrite_family_keys(family.root, &keys_vec)?;
-            extra_puts.append(&mut rewrite_puts);
-            extra_deletes.append(&mut rewrite_deletes);
-        }
-
-        Ok((extra_puts, extra_deletes))
+    fn raw_scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut keys = match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_prefix_keys_at_blockhash(&blockhash, prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys_at_blockhash failed: {e}"))?,
+            None => self
+                .mdb
+                .scan_prefix_keys(prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys failed: {e}"))?,
+        };
+        keys.sort();
+        Ok(keys)
     }
 
     pub fn get_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
@@ -1725,13 +1510,11 @@ impl AmmDataProvider {
         Ok(GetMultiValuesResult { values })
     }
 
-    pub fn get_list_keys_by_prefix(&self, params: GetListKeysByPrefixParams) -> Result<GetListKeysByPrefixResult> {
-        let Some(idx) = list_family_index_for_prefix(&params.prefix) else {
-            return Ok(GetListKeysByPrefixResult { keys: Vec::new() });
-        };
-        let family = AMMDATA_LIST_FAMILIES[idx];
-        let mut keys = self.read_family_keys(family.root)?;
-        keys.retain(|k| k.starts_with(&params.prefix));
+    pub fn get_list_keys_by_prefix(
+        &self,
+        params: GetListKeysByPrefixParams,
+    ) -> Result<GetListKeysByPrefixResult> {
+        let keys = self.raw_scan_prefix_keys(&params.prefix)?;
         Ok(GetListKeysByPrefixResult { keys })
     }
 
@@ -1739,37 +1522,23 @@ impl AmmDataProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
-        let Some(idx) = list_family_index_for_prefix(&params.prefix) else {
-            return Ok(GetListEntriesDescResult { entries: Vec::new() });
-        };
-        let family = AMMDATA_LIST_FAMILIES[idx];
-        let mut keys = self.read_family_keys(family.root)?;
-        keys.retain(|k| k.starts_with(&params.prefix));
-        keys.reverse();
-        let values = self.raw_multi_get(&keys)?;
-        let mut entries = Vec::new();
-        for (key, value) in keys.into_iter().zip(values.into_iter()) {
-            if let Some(value) = value {
-                entries.push((key, value));
-            }
-        }
+        let mut entries = self.raw_scan_prefix_entries(&params.prefix)?;
+        entries.reverse();
         Ok(GetListEntriesDescResult { entries })
     }
 
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
-        self.set_batch(SetBatchParams { puts: vec![(params.key, params.value)], deletes: Vec::new() })
+        self.set_batch(SetBatchParams {
+            puts: vec![(params.key, params.value)],
+            deletes: Vec::new(),
+        })
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
         if self.view_blockhash.is_some() {
             return Err(anyhow!("cannot_write_historical_view"));
         }
-        let (mut list_puts, mut list_deletes) =
-            self.build_list_index_updates(&params.puts, &params.deletes)?;
-        let mut all_puts = params.puts;
-        let mut all_deletes = params.deletes;
-        all_puts.append(&mut list_puts);
-        all_deletes.append(&mut list_deletes);
+        let (all_puts, all_deletes) = dedupe_batch_ops(params.puts, params.deletes);
 
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
@@ -2211,9 +1980,9 @@ impl AmmDataProvider {
     ) -> Result<GetAmmFactoriesResult> {
         crate::debug_timer_log!("get_amm_factories");
         let table = self.table();
-        let keys = match self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: table.AMM_FACTORIES.key().to_vec() })
-        {
+        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            prefix: table.AMM_FACTORIES.key().to_vec(),
+        }) {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -2233,7 +2002,9 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_factory_pools");
         let table = self.table();
         let prefix = table.factory_pools_prefix(&params.factory);
-        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() }) {
+        let keys = match self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+        {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -2655,7 +2426,9 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_pools");
         let table = self.table();
         let prefix = table.token_pools_prefix(&params.token);
-        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() }) {
+        let keys = match self
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+        {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };

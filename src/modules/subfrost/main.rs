@@ -119,8 +119,7 @@ impl EspoModule for Subfrost {
         let mut wrap_events_all: Vec<SchemaWrapEventV1> = Vec::new();
         let mut unwrap_events_all: Vec<SchemaWrapEventV1> = Vec::new();
         let mut wrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> = HashMap::new();
-        let mut unwrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> =
-            HashMap::new();
+        let mut unwrap_events_by_address: HashMap<Vec<u8>, Vec<SchemaWrapEventV1>> = HashMap::new();
         debug::log_elapsed(module, "init_context", timer);
 
         let timer = debug::start_if(debug);
@@ -264,21 +263,21 @@ impl EspoModule for Subfrost {
                     table.unwrap_total_by_height_key(block.height, true),
                     encode_u128_value(total_success),
                 ));
-                puts.extend(
-                    provider.build_unwrap_total_point_appends(BuildUnwrapTotalPointAppendsParams {
+                puts.extend(provider.build_unwrap_total_point_appends(
+                    BuildUnwrapTotalPointAppendsParams {
                         successful: false,
                         points: vec![UnwrapTotalPoint { height: block.height, total: total_all }],
-                    })?,
-                );
-                puts.extend(
-                    provider.build_unwrap_total_point_appends(BuildUnwrapTotalPointAppendsParams {
+                    },
+                )?);
+                puts.extend(provider.build_unwrap_total_point_appends(
+                    BuildUnwrapTotalPointAppendsParams {
                         successful: true,
                         points: vec![UnwrapTotalPoint {
                             height: block.height,
                             total: total_success,
                         }],
-                    })?,
-                );
+                    },
+                )?);
             }
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);

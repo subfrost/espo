@@ -107,8 +107,8 @@ fn default_block_source_mode() -> String {
     "rpc".to_string()
 }
 
-fn default_chunk_size() -> u32 {
-    256
+fn default_compact_tx_trace_rows() -> bool {
+    true
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
@@ -250,8 +250,8 @@ pub struct ConfigFile {
     pub block_source_mode: String,
     #[serde(default)]
     pub simulate_reorg: bool,
-    #[serde(default = "default_chunk_size")]
-    pub chunk_size: u32,
+    #[serde(default = "default_compact_tx_trace_rows")]
+    pub compact_tx_trace_rows: bool,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
@@ -286,7 +286,7 @@ pub struct AppConfig {
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
     pub simulate_reorg: bool,
-    pub chunk_size: u32,
+    pub compact_tx_trace_rows: bool,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -345,7 +345,7 @@ impl AppConfig {
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
             simulate_reorg: file.simulate_reorg,
-            chunk_size: file.chunk_size.max(1),
+            compact_tx_trace_rows: file.compact_tx_trace_rows,
             explorer_networks,
             modules: file.modules,
         })
@@ -602,8 +602,8 @@ pub fn get_network() -> Network {
     *NETWORK.get().expect("init_config() must set NETWORK")
 }
 
-pub fn get_chunk_size() -> u32 {
-    get_config().chunk_size.max(1)
+pub fn compact_tx_trace_rows_enabled() -> bool {
+    get_config().compact_tx_trace_rows
 }
 
 pub fn is_strict_mode() -> bool {

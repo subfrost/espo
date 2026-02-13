@@ -1,4 +1,3 @@
-use crate::config::get_chunk_size;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::tree_db::get_global_tree_db;
@@ -43,6 +42,34 @@ fn series_id_matches_name(series_id: &str, name_norm: &str) -> bool {
         }
     }
     false
+}
+
+fn dedupe_batch_ops(
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    deletes: Vec<Vec<u8>>,
+) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
+    let mut seen_puts: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_puts_rev: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(puts.len());
+    for (key, value) in puts.into_iter().rev() {
+        if seen_puts.insert(key.clone()) {
+            dedup_puts_rev.push((key, value));
+        }
+    }
+    dedup_puts_rev.reverse();
+
+    let put_keys: HashSet<Vec<u8>> = dedup_puts_rev.iter().map(|(k, _)| k.clone()).collect();
+    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut dedup_deletes: Vec<Vec<u8>> = Vec::with_capacity(deletes.len());
+    for key in deletes {
+        if put_keys.contains(&key) {
+            continue;
+        }
+        if seen_deletes.insert(key.clone()) {
+            dedup_deletes.push(key);
+        }
+    }
+
+    (dedup_puts_rev, dedup_deletes)
 }
 
 #[allow(non_snake_case)]
@@ -90,16 +117,15 @@ impl<'a> PizzafunTable<'a> {
         self.SERIES_ALL.key().to_vec()
     }
 
-    pub fn series_all_length_key(&self) -> Vec<u8> {
+    pub fn series_all_entry_prefix(&self) -> Vec<u8> {
         let mut key = self.series_all_prefix();
-        key.extend_from_slice(b"length");
+        key.extend_from_slice(b"entry/");
         key
     }
 
-    pub fn series_all_chunk_key(&self, chunk_id: u64) -> Vec<u8> {
-        let mut key = self.series_all_prefix();
-        key.extend_from_slice(b"chunk/");
-        key.extend_from_slice(&chunk_id.to_be_bytes());
+    pub fn series_all_entry_key(&self, series_id: &str) -> Vec<u8> {
+        let mut key = self.series_all_entry_prefix();
+        key.extend_from_slice(series_id.as_bytes());
         key
     }
 }
@@ -112,27 +138,6 @@ pub struct GetIndexHeightResult {
 
 pub struct SetIndexHeightParams {
     pub height: u32,
-}
-
-fn encode_u64_le(value: u64) -> [u8; 8] {
-    value.to_le_bytes()
-}
-
-fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 8 {
-        return None;
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(bytes);
-    Some(u64::from_le_bytes(arr))
-}
-
-fn encode_series_id_chunk(chunk: &[String]) -> Result<Vec<u8>> {
-    Ok(borsh::to_vec(&chunk.to_vec())?)
-}
-
-fn decode_series_id_chunk(bytes: &[u8]) -> Result<Vec<String>> {
-    Ok(Vec::<String>::try_from_slice(bytes)?)
 }
 
 #[derive(Clone)]
@@ -161,8 +166,9 @@ impl PizzafunProvider {
         let Some(tree) = get_global_tree_db() else {
             return Err(anyhow!("versioned_tree_unavailable"));
         };
-        let Some(blockhash) =
-            tree.blockhash_for_height(height_u32).map_err(|e| anyhow!("tree lookup failed: {e}"))?
+        let Some(blockhash) = tree
+            .blockhash_for_height(height_u32)
+            .map_err(|e| anyhow!("tree lookup failed: {e}"))?
         else {
             return Err(anyhow!("height_not_indexed"));
         };
@@ -179,9 +185,10 @@ impl PizzafunProvider {
 
     fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.view_blockhash {
-            Some(blockhash) => {
-                self.mdb.get_at_blockhash(&blockhash, key).map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}"))
-            }
+            Some(blockhash) => self
+                .mdb
+                .get_at_blockhash(&blockhash, key)
+                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
             None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
         }
     }
@@ -199,30 +206,34 @@ impl PizzafunProvider {
         }
     }
 
-    fn read_u64_len(&self, key: &[u8]) -> Result<u64> {
-        Ok(self.raw_get(key)?.and_then(|v| decode_u64_le(&v)).unwrap_or(0))
+    fn raw_scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let mut keys = match self.view_blockhash {
+            Some(blockhash) => self
+                .mdb
+                .scan_prefix_keys_at_blockhash(&blockhash, prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys_at_blockhash failed: {e}"))?,
+            None => self
+                .mdb
+                .scan_prefix_keys(prefix)
+                .map_err(|e| anyhow!("mdb.scan_prefix_keys failed: {e}"))?,
+        };
+        keys.sort();
+        Ok(keys)
     }
 
     fn read_series_ids_all(&self) -> Result<Vec<String>> {
         let table = self.table();
-        let len = self.read_u64_len(&table.series_all_length_key())? as usize;
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let chunk_size = get_chunk_size() as usize;
-        let chunk_count = len.div_ceil(chunk_size);
-        let mut keys = Vec::with_capacity(chunk_count);
-        for chunk_id in 0..chunk_count {
-            keys.push(table.series_all_chunk_key(chunk_id as u64));
-        }
-        let values = self.raw_multi_get(&keys)?;
-        let mut out = Vec::with_capacity(len);
-        for raw in values {
-            let Some(bytes) = raw else { continue };
-            out.extend(decode_series_id_chunk(&bytes)?);
-        }
-        if out.len() > len {
-            out.truncate(len);
+        let entry_prefix = table.series_all_entry_prefix();
+        let keys = self.raw_scan_prefix_keys(&entry_prefix)?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(suffix) = key.strip_prefix(entry_prefix.as_slice()) else {
+                continue;
+            };
+            let Ok(series_id) = std::str::from_utf8(suffix) else {
+                continue;
+            };
+            out.push(series_id.to_string());
         }
         Ok(out)
     }
@@ -232,33 +243,21 @@ impl PizzafunProvider {
         ids: &[String],
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
         let table = self.table();
-        let chunk_size = get_chunk_size() as usize;
-        let old_len = self
-            .mdb
-            .get(&table.series_all_length_key())
-            .map_err(|e| anyhow!("mdb.get failed: {e}"))?
-            .and_then(|v| decode_u64_le(&v))
-            .unwrap_or(0) as usize;
+        let existing_ids = self.read_series_ids_all()?;
+        let existing_set: HashSet<String> = existing_ids.into_iter().collect();
+        let next_set: HashSet<String> = ids.iter().cloned().collect();
 
-        let old_chunk_count = if old_len == 0 { 0 } else { old_len.div_ceil(chunk_size) };
-        let new_chunk_count = if ids.is_empty() { 0 } else { ids.len().div_ceil(chunk_size) };
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = next_set
+            .difference(&existing_set)
+            .map(|series_id| (table.series_all_entry_key(series_id), Vec::new()))
+            .collect();
+        puts.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        for chunk_id in 0..new_chunk_count {
-            let start = chunk_id * chunk_size;
-            let end = (start + chunk_size).min(ids.len());
-            puts.push((
-                table.series_all_chunk_key(chunk_id as u64),
-                encode_series_id_chunk(&ids[start..end])?,
-            ));
-        }
-        puts.push((table.series_all_length_key(), encode_u64_le(ids.len() as u64).to_vec()));
-
-        let mut deletes = Vec::new();
-        for chunk_id in new_chunk_count..old_chunk_count {
-            deletes.push(table.series_all_chunk_key(chunk_id as u64));
-        }
-
+        let mut deletes: Vec<Vec<u8>> = existing_set
+            .difference(&next_set)
+            .map(|series_id| table.series_all_entry_key(series_id))
+            .collect();
+        deletes.sort();
         Ok((puts, deletes))
     }
 
@@ -390,13 +389,15 @@ impl PizzafunProvider {
         }
         deletes.extend(list_deletes);
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(updated.len() * 2 + list_puts.len());
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(updated.len() * 2 + list_puts.len());
         for entry in updated {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
         }
         puts.extend(list_puts);
+        let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
@@ -431,13 +432,15 @@ impl PizzafunProvider {
         let (list_puts, list_deletes) = self.build_series_id_list_rewrite(&new_ids)?;
         deletes.extend(list_deletes);
 
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(entries.len() * 2 + list_puts.len());
+        let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(entries.len() * 2 + list_puts.len());
         for entry in entries {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
         }
         puts.extend(list_puts);
+        let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
