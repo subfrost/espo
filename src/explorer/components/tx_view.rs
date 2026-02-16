@@ -877,7 +877,7 @@ fn render_vouts(
         } @else {
             div class="io-list" {
                 @for (vout, o) in tx.output.iter().enumerate() {
-                    @let OutpointLookup { balances, spent_by: db_spent } = outpoint_fn(txid, vout as u32);
+                    @let OutpointLookup { balances, spent_by: db_spent, .. } = outpoint_fn(txid, vout as u32);
                     @let spent_by = outspends.get(vout).cloned().flatten().or(db_spent);
                     @let opret = decode_op_return_payload(&o.script_pubkey);
                     @let is_opret = opret.is_some();

@@ -436,6 +436,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            cursor: payload
+                                .get("cursor")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         view.rpc_get_alkane_balance_txs(params)
                             .map(|resp| resp.value)
@@ -469,6 +473,10 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
                                 .map(|s| s.to_string()),
                             page: payload.get("page").and_then(|v| v.as_u64()),
                             limit: payload.get("limit").and_then(|v| v.as_u64()),
+                            cursor: payload
+                                .get("cursor")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                         };
                         view.rpc_get_alkane_balance_txs_by_token(params)
                             .map(|resp| resp.value)

@@ -1,16 +1,18 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
+    prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
 };
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew, get_network};
 use crate::modules::essentials::utils::balances::{
-    SignedU128, get_address_activity_for_address, get_alkane_balances,
-    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
-    get_outpoint_balances as get_outpoint_balances_index, get_total_received_for_alkane,
-    get_transfer_volume_for_alkane,
+    get_address_activity_for_address, get_alkane_balances, get_alkane_balances_at_or_before,
+    get_balance_for_address, get_holders_for_alkane,
+    get_outpoint_address, get_total_received_for_alkane, get_transfer_volume_for_alkane,
+    SignedU128,
 };
-use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
+use crate::modules::essentials::utils::inspections::{inspection_to_json, AlkaneCreationRecord};
 use crate::runtime::mdb::{Mdb, MdbBatch};
-use crate::runtime::pointers::{KvPointer, ListPointer};
+use crate::runtime::pointers::{
+    CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer,
+};
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use alkanes_support::proto::alkanes::AlkanesTrace;
@@ -21,15 +23,15 @@ use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{Value, json, map::Map};
+use serde_json::{json, map::Map, Value};
 
 use crate::runtime::mempool::{
-    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address, MempoolEntry,
 };
 use crate::utils::electrum_like::AddressHistoryEntry;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use hex;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -39,6 +41,10 @@ const ALKANE_V2_PREFIX: &[u8] = b"/alkane/v2/";
 const TX_V2_PREFIX: &[u8] = b"/tx/v2/";
 const BALANCE_CHANGES_V2_PREFIX: &[u8] = b"/balance_changes/v2/";
 const ALKANE_LATEST_TRACES_V2_PREFIX: &[u8] = b"/alkane_latest_traces/v2/";
+const TX_LOCATOR_CANDIDATE_BLOB_V2_PREFIX: &[u8] = b"/tx_locator_candidates/v2/";
+const TX_SUMMARY_MARKER_BLOB_V2_PREFIX: &[u8] = b"/tx_summary_marker/v2/";
+const OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX: &[u8] = b"/outpoint_create_candidates/v2/";
+const OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX: &[u8] = b"/outpoint_spend_events/v2/";
 
 fn encode_alkane_id_be(id: &SchemaAlkaneId) -> [u8; 12] {
     let mut out = [0u8; 12];
@@ -109,7 +115,7 @@ fn dedupe_batch_ops(
     puts: Vec<(Vec<u8>, Vec<u8>)>,
     deletes: Vec<Vec<u8>>,
 ) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>) {
-    let mut seen_puts: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen_puts: HashSet<Vec<u8>> = HashSet::with_capacity(puts.len());
     let mut dedup_puts_rev: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(puts.len());
     for (key, value) in puts.into_iter().rev() {
         if seen_puts.insert(key.clone()) {
@@ -118,11 +124,10 @@ fn dedupe_batch_ops(
     }
     dedup_puts_rev.reverse();
 
-    let put_keys: HashSet<Vec<u8>> = dedup_puts_rev.iter().map(|(k, _)| k.clone()).collect();
-    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen_deletes: HashSet<Vec<u8>> = HashSet::with_capacity(deletes.len());
     let mut dedup_deletes: Vec<Vec<u8>> = Vec::with_capacity(deletes.len());
     for key in deletes {
-        if put_keys.contains(&key) {
+        if seen_puts.contains(&key) {
             continue;
         }
         if seen_deletes.insert(key.clone()) {
@@ -156,13 +161,6 @@ pub struct EssentialsTable<'a> {
     pub ADDRESS_ACTIVITY: KvPointer<'a>,
     pub ALKANE_BALANCES: KvPointer<'a>,
     pub ALKANE_BALANCES_BY_HEIGHT: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS_PAGED: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS_META: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS_BY_TOKEN: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS_BY_TOKEN_PAGED: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS_BY_TOKEN_META: KvPointer<'a>,
-    pub ALKANE_BALANCE_TXS_BY_HEIGHT: KvPointer<'a>,
     // Alkane creation + metadata.
     pub ALKANE_INFO: KvPointer<'a>,
     pub ALKANE_NAME_INDEX: ListPointer<'a>,
@@ -192,8 +190,8 @@ impl<'a> EssentialsTable<'a> {
             KV_ROWS: root.select(&[0x01]),
             DIR_ROWS: root.list_select(&[0x03]),
             INDEX_HEIGHT: root.keyword("/index_height"),
-            BALANCES: root.keyword("/address/v2/"),
-            OUTPOINT_BALANCES: root.keyword("/outpoint/v2/"),
+            BALANCES: root.keyword("/balances/"),
+            OUTPOINT_BALANCES: root.keyword("/outpoint_balances/"),
             OUTPOINT_ADDR: root.keyword("/outpoint_addr/"),
             UTXO_SPK: root.keyword("/utxo_spk/"),
             ADDR_SPK: root.keyword("/addr_spk/"),
@@ -205,13 +203,6 @@ impl<'a> EssentialsTable<'a> {
             ADDRESS_ACTIVITY: root.keyword("/address/v2/"),
             ALKANE_BALANCES: root.keyword("/alkane/v2/"),
             ALKANE_BALANCES_BY_HEIGHT: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS_PAGED: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS_META: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS_BY_TOKEN: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS_BY_TOKEN_PAGED: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS_BY_TOKEN_META: root.keyword("/alkane/v2/"),
-            ALKANE_BALANCE_TXS_BY_HEIGHT: root.keyword("/balance_changes/v2/"),
             ALKANE_INFO: root.keyword("/alkane_info/"),
             ALKANE_NAME_INDEX: root.list_keyword("/alkanes/name/"),
             ALKANE_SYMBOL_INDEX: root.list_keyword("/alkanes/symbol/"),
@@ -223,10 +214,10 @@ impl<'a> EssentialsTable<'a> {
             CIRCULATING_SUPPLY_LATEST: root.keyword("/circulating_supply/latest/"),
             TOTAL_MINTED: root.keyword("/total_minted/v1/"),
             TOTAL_MINTED_LATEST: root.keyword("/total_minted/latest/"),
-            ALKANE_TX_SUMMARY: root.keyword("/tx/v2/"),
+            ALKANE_TX_SUMMARY: root.keyword("/alkane_tx_summary/"),
             ALKANE_BLOCK: root.list_keyword("/alkane_block/"),
             ALKANE_ADDR: root.list_keyword("/alkane_addr/"),
-            ALKANE_LATEST_TRACES: root.keyword("/alkane_latest_traces/v2/"),
+            ALKANE_LATEST_TRACES: root.keyword("/alkane_latest_traces"),
             BLOCK_SUMMARY: root.keyword("/block_summary/"),
         }
     }
@@ -347,6 +338,128 @@ impl<'a> EssentialsTable<'a> {
         Some((address, alkane))
     }
 
+    pub fn outpoint_pos_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
+        self.outpoint_pos_key_from_parts(&outp.txid, outp.vout)
+    }
+
+    pub fn outpoint_pos_key_from_parts(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
+        let outpoint_id = outpoint_id_bytes(txid, vout)
+            .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
+        let mut key = Vec::with_capacity(OUTPOINT_V2_PREFIX.len() + 2 + outpoint_id.len());
+        key.extend_from_slice(OUTPOINT_V2_PREFIX);
+        key.extend_from_slice(b"p/");
+        key.extend_from_slice(&outpoint_id);
+        Ok(key)
+    }
+
+    pub fn outpoint_row_key(&self, blockhash: &[u8; 32], tx_idx: u32, vout: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_PREFIX.len() + 2 + 32 + 4 + 4);
+        key.extend_from_slice(OUTPOINT_V2_PREFIX);
+        key.extend_from_slice(b"r/");
+        key.extend_from_slice(blockhash);
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(&vout.to_be_bytes());
+        key
+    }
+
+    pub fn outpoint_create_candidate_prefix_from_parts(
+        &self,
+        txid: &[u8],
+        vout: u32,
+    ) -> Result<Vec<u8>> {
+        let outpoint_id = outpoint_id_bytes(txid, vout)
+            .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
+        let mut key = Vec::with_capacity(OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX.len() + 36);
+        key.extend_from_slice(OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX);
+        key.extend_from_slice(&outpoint_id);
+        Ok(key)
+    }
+
+    pub fn outpoint_create_candidate_key(
+        &self,
+        txid: &[u8],
+        vout: u32,
+        height: u32,
+        tx_idx: u32,
+        blockhash: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let mut key = self.outpoint_create_candidate_prefix_from_parts(txid, vout)?;
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(blockhash);
+        Ok(key)
+    }
+
+    pub fn parse_outpoint_create_candidate_key(
+        &self,
+        key: &[u8],
+    ) -> Option<(Vec<u8>, u32, u32, u32, [u8; 32])> {
+        if !key.starts_with(OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX) {
+            return None;
+        }
+        let rest = &key[OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX.len()..];
+        if rest.len() != 36 + 4 + 4 + 32 {
+            return None;
+        }
+        let (txid, vout) = parse_outpoint_id_bytes(&rest[..36])?;
+        let mut h = [0u8; 4];
+        h.copy_from_slice(&rest[36..40]);
+        let mut i = [0u8; 4];
+        i.copy_from_slice(&rest[40..44]);
+        let mut bh = [0u8; 32];
+        bh.copy_from_slice(&rest[44..76]);
+        Some((txid, vout, u32::from_be_bytes(h), u32::from_be_bytes(i), bh))
+    }
+
+    pub fn outpoint_spend_event_prefix_from_parts(
+        &self,
+        txid: &[u8],
+        vout: u32,
+    ) -> Result<Vec<u8>> {
+        let outpoint_id = outpoint_id_bytes(txid, vout)
+            .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
+        let mut key = Vec::with_capacity(OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX.len() + 36);
+        key.extend_from_slice(OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX);
+        key.extend_from_slice(&outpoint_id);
+        Ok(key)
+    }
+
+    pub fn outpoint_spend_event_key(
+        &self,
+        txid: &[u8],
+        vout: u32,
+        height: u32,
+        tx_idx: u32,
+        blockhash: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let mut key = self.outpoint_spend_event_prefix_from_parts(txid, vout)?;
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(blockhash);
+        Ok(key)
+    }
+
+    pub fn parse_outpoint_spend_event_key(
+        &self,
+        key: &[u8],
+    ) -> Option<(Vec<u8>, u32, u32, u32, [u8; 32])> {
+        if !key.starts_with(OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX) {
+            return None;
+        }
+        let rest = &key[OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX.len()..];
+        if rest.len() != 36 + 4 + 4 + 32 {
+            return None;
+        }
+        let (txid, vout) = parse_outpoint_id_bytes(&rest[..36])?;
+        let mut h = [0u8; 4];
+        h.copy_from_slice(&rest[36..40]);
+        let mut i = [0u8; 4];
+        i.copy_from_slice(&rest[40..44]);
+        let mut bh = [0u8; 32];
+        bh.copy_from_slice(&rest[44..76]);
+        Some((txid, vout, u32::from_be_bytes(h), u32::from_be_bytes(i), bh))
+    }
+
     pub fn outpoint_prefix(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
         let outpoint_id = outpoint_id_bytes(&outp.txid, outp.vout)
             .ok_or_else(|| anyhow!("invalid outpoint txid length {}", outp.txid.len()))?;
@@ -368,8 +481,16 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn outpoint_spent_by_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        let mut key = self.outpoint_prefix(outp)?;
-        key.extend_from_slice(b"spent_by");
+        self.outpoint_spent_by_key_from_parts(&outp.txid, outp.vout)
+    }
+
+    pub fn outpoint_spent_by_key_from_parts(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
+        let outpoint_id = outpoint_id_bytes(txid, vout)
+            .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
+        let mut key = Vec::with_capacity(OUTPOINT_V2_PREFIX.len() + 2 + outpoint_id.len());
+        key.extend_from_slice(OUTPOINT_V2_PREFIX);
+        key.extend_from_slice(b"s/");
+        key.extend_from_slice(&outpoint_id);
         Ok(key)
     }
 
@@ -765,59 +886,74 @@ impl<'a> EssentialsTable<'a> {
         key
     }
 
-    pub fn tx_prefix(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(TX_V2_PREFIX.len() + txid.len() + 1);
+    pub fn tx_packed_outflow_pos_key(&self, txid: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_V2_PREFIX.len() + 2 + txid.len());
         key.extend_from_slice(TX_V2_PREFIX);
+        key.extend_from_slice(b"l/");
         key.extend_from_slice(txid);
-        key.push(b'/');
         key
     }
 
-    pub fn tx_height_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = self.tx_prefix(txid);
-        key.extend_from_slice(b"height");
-        key
-    }
-
-    pub fn tx_outflow_prefix(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = self.tx_prefix(txid);
-        key.extend_from_slice(b"outflow/");
-        key
-    }
-
-    pub fn tx_outflow_owner_prefix(&self, txid: &[u8; 32], owner: &SchemaAlkaneId) -> Vec<u8> {
-        let mut key = self.tx_outflow_prefix(txid);
-        key.extend_from_slice(&encode_alkane_id_be(owner));
-        key.push(b'/');
-        key
-    }
-
-    pub fn tx_outflow_key(
-        &self,
-        txid: &[u8; 32],
-        owner: &SchemaAlkaneId,
-        token: &SchemaAlkaneId,
-    ) -> Vec<u8> {
-        let mut key = self.tx_outflow_owner_prefix(txid, owner);
-        key.extend_from_slice(&encode_alkane_id_be(token));
-        key
-    }
-
-    pub fn tx_trace_prefix(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = self.tx_prefix(txid);
-        key.extend_from_slice(b"trace/");
-        key
-    }
-
-    pub fn tx_trace_key(&self, txid: &[u8; 32], idx: u32) -> Vec<u8> {
-        let mut key = self.tx_trace_prefix(txid);
+    pub fn tx_packed_outflow_row_key(&self, blockhash: &[u8; 32], idx: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_V2_PREFIX.len() + 2 + 32 + 4);
+        key.extend_from_slice(TX_V2_PREFIX);
+        key.extend_from_slice(b"r/");
+        key.extend_from_slice(blockhash);
         key.extend_from_slice(&idx.to_be_bytes());
         key
     }
 
-    pub fn tx_trace_length_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = self.tx_prefix(txid);
-        key.extend_from_slice(b"trace_length");
+    pub fn tx_packed_outflow_key(&self, txid: &[u8; 32]) -> Vec<u8> {
+        self.tx_packed_outflow_pos_key(txid)
+    }
+
+    pub fn tx_locator_candidate_prefix(&self, txid: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_LOCATOR_CANDIDATE_BLOB_V2_PREFIX.len() + txid.len());
+        key.extend_from_slice(TX_LOCATOR_CANDIDATE_BLOB_V2_PREFIX);
+        key.extend_from_slice(txid);
+        key
+    }
+
+    pub fn tx_locator_candidate_key(
+        &self,
+        txid: &[u8; 32],
+        height: u32,
+        tx_idx: u32,
+        blockhash: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut key = self.tx_locator_candidate_prefix(txid);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(blockhash);
+        key
+    }
+
+    pub fn parse_tx_locator_candidate_key(
+        &self,
+        txid: &[u8; 32],
+        key: &[u8],
+    ) -> Option<(u32, u32, [u8; 32])> {
+        let prefix = self.tx_locator_candidate_prefix(txid);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 4 + 4 + 32 {
+            return None;
+        }
+        let mut h = [0u8; 4];
+        h.copy_from_slice(&rest[..4]);
+        let mut i = [0u8; 4];
+        i.copy_from_slice(&rest[4..8]);
+        let mut bh = [0u8; 32];
+        bh.copy_from_slice(&rest[8..40]);
+        Some((u32::from_be_bytes(h), u32::from_be_bytes(i), bh))
+    }
+
+    pub fn tx_summary_marker_key(&self, txid: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_SUMMARY_MARKER_BLOB_V2_PREFIX.len() + txid.len());
+        key.extend_from_slice(TX_SUMMARY_MARKER_BLOB_V2_PREFIX);
+        key.extend_from_slice(txid);
         key
     }
 
@@ -858,7 +994,8 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn balances_key(&self, address: &str, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        self.address_outpoint_key(address, outp)
+        let suffix = borsh::to_vec(outp)?;
+        Ok(self.BALANCES.select(address.as_bytes()).keyword("/").select(&suffix).key().to_vec())
     }
 
     pub fn holders_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
@@ -893,63 +1030,140 @@ impl<'a> EssentialsTable<'a> {
         self.ADDRESS_ACTIVITY.select(address.as_bytes()).key().to_vec()
     }
 
-    pub fn alkane_balance_txs_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
-        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 14);
+    pub fn alkane_balance_txs_log_prefix(&self, owner: &SchemaAlkaneId) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 16);
         key.extend_from_slice(ALKANE_V2_PREFIX);
-        key.extend_from_slice(&encode_alkane_id_be(alkane));
-        key.extend_from_slice(b"/balance_txs/");
+        key.extend_from_slice(&encode_alkane_id_be(owner));
+        key.extend_from_slice(b"/balance_txs/v2/");
         key
     }
 
-    pub fn alkane_balance_txs_page_key(&self, alkane: &SchemaAlkaneId, page: u64) -> Vec<u8> {
-        let mut key = self.alkane_balance_txs_key(alkane);
-        key.extend_from_slice(&page.to_be_bytes());
+    pub fn alkane_balance_txs_log_key(
+        &self,
+        owner: &SchemaAlkaneId,
+        height: u32,
+        tx_idx: u32,
+        txid: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut key = self.alkane_balance_txs_log_prefix(owner);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(txid);
         key
     }
 
-    pub fn alkane_balance_txs_meta_key(&self, alkane: &SchemaAlkaneId) -> Vec<u8> {
-        let mut key = self.alkane_balance_txs_key(alkane);
-        key.extend_from_slice(b"length");
-        key
+    pub fn parse_alkane_balance_txs_log_key(
+        &self,
+        owner: &SchemaAlkaneId,
+        key: &[u8],
+    ) -> Option<(u32, u32, [u8; 32])> {
+        let prefix = self.alkane_balance_txs_log_prefix(owner);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 4 + 4 + 32 {
+            return None;
+        }
+        let mut height = [0u8; 4];
+        height.copy_from_slice(&rest[..4]);
+        let mut tx_idx = [0u8; 4];
+        tx_idx.copy_from_slice(&rest[4..8]);
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&rest[8..40]);
+        Some((u32::from_be_bytes(height), u32::from_be_bytes(tx_idx), txid))
     }
 
-    pub fn alkane_balance_txs_by_height_key(&self, height: u32) -> Vec<u8> {
-        self.balance_changes_length_key(height)
-    }
-
-    pub fn alkane_balance_txs_by_token_key(
+    pub fn alkane_balance_txs_by_token_log_prefix(
         &self,
         owner: &SchemaAlkaneId,
         token: &SchemaAlkaneId,
     ) -> Vec<u8> {
-        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 24 + 12);
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 12 + 25 + 12 + 1);
         key.extend_from_slice(ALKANE_V2_PREFIX);
         key.extend_from_slice(&encode_alkane_id_be(owner));
-        key.extend_from_slice(b"/balance_txs_by_token/");
+        key.extend_from_slice(b"/balance_txs_by_token/v2/");
         key.extend_from_slice(&encode_alkane_id_be(token));
         key.push(b'/');
         key
     }
 
-    pub fn alkane_balance_txs_by_token_page_key(
+    pub fn alkane_balance_txs_by_token_log_key(
         &self,
         owner: &SchemaAlkaneId,
         token: &SchemaAlkaneId,
-        page: u64,
+        height: u32,
+        tx_idx: u32,
+        txid: &[u8; 32],
     ) -> Vec<u8> {
-        let mut key = self.alkane_balance_txs_by_token_key(owner, token);
-        key.extend_from_slice(&page.to_be_bytes());
+        let mut key = self.alkane_balance_txs_by_token_log_prefix(owner, token);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(txid);
         key
     }
 
-    pub fn alkane_balance_txs_by_token_meta_key(
+    pub fn parse_alkane_balance_txs_by_token_log_key(
         &self,
         owner: &SchemaAlkaneId,
         token: &SchemaAlkaneId,
-    ) -> Vec<u8> {
-        let mut key = self.alkane_balance_txs_by_token_key(owner, token);
-        key.extend_from_slice(b"length");
+        key: &[u8],
+    ) -> Option<(u32, u32, [u8; 32])> {
+        let prefix = self.alkane_balance_txs_by_token_log_prefix(owner, token);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 4 + 4 + 32 {
+            return None;
+        }
+        let mut height = [0u8; 4];
+        height.copy_from_slice(&rest[..4]);
+        let mut tx_idx = [0u8; 4];
+        tx_idx.copy_from_slice(&rest[4..8]);
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&rest[8..40]);
+        Some((u32::from_be_bytes(height), u32::from_be_bytes(tx_idx), txid))
+    }
+
+    pub fn alkane_balance_txs_by_height_log_prefix(&self, height: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ALKANE_V2_PREFIX.len() + 31 + 4 + 1);
+        key.extend_from_slice(ALKANE_V2_PREFIX);
+        key.extend_from_slice(b"balance_txs_by_height/v2/");
+        key.extend_from_slice(&height.to_be_bytes());
+        key.push(b'/');
         key
+    }
+
+    pub fn alkane_balance_txs_by_height_log_key(
+        &self,
+        height: u32,
+        tx_idx: u32,
+        owner: &SchemaAlkaneId,
+    ) -> Vec<u8> {
+        let mut key = self.alkane_balance_txs_by_height_log_prefix(height);
+        key.extend_from_slice(&tx_idx.to_be_bytes());
+        key.extend_from_slice(&encode_alkane_id_be(owner));
+        key
+    }
+
+    pub fn parse_alkane_balance_txs_by_height_log_key(
+        &self,
+        height: u32,
+        key: &[u8],
+    ) -> Option<(u32, SchemaAlkaneId)> {
+        let prefix = self.alkane_balance_txs_by_height_log_prefix(height);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 4 + 12 {
+            return None;
+        }
+        let mut tx_idx = [0u8; 4];
+        tx_idx.copy_from_slice(&rest[..4]);
+        let owner = decode_alkane_id_be(&rest[4..16])?;
+        Some((u32::from_be_bytes(tx_idx), owner))
     }
 
     pub fn alkane_balances_key(&self, owner: &SchemaAlkaneId) -> Vec<u8> {
@@ -1159,7 +1373,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn alkane_tx_summary_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        self.tx_height_key(txid)
+        self.tx_packed_outflow_pos_key(txid)
     }
 
     pub fn alkane_block_txid_key(&self, height: u64, idx: u64) -> Vec<u8> {
@@ -1193,24 +1407,21 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn alkane_latest_traces_key(&self) -> Vec<u8> {
-        self.latest_traces_length_key()
+        self.ALKANE_LATEST_TRACES.key().to_vec()
     }
 
     pub fn outpoint_addr_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        let mut key = self.outpoint_prefix(outp)?;
-        key.extend_from_slice(b"addr");
-        Ok(key)
+        let suffix = borsh::to_vec(outp)?;
+        Ok(self.OUTPOINT_ADDR.select(&suffix).key().to_vec())
     }
 
     pub fn utxo_spk_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        let mut key = self.outpoint_prefix(outp)?;
-        key.extend_from_slice(b"spk");
-        Ok(key)
+        let suffix = borsh::to_vec(outp)?;
+        Ok(self.UTXO_SPK.select(&suffix).key().to_vec())
     }
 
     pub fn outpoint_balances_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        let suffix = borsh::to_vec(outp)?;
-        Ok(self.OUTPOINT_BALANCES.select(&suffix).key().to_vec())
+        self.outpoint_pos_key(outp)
     }
 
     pub fn block_summary_key(&self, height: u32) -> Vec<u8> {
@@ -1222,23 +1433,29 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn outpoint_balances_prefix(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
-        self.outpoint_balance_prefix_from_parts(txid, vout)
+        self.outpoint_pos_key_from_parts(txid, vout)
     }
 }
 
 #[derive(Clone)]
 pub struct EssentialsProvider {
     mdb: Arc<Mdb>,
+    blob_mdb: Arc<Mdb>,
     view_blockhash: Option<BlockHash>,
 }
 
 impl EssentialsProvider {
     pub fn new(mdb: Arc<Mdb>) -> Self {
-        Self { mdb, view_blockhash: None }
+        let blob_mdb = Arc::new(mdb.clone_with_prefix_no_aof(b"essentials_blob:"));
+        Self { mdb, blob_mdb, view_blockhash: None }
     }
 
     pub fn with_view_blockhash(&self, blockhash: Option<BlockHash>) -> Self {
-        Self { mdb: Arc::clone(&self.mdb), view_blockhash: blockhash }
+        Self {
+            mdb: Arc::clone(&self.mdb),
+            blob_mdb: Arc::clone(&self.blob_mdb),
+            view_blockhash: blockhash,
+        }
     }
 
     pub fn with_height(&self, height: Option<u64>, height_present: bool) -> Result<Self> {
@@ -1269,6 +1486,35 @@ impl EssentialsProvider {
         self.mdb.as_ref()
     }
 
+    pub fn blob_mdb(&self) -> &Mdb {
+        self.blob_mdb.as_ref()
+    }
+
+    pub fn view_blockhash(&self) -> Option<BlockHash> {
+        self.view_blockhash
+    }
+
+    pub fn resolved_view_blockhash(&self) -> Option<BlockHash> {
+        self.view_blockhash
+            .or_else(|| get_global_tree_db().and_then(|tree| tree.active_blockhash()))
+    }
+
+    pub fn blockhash_is_ancestor(
+        &self,
+        ancestor: &BlockHash,
+        descendant: &BlockHash,
+    ) -> Result<bool> {
+        let Some(tree) = get_global_tree_db() else {
+            return Ok(false);
+        };
+        tree.is_ancestor(ancestor, descendant)
+            .map_err(|e| anyhow!("tree.is_ancestor failed: {e}"))
+    }
+
+    pub fn non_mutating_pointer(&self) -> ListNonMutatePointer<'_> {
+        ListNonMutatePointer::root(self.mdb.as_ref(), self.blob_mdb.as_ref())
+    }
+
     fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.view_blockhash {
             Some(blockhash) => self
@@ -1277,6 +1523,10 @@ impl EssentialsProvider {
                 .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
             None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
         }
+    }
+
+    fn raw_blob_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.blob_mdb.get(key).map_err(|e| anyhow!("blob_mdb.get failed: {e}"))
     }
 
     fn raw_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
@@ -1290,6 +1540,12 @@ impl EssentialsProvider {
             }
             None => self.mdb.multi_get(keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}")),
         }
+    }
+
+    fn raw_blob_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        self.blob_mdb
+            .multi_get(keys)
+            .map_err(|e| anyhow!("blob_mdb.multi_get failed: {e}"))
     }
 
     fn raw_scan_prefix_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -1332,6 +1588,16 @@ impl EssentialsProvider {
         Ok(GetMultiValuesResult { values })
     }
 
+    pub fn get_blob_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
+        let value = self.raw_blob_get(&params.key)?;
+        Ok(GetRawValueResult { value })
+    }
+
+    pub fn get_blob_multi_values(&self, params: GetMultiValuesParams) -> Result<GetMultiValuesResult> {
+        let values = self.raw_blob_multi_get(&params.keys)?;
+        Ok(GetMultiValuesResult { values })
+    }
+
     pub fn get_list_keys_by_prefix(
         &self,
         params: GetListKeysByPrefixParams,
@@ -1349,6 +1615,23 @@ impl EssentialsProvider {
         Ok(GetListEntriesDescResult { entries })
     }
 
+    pub fn get_list_entries_desc_cursor(
+        &self,
+        params: GetListEntriesDescCursorParams,
+    ) -> Result<GetListEntriesDescCursorResult> {
+        let list = ListPointer::root(self.mdb.as_ref()).select(&params.prefix);
+        let cursor_page: CursorScanPage = list.scan_desc_cursor_page(
+            self.view_blockhash.as_ref(),
+            params.cursor.as_deref(),
+            params.limit.max(1),
+        )?;
+        Ok(GetListEntriesDescCursorResult {
+            entries: cursor_page.entries,
+            next_cursor: cursor_page.next_cursor,
+            has_more: cursor_page.has_more,
+        })
+    }
+
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
         self.set_batch(SetBatchParams {
             puts: vec![(params.key, params.value)],
@@ -1360,9 +1643,37 @@ impl EssentialsProvider {
         if self.view_blockhash.is_some() {
             return Err(anyhow!("cannot_write_historical_view"));
         }
-        let (all_puts, all_deletes) = dedupe_batch_ops(params.puts, params.deletes);
+        let batch_progress = std::env::var_os("ESPO_BATCH_PROGRESS").is_some();
+        let started = std::time::Instant::now();
+        let versioned = self.mdb.is_versioned();
 
-        self.mdb
+        if batch_progress {
+            eprintln!(
+                "[storage.set_batch] begin versioned={} puts={} deletes={}",
+                versioned,
+                params.puts.len(),
+                params.deletes.len()
+            );
+        }
+
+        // Versioned B+Tree writes are canonically deduped in tree_db (last-write-wins),
+        // so skipping this pre-pass avoids a large clone-heavy batch rewrite.
+        let (all_puts, all_deletes) = if versioned {
+            (params.puts, params.deletes)
+        } else {
+            dedupe_batch_ops(params.puts, params.deletes)
+        };
+
+        if batch_progress {
+            eprintln!(
+                "[storage.set_batch] prepared puts={} deletes={}",
+                all_puts.len(),
+                all_deletes.len()
+            );
+        }
+
+        let res = self
+            .mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
                 for key in &all_deletes {
                     wb.delete(key);
@@ -1371,7 +1682,60 @@ impl EssentialsProvider {
                     wb.put(key, value);
                 }
             })
-            .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"))
+            .map_err(|e| anyhow!("mdb.bulk_write failed: {e}"));
+
+        if batch_progress {
+            eprintln!("[storage.set_batch] end elapsed_ms={}", started.elapsed().as_millis());
+        }
+
+        res
+    }
+
+    pub fn set_blob_values_if_missing(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+        if puts.is_empty() {
+            return Ok(());
+        }
+        if self.view_blockhash.is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
+
+        let mut dedup: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(puts.len());
+        for (k, v) in puts {
+            dedup.entry(k).or_insert(v);
+        }
+        if dedup.is_empty() {
+            return Ok(());
+        }
+
+        let mut keys: Vec<Vec<u8>> = dedup.keys().cloned().collect();
+        keys.sort();
+        let existing = self
+            .blob_mdb
+            .multi_get(&keys)
+            .map_err(|e| anyhow!("blob_mdb.multi_get failed: {e}"))?;
+
+        let mut write_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for (idx, key) in keys.into_iter().enumerate() {
+            if existing.get(idx).and_then(|v| v.as_ref()).is_some() {
+                continue;
+            }
+            let Some(value) = dedup.remove(&key) else {
+                continue;
+            };
+            write_pairs.push((key, value));
+        }
+
+        if write_pairs.is_empty() {
+            return Ok(());
+        }
+
+        self.blob_mdb
+            .bulk_write(|wb: &mut MdbBatch<'_>| {
+                for (key, value) in &write_pairs {
+                    wb.put(key, value);
+                }
+            })
+            .map_err(|e| anyhow!("blob_mdb.bulk_write failed: {e}"))
     }
 
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
@@ -1958,7 +2322,11 @@ impl EssentialsProvider {
             let key_str_val = utf8_or_null(k);
 
             let top_key = if try_decode_utf8 {
-                if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
+                if let Value::String(s) = &key_str_val {
+                    s.clone()
+                } else {
+                    key_hex.clone()
+                }
             } else {
                 key_hex.clone()
             };
@@ -2454,31 +2822,58 @@ impl EssentialsProvider {
             "address": address,
             "balances": Value::Object(balances),
         });
-        let table = self.table();
 
         if include_outpoints {
-            let addr = resp["address"].as_str().unwrap_or_default().to_string();
-            let pref = table.address_outpoint_prefix(&addr);
-            let keys = match self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
-            {
-                Ok(v) => v.keys,
-                Err(_) => Vec::new(),
-            };
+            let mut pref = b"/balances/".to_vec();
+            pref.extend_from_slice(resp["address"].as_str().unwrap_or_default().as_bytes());
+            pref.push(b'/');
 
-            let mut outpoints = Vec::with_capacity(keys.len());
+            let keys = self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
+                .map(|v| v.keys)
+                .unwrap_or_default();
+
+            let mut parsed: Vec<(String, Txid, u32)> = Vec::new();
             for k in keys {
-                let Some((_addr, txid_bytes, vout)) = table.parse_address_outpoint_key(&k) else {
+                if k.len() <= pref.len() {
+                    continue;
+                }
+                let Ok(espo_out) = EspoOutpoint::try_from_slice(&k[pref.len()..]) else {
                     continue;
                 };
-                let Ok(txid) = Txid::from_slice(&txid_bytes) else {
+                if espo_out.txid.len() != 32 {
+                    continue;
+                }
+                let outpoint_str = espo_out.as_outpoint_string();
+                let (txid, vout) = match outpoint_str.split_once(':') {
+                    Some((txid_hex, vout_s)) => {
+                        let Ok(tid) = bitcoin::Txid::from_str(txid_hex) else { continue };
+                        let Ok(v) = vout_s.parse::<u32>() else { continue };
+                        (tid, v)
+                    }
+                    None => continue,
+                };
+                parsed.push((outpoint_str, txid, vout));
+            }
+
+            let lookup_inputs: Vec<(Txid, u32)> =
+                parsed.iter().map(|(_, txid, vout)| (*txid, *vout)).collect();
+            let lookups =
+                crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch(
+                    self,
+                    &lookup_inputs,
+                )
+                .unwrap_or_default();
+
+            let mut outpoints = Vec::with_capacity(parsed.len());
+            for (idx, (outpoint_str, _txid, _vout)) in parsed.into_iter().enumerate() {
+                let Some(lookup) = lookups.get(&lookup_inputs[idx]) else {
                     continue;
                 };
-                let op = format!("{txid}:{vout}");
-                let entries = match get_outpoint_balances_index(self, &txid, vout) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                if lookup.spent_by.is_some() {
+                    continue;
+                }
+                let entries = lookup.balances.clone();
                 let entry_list: Vec<Value> = entries
                     .into_iter()
                     .map(|be| {
@@ -2489,7 +2884,7 @@ impl EssentialsProvider {
                     })
                     .collect();
 
-                outpoints.push(json!({ "outpoint": op, "entries": entry_list }));
+                outpoints.push(json!({ "outpoint": outpoint_str, "entries": entry_list }));
             }
 
             resp.as_object_mut()
@@ -2646,68 +3041,96 @@ impl EssentialsProvider {
 
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let page = params.page.unwrap_or(1).max(1) as usize;
-
         let table = self.table();
-        let total = self
-            .get_raw_value(GetRawValueParams { key: table.alkane_balance_txs_meta_key(&alk) })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|bytes| decode_u64_le(&bytes))
-            .unwrap_or(0) as usize;
-        let mut slice: Vec<AlkaneBalanceTxEntry> = Vec::new();
+        let prefix = table.alkane_balance_txs_log_prefix(&alk);
 
-        let off = limit.saturating_mul(page.saturating_sub(1));
-        let end = (off + limit).min(total);
-        if off < total {
-            let mut keys = Vec::new();
-            for idx in off..end {
-                keys.push(table.alkane_balance_txs_page_key(&alk, idx as u64));
-            }
-            let vals = self.get_multi_values(GetMultiValuesParams { keys })?.values;
-            for val in vals {
-                let Some(bytes) = val else { continue };
-                if bytes.len() != 32 {
-                    continue;
+        let cursor_bytes = match params
+            .cursor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => match hex::decode(s) {
+                Ok(v) => {
+                    if !v.starts_with(&prefix) {
+                        return Ok(RpcGetAlkaneBalanceTxsResult {
+                            value: json!({"ok": false, "error": "invalid_cursor"}),
+                        });
+                    }
+                    Some(v)
                 }
-                let mut txid_arr = [0u8; 32];
-                txid_arr.copy_from_slice(&bytes);
-                let height = self
-                    .get_raw_value(GetRawValueParams { key: table.tx_height_key(&txid_arr) })
-                    .ok()
-                    .and_then(|resp| resp.value)
-                    .and_then(|raw| decode_u32_le(&raw))
-                    .unwrap_or(0);
-                let outflow = load_tx_outflow_for_owner(self, &table, &txid_arr, &alk);
-                slice.push(AlkaneBalanceTxEntry { txid: txid_arr, height, outflow });
+                Err(_) => {
+                    return Ok(RpcGetAlkaneBalanceTxsResult {
+                        value: json!({"ok": false, "error": "invalid_cursor"}),
+                    });
+                }
+            },
+            None => None,
+        };
+
+        let (keys_desc, total_opt, has_more, next_cursor_raw) = if cursor_bytes.is_some() {
+            let page_data = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+                prefix: prefix.clone(),
+                cursor: cursor_bytes.clone(),
+                limit,
+            })?;
+            let keys = page_data.entries.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+            (keys, None, page_data.has_more, page_data.next_cursor)
+        } else {
+            let mut all_keys = self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .map(|v| v.keys)
+                .unwrap_or_default();
+            all_keys.sort();
+            all_keys.reverse();
+            let total = all_keys.len();
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(total);
+            let slice = if off >= total { Vec::new() } else { all_keys[off..end].to_vec() };
+            let has_more = end < total;
+            let next_cursor = if has_more && !slice.is_empty() {
+                slice.last().cloned()
+            } else {
+                None
+            };
+            (slice, Some(total), has_more, next_cursor)
+        };
+
+        let mut items: Vec<Value> = Vec::with_capacity(keys_desc.len());
+        for key in keys_desc {
+            let Some((height_from_key, _tx_idx, txid_arr)) =
+                table.parse_alkane_balance_txs_log_key(&alk, &key)
+            else {
+                continue;
+            };
+            let txid = Txid::from_byte_array(txid_arr);
+            let packed = load_tx_packed_outflow_v2(self, &txid);
+            let height = packed.as_ref().map(|p| p.height).unwrap_or(height_from_key);
+            let owner_map =
+                packed.and_then(|p| p.outflows.get(&alk).cloned()).unwrap_or_else(BTreeMap::new);
+
+            let mut outflow: Map<String, Value> = Map::new();
+            for (id, delta) in owner_map {
+                outflow.insert(format!("{}:{}", id.block, id.tx), Value::String(delta.to_string()));
             }
+            items.push(json!({
+                "txid": txid.to_string(),
+                "height": height,
+                "outflow": Value::Object(outflow),
+            }));
         }
 
-        let items: Vec<Value> = slice
-            .into_iter()
-            .map(|entry| {
-                let mut outflow: Map<String, Value> = Map::new();
-                for (id, delta) in entry.outflow {
-                    outflow.insert(
-                        format!("{}:{}", id.block, id.tx),
-                        Value::String(delta.to_string()),
-                    );
-                }
-                json!({
-                    "txid": Txid::from_byte_array(entry.txid).to_string(),
-                    "height": entry.height,
-                    "outflow": Value::Object(outflow),
-                })
-            })
-            .collect();
-
+        let next_cursor = next_cursor_raw.map(hex::encode);
         Ok(RpcGetAlkaneBalanceTxsResult {
             value: json!({
                 "ok": true,
                 "alkane": format!("{}:{}", alk.block, alk.tx),
-                "page": page,
+                "page": if cursor_bytes.is_some() { Value::Null } else { json!(page) },
+                "cursor": params.cursor,
+                "next_cursor": next_cursor,
                 "limit": limit,
-                "total": total,
-                "has_more": limit.saturating_mul(page.saturating_sub(1)) + items.len() < total,
+                "total": total_opt.map(Value::from).unwrap_or(Value::Null),
+                "has_more": has_more,
                 "txids": items
             }),
         })
@@ -2740,71 +3163,97 @@ impl EssentialsProvider {
 
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let page = params.page.unwrap_or(1).max(1) as usize;
-
         let table = self.table();
-        let total = self
-            .get_raw_value(GetRawValueParams {
-                key: table.alkane_balance_txs_by_token_meta_key(&owner, &token),
-            })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|bytes| decode_u64_le(&bytes))
-            .unwrap_or(0) as usize;
-        let mut slice: Vec<AlkaneBalanceTxEntry> = Vec::new();
+        let prefix = table.alkane_balance_txs_by_token_log_prefix(&owner, &token);
 
-        let off = limit.saturating_mul(page.saturating_sub(1));
-        let end = (off + limit).min(total);
-        if off < total {
-            let mut keys = Vec::new();
-            for idx in off..end {
-                keys.push(table.alkane_balance_txs_by_token_page_key(&owner, &token, idx as u64));
-            }
-            let vals = self.get_multi_values(GetMultiValuesParams { keys })?.values;
-            for val in vals {
-                let Some(bytes) = val else { continue };
-                if bytes.len() != 32 {
-                    continue;
+        let cursor_bytes = match params
+            .cursor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => match hex::decode(s) {
+                Ok(v) => {
+                    if !v.starts_with(&prefix) {
+                        return Ok(RpcGetAlkaneBalanceTxsByTokenResult {
+                            value: json!({"ok": false, "error": "invalid_cursor"}),
+                        });
+                    }
+                    Some(v)
                 }
-                let mut txid_arr = [0u8; 32];
-                txid_arr.copy_from_slice(&bytes);
-                let height = self
-                    .get_raw_value(GetRawValueParams { key: table.tx_height_key(&txid_arr) })
-                    .ok()
-                    .and_then(|resp| resp.value)
-                    .and_then(|raw| decode_u32_le(&raw))
-                    .unwrap_or(0);
-                let outflow = load_tx_outflow_for_owner(self, &table, &txid_arr, &owner);
-                slice.push(AlkaneBalanceTxEntry { txid: txid_arr, height, outflow });
+                Err(_) => {
+                    return Ok(RpcGetAlkaneBalanceTxsByTokenResult {
+                        value: json!({"ok": false, "error": "invalid_cursor"}),
+                    });
+                }
+            },
+            None => None,
+        };
+
+        let (keys_desc, total_opt, has_more, next_cursor_raw) = if cursor_bytes.is_some() {
+            let page_data = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+                prefix: prefix.clone(),
+                cursor: cursor_bytes.clone(),
+                limit,
+            })?;
+            let keys = page_data.entries.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+            (keys, None, page_data.has_more, page_data.next_cursor)
+        } else {
+            let mut all_keys = self
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .map(|v| v.keys)
+                .unwrap_or_default();
+            all_keys.sort();
+            all_keys.reverse();
+            let total = all_keys.len();
+            let off = limit.saturating_mul(page.saturating_sub(1));
+            let end = (off + limit).min(total);
+            let slice = if off >= total { Vec::new() } else { all_keys[off..end].to_vec() };
+            let has_more = end < total;
+            let next_cursor = if has_more && !slice.is_empty() {
+                slice.last().cloned()
+            } else {
+                None
+            };
+            (slice, Some(total), has_more, next_cursor)
+        };
+
+        let mut items: Vec<Value> = Vec::with_capacity(keys_desc.len());
+        for key in keys_desc {
+            let Some((height_from_key, _tx_idx, txid_arr)) =
+                table.parse_alkane_balance_txs_by_token_log_key(&owner, &token, &key)
+            else {
+                continue;
+            };
+            let txid = Txid::from_byte_array(txid_arr);
+            let packed = load_tx_packed_outflow_v2(self, &txid);
+            let height = packed.as_ref().map(|p| p.height).unwrap_or(height_from_key);
+            let owner_map =
+                packed.and_then(|p| p.outflows.get(&owner).cloned()).unwrap_or_else(BTreeMap::new);
+
+            let mut outflow: Map<String, Value> = Map::new();
+            for (id, delta) in owner_map {
+                outflow.insert(format!("{}:{}", id.block, id.tx), Value::String(delta.to_string()));
             }
+            items.push(json!({
+                "txid": txid.to_string(),
+                "height": height,
+                "outflow": Value::Object(outflow),
+            }));
         }
 
-        let items: Vec<Value> = slice
-            .into_iter()
-            .map(|entry| {
-                let mut outflow: Map<String, Value> = Map::new();
-                for (id, delta) in entry.outflow {
-                    outflow.insert(
-                        format!("{}:{}", id.block, id.tx),
-                        Value::String(delta.to_string()),
-                    );
-                }
-                json!({
-                    "txid": Txid::from_byte_array(entry.txid).to_string(),
-                    "height": entry.height,
-                    "outflow": Value::Object(outflow),
-                })
-            })
-            .collect();
-
+        let next_cursor = next_cursor_raw.map(hex::encode);
         Ok(RpcGetAlkaneBalanceTxsByTokenResult {
             value: json!({
                 "ok": true,
                 "owner": format!("{}:{}", owner.block, owner.tx),
                 "token": format!("{}:{}", token.block, token.tx),
-                "page": page,
+                "page": if cursor_bytes.is_some() { Value::Null } else { json!(page) },
+                "cursor": params.cursor,
+                "next_cursor": next_cursor,
                 "limit": limit,
-                "total": total,
-                "has_more": limit.saturating_mul(page.saturating_sub(1)) + items.len() < total,
+                "total": total_opt.map(Value::from).unwrap_or(Value::Null),
+                "has_more": has_more,
                 "txids": items
             }),
         })
@@ -2832,8 +3281,9 @@ impl EssentialsProvider {
             }
         };
 
-        let table = self.table();
-        let entries = match get_outpoint_balances_index(self, &txid, vout_u32) {
+        let lookup = match crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent(
+            self, &txid, vout_u32,
+        ) {
             Ok(v) => v,
             Err(_) => {
                 return Ok(RpcGetOutpointBalancesResult {
@@ -2841,17 +3291,10 @@ impl EssentialsProvider {
                 });
             }
         };
+        let addr = get_outpoint_address(self, &txid, vout_u32).ok().flatten();
 
-        let outp = mk_outpoint(txid.to_byte_array().to_vec(), vout_u32, None);
-        let addr = table
-            .outpoint_addr_key(&outp)
-            .ok()
-            .and_then(|key| {
-                self.get_raw_value(GetRawValueParams { key }).ok().and_then(|r| r.value)
-            })
-            .and_then(|bytes| std::str::from_utf8(&bytes).ok().map(|s| s.to_string()));
-
-        let entry_list: Vec<Value> = entries
+        let entry_list: Vec<Value> = lookup
+            .balances
             .into_iter()
             .map(|be| {
                 json!({
@@ -2988,38 +3431,69 @@ impl EssentialsProvider {
             });
         };
 
-        let table = self.table();
-        let pref = table.address_outpoint_prefix(&address);
+        let mut pref = b"/balances/".to_vec();
+        pref.extend_from_slice(address.as_bytes());
+        pref.push(b'/');
 
-        let keys = match self
+        let keys = self
             .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
-        {
-            Ok(v) => v.keys,
-            Err(_) => Vec::new(),
-        };
+            .map(|v| v.keys)
+            .unwrap_or_default();
 
-        let mut outpoints: Vec<Value> = Vec::with_capacity(keys.len());
+        let mut parsed: Vec<(String, Txid, u32)> = Vec::new();
         for k in keys {
-            let Some((_addr, txid_bytes, vout)) = table.parse_address_outpoint_key(&k) else {
+            if k.len() <= pref.len() {
+                continue;
+            }
+
+            let decoded = EspoOutpoint::try_from_slice(&k[pref.len()..]);
+            let espo_out = match decoded {
+                Ok(op) => op,
+                Err(_) => continue,
+            };
+
+            if espo_out.txid.len() != 32 {
+                continue;
+            }
+
+            let outpoint_str = espo_out.as_outpoint_string();
+            let (txid, vout) = match outpoint_str.split_once(':') {
+                Some((txid_hex, vout_s)) => {
+                    let tid = match bitcoin::Txid::from_str(txid_hex) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let v = match vout_s.parse::<u32>() {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    (tid, v)
+                }
+                None => continue,
+            };
+            parsed.push((outpoint_str, txid, vout));
+        }
+
+        let lookup_inputs: Vec<(Txid, u32)> =
+            parsed.iter().map(|(_, txid, vout)| (*txid, *vout)).collect();
+        let lookups =
+            crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch(
+                self,
+                &lookup_inputs,
+            )
+            .unwrap_or_default();
+
+        let mut outpoints: Vec<Value> = Vec::with_capacity(parsed.len());
+        for (idx, (outpoint_str, _txid, _vout)) in parsed.into_iter().enumerate() {
+            let Some(lookup) = lookups.get(&lookup_inputs[idx]) else {
                 continue;
             };
-            let Ok(txid) = Txid::from_slice(&txid_bytes) else {
-                continue;
-            };
-            let lookup =
-                match crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent(
-                    self, &txid, vout,
-                ) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
             if lookup.spent_by.is_some() {
                 continue;
             }
-            let outpoint_str = format!("{txid}:{vout}");
+            let entries_vec = lookup.balances.clone();
 
-            let entry_list: Vec<Value> = lookup
-                .balances
+            let entry_list: Vec<Value> = entries_vec
                 .into_iter()
                 .map(|be| {
                     json!({
@@ -3077,7 +3551,8 @@ impl EssentialsProvider {
             });
         };
 
-        let traces_json = serde_json::to_value(&summary.traces).unwrap_or(Value::Null);
+        let traces = summary.traces.clone();
+        let traces_json = serde_json::to_value(&traces).unwrap_or(Value::Null);
         let mut outflows_json: Vec<Value> = Vec::new();
         for entry in &summary.outflows {
             let mut outflow_map = Map::new();
@@ -3254,28 +3729,19 @@ impl EssentialsProvider {
         let mut items: Vec<Value> = Vec::new();
 
         if !txid_rows.is_empty() {
-            let table = self.table();
             let chain_tip = get_bitcoind_rpc_client()
                 .get_blockchain_info()
                 .ok()
                 .map(|info| info.blocks as u64);
-            let height_keys: Vec<Vec<u8>> = txid_rows
+            let heights: Vec<Option<u64>> = txid_rows
                 .iter()
-                .map(|txid| table.tx_height_key(&txid.to_byte_array()))
+                .map(|txid| load_tx_summary_v2(self, txid).map(|summary| summary.height as u64))
                 .collect();
-            let height_vals = self
-                .get_multi_values(GetMultiValuesParams { keys: height_keys })
-                .map(|r| r.values)
-                .unwrap_or_default();
             let raw_txs =
                 get_electrum_like().batch_transaction_get_raw(&txid_rows).unwrap_or_default();
 
             for (idx, txid) in txid_rows.iter().enumerate() {
-                let height = height_vals
-                    .get(idx)
-                    .and_then(|v| v.as_ref())
-                    .and_then(|raw| decode_u32_le(raw))
-                    .map(|h| h as u64);
+                let height = heights.get(idx).copied().flatten();
 
                 let confirmations = height.and_then(|h| {
                     chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
@@ -3468,8 +3934,15 @@ impl EssentialsProvider {
                             let confirmations =
                                 summary.as_ref().and_then(|s| {
                                     let h = s.height as u64;
+                                    if h == 0 {
+                                        return None;
+                                    }
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h { Some(tip - h + 1) } else { None }
+                                        if tip >= h {
+                                            Some(tip - h + 1)
+                                        } else {
+                                            None
+                                        }
                                     })
                                 });
                             let traces = summary
@@ -3527,7 +4000,11 @@ impl EssentialsProvider {
                                 let summary = load_tx_summary_v2(self, txid);
                                 let confirmations = entries_for_page[idx].height.and_then(|h| {
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h { Some(tip - h + 1) } else { None }
+                                        if tip >= h {
+                                            Some(tip - h + 1)
+                                        } else {
+                                            None
+                                        }
                                     })
                                 });
                                 let traces = summary
@@ -3610,24 +4087,37 @@ impl EssentialsProvider {
             .get_raw_value(GetRawValueParams { key: table.latest_traces_length_key() })
             .ok()
             .and_then(|resp| resp.value)
-            .and_then(|b| decode_u32_le(&b))
-            .unwrap_or(0);
-        let mut keys = Vec::new();
-        for idx in 0..len {
-            keys.push(table.latest_traces_idx_key(idx));
-        }
-        let mut txids = Vec::new();
-        if !keys.is_empty() {
-            let vals = self.get_multi_values(GetMultiValuesParams { keys })?.values;
-            for raw in vals.into_iter().flatten() {
-                if raw.len() != 32 {
-                    continue;
+            .and_then(|b| {
+                if b.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&b);
+                    Some(u32::from_le_bytes(arr))
+                } else {
+                    None
                 }
-                if let Ok(txid) = Txid::from_slice(&raw) {
-                    txids.push(txid.to_string());
+            })
+            .unwrap_or(0);
+
+        let mut txids: Vec<String> = Vec::new();
+        if len > 0 {
+            let mut keys = Vec::with_capacity(len as usize);
+            for idx in 0..len {
+                keys.push(table.latest_traces_idx_key(idx));
+            }
+            let values = self.get_multi_values(GetMultiValuesParams { keys }).ok().map(|r| r.values);
+            if let Some(values) = values {
+                for v in values.into_iter().flatten() {
+                    if v.len() != 32 {
+                        continue;
+                    }
+                    if let Ok(txid) = Txid::from_slice(&v) {
+                        txids.push(txid.to_string());
+                    }
                 }
             }
         }
+
+        let txids: Vec<String> = txids.into_iter().take(20).collect();
 
         Ok(RpcGetAlkaneLatestTracesResult {
             value: json!({
@@ -3672,6 +4162,18 @@ pub struct GetListEntriesDescParams {
 
 pub struct GetListEntriesDescResult {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+pub struct GetListEntriesDescCursorParams {
+    pub prefix: Vec<u8>,
+    pub cursor: Option<Vec<u8>>,
+    pub limit: usize,
+}
+
+pub struct GetListEntriesDescCursorResult {
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub next_cursor: Option<Vec<u8>>,
+    pub has_more: bool,
 }
 
 pub struct SetRawValueParams {
@@ -3983,6 +4485,7 @@ pub struct RpcGetAlkaneBalanceTxsParams {
     pub alkane: Option<String>,
     pub page: Option<u64>,
     pub limit: Option<u64>,
+    pub cursor: Option<String>,
 }
 
 pub struct RpcGetAlkaneBalanceTxsResult {
@@ -3994,6 +4497,7 @@ pub struct RpcGetAlkaneBalanceTxsByTokenParams {
     pub token: Option<String>,
     pub page: Option<u64>,
     pub limit: Option<u64>,
+    pub cursor: Option<String>,
 }
 
 pub struct RpcGetAlkaneBalanceTxsByTokenResult {
@@ -4118,6 +4622,13 @@ pub struct BalanceEntry {
     pub amount: u128,
 }
 
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
+pub struct OutpointRowV2 {
+    pub address: String,
+    pub spk: Vec<u8>,
+    pub balances: Vec<BalanceEntry>,
+}
+
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct AlkaneBalanceTxEntry {
     pub txid: [u8; 32],
@@ -4131,6 +4642,13 @@ pub struct AlkaneTxSummary {
     pub traces: Vec<EspoSandshrewLikeTrace>,
     pub outflows: Vec<AlkaneBalanceTxEntry>,
     pub height: u32,
+}
+
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
+pub struct TxPackedOutflowRowV2 {
+    pub height: u32,
+    pub traces: Vec<EspoSandshrewLikeTrace>,
+    pub outflows: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
 }
 
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
@@ -4230,14 +4748,6 @@ pub struct AlkaneInfo {
     pub creation_timestamp: u32,
 }
 
-pub const BALANCE_TXS_PAGE_SIZE: u32 = 2048;
-
-#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-pub struct AlkaneBalanceTxsMeta {
-    pub page_size: u32,
-    pub last_page: u64,
-    pub total_len: u64,
-}
 /// Helper to build an outpoint with optional spending txid for lookups.
 pub fn mk_outpoint(txid: Vec<u8>, vout: u32, tx_spent: Option<Vec<u8>>) -> EspoOutpoint {
     EspoOutpoint { txid, vout, tx_spent }
@@ -4255,33 +4765,87 @@ pub fn decode_balances_vec(bytes: &[u8]) -> Result<Vec<BalanceEntry>> {
     Ok(Vec::<BalanceEntry>::try_from_slice(bytes)?)
 }
 
-pub fn decode_alkane_balance_tx_entries(bytes: &[u8]) -> Result<Vec<AlkaneBalanceTxEntry>> {
-    if let Ok(parsed) = Vec::<AlkaneBalanceTxEntry>::try_from_slice(bytes) {
-        return Ok(parsed);
-    }
+pub fn encode_alkane_balance_tx_entry(entry: &AlkaneBalanceTxEntry) -> Result<Vec<u8>> {
+    borsh::to_vec(entry).map_err(|e| anyhow!("encode alkane balance tx entry failed: {e}"))
+}
 
-    #[derive(BorshDeserialize)]
-    struct LegacyAlkaneBalanceTxEntry {
-        txid: [u8; 32],
-        outflow: BTreeMap<SchemaAlkaneId, SignedU128>,
-    }
+pub fn decode_alkane_balance_tx_entry(bytes: &[u8]) -> Result<AlkaneBalanceTxEntry> {
+    AlkaneBalanceTxEntry::try_from_slice(bytes)
+        .map_err(|e| anyhow!("decode alkane balance tx entry failed: {e}"))
+}
 
-    if let Ok(legacy) = Vec::<LegacyAlkaneBalanceTxEntry>::try_from_slice(bytes) {
-        return Ok(legacy
-            .into_iter()
-            .map(|entry| AlkaneBalanceTxEntry {
-                txid: entry.txid,
-                height: 0,
-                outflow: entry.outflow,
-            })
-            .collect());
-    }
+pub fn encode_tx_packed_outflow_row_v2(
+    height: u32,
+    traces: &[EspoSandshrewLikeTrace],
+    outflows: &BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+) -> Result<Vec<u8>> {
+    borsh::to_vec(&TxPackedOutflowRowV2 {
+        height,
+        traces: traces.to_vec(),
+        outflows: outflows.clone(),
+    })
+        .map_err(|e| anyhow!("encode tx packed outflow v2 failed: {e}"))
+}
 
-    let legacy: Vec<[u8; 32]> = Vec::<[u8; 32]>::try_from_slice(bytes)?;
-    Ok(legacy
-        .into_iter()
-        .map(|txid| AlkaneBalanceTxEntry { txid, height: 0, outflow: BTreeMap::new() })
-        .collect())
+pub fn decode_tx_packed_outflow_row_v2(bytes: &[u8]) -> Result<TxPackedOutflowRowV2> {
+    TxPackedOutflowRowV2::try_from_slice(bytes)
+        .map_err(|e| anyhow!("decode tx packed outflow v2 failed: {e}"))
+}
+
+pub fn encode_tx_packed_outflow_pos_v2(blockhash: &[u8; 32], idx: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(36);
+    out.extend_from_slice(blockhash);
+    out.extend_from_slice(&idx.to_be_bytes());
+    out
+}
+
+pub fn decode_tx_packed_outflow_pos_v2(bytes: &[u8]) -> Result<([u8; 32], u32)> {
+    if bytes.len() != 36 {
+        return Err(anyhow!("decode tx packed outflow pos v2 failed: invalid length {}", bytes.len()));
+    }
+    let mut bh = [0u8; 32];
+    bh.copy_from_slice(&bytes[..32]);
+    let mut i = [0u8; 4];
+    i.copy_from_slice(&bytes[32..36]);
+    Ok((bh, u32::from_be_bytes(i)))
+}
+
+pub fn encode_outpoint_pos_v2(blockhash: &[u8; 32], tx_idx: u32, vout: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    out.extend_from_slice(blockhash);
+    out.extend_from_slice(&tx_idx.to_be_bytes());
+    out.extend_from_slice(&vout.to_be_bytes());
+    out
+}
+
+pub fn decode_outpoint_pos_v2(bytes: &[u8]) -> Result<([u8; 32], u32, u32)> {
+    if bytes.len() != 40 {
+        return Err(anyhow!("decode outpoint pos v2 failed: invalid length {}", bytes.len()));
+    }
+    let mut bh = [0u8; 32];
+    bh.copy_from_slice(&bytes[..32]);
+    let mut i = [0u8; 4];
+    i.copy_from_slice(&bytes[32..36]);
+    let mut v = [0u8; 4];
+    v.copy_from_slice(&bytes[36..40]);
+    Ok((bh, u32::from_be_bytes(i), u32::from_be_bytes(v)))
+}
+
+pub fn encode_outpoint_row_v2(
+    address: &str,
+    spk: &[u8],
+    balances: &Vec<BalanceEntry>,
+) -> Result<Vec<u8>> {
+    borsh::to_vec(&OutpointRowV2 {
+        address: address.to_string(),
+        spk: spk.to_vec(),
+        balances: balances.clone(),
+    })
+    .map_err(|e| anyhow!("encode outpoint row v2 failed: {e}"))
+}
+
+pub fn decode_outpoint_row_v2(bytes: &[u8]) -> Result<OutpointRowV2> {
+    OutpointRowV2::try_from_slice(bytes).map_err(|e| anyhow!("decode outpoint row v2 failed: {e}"))
 }
 
 pub fn decode_holders_vec(bytes: &[u8]) -> Result<Vec<HolderEntry>> {
@@ -4449,15 +5013,6 @@ fn decode_u32_le(bytes: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(arr))
 }
 
-fn decode_u64_le(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 8 {
-        return None;
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(bytes);
-    Some(u64::from_le_bytes(arr))
-}
-
 const TX_TRACE_ROW_COMPACT_V1: u8 = 1;
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -4483,124 +5038,75 @@ pub fn encode_tx_trace_row(trace: &EspoSandshrewLikeTrace, compact: bool) -> Res
     Ok(borsh::to_vec(trace)?)
 }
 
-fn decode_tx_trace_row(raw: &[u8], txid: &[u8; 32]) -> Option<EspoSandshrewLikeTrace> {
-    if raw.first().copied() == Some(TX_TRACE_ROW_COMPACT_V1) {
-        if let Ok(compact_row) = CompactTxTraceRowV1::try_from_slice(&raw[1..]) {
-            return Some(EspoSandshrewLikeTrace {
-                outpoint: format!("{}:{}", hex::encode(txid), compact_row.vout),
-                events: compact_row.events,
-            });
-        }
-    }
-    EspoSandshrewLikeTrace::try_from_slice(raw).ok()
-}
-
-fn load_tx_outflow_for_owner(
+fn resolve_tx_locator_candidate_v2(
     provider: &EssentialsProvider,
-    table: &EssentialsTable<'_>,
     txid: &[u8; 32],
-    owner: &SchemaAlkaneId,
-) -> BTreeMap<SchemaAlkaneId, SignedU128> {
-    let prefix = table.tx_outflow_owner_prefix(txid, owner);
-    let keys = provider
-        .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
-        .map(|v| v.keys);
-    let Ok(keys) = keys else { return BTreeMap::new() };
-    let values = provider.get_multi_values(GetMultiValuesParams { keys: keys.clone() });
-    let Ok(values) = values else { return BTreeMap::new() };
-    let mut out = BTreeMap::new();
-    for (key, value) in keys.iter().zip(values.values) {
-        let Some(bytes) = value else { continue };
-        if !key.starts_with(&prefix) {
-            continue;
-        }
-        let suffix = &key[prefix.len()..];
-        let Some(token) = decode_alkane_id_be(suffix) else {
+) -> Option<([u8; 32], u32, u32)> {
+    let table = provider.table();
+    let prefix = table.tx_locator_candidate_prefix(txid);
+    let keys = provider.blob_mdb().scan_prefix_keys(&prefix).ok()?;
+    if keys.is_empty() {
+        return None;
+    }
+
+    let target_blockhash = provider.resolved_view_blockhash();
+    let mut best: Option<(u32, u32, [u8; 32])> = None;
+    for key in keys {
+        let Some((height, idx, candidate_hash)) = table.parse_tx_locator_candidate_key(txid, &key)
+        else {
             continue;
         };
-        if let Ok(delta) = SignedU128::try_from_slice(&bytes) {
-            out.insert(token, delta);
+        if let Some(target) = target_blockhash {
+            let candidate = BlockHash::from_byte_array(candidate_hash);
+            let Ok(is_ancestor) = provider.blockhash_is_ancestor(&candidate, &target) else {
+                continue;
+            };
+            if !is_ancestor {
+                continue;
+            }
+        }
+        match best {
+            Some((best_h, best_idx, _)) if (height, idx) <= (best_h, best_idx) => {}
+            _ => best = Some((height, idx, candidate_hash)),
         }
     }
-    out
+    best.map(|(height, idx, blockhash)| (blockhash, idx, height))
+}
+
+pub(crate) fn load_tx_packed_outflow_v2(
+    provider: &EssentialsProvider,
+    txid: &Txid,
+) -> Option<TxPackedOutflowRowV2> {
+    let mut txid_arr = [0u8; 32];
+    txid_arr.copy_from_slice(txid.as_byte_array());
+    let (blockhash, tx_idx, _height) = resolve_tx_locator_candidate_v2(provider, &txid_arr)?;
+    let table = provider.table();
+    let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
+    let row_raw = provider.get_blob_raw_value(GetRawValueParams { key: row_key }).ok()?.value?;
+    decode_tx_packed_outflow_row_v2(&row_raw).ok()
 }
 
 pub(crate) fn load_tx_summary_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
 ) -> Option<AlkaneTxSummary> {
-    let table = provider.table();
-    let txid_arr = txid.to_byte_array();
-    let height_raw = provider
-        .get_raw_value(GetRawValueParams { key: table.tx_height_key(&txid_arr) })
-        .ok();
-    let mut found_any = height_raw.as_ref().and_then(|resp| resp.value.as_ref()).is_some();
-    let height = height_raw
-        .and_then(|resp| resp.value)
-        .and_then(|bytes| decode_u32_le(&bytes))
-        .unwrap_or(0);
-
-    let trace_len_raw = provider
-        .get_raw_value(GetRawValueParams { key: table.tx_trace_length_key(&txid_arr) })
-        .ok();
-    if trace_len_raw.as_ref().and_then(|resp| resp.value.as_ref()).is_some() {
-        found_any = true;
+    let mut txid_arr = [0u8; 32];
+    txid_arr.copy_from_slice(txid.as_byte_array());
+    let packed = load_tx_packed_outflow_v2(provider, txid)?;
+    let mut outflows = Vec::with_capacity(packed.outflows.len());
+    for (_owner, outflow_map) in packed.outflows {
+        outflows.push(AlkaneBalanceTxEntry {
+            txid: txid_arr,
+            height: packed.height,
+            outflow: outflow_map,
+        });
     }
-    let trace_len = trace_len_raw
-        .and_then(|resp| resp.value)
-        .and_then(|bytes| decode_u32_le(&bytes))
-        .unwrap_or(0);
-    let mut traces = Vec::new();
-    if trace_len > 0 {
-        let mut keys = Vec::new();
-        for idx in 0..trace_len {
-            keys.push(table.tx_trace_key(&txid_arr, idx));
-        }
-        if let Ok(resp) = provider.get_multi_values(GetMultiValuesParams { keys }) {
-            for raw in resp.values.into_iter().flatten() {
-                if let Some(trace) = decode_tx_trace_row(&raw, &txid_arr) {
-                    traces.push(trace);
-                }
-            }
-        }
-    }
-
-    let outflow_prefix = table.tx_outflow_prefix(&txid_arr);
-    let outflow_keys = provider
-        .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: outflow_prefix.clone() })
-        .ok()
-        .map(|v| v.keys)
-        .unwrap_or_default();
-    if !outflow_keys.is_empty() {
-        found_any = true;
-    }
-    let mut owner_set: BTreeSet<SchemaAlkaneId> = BTreeSet::new();
-    for key in &outflow_keys {
-        if !key.starts_with(&outflow_prefix) {
-            continue;
-        }
-        let suffix = &key[outflow_prefix.len()..];
-        if suffix.len() < 12 + 1 + 12 || suffix[12] != b'/' {
-            continue;
-        }
-        if let Some(owner) = decode_alkane_id_be(&suffix[..12]) {
-            owner_set.insert(owner);
-        }
-    }
-
-    let mut outflows = Vec::new();
-    for owner in owner_set {
-        let outflow = load_tx_outflow_for_owner(provider, &table, &txid_arr, &owner);
-        if !outflow.is_empty() {
-            outflows.push(AlkaneBalanceTxEntry { txid: txid_arr, height, outflow });
-        }
-    }
-
-    if !found_any {
-        return None;
-    }
-
-    Some(AlkaneTxSummary { txid: txid_arr, traces, outflows, height })
+    Some(AlkaneTxSummary {
+        txid: txid_arr,
+        traces: packed.traces,
+        outflows,
+        height: packed.height,
+    })
 }
 
 fn mem_entry_to_json(entry: &MempoolEntry) -> Value {
@@ -4695,7 +5201,11 @@ fn enriched_transaction_json(
     let has_protostones = !protostones.is_empty();
     let alkanes_traces = render.traces.as_ref().and_then(|traces| {
         let vals = traces.iter().map(enriched_trace_to_value).collect::<Vec<_>>();
-        if vals.is_empty() { None } else { Some(Value::Array(vals)) }
+        if vals.is_empty() {
+            None
+        } else {
+            Some(Value::Array(vals))
+        }
     });
 
     let mut out = Map::new();

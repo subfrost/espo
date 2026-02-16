@@ -63,6 +63,14 @@ impl Mdb {
         Self::from_parts(db, prefix, aof, label, true)
     }
 
+    /// Clone this handle onto the same underlying RocksDB with a different namespace prefix.
+    /// The returned namespace does not carry AOF wiring.
+    pub fn clone_with_prefix_no_aof(&self, prefix: impl AsRef<[u8]>) -> Self {
+        let p = prefix.as_ref().to_vec();
+        let versioned = Self::should_enable_versioned_namespace(&p);
+        Self::from_parts(Arc::clone(&self.db), p, None, None, versioned)
+    }
+
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
         // ---- Block cache + table options ----
         let cache = Cache::new_lru_cache(ROCKS_BLOCK_CACHE_BYTES);
@@ -337,7 +345,7 @@ impl Mdb {
         F: FnOnce(&mut MdbBatch<'_>),
     {
         if let Some(tree) = self.versioned_manager() {
-            let mut versioned_changes: Vec<VersionedChange> = Vec::new();
+            let mut versioned_changes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
             {
                 let mut mb = MdbBatch {
                     mdb: self,
@@ -347,9 +355,7 @@ impl Mdb {
                 };
                 build(&mut mb);
             }
-            let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> =
-                versioned_changes.into_iter().map(|c| (c.key, c.value)).collect();
-            return tree.apply_batch(&ops);
+            return tree.apply_batch_owned(versioned_changes);
         }
 
         let mut wb = WriteBatch::default();
@@ -413,6 +419,11 @@ impl Mdb {
         &self.prefix
     }
 
+    #[inline]
+    pub fn is_versioned(&self) -> bool {
+        self.versioned_manager().is_some()
+    }
+
     fn load_previous_values(
         &self,
         pending_ops: &[PendingChange],
@@ -463,12 +474,7 @@ pub struct MdbBatch<'a> {
     mdb: &'a Mdb,
     wb: Option<&'a mut WriteBatch>,
     pending_ops: Option<&'a mut Vec<PendingChange>>,
-    versioned_changes: Option<&'a mut Vec<VersionedChange>>,
-}
-
-struct VersionedChange {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
+    versioned_changes: Option<&'a mut Vec<(Vec<u8>, Option<Vec<u8>>)>>,
 }
 
 impl<'a> MdbBatch<'a> {
@@ -476,7 +482,7 @@ impl<'a> MdbBatch<'a> {
     pub fn put(&mut self, k: &[u8], v: &[u8]) {
         let key = self.mdb.prefixed(k);
         if let Some(buf) = self.versioned_changes.as_mut() {
-            buf.push(VersionedChange { key, value: Some(v.to_vec()) });
+            buf.push((key, Some(v.to_vec())));
             return;
         }
         if let Some(buf) = self.pending_ops.as_mut() {
@@ -490,7 +496,7 @@ impl<'a> MdbBatch<'a> {
     pub fn delete(&mut self, k: &[u8]) {
         let key = self.mdb.prefixed(k);
         if let Some(buf) = self.versioned_changes.as_mut() {
-            buf.push(VersionedChange { key, value: None });
+            buf.push((key, None));
             return;
         }
         if let Some(buf) = self.pending_ops.as_mut() {

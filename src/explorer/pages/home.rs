@@ -121,6 +121,9 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
     }
 
     let table = EssentialsTable::new(mdb);
+    let mut txid_vals: Vec<Option<Vec<u8>>> = Vec::new();
+
+    // Newer layout: /alkane_latest_traces/v2/{length,idx}
     let len = mdb
         .get(&table.latest_traces_length_key())
         .ok()
@@ -135,15 +138,18 @@ fn load_latest_alkane_txs(mdb: &crate::runtime::mdb::Mdb, limit: usize) -> Vec<A
             }
         })
         .unwrap_or(0);
-    if len == 0 {
+    if len > 0 {
+        let mut keys = Vec::with_capacity(len as usize);
+        for idx in 0..len {
+            keys.push(table.latest_traces_idx_key(idx));
+        }
+        txid_vals = mdb.multi_get(&keys).unwrap_or_default();
+    }
+
+    if txid_vals.is_empty() {
         return out;
     }
 
-    let mut keys = Vec::with_capacity(len as usize);
-    for idx in 0..len {
-        keys.push(table.latest_traces_idx_key(idx));
-    }
-    let txid_vals = mdb.multi_get(&keys).unwrap_or_default();
     let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
 
     for v in txid_vals {

@@ -1,56 +1,74 @@
 use bitcoin::BlockHash;
 use bitcoin::hashes::{Hash as _, sha256};
 use borsh::{BorshDeserialize, BorshSerialize};
-use rocksdb::{DB, Error as RocksError, WriteBatch};
-use std::collections::{BTreeMap, HashMap};
+use rocksdb::{DB, Direction, Error as RocksError, IteratorMode, WriteBatch};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
-const ROOT_PREFIX: &[u8] = b"__espo_tree:";
-const NODE_PREFIX: &[u8] = b"__espo_tree:node:";
-const META_ACTIVE_ROOT: &[u8] = b"__espo_tree:meta:active_root";
-const META_ACTIVE_BLOCK: &[u8] = b"__espo_tree:meta:active_block";
-const META_PINNED_ROOT: &[u8] = b"__espo_tree:meta:pinned_root";
-const META_PIN_UNTIL_HEIGHT: &[u8] = b"__espo_tree:meta:pin_until_height";
-const BLOCK_ROOT_PREFIX: &[u8] = b"__espo_tree:block:";
-const HEIGHT_BLOCK_PREFIX: &[u8] = b"__espo_tree:height:";
+// Internal keyspace for the persistent Merkle B+Tree.
+const ROOT_PREFIX: &[u8] = b"__espo_bptree:";
+const NODE_PREFIX: &[u8] = b"__espo_bptree:node:";
+const META_ACTIVE_ROOT: &[u8] = b"__espo_bptree:meta:active_root";
+const META_ACTIVE_BLOCK: &[u8] = b"__espo_bptree:meta:active_block";
+const META_PINNED_ROOT: &[u8] = b"__espo_bptree:meta:pinned_root";
+const META_PIN_UNTIL_HEIGHT: &[u8] = b"__espo_bptree:meta:pin_until_height";
+const BLOCK_ROOT_PREFIX: &[u8] = b"__espo_bptree:block:";
+const HEIGHT_BLOCK_PREFIX: &[u8] = b"__espo_bptree:height:";
+const BLOCK_HEIGHT_PREFIX: &[u8] = b"__espo_bptree:block_height:";
+const BLOCK_PARENT_PREFIX: &[u8] = b"__espo_bptree:parent:";
+
+// Fixed fanout parameters (deterministic split at half).
+const MAX_LEAF_ENTRIES: usize = 128;
+const MAX_INTERNAL_KEYS: usize = 128;
+// Legacy fixed-page size kept only for backward-compatible decoding.
+const NODE_PAGE_BYTES: usize = 16 * 1024;
+// Batch in-memory node cache controls (OOM protection under very large blocks).
+const BATCH_PENDING_GC_INTERVAL: usize = 1024;
+const BATCH_PENDING_SOFT_LIMIT: usize = 25_000;
+const BATCH_PENDING_SOFT_GC_INTERVAL: usize = 2048;
+const BATCH_PENDING_HARD_LIMIT: usize = 50_000;
+
+#[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+struct LeafEntry {
+    key: Vec<u8>,
+    // Legacy Optional payload to decode historical tombstone-based nodes.
+    value: Option<Vec<u8>>,
+}
 
 #[derive(Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
-struct TrieNode {
-    value: Option<Vec<u8>>,
-    children: BTreeMap<u8, TrieEdge>,
+struct LeafNode {
+    entries: Vec<LeafEntry>,
+    next: Option<[u8; 32]>,
+}
+
+#[derive(Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
+struct InternalNode {
+    // Separator keys: first key in each right child.
+    keys: Vec<Vec<u8>>,
+    // children.len() = keys.len() + 1
+    children: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
-struct TrieEdge {
-    label: Vec<u8>,
-    child: [u8; 32],
+enum BptreeNode {
+    Leaf(LeafNode),
+    Internal(InternalNode),
 }
 
-#[derive(Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
-struct LegacyTrieNode {
-    value: Option<Vec<u8>>,
-    children: BTreeMap<u8, [u8; 32]>,
+enum MutationOutcome {
+    Node([u8; 32]),
+    Split { left: [u8; 32], right: [u8; 32], separator: Vec<u8> },
 }
 
-#[derive(Clone, Copy)]
-struct PrefixCursor {
-    node_id: [u8; 32],
-    key_buf_len: usize,
-}
-
-fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    let mut i = 0usize;
-    let limit = a.len().min(b.len());
-    while i < limit && a[i] == b[i] {
-        i += 1;
-    }
-    i
+struct MutationResult {
+    outcome: MutationOutcome,
 }
 
 #[derive(Clone, Copy)]
 struct BlockContext {
     height: u32,
     block_hash: [u8; 32],
+    parent_hash: [u8; 32],
     working_root: [u8; 32],
 }
 
@@ -60,6 +78,12 @@ struct TreeState {
     pinned_root: Option<[u8; 32]>,
     pin_until_height: Option<u32>,
     current_block: Option<BlockContext>,
+}
+
+#[derive(Default)]
+struct BatchWriteContext {
+    pending_nodes: HashMap<[u8; 32], BptreeNode>,
+    ops_since_gc: usize,
 }
 
 impl Default for TreeState {
@@ -91,14 +115,37 @@ pub fn get_global_tree_db() -> Option<Arc<VersionedTreeDb>> {
     TREE_DB.get().cloned()
 }
 
-fn empty_root_id() -> [u8; 32] {
-    let empty = TrieNode::default();
-    hash_node(&empty)
+fn hash_node(node: &BptreeNode) -> [u8; 32] {
+    let encoded = borsh::to_vec(node).expect("b+tree node serialization must succeed");
+    sha256::Hash::hash(&encoded).to_byte_array()
 }
 
-fn hash_node(node: &TrieNode) -> [u8; 32] {
-    let encoded = borsh::to_vec(node).expect("trie node serialization must succeed");
-    sha256::Hash::hash(&encoded).to_byte_array()
+fn encode_node_page(node: &BptreeNode) -> Vec<u8> {
+    // Store canonical variable-sized payload. Fixed page sizing is now a split heuristic only.
+    borsh::to_vec(node).expect("b+tree node serialization must succeed")
+}
+
+fn decode_node_page(bytes: &[u8]) -> Option<BptreeNode> {
+    if let Ok(node) = BptreeNode::try_from_slice(bytes) {
+        return Some(node);
+    }
+    if bytes.len() == NODE_PAGE_BYTES {
+        if bytes.len() < 4 {
+            return None;
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&bytes[..4]);
+        let payload_len = u32::from_be_bytes(len_bytes) as usize;
+        if payload_len + 4 > NODE_PAGE_BYTES {
+            return None;
+        }
+        return BptreeNode::try_from_slice(&bytes[4..4 + payload_len]).ok();
+    }
+    None
+}
+
+fn empty_root_id() -> [u8; 32] {
+    hash_node(&BptreeNode::Leaf(LeafNode::default()))
 }
 
 fn node_key(id: &[u8; 32]) -> Vec<u8> {
@@ -122,11 +169,64 @@ fn height_block_key(height: u32) -> Vec<u8> {
     out
 }
 
+fn block_height_key(block_hash: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BLOCK_HEIGHT_PREFIX.len() + 32);
+    out.extend_from_slice(BLOCK_HEIGHT_PREFIX);
+    out.extend_from_slice(block_hash);
+    out
+}
+
+fn block_parent_key(block_hash: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(BLOCK_PARENT_PREFIX.len() + 32);
+    out.extend_from_slice(BLOCK_PARENT_PREFIX);
+    out.extend_from_slice(block_hash);
+    out
+}
+
+fn decode_height_block_key(key: &[u8]) -> Option<u32> {
+    if key.len() != HEIGHT_BLOCK_PREFIX.len() + 4 || !key.starts_with(HEIGHT_BLOCK_PREFIX) {
+        return None;
+    }
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(&key[HEIGHT_BLOCK_PREFIX.len()..]);
+    Some(u32::from_be_bytes(arr))
+}
+
+fn child_index_for_key(keys: &[Vec<u8>], key: &[u8]) -> usize {
+    // Upper bound: first separator > key.
+    let mut lo = 0usize;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if key < keys[mid].as_slice() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+fn prefix_end_exclusive(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for i in (0..end.len()).rev() {
+        if end[i] != 0xFF {
+            end[i] = end[i].saturating_add(1);
+            end.truncate(i + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
 impl VersionedTreeDb {
     pub fn new(db: Arc<DB>) -> Result<Self, RocksError> {
-        let empty = TrieNode::default();
+        let empty = BptreeNode::Leaf(LeafNode::default());
         let empty_id = hash_node(&empty);
-        db.put(node_key(&empty_id), borsh::to_vec(&empty).expect("empty trie serialization"))?;
+        let empty_key = node_key(&empty_id);
+        if db.get(&empty_key)?.is_none() {
+            db.put(empty_key, encode_node_page(&empty))?;
+        }
 
         let mut state = TreeState::default();
 
@@ -175,6 +275,7 @@ impl VersionedTreeDb {
         st.current_block = Some(BlockContext {
             height,
             block_hash: block_hash.to_byte_array(),
+            parent_hash: parent_arr,
             working_root: base_root,
         });
         Ok(())
@@ -189,6 +290,8 @@ impl VersionedTreeDb {
         let mut wb = WriteBatch::default();
         wb.put(block_root_key(&ctx.block_hash), ctx.working_root);
         wb.put(height_block_key(ctx.height), ctx.block_hash);
+        wb.put(block_height_key(&ctx.block_hash), ctx.height.to_be_bytes());
+        wb.put(block_parent_key(&ctx.block_hash), ctx.parent_hash);
 
         let mut should_switch_active = true;
         if let Some(until_height) = st.pin_until_height {
@@ -240,6 +343,102 @@ impl VersionedTreeDb {
         Ok(Some(BlockHash::from_byte_array(arr)))
     }
 
+    pub fn active_blockhash(&self) -> Option<BlockHash> {
+        let st = self.state.read().expect("tree state poisoned");
+        st.active_block.map(BlockHash::from_byte_array)
+    }
+
+    pub fn height_for_blockhash(&self, block_hash: &BlockHash) -> Result<Option<u32>, RocksError> {
+        let Some(bytes) = self.db.get(block_height_key(&block_hash.to_byte_array()))? else {
+            return Ok(None);
+        };
+        if bytes.len() != 4 {
+            return Ok(None);
+        }
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(&bytes);
+        Ok(Some(u32::from_be_bytes(arr)))
+    }
+
+    pub fn parent_for_blockhash(
+        &self,
+        block_hash: &BlockHash,
+    ) -> Result<Option<BlockHash>, RocksError> {
+        let Some(bytes) = self.db.get(block_parent_key(&block_hash.to_byte_array()))? else {
+            return Ok(None);
+        };
+        if bytes.len() != 32 {
+            return Ok(None);
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(Some(BlockHash::from_byte_array(arr)))
+    }
+
+    pub fn is_ancestor(
+        &self,
+        ancestor: &BlockHash,
+        descendant: &BlockHash,
+    ) -> Result<bool, RocksError> {
+        let Some(ancestor_height) = self.height_for_blockhash(ancestor)? else {
+            return Ok(false);
+        };
+        let Some(mut current_height) = self.height_for_blockhash(descendant)? else {
+            return Ok(false);
+        };
+        if ancestor_height > current_height {
+            return Ok(false);
+        }
+        let mut cursor = *descendant;
+        while current_height > ancestor_height {
+            let Some(parent) = self.parent_for_blockhash(&cursor)? else {
+                return Ok(false);
+            };
+            cursor = parent;
+            current_height = current_height.saturating_sub(1);
+        }
+        Ok(cursor == *ancestor)
+    }
+
+    pub fn indexed_height_bounds(&self) -> Result<Option<(u32, u32)>, RocksError> {
+        let mut first: Option<u32> = None;
+        for res in self.db.iterator(IteratorMode::From(HEIGHT_BLOCK_PREFIX, Direction::Forward)) {
+            let (key, _value) = res?;
+            let key_ref = key.as_ref();
+            if !key_ref.starts_with(HEIGHT_BLOCK_PREFIX) {
+                break;
+            }
+            if let Some(height) = decode_height_block_key(key_ref) {
+                first = Some(height);
+                break;
+            }
+        }
+
+        let Some(first_height) = first else {
+            return Ok(None);
+        };
+
+        let mut last = first_height;
+        if let Some(end_prefix) = prefix_end_exclusive(HEIGHT_BLOCK_PREFIX) {
+            for res in self.db.iterator(IteratorMode::From(&end_prefix, Direction::Reverse)) {
+                let (key, _value) = res?;
+                let key_ref = key.as_ref();
+                if !key_ref.starts_with(HEIGHT_BLOCK_PREFIX) {
+                    if key_ref < HEIGHT_BLOCK_PREFIX {
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(height) = decode_height_block_key(key_ref) {
+                    last = height;
+                    break;
+                }
+            }
+        }
+
+        Ok(Some((first_height, last)))
+    }
+
     pub fn active_root(&self) -> [u8; 32] {
         let st = self.state.read().expect("tree state poisoned");
         st.pinned_root.unwrap_or(st.active_root)
@@ -274,21 +473,26 @@ impl VersionedTreeDb {
 
     pub fn get_at_root(&self, root: [u8; 32], key: &[u8]) -> Result<Option<Vec<u8>>, RocksError> {
         let mut current = root;
-        let mut depth = 0usize;
-        while depth < key.len() {
-            let node = self.load_node(&current)?;
-            let edge = match node.children.get(&key[depth]) {
-                Some(edge) => edge,
-                None => return Ok(None),
-            };
-            if !key[depth..].starts_with(&edge.label) {
-                return Ok(None);
+        loop {
+            match self.load_node(&current)? {
+                BptreeNode::Leaf(leaf) => {
+                    match leaf.entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
+                        Ok(idx) => return Ok(leaf.entries[idx].value.clone()),
+                        Err(_) => return Ok(None),
+                    }
+                }
+                BptreeNode::Internal(internal) => {
+                    if internal.children.is_empty() {
+                        return Ok(None);
+                    }
+                    let idx = child_index_for_key(&internal.keys, key);
+                    let Some(next) = internal.children.get(idx).copied() else {
+                        return Ok(None);
+                    };
+                    current = next;
+                }
             }
-            depth += edge.label.len();
-            current = edge.child;
         }
-        let node = self.load_node(&current)?;
-        Ok(node.value)
     }
 
     pub fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
@@ -308,20 +512,90 @@ impl VersionedTreeDb {
         if changes.is_empty() {
             return Ok(());
         }
+        let mut owned = Vec::with_capacity(changes.len());
+        for (k, v) in changes {
+            owned.push((k.clone(), v.clone()));
+        }
+        self.apply_batch_owned(owned)
+    }
+
+    pub fn apply_batch_owned(
+        &self,
+        mut changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> Result<(), RocksError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        // Canonicalize for deterministic structure with last-write-wins semantics:
+        // stable sort by key, then keep only the final value for duplicate keys.
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut write = 0usize;
+        for read in 0..changes.len() {
+            if write > 0 && changes[write - 1].0 == changes[read].0 {
+                let replacement = changes[read].1.take();
+                changes[write - 1].1 = replacement;
+                continue;
+            }
+            if write != read {
+                changes.swap(write, read);
+            }
+            write += 1;
+        }
+        changes.truncate(write);
+
+        let progress = std::env::var_os("ESPO_TREE_BATCH_PROGRESS").is_some();
+        let total_ops = changes.len();
+        if progress {
+            eprintln!("[tree_db] apply_batch_owned: canonical_ops={total_ops}");
+        }
+
+        let mut batch_ctx = BatchWriteContext::default();
         let mut st = self.state.write().expect("tree state poisoned");
-        let mut cache: HashMap<[u8; 32], TrieNode> = HashMap::new();
         if let Some(ctx) = st.current_block.as_mut() {
             let mut root = ctx.working_root;
-            for (k, v) in changes {
-                root = self.apply_single(root, k, v.clone(), &mut cache)?;
+            for (idx, (k, v)) in changes.into_iter().enumerate() {
+                root = self.apply_single(root, &k, v, Some(&mut batch_ctx))?;
+                self.maybe_compact_batch_nodes(root, &mut batch_ctx)?;
+                if progress && (idx + 1) % 100_000 == 0 {
+                    eprintln!(
+                        "[tree_db] apply_batch_owned: progress={}/{} pending_nodes={}",
+                        idx + 1,
+                        total_ops,
+                        batch_ctx.pending_nodes.len()
+                    );
+                }
+            }
+            self.flush_pending_batch_nodes(root, &batch_ctx)?;
+            if progress {
+                eprintln!(
+                    "[tree_db] apply_batch_owned: flushed_pending_nodes={}",
+                    batch_ctx.pending_nodes.len()
+                );
             }
             ctx.working_root = root;
             return Ok(());
         }
 
         let mut root = st.active_root;
-        for (k, v) in changes {
-            root = self.apply_single(root, k, v.clone(), &mut cache)?;
+        for (idx, (k, v)) in changes.into_iter().enumerate() {
+            root = self.apply_single(root, &k, v, Some(&mut batch_ctx))?;
+            self.maybe_compact_batch_nodes(root, &mut batch_ctx)?;
+            if progress && (idx + 1) % 100_000 == 0 {
+                eprintln!(
+                    "[tree_db] apply_batch_owned: progress={}/{} pending_nodes={}",
+                    idx + 1,
+                    total_ops,
+                    batch_ctx.pending_nodes.len()
+                );
+            }
+        }
+        self.flush_pending_batch_nodes(root, &batch_ctx)?;
+        if progress {
+            eprintln!(
+                "[tree_db] apply_batch_owned: flushed_pending_nodes={}",
+                batch_ctx.pending_nodes.len()
+            );
         }
         st.active_root = root;
 
@@ -360,25 +634,70 @@ impl VersionedTreeDb {
         root: [u8; 32],
         prefix: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
-        let mut key = Vec::new();
-        let Some(cursor) = self.find_prefix_cursor(root, prefix, &mut key)? else {
-            return Ok(Vec::new());
-        };
+        let end = prefix_end_exclusive(prefix);
+        let mut out = self.range_entries_at_root(root, prefix, end.as_deref())?;
+        out.retain(|(k, _)| k.starts_with(prefix));
+        Ok(out)
+    }
+
+    pub fn range_entries(
+        &self,
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
+        let root = self.active_root();
+        self.range_entries_at_root(root, start_inclusive, end_exclusive)
+    }
+
+    pub fn range_entries_at_root(
+        &self,
+        root: [u8; 32],
+        start_inclusive: &[u8],
+        end_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, RocksError> {
         let mut out = Vec::new();
-        key.truncate(cursor.key_buf_len);
-        self.collect_entries(cursor.node_id, &mut key, &mut out)?;
+        let Some((mut cursor, mut path)) = self.find_leaf_with_path(root, start_inclusive)? else {
+            return Ok(out);
+        };
+        let mut first_leaf = true;
+
+        loop {
+            let leaf = self.load_leaf(&cursor)?;
+            let start_idx = if first_leaf {
+                leaf.entries.partition_point(|entry| entry.key.as_slice() < start_inclusive)
+            } else {
+                0
+            };
+
+            for entry in leaf.entries.iter().skip(start_idx) {
+                if let Some(end) = end_exclusive {
+                    if entry.key.as_slice() >= end {
+                        return Ok(out);
+                    }
+                }
+                if let Some(v) = &entry.value {
+                    out.push((entry.key.clone(), v.clone()));
+                }
+            }
+
+            first_leaf = false;
+            let Some(next) = self.next_leaf_from_path(&mut path)? else {
+                break;
+            };
+            cursor = next;
+        }
+
         Ok(out)
     }
 
     fn apply_mutation(&self, key: &[u8], value: Option<Vec<u8>>) -> Result<(), RocksError> {
         let mut st = self.state.write().expect("tree state poisoned");
-        let mut cache: HashMap<[u8; 32], TrieNode> = HashMap::new();
         if let Some(ctx) = st.current_block.as_mut() {
-            ctx.working_root = self.apply_single(ctx.working_root, key, value, &mut cache)?;
+            ctx.working_root = self.apply_single(ctx.working_root, key, value, None)?;
             return Ok(());
         }
 
-        st.active_root = self.apply_single(st.active_root, key, value, &mut cache)?;
+        st.active_root = self.apply_single(st.active_root, key, value, None)?;
         let mut wb = WriteBatch::default();
         wb.put(META_ACTIVE_ROOT, st.active_root);
         if let Some(active_block) = st.active_block {
@@ -392,233 +711,367 @@ impl VersionedTreeDb {
         root: [u8; 32],
         key: &[u8],
         value: Option<Vec<u8>>,
-        cache: &mut HashMap<[u8; 32], TrieNode>,
+        mut batch_ctx: Option<&mut BatchWriteContext>,
     ) -> Result<[u8; 32], RocksError> {
-        let updated = self.update_node(root, key, 0, value.as_deref(), cache)?;
-        Ok(updated.unwrap_or_else(empty_root_id))
-    }
-
-    fn update_node(
-        &self,
-        node_id: [u8; 32],
-        key: &[u8],
-        depth: usize,
-        value: Option<&[u8]>,
-        cache: &mut HashMap<[u8; 32], TrieNode>,
-    ) -> Result<Option<[u8; 32]>, RocksError> {
-        let before = self.load_node_cached(node_id, cache)?;
-        let mut node = before.clone();
-
-        if depth == key.len() {
-            node.value = value.map(|v| v.to_vec());
-        } else {
-            let remaining = &key[depth..];
-            let edge_key = remaining[0];
-            match node.children.get(&edge_key).cloned() {
-                None => {
-                    if let Some(v) = value {
-                        let edge = self.build_edge(remaining, v, cache)?;
-                        node.children.insert(edge_key, edge);
-                    } else {
-                        return Ok(Some(node_id));
-                    }
-                }
-                Some(existing_edge) => {
-                    let common = common_prefix_len(&existing_edge.label, remaining);
-                    if common == existing_edge.label.len() {
-                        let next = self.update_node(
-                            existing_edge.child,
-                            key,
-                            depth + common,
-                            value,
-                            cache,
-                        )?;
-                        match next {
-                            Some(id) => {
-                                let compact =
-                                    self.compact_edge(existing_edge.label.clone(), id, cache)?;
-                                node.children.insert(edge_key, compact);
-                            }
-                            None => {
-                                node.children.remove(&edge_key);
-                            }
-                        }
-                    } else if value.is_some() {
-                        let mut split = TrieNode::default();
-                        let old_suffix = existing_edge.label[common..].to_vec();
-                        let old_first = old_suffix[0];
-                        split.children.insert(
-                            old_first,
-                            TrieEdge { label: old_suffix, child: existing_edge.child },
-                        );
-
-                        let new_suffix = &remaining[common..];
-                        if new_suffix.is_empty() {
-                            split.value = value.map(|v| v.to_vec());
-                        } else {
-                            let new_edge = self.build_edge(
-                                new_suffix,
-                                value.expect("checked is_some"),
-                                cache,
-                            )?;
-                            split.children.insert(new_edge.label[0], new_edge);
-                        }
-
-                        let split_id = self.store_node_cached(&split, cache)?;
-                        let compact = self.compact_edge(
-                            existing_edge.label[..common].to_vec(),
-                            split_id,
-                            cache,
-                        )?;
-                        node.children.insert(edge_key, compact);
-                    } else {
-                        return Ok(Some(node_id));
-                    }
-                }
+        let res = self.mutate_node(root, key, value, batch_ctx.as_deref_mut())?;
+        let next_root = match res.outcome {
+            MutationOutcome::Node(id) => id,
+            MutationOutcome::Split { left, right, separator } => {
+                let new_root = BptreeNode::Internal(InternalNode {
+                    keys: vec![separator],
+                    children: vec![left, right],
+                });
+                self.store_node_with_ctx(&new_root, batch_ctx.as_deref_mut())?
             }
-        }
+        };
 
-        if node.value.is_none() && node.children.is_empty() {
-            return Ok(None);
-        }
-        if node == before {
-            return Ok(Some(node_id));
-        }
-
-        let id = self.store_node_cached(&node, cache)?;
-        Ok(Some(id))
+        Ok(next_root)
     }
 
-    fn build_edge(
-        &self,
-        suffix: &[u8],
-        value: &[u8],
-        cache: &mut HashMap<[u8; 32], TrieNode>,
-    ) -> Result<TrieEdge, RocksError> {
-        debug_assert!(!suffix.is_empty());
-        let leaf = TrieNode { value: Some(value.to_vec()), children: BTreeMap::new() };
-        let child = self.store_node_cached(&leaf, cache)?;
-        Ok(TrieEdge { label: suffix.to_vec(), child })
-    }
-
-    fn compact_edge(
-        &self,
-        mut label: Vec<u8>,
-        mut child: [u8; 32],
-        cache: &mut HashMap<[u8; 32], TrieNode>,
-    ) -> Result<TrieEdge, RocksError> {
-        loop {
-            let next = self.load_node_cached(child, cache)?;
-            if next.value.is_some() || next.children.len() != 1 {
-                break;
-            }
-            let (_, edge) = next.children.iter().next().expect("checked len");
-            label.extend_from_slice(&edge.label);
-            child = edge.child;
-        }
-        Ok(TrieEdge { label, child })
-    }
-
-    fn find_prefix_cursor(
+    fn maybe_compact_batch_nodes(
         &self,
         root: [u8; 32],
-        prefix: &[u8],
-        key_buf: &mut Vec<u8>,
-    ) -> Result<Option<PrefixCursor>, RocksError> {
-        let mut current = root;
-        let mut depth = 0usize;
-        while depth < prefix.len() {
-            let node = self.load_node(&current)?;
-            let edge = match node.children.get(&prefix[depth]) {
-                Some(edge) => edge,
-                None => return Ok(None),
-            };
-            let common = common_prefix_len(&edge.label, &prefix[depth..]);
-            if common == 0 {
-                return Ok(None);
-            }
-
-            if common < edge.label.len() {
-                if depth + common == prefix.len() {
-                    key_buf.extend_from_slice(&edge.label);
-                    return Ok(Some(PrefixCursor {
-                        node_id: edge.child,
-                        key_buf_len: key_buf.len(),
-                    }));
-                }
-                return Ok(None);
-            }
-
-            key_buf.extend_from_slice(&edge.label);
-            depth += common;
-            current = edge.child;
-        }
-        Ok(Some(PrefixCursor { node_id: current, key_buf_len: key_buf.len() }))
-    }
-
-    fn collect_entries(
-        &self,
-        node_id: [u8; 32],
-        key_buf: &mut Vec<u8>,
-        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        batch_ctx: &mut BatchWriteContext,
     ) -> Result<(), RocksError> {
-        let node = self.load_node(&node_id)?;
-        if let Some(v) = node.value {
-            out.push((key_buf.clone(), v));
+        if batch_ctx.pending_nodes.is_empty() {
+            return Ok(());
         }
-        for (_, edge) in node.children {
-            key_buf.extend_from_slice(&edge.label);
-            self.collect_entries(edge.child, key_buf, out)?;
-            key_buf.truncate(key_buf.len() - edge.label.len());
+        batch_ctx.ops_since_gc = batch_ctx.ops_since_gc.saturating_add(1);
+        let over_soft = batch_ctx.pending_nodes.len() >= BATCH_PENDING_SOFT_LIMIT;
+        let should_gc = batch_ctx.ops_since_gc >= BATCH_PENDING_GC_INTERVAL
+            || (over_soft && batch_ctx.ops_since_gc >= BATCH_PENDING_SOFT_GC_INTERVAL);
+        if should_gc {
+            self.retain_reachable_pending_nodes(root, batch_ctx);
+            batch_ctx.ops_since_gc = 0;
+        }
+
+        if batch_ctx.pending_nodes.len() >= BATCH_PENDING_HARD_LIMIT {
+            // Safety valve: spill current reachable frontier to disk and reset in-memory cache.
+            self.retain_reachable_pending_nodes(root, batch_ctx);
+            self.flush_pending_batch_nodes(root, batch_ctx)?;
+            batch_ctx.pending_nodes.clear();
+            batch_ctx.ops_since_gc = 0;
         }
         Ok(())
     }
 
-    fn load_node(&self, id: &[u8; 32]) -> Result<TrieNode, RocksError> {
+    fn retain_reachable_pending_nodes(
+        &self,
+        root: [u8; 32],
+        batch_ctx: &mut BatchWriteContext,
+    ) {
+        if batch_ctx.pending_nodes.is_empty() {
+            return;
+        }
+
+        let mut reachable: HashSet<[u8; 32]> = HashSet::new();
+        let mut stack = vec![root];
+
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            let Some(node) = batch_ctx.pending_nodes.get(&id) else {
+                continue;
+            };
+            if let BptreeNode::Internal(internal) = node {
+                for child in &internal.children {
+                    stack.push(*child);
+                }
+            }
+        }
+
+        if reachable.len() == batch_ctx.pending_nodes.len() {
+            return;
+        }
+        batch_ctx.pending_nodes.retain(|id, _| reachable.contains(id));
+    }
+
+    fn flush_pending_batch_nodes(
+        &self,
+        root: [u8; 32],
+        batch_ctx: &BatchWriteContext,
+    ) -> Result<(), RocksError> {
+        if batch_ctx.pending_nodes.is_empty() {
+            return Ok(());
+        }
+
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+        let mut stack = vec![root];
+        let mut wb = WriteBatch::default();
+        let mut writes = 0usize;
+
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(node) = batch_ctx.pending_nodes.get(&id) else {
+                continue;
+            };
+            // Nodes are content-addressed by hash; unconditional put is idempotent and avoids
+            // expensive per-node DB reads in large batches.
+            wb.put(node_key(&id), encode_node_page(node));
+            writes = writes.saturating_add(1);
+            if let BptreeNode::Internal(internal) = node {
+                for child in &internal.children {
+                    stack.push(*child);
+                }
+            }
+        }
+
+        if writes == 0 {
+            return Ok(());
+        }
+
+        self.db.write(wb)
+    }
+
+    fn mutate_node(
+        &self,
+        node_id: [u8; 32],
+        key: &[u8],
+        value: Option<Vec<u8>>,
+        mut batch_ctx: Option<&mut BatchWriteContext>,
+    ) -> Result<MutationResult, RocksError> {
+        match self.load_node_with_ctx(&node_id, batch_ctx.as_deref())? {
+            BptreeNode::Leaf(mut leaf) => {
+                let search = leaf.entries.binary_search_by(|entry| entry.key.as_slice().cmp(key));
+
+                let mut changed = false;
+                match search {
+                    Ok(idx) => {
+                        match value {
+                            Some(next) => {
+                                if leaf.entries[idx].value.as_ref() != Some(&next) {
+                                    leaf.entries[idx].value = Some(next);
+                                    changed = true;
+                                }
+                            }
+                            None => {
+                                // COW versioning already preserves history, so deletes remove keys
+                                // from the new version instead of accumulating tombstones forever.
+                                leaf.entries.remove(idx);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Err(idx) => {
+                        if let Some(next) = value {
+                            leaf.entries.insert(
+                                idx,
+                                LeafEntry { key: key.to_vec(), value: Some(next) },
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+
+                if leaf.entries.iter().any(|entry| entry.value.is_none()) {
+                    // Opportunistically compact legacy tombstones when this leaf is touched.
+                    leaf.entries.retain(|entry| entry.value.is_some());
+                    changed = true;
+                }
+
+                if !changed {
+                    return Ok(MutationResult { outcome: MutationOutcome::Node(node_id) });
+                }
+
+                if leaf.entries.len() <= MAX_LEAF_ENTRIES {
+                    let new_id =
+                        self.store_node_with_ctx(&BptreeNode::Leaf(leaf), batch_ctx.as_deref_mut())?;
+                    return Ok(MutationResult { outcome: MutationOutcome::Node(new_id) });
+                }
+
+                // Deterministic split: exact half.
+                let mid = leaf.entries.len() / 2;
+                let right_entries = leaf.entries.split_off(mid);
+                let left_entries = leaf.entries;
+
+                let separator = right_entries[0].key.clone();
+                let old_next = leaf.next;
+
+                let right_node =
+                    BptreeNode::Leaf(LeafNode { entries: right_entries, next: old_next });
+                let right_id = self.store_node_with_ctx(&right_node, batch_ctx.as_deref_mut())?;
+
+                let left_node =
+                    BptreeNode::Leaf(LeafNode { entries: left_entries, next: Some(right_id) });
+                let left_id = self.store_node_with_ctx(&left_node, batch_ctx.as_deref_mut())?;
+
+                Ok(MutationResult {
+                    outcome: MutationOutcome::Split { left: left_id, right: right_id, separator },
+                })
+            }
+            BptreeNode::Internal(mut internal) => {
+                if internal.children.is_empty() {
+                    return Ok(MutationResult { outcome: MutationOutcome::Node(node_id) });
+                }
+
+                let idx = child_index_for_key(&internal.keys, key);
+                let Some(child_id) = internal.children.get(idx).copied() else {
+                    return Ok(MutationResult { outcome: MutationOutcome::Node(node_id) });
+                };
+
+                let child = self.mutate_node(child_id, key, value, batch_ctx.as_deref_mut())?;
+
+                match child.outcome {
+                    MutationOutcome::Node(new_child) => {
+                        if new_child == child_id {
+                            return Ok(MutationResult { outcome: MutationOutcome::Node(node_id) });
+                        }
+                        internal.children[idx] = new_child;
+                    }
+                    MutationOutcome::Split { left, right, separator } => {
+                        internal.children[idx] = left;
+                        internal.keys.insert(idx, separator);
+                        internal.children.insert(idx + 1, right);
+                    }
+                }
+
+                if internal.keys.len() <= MAX_INTERNAL_KEYS {
+                    let new_id = self
+                        .store_node_with_ctx(&BptreeNode::Internal(internal), batch_ctx.as_deref_mut())?;
+                    return Ok(MutationResult { outcome: MutationOutcome::Node(new_id) });
+                }
+
+                // Deterministic split: exact half.
+                let mid = internal.keys.len() / 2;
+                let separator = internal.keys[mid].clone();
+
+                let left_keys = internal.keys[..mid].to_vec();
+                let right_keys = internal.keys[mid + 1..].to_vec();
+
+                let left_children = internal.children[..mid + 1].to_vec();
+                let right_children = internal.children[mid + 1..].to_vec();
+
+                let left_id = self.store_node_with_ctx(
+                    &BptreeNode::Internal(InternalNode { keys: left_keys, children: left_children }),
+                    batch_ctx.as_deref_mut(),
+                )?;
+                let right_id = self.store_node_with_ctx(
+                    &BptreeNode::Internal(InternalNode {
+                        keys: right_keys,
+                        children: right_children,
+                    }),
+                    batch_ctx.as_deref_mut(),
+                )?;
+
+                Ok(MutationResult {
+                    outcome: MutationOutcome::Split { left: left_id, right: right_id, separator },
+                })
+            }
+        }
+    }
+
+    fn find_leaf_with_path(
+        &self,
+        root: [u8; 32],
+        key: &[u8],
+    ) -> Result<Option<([u8; 32], Vec<([u8; 32], usize)>)>, RocksError> {
+        let mut path = Vec::new();
+        let mut current = root;
+        loop {
+            match self.load_node(&current)? {
+                BptreeNode::Leaf(_) => return Ok(Some((current, path))),
+                BptreeNode::Internal(internal) => {
+                    if internal.children.is_empty() {
+                        return Ok(None);
+                    }
+                    let idx = child_index_for_key(&internal.keys, key);
+                    let Some(next) = internal.children.get(idx).copied() else {
+                        return Ok(None);
+                    };
+                    path.push((current, idx));
+                    current = next;
+                }
+            }
+        }
+    }
+
+    fn next_leaf_from_path(
+        &self,
+        path: &mut Vec<([u8; 32], usize)>,
+    ) -> Result<Option<[u8; 32]>, RocksError> {
+        while let Some((internal_id, child_idx)) = path.pop() {
+            let internal = self.load_internal(&internal_id)?;
+            let next_idx = child_idx + 1;
+            if next_idx >= internal.children.len() {
+                continue;
+            }
+
+            let mut node_id = internal.children[next_idx];
+            path.push((internal_id, next_idx));
+            loop {
+                match self.load_node(&node_id)? {
+                    BptreeNode::Leaf(_) => return Ok(Some(node_id)),
+                    BptreeNode::Internal(next_internal) => {
+                        if next_internal.children.is_empty() {
+                            return Ok(None);
+                        }
+                        path.push((node_id, 0));
+                        node_id = next_internal.children[0];
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn load_leaf(&self, id: &[u8; 32]) -> Result<LeafNode, RocksError> {
+        match self.load_node(id)? {
+            BptreeNode::Leaf(leaf) => Ok(leaf),
+            BptreeNode::Internal(_) => Ok(LeafNode::default()),
+        }
+    }
+
+    fn load_internal(&self, id: &[u8; 32]) -> Result<InternalNode, RocksError> {
+        match self.load_node(id)? {
+            BptreeNode::Internal(node) => Ok(node),
+            BptreeNode::Leaf(_) => Ok(InternalNode::default()),
+        }
+    }
+
+    fn load_node(&self, id: &[u8; 32]) -> Result<BptreeNode, RocksError> {
         let key = node_key(id);
         let Some(bytes) = self.db.get(key)? else {
-            return Ok(TrieNode::default());
+            return Ok(BptreeNode::Leaf(LeafNode::default()));
         };
-        if let Ok(node) = TrieNode::try_from_slice(&bytes) {
+        if let Some(node) = decode_node_page(&bytes) {
             return Ok(node);
         }
+        Ok(BptreeNode::Leaf(LeafNode::default()))
+    }
 
-        // Backward compatibility for legacy one-byte-per-edge trie encoding.
-        if let Ok(old) = LegacyTrieNode::try_from_slice(&bytes) {
-            let mut children = BTreeMap::new();
-            for (k, child) in old.children {
-                children.insert(k, TrieEdge { label: vec![k], child });
+    fn load_node_with_ctx(
+        &self,
+        id: &[u8; 32],
+        batch_ctx: Option<&BatchWriteContext>,
+    ) -> Result<BptreeNode, RocksError> {
+        if let Some(ctx) = batch_ctx {
+            if let Some(node) = ctx.pending_nodes.get(id) {
+                return Ok(node.clone());
             }
-            return Ok(TrieNode { value: old.value, children });
         }
-
-        Ok(TrieNode::default())
+        self.load_node(id)
     }
 
-    fn load_node_cached(
+    fn store_node_with_ctx(
         &self,
-        id: [u8; 32],
-        cache: &mut HashMap<[u8; 32], TrieNode>,
-    ) -> Result<TrieNode, RocksError> {
-        if let Some(node) = cache.get(&id) {
-            return Ok(node.clone());
-        }
-        let node = self.load_node(&id)?;
-        cache.insert(id, node.clone());
-        Ok(node)
-    }
-
-    fn store_node_cached(
-        &self,
-        node: &TrieNode,
-        cache: &mut HashMap<[u8; 32], TrieNode>,
+        node: &BptreeNode,
+        batch_ctx: Option<&mut BatchWriteContext>,
     ) -> Result<[u8; 32], RocksError> {
         let id = hash_node(node);
+        if let Some(ctx) = batch_ctx {
+            ctx.pending_nodes.entry(id).or_insert_with(|| node.clone());
+            return Ok(id);
+        }
         let key = node_key(&id);
-        self.db.put(key, borsh::to_vec(node).expect("trie node serialization"))?;
-        cache.insert(id, node.clone());
+        if self.db.get(&key)?.is_none() {
+            self.db.put(key, encode_node_page(node))?;
+        }
         Ok(id)
     }
+
 }
 
 pub fn is_tree_internal_key(full_key: &[u8]) -> bool {
@@ -640,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_lookup_matches_mid_edge() {
+    fn prefix_lookup_works() {
         let (_dir, tree) = new_tree();
         let key = b"essentials:/address/v2/some-very-long-address/outpoint/txid:vout";
         let value = b"v1".to_vec();
@@ -687,29 +1140,36 @@ mod tests {
     }
 
     #[test]
-    fn legacy_node_encoding_is_readable() {
+    fn range_entries_remain_correct_after_many_splits() {
         let (_dir, tree) = new_tree();
 
-        let old_leaf = LegacyTrieNode { value: Some(vec![0x99]), children: BTreeMap::new() };
-        let old_leaf_id =
-            sha256::Hash::hash(&borsh::to_vec(&old_leaf).expect("serialize legacy leaf"))
-                .to_byte_array();
-        tree.db
-            .put(node_key(&old_leaf_id), borsh::to_vec(&old_leaf).expect("serialize legacy leaf"))
-            .expect("put legacy leaf");
+        let mut initial = Vec::new();
+        for i in 0..900u32 {
+            let key = format!("holders/{i:04}").into_bytes();
+            let value = vec![(i % 251) as u8];
+            initial.push((key, Some(value)));
+        }
+        tree.apply_batch(&initial).expect("seed");
 
-        let mut root_children = BTreeMap::new();
-        root_children.insert(b'k', old_leaf_id);
-        let old_root = LegacyTrieNode { value: None, children: root_children };
-        let old_root_id =
-            sha256::Hash::hash(&borsh::to_vec(&old_root).expect("serialize legacy root"))
-                .to_byte_array();
-        tree.db
-            .put(node_key(&old_root_id), borsh::to_vec(&old_root).expect("serialize legacy root"))
-            .expect("put legacy root");
+        let mut updates = Vec::new();
+        for i in (0..900u32).step_by(4) {
+            updates.push((format!("holders/{i:04}").into_bytes(), None));
+        }
+        for i in 900..1200u32 {
+            updates.push((format!("holders/{i:04}").into_bytes(), Some(vec![(i % 251) as u8])));
+        }
+        tree.apply_batch(&updates).expect("updates");
 
-        let got = tree.get_at_root(old_root_id, b"k").expect("get_at_root legacy");
-        assert_eq!(got, Some(vec![0x99]));
+        let entries = tree.collect_prefixed_entries(b"holders/").expect("collect");
+        assert!(!entries.is_empty());
+
+        let observed_keys: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
+        let mut sorted = observed_keys.clone();
+        sorted.sort();
+        assert_eq!(observed_keys, sorted);
+
+        // 1200 total keys minus 225 deletes (every 4th key in 0..900).
+        assert_eq!(entries.len(), 975);
     }
 
     #[test]

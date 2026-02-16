@@ -21,7 +21,7 @@ use crate::modules::ammdata::utils::pathfinder::{
 };
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::mdb::{Mdb, MdbBatch};
-use crate::runtime::pointers::{KvPointer, ListPointer};
+use crate::runtime::pointers::{CursorScanPage, KvPointer, ListPointer};
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
@@ -1470,21 +1470,6 @@ impl AmmDataProvider {
         }
     }
 
-    fn raw_scan_prefix_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut entries = match self.view_blockhash {
-            Some(blockhash) => self
-                .mdb
-                .scan_prefix_entries_at_blockhash(&blockhash, prefix)
-                .map_err(|e| anyhow!("mdb.scan_prefix_entries_at_blockhash failed: {e}"))?,
-            None => self
-                .mdb
-                .scan_prefix_entries(prefix)
-                .map_err(|e| anyhow!("mdb.scan_prefix_entries failed: {e}"))?,
-        };
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(entries)
-    }
-
     fn raw_scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
         let mut keys = match self.view_blockhash {
             Some(blockhash) => self
@@ -1522,9 +1507,30 @@ impl AmmDataProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
-        let mut entries = self.raw_scan_prefix_entries(&params.prefix)?;
-        entries.reverse();
-        Ok(GetListEntriesDescResult { entries })
+        let page = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+            prefix: params.prefix,
+            cursor: None,
+            limit: usize::MAX,
+        })?;
+        Ok(GetListEntriesDescResult { entries: page.entries })
+    }
+
+    pub fn get_list_entries_desc_cursor(
+        &self,
+        params: GetListEntriesDescCursorParams,
+    ) -> Result<GetListEntriesDescCursorResult> {
+        let root = ListPointer::root(self.mdb.as_ref());
+        let list = root.select(&params.prefix);
+        let cursor_page: CursorScanPage = list.scan_desc_cursor_page(
+            self.view_blockhash.as_ref(),
+            params.cursor.as_deref(),
+            params.limit,
+        )?;
+        Ok(GetListEntriesDescCursorResult {
+            entries: cursor_page.entries,
+            next_cursor: cursor_page.next_cursor,
+            has_more: cursor_page.has_more,
+        })
     }
 
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
@@ -3328,6 +3334,18 @@ pub struct GetListEntriesDescParams {
 
 pub struct GetListEntriesDescResult {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+pub struct GetListEntriesDescCursorParams {
+    pub prefix: Vec<u8>,
+    pub cursor: Option<Vec<u8>>,
+    pub limit: usize,
+}
+
+pub struct GetListEntriesDescCursorResult {
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub next_cursor: Option<Vec<u8>>,
+    pub has_more: bool,
 }
 
 pub struct SetRawValueParams {
