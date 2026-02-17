@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::modules::oylapi::storage::{
     GetAlkanesParams, OylApiState, get_address_pool_burn_history,
     get_address_pool_creation_history, get_address_pool_mint_history, get_address_positions,
@@ -354,6 +355,7 @@ async fn get_alkanes_handler(
     Json(req): Json<GetAlkanesRequest>,
 ) -> Json<Value> {
     let params = GetAlkanesParams {
+        blockhash: StateAt::Latest,
         limit: req.limit,
         offset: req.offset,
         sort_by: req.sort_by,

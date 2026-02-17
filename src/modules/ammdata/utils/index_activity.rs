@@ -7,8 +7,8 @@ use crate::modules::ammdata::utils::candles::{
 use crate::modules::ammdata::utils::index_state::IndexState;
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::schemas::SchemaAlkaneId;
-use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoin::Txid;
 use std::collections::HashMap;
 
 pub fn process_balance_deltas(

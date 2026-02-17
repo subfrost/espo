@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::config::{debug_enabled, get_config, get_electrum_like, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -11,6 +12,7 @@ use crate::modules::ammdata::storage::{
     GetAddressPoolCreationsPageParams, GetAddressPoolMintsPageParams,
     GetAddressPoolSwapsPageParams, GetAddressTokenSwapsPageParams, GetCanonicalPoolPricesParams,
     GetFactoryPoolsParams, GetLatestTokenUsdCloseParams, GetListEntriesDescParams,
+    GetLatestBtcUsdPriceParams,
     GetPoolActivityEntriesParams, GetPoolCreationInfoParams, GetPoolCreationsPageParams,
     GetPoolDefsParams, GetPoolDetailsSnapshotParams, GetPoolFactoryParams,
     GetPoolIdsByNamePrefixParams, GetPoolLpSupplyLatestParams, GetPoolMetricsParams,
@@ -114,6 +116,7 @@ pub struct OylApiState {
 }
 
 pub struct GetAlkanesParams {
+    pub blockhash: StateAt,
     pub limit: u64,
     pub offset: Option<u64>,
     pub sort_by: Option<String>,
@@ -138,7 +141,8 @@ pub async fn get_alkanes_by_address(state: &OylApiState, address: &str) -> Value
     let ids: Vec<SchemaAlkaneId> = balances.keys().copied().collect();
     let records = match state
         .essentials
-        .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids })
+        .get_creation_records_by_id(GetCreationRecordsByIdParams {
+            blockhash: StateAt::Latest, alkanes: ids })
     {
         Ok(r) => r.records,
         Err(err) => return internal_error(err),
@@ -348,6 +352,7 @@ pub async fn get_amm_utxos(
 
 pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value {
     crate::debug_timer_log!("get_alkanes");
+    let query_blockhash = params.blockhash;
     if params.limit == 0 {
         return error_response(400, "limit_required");
     }
@@ -422,6 +427,7 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
                 if field != SearchIndexField::Holders {
                     ids = match state.ammdata.get_token_derived_search_index_page(
                         GetTokenDerivedSearchIndexPageParams {
+                            blockhash: query_blockhash,
                             quote,
                             field,
                             prefix: query_norm.clone(),
@@ -437,6 +443,7 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
             } else {
                 ids =
                     match state.ammdata.get_token_search_index_page(GetTokenSearchIndexPageParams {
+                        blockhash: query_blockhash,
                         field,
                         prefix: query_norm.clone(),
                         offset: offset as u64,
@@ -474,7 +481,10 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
         if !ids.is_empty() {
             let records = match state
                 .essentials
-                .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })
+                .get_creation_records_by_id(GetCreationRecordsByIdParams {
+                    blockhash: query_blockhash,
+                    alkanes: ids.clone(),
+                })
             {
                 Ok(res) => res.records,
                 Err(err) => return internal_error(err),
@@ -506,13 +516,18 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
         total = match sort_index {
             AlkaneSortIndex::Derived { quote, .. } => {
                 match state.ammdata.get_token_derived_metrics_index_count(
-                    GetTokenDerivedMetricsIndexCountParams { quote },
+                    GetTokenDerivedMetricsIndexCountParams {
+                        blockhash: query_blockhash,
+                        quote,
+                    },
                 ) {
                     Ok(res) => res.count as usize,
                     Err(err) => return internal_error(err),
                 }
             }
-            _ => match state.essentials.get_creation_count(GetCreationCountParams) {
+            _ => match state.essentials.get_creation_count(GetCreationCountParams {
+                blockhash: query_blockhash,
+            }) {
                 Ok(res) => res.count as usize,
                 Err(err) => return internal_error(err),
             },
@@ -533,7 +548,10 @@ pub async fn get_alkanes(state: &OylApiState, params: GetAlkanesParams) -> Value
 
             if !ids.is_empty() {
                 let records = match state.essentials.get_creation_records_by_id(
-                    GetCreationRecordsByIdParams { alkanes: ids.clone() },
+                    GetCreationRecordsByIdParams {
+                        blockhash: query_blockhash,
+                        alkanes: ids.clone(),
+                    },
                 ) {
                     Ok(res) => res.records,
                     Err(err) => return internal_error(err),
@@ -629,7 +647,8 @@ pub async fn get_alkane_details(state: &OylApiState, block: &str, tx: &str) -> V
         return error_response(400, "invalid_alkane_id");
     };
 
-    let rec = match state.essentials.get_creation_record(GetCreationRecordParams { alkane }) {
+    let rec = match state.essentials.get_creation_record(GetCreationRecordParams {
+            blockhash: StateAt::Latest, alkane }) {
         Ok(resp) => resp.record,
         Err(err) => return internal_error(err),
     };
@@ -688,7 +707,8 @@ pub async fn get_pools(
         return error_response(400, "invalid_factory_id");
     };
 
-    let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+    let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -727,11 +747,13 @@ pub async fn get_pool_details(
         return error_response(400, "invalid_pool_id");
     };
 
-    let factory_ok = match state.ammdata.get_pool_factory(GetPoolFactoryParams { pool }) {
+    let factory_ok = match state.ammdata.get_pool_factory(GetPoolFactoryParams {
+            blockhash: StateAt::Latest, pool }) {
         Ok(res) => match res.factory {
             Some(found) => found == factory,
             None => {
-                let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory })
+                let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory })
                 {
                     Ok(res) => res.pools,
                     Err(err) => return internal_error(err),
@@ -779,7 +801,8 @@ pub async fn get_address_positions(
         return json!({ "statusCode": 200, "data": [] });
     }
 
-    let pool_ids = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+    let pool_ids = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -804,7 +827,8 @@ pub async fn get_address_positions(
 
         let lp_supply = state
             .essentials
-            .get_latest_circulating_supply(GetLatestCirculatingSupplyParams { alkane: pool_id })
+            .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
+            blockhash: StateAt::Latest, alkane: pool_id })
             .map(|res| res.supply)
             .unwrap_or(details.lp_supply);
         let share_value = if lp_supply == 0 { 0 } else { balance };
@@ -872,7 +896,8 @@ pub async fn get_all_pools_details(
     };
 
     let timer = debug::start_if(debug);
-    let mut pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+    let mut pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -895,7 +920,8 @@ pub async fn get_all_pools_details(
                     filtered.push(pool);
                     continue;
                 }
-                let resp = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+                let resp = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool }) {
                     Ok(v) => v,
                     Err(err) => return internal_error(err),
                 };
@@ -910,7 +936,8 @@ pub async fn get_all_pools_details(
             let norm = normalize_query(query);
             let ids = match state
                 .ammdata
-                .get_pool_ids_by_name_prefix(GetPoolIdsByNamePrefixParams { prefix: norm })
+                .get_pool_ids_by_name_prefix(GetPoolIdsByNamePrefixParams {
+            blockhash: StateAt::Latest, prefix: norm })
             {
                 Ok(res) => res.ids,
                 Err(err) => return internal_error(err),
@@ -1101,7 +1128,8 @@ pub async fn get_pool_swap_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool }) {
         Ok(res) => match res.defs {
             Some(defs) => defs,
             None => {
@@ -1129,6 +1157,7 @@ pub async fn get_pool_swap_history(
     };
 
     let resp = match state.ammdata.get_pool_activity_entries(GetPoolActivityEntriesParams {
+            blockhash: StateAt::Latest,
         pool,
         offset,
         limit,
@@ -1208,7 +1237,8 @@ pub async fn get_token_swap_history(
     let resp =
         match state
             .ammdata
-            .get_token_swaps_page(GetTokenSwapsPageParams { token, offset, limit })
+            .get_token_swaps_page(GetTokenSwapsPageParams {
+            blockhash: StateAt::Latest, token, offset, limit })
         {
             Ok(res) => res,
             Err(err) => return internal_error(err),
@@ -1218,6 +1248,7 @@ pub async fn get_token_swap_history(
     let mut swaps = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1235,7 +1266,8 @@ pub async fn get_token_swap_history(
             *cached
         } else {
             let defs_resp =
-                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool: entry.pool }) {
                     Ok(res) => res,
                     Err(err) => return internal_error(err),
                 };
@@ -1296,7 +1328,8 @@ pub async fn get_pool_mint_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool }) {
         Ok(res) => match res.defs {
             Some(defs) => defs,
             None => {
@@ -1310,6 +1343,7 @@ pub async fn get_pool_mint_history(
     };
 
     let resp = match state.ammdata.get_pool_activity_entries(GetPoolActivityEntriesParams {
+            blockhash: StateAt::Latest,
         pool,
         offset,
         limit,
@@ -1322,7 +1356,8 @@ pub async fn get_pool_mint_history(
     };
 
     let lp_supply =
-        match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool }) {
+        match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool }) {
             Ok(res) => res.supply,
             Err(err) => return internal_error(err),
         };
@@ -1378,7 +1413,8 @@ pub async fn get_pool_burn_history(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool }) {
         Ok(res) => match res.defs {
             Some(defs) => defs,
             None => {
@@ -1392,6 +1428,7 @@ pub async fn get_pool_burn_history(
     };
 
     let resp = match state.ammdata.get_pool_activity_entries(GetPoolActivityEntriesParams {
+            blockhash: StateAt::Latest,
         pool,
         offset,
         limit,
@@ -1404,7 +1441,8 @@ pub async fn get_pool_burn_history(
     };
 
     let lp_supply =
-        match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool }) {
+        match state.ammdata.get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool }) {
             Ok(res) => res.supply,
             Err(err) => return internal_error(err),
         };
@@ -1457,7 +1495,8 @@ pub async fn get_pool_creation_history(
 
     let resp = match state
         .ammdata
-        .get_pool_creations_page(GetPoolCreationsPageParams { offset, limit })
+        .get_pool_creations_page(GetPoolCreationsPageParams {
+            blockhash: StateAt::Latest, offset, limit })
     {
         Ok(res) => res,
         Err(err) => return internal_error(err),
@@ -1467,6 +1506,7 @@ pub async fn get_pool_creation_history(
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1484,7 +1524,8 @@ pub async fn get_pool_creation_history(
             *cached
         } else {
             let defs_resp =
-                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool: entry.pool }) {
                     Ok(res) => res,
                     Err(err) => return internal_error(err),
                 };
@@ -1497,7 +1538,8 @@ pub async fn get_pool_creation_history(
 
         let creation_info = match state
             .ammdata
-            .get_pool_creation_info(GetPoolCreationInfoParams { pool: entry.pool })
+            .get_pool_creation_info(GetPoolCreationInfoParams {
+            blockhash: StateAt::Latest, pool: entry.pool })
         {
             Ok(res) => res.info,
             Err(err) => return internal_error(err),
@@ -1569,7 +1611,8 @@ pub async fn get_address_swap_history_for_pool(
     let offset = clamp_offset(offset);
     let include_total = include_total.unwrap_or(true);
 
-    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams { pool }) {
+    let defs = match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool }) {
         Ok(res) => match res.defs {
             Some(defs) => defs,
             None => {
@@ -1583,6 +1626,7 @@ pub async fn get_address_swap_history_for_pool(
     };
 
     let resp = match state.ammdata.get_address_pool_swaps_page(GetAddressPoolSwapsPageParams {
+            blockhash: StateAt::Latest,
         address_spk: address_spk.clone(),
         pool,
         offset,
@@ -1595,6 +1639,7 @@ pub async fn get_address_swap_history_for_pool(
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1664,6 +1709,7 @@ pub async fn get_address_swap_history_for_token(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.ammdata.get_address_token_swaps_page(GetAddressTokenSwapsPageParams {
+            blockhash: StateAt::Latest,
         address_spk: address_spk.clone(),
         token,
         offset,
@@ -1677,6 +1723,7 @@ pub async fn get_address_swap_history_for_token(
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1694,7 +1741,8 @@ pub async fn get_address_swap_history_for_token(
             *cached
         } else {
             let defs_resp =
-                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool: entry.pool }) {
                     Ok(res) => res,
                     Err(err) => return internal_error(err),
                 };
@@ -1758,6 +1806,7 @@ pub async fn get_address_pool_creation_history(
         match state
             .ammdata
             .get_address_pool_creations_page(GetAddressPoolCreationsPageParams {
+            blockhash: StateAt::Latest,
                 address_spk,
                 offset,
                 limit,
@@ -1770,6 +1819,7 @@ pub async fn get_address_pool_creation_history(
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1787,7 +1837,8 @@ pub async fn get_address_pool_creation_history(
             *cached
         } else {
             let defs_resp =
-                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool: entry.pool }) {
                     Ok(res) => res,
                     Err(err) => return internal_error(err),
                 };
@@ -1800,7 +1851,8 @@ pub async fn get_address_pool_creation_history(
 
         let creation_info = match state
             .ammdata
-            .get_pool_creation_info(GetPoolCreationInfoParams { pool: entry.pool })
+            .get_pool_creation_info(GetPoolCreationInfoParams {
+            blockhash: StateAt::Latest, pool: entry.pool })
         {
             Ok(res) => res.info,
             Err(err) => return internal_error(err),
@@ -1868,6 +1920,7 @@ pub async fn get_address_pool_mint_history(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.ammdata.get_address_pool_mints_page(GetAddressPoolMintsPageParams {
+            blockhash: StateAt::Latest,
         address_spk,
         offset,
         limit,
@@ -1880,6 +1933,7 @@ pub async fn get_address_pool_mint_history(
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1897,7 +1951,8 @@ pub async fn get_address_pool_mint_history(
             *cached
         } else {
             let defs_resp =
-                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool: entry.pool }) {
                     Ok(res) => res,
                     Err(err) => return internal_error(err),
                 };
@@ -1910,7 +1965,8 @@ pub async fn get_address_pool_mint_history(
 
         let lp_supply = match state
             .ammdata
-            .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool: entry.pool })
+            .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool: entry.pool })
         {
             Ok(res) => res.supply,
             Err(err) => return internal_error(err),
@@ -1962,6 +2018,7 @@ pub async fn get_address_pool_burn_history(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.ammdata.get_address_pool_burns_page(GetAddressPoolBurnsPageParams {
+            blockhash: StateAt::Latest,
         address_spk,
         offset,
         limit,
@@ -1974,6 +2031,7 @@ pub async fn get_address_pool_burn_history(
     let mut items = Vec::new();
     for entry in resp.entries {
         let activity = match state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -1991,7 +2049,8 @@ pub async fn get_address_pool_burn_history(
             *cached
         } else {
             let defs_resp =
-                match state.ammdata.get_pool_defs(GetPoolDefsParams { pool: entry.pool }) {
+                match state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool: entry.pool }) {
                     Ok(res) => res,
                     Err(err) => return internal_error(err),
                 };
@@ -2004,7 +2063,8 @@ pub async fn get_address_pool_burn_history(
 
         let lp_supply = match state
             .ammdata
-            .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool: entry.pool })
+            .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool: entry.pool })
         {
             Ok(res) => res.supply,
             Err(err) => return internal_error(err),
@@ -2056,6 +2116,7 @@ pub async fn get_address_wrap_history(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.subfrost.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+            blockhash: StateAt::Latest,
         address_spk: address_spk.clone(),
         offset,
         limit,
@@ -2107,6 +2168,7 @@ pub async fn get_address_unwrap_history(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.subfrost.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+            blockhash: StateAt::Latest,
         address_spk: address_spk.clone(),
         offset,
         limit,
@@ -2154,6 +2216,7 @@ pub async fn get_all_wrap_history(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.subfrost.get_wrap_events_all(GetWrapEventsAllParams {
+            blockhash: StateAt::Latest,
         offset,
         limit,
         successful,
@@ -2200,6 +2263,7 @@ pub async fn get_all_unwrap_history(
     let include_total = include_total.unwrap_or(true);
 
     let resp = match state.subfrost.get_unwrap_events_all(GetUnwrapEventsAllParams {
+            blockhash: StateAt::Latest,
         offset,
         limit,
         successful,
@@ -2243,13 +2307,15 @@ pub async fn get_total_unwrap_amount(
     let total = if let Some(height) = block_height {
         match state
             .subfrost
-            .get_unwrap_total_at_or_before(GetUnwrapTotalAtOrBeforeParams { height, successful })
+            .get_unwrap_total_at_or_before(GetUnwrapTotalAtOrBeforeParams {
+            blockhash: StateAt::Latest, height, successful })
         {
             Ok(res) => res.total.unwrap_or(0),
             Err(err) => return internal_error(err),
         }
     } else {
         match state.subfrost.get_unwrap_total_latest(GetUnwrapTotalLatestParams {
+            blockhash: StateAt::Latest,
             successful,
             height: None,
             height_present: false,
@@ -2289,6 +2355,7 @@ pub async fn get_all_address_amm_tx_history(
 
     if let Some(AmmTxType::Wrap) = tx_type {
         let resp = match state.subfrost.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+            blockhash: StateAt::Latest,
             address_spk: address_spk.clone(),
             offset,
             limit,
@@ -2317,6 +2384,7 @@ pub async fn get_all_address_amm_tx_history(
     if let Some(AmmTxType::Unwrap) = tx_type {
         let resp =
             match state.subfrost.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+            blockhash: StateAt::Latest,
                 address_spk: address_spk.clone(),
                 offset,
                 limit,
@@ -2392,6 +2460,7 @@ pub async fn get_all_address_amm_tx_history(
     };
 
     let wrap_resp = match state.subfrost.get_wrap_events_by_address(GetWrapEventsByAddressParams {
+            blockhash: StateAt::Latest,
         address_spk: address_spk.clone(),
         offset: 0,
         limit: combined_limit,
@@ -2404,6 +2473,7 @@ pub async fn get_all_address_amm_tx_history(
     };
     let unwrap_resp =
         match state.subfrost.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
+            blockhash: StateAt::Latest,
             address_spk: address_spk.clone(),
             offset: 0,
             limit: combined_limit,
@@ -2466,6 +2536,7 @@ pub async fn get_all_amm_tx_history(
 
     if let Some(AmmTxType::Wrap) = tx_type {
         let resp = match state.subfrost.get_wrap_events_all(GetWrapEventsAllParams {
+            blockhash: StateAt::Latest,
             offset,
             limit,
             successful: if successful_only { Some(true) } else { None },
@@ -2492,6 +2563,7 @@ pub async fn get_all_amm_tx_history(
     }
     if let Some(AmmTxType::Unwrap) = tx_type {
         let resp = match state.subfrost.get_unwrap_events_all(GetUnwrapEventsAllParams {
+            blockhash: StateAt::Latest,
             offset,
             limit,
             successful: if successful_only { Some(true) } else { None },
@@ -2566,6 +2638,7 @@ pub async fn get_all_amm_tx_history(
     };
 
     let wrap_resp = match state.subfrost.get_wrap_events_all(GetWrapEventsAllParams {
+            blockhash: StateAt::Latest,
         offset: 0,
         limit: combined_limit,
         successful: if successful_only { Some(true) } else { None },
@@ -2576,6 +2649,7 @@ pub async fn get_all_amm_tx_history(
         Err(err) => return internal_error(err),
     };
     let unwrap_resp = match state.subfrost.get_unwrap_events_all(GetUnwrapEventsAllParams {
+            blockhash: StateAt::Latest,
         offset: 0,
         limit: combined_limit,
         successful: if successful_only { Some(true) } else { None },
@@ -2627,7 +2701,8 @@ pub async fn get_all_token_pairs(
         return error_response(400, "invalid_factory_id");
     };
 
-    let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+    let pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -2666,11 +2741,13 @@ pub async fn get_token_pairs(
         return error_response(400, "invalid_token_id");
     };
 
-    let pools = match state.ammdata.get_token_pools(GetTokenPoolsParams { token }) {
+    let pools = match state.ammdata.get_token_pools(GetTokenPoolsParams {
+            blockhash: StateAt::Latest, token }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
-    let factory_pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+    let factory_pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -2738,12 +2815,15 @@ pub async fn get_alkane_swap_pair_details(
         return error_response(400, "invalid_token_b_id");
     };
 
-    let snapshot = match state.ammdata.get_reserves_snapshot(GetReservesSnapshotParams) {
+    let snapshot = match state.ammdata.get_reserves_snapshot(GetReservesSnapshotParams {
+        blockhash: StateAt::Latest,
+    }) {
         Ok(res) => res.snapshot.unwrap_or_default(),
         Err(err) => return internal_error(err),
     };
 
-    let factory_pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams { factory }) {
+    let factory_pools = match state.ammdata.get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory }) {
         Ok(res) => res.pools,
         Err(err) => return internal_error(err),
     };
@@ -2830,7 +2910,8 @@ pub async fn get_address_utxos(
     if !alkane_ids.is_empty() {
         let alkanes: Vec<SchemaAlkaneId> = alkane_ids.iter().copied().collect();
         let records = essentials
-            .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes })?
+            .get_creation_records_by_id(GetCreationRecordsByIdParams {
+            blockhash: StateAt::Latest, alkanes })?
             .records;
         for rec in records.into_iter().flatten() {
             let name = rec.names.first().cloned().unwrap_or_default();
@@ -2971,7 +3052,9 @@ fn btc_price_usd_cached(state: &OylApiState) -> Result<u128> {
     // Read-paths must never call external ETH RPC. Use the latest indexed BTC/USD price.
     state
         .ammdata
-        .get_latest_btc_usd_price()
+        .get_latest_btc_usd_price(GetLatestBtcUsdPriceParams {
+            blockhash: StateAt::Latest,
+        })
         .map_err(|e| anyhow!("failed to load btc/usd price from ammdata index: {e}"))?
         .ok_or_else(|| anyhow!("btc/usd price unavailable (ammdata index empty)"))
 }
@@ -2996,7 +3079,8 @@ fn pool_candle_volume_sums(
     let prefix = table.candle_ns_prefix(pool, Timeframe::D1);
     let entries = state
         .ammdata
-        .get_list_entries_desc(GetListEntriesDescParams { prefix })?
+        .get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest, prefix })?
         .entries;
 
     let mut token0_volume_7d = 0u128;
@@ -3085,7 +3169,8 @@ fn canonical_pool_prices(
 ) -> Result<(u128, u128)> {
     state
         .ammdata
-        .get_canonical_pool_prices(GetCanonicalPoolPricesParams { token: *token, now_ts })
+        .get_canonical_pool_prices(GetCanonicalPoolPricesParams {
+            blockhash: StateAt::Latest, token: *token, now_ts })
         .map(|res| (res.frbtc_price, res.busd_price))
 }
 
@@ -3093,6 +3178,7 @@ fn latest_token_usd_close(state: &OylApiState, token: &SchemaAlkaneId) -> Result
     state
         .ammdata
         .get_latest_token_usd_close(GetLatestTokenUsdCloseParams {
+            blockhash: StateAt::Latest,
             token: *token,
             timeframe: Timeframe::M10,
         })
@@ -3102,7 +3188,8 @@ fn latest_token_usd_close(state: &OylApiState, token: &SchemaAlkaneId) -> Result
 fn token_metrics(state: &OylApiState, token: &SchemaAlkaneId) -> Result<SchemaTokenMetricsV1> {
     let mut metrics = state
         .ammdata
-        .get_token_metrics(GetTokenMetricsParams { token: *token })?
+        .get_token_metrics(GetTokenMetricsParams {
+            blockhash: StateAt::Latest, token: *token })?
         .metrics;
     if metrics.change_1d.is_empty() {
         metrics.change_1d = "0".to_string();
@@ -3122,21 +3209,24 @@ fn token_metrics(state: &OylApiState, token: &SchemaAlkaneId) -> Result<SchemaTo
 fn holders_count(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u64> {
     state
         .essentials
-        .get_holders_count(GetHoldersCountParams { alkane: *token })
+        .get_holders_count(GetHoldersCountParams {
+            blockhash: StateAt::Latest, alkane: *token })
         .map(|res| res.count)
 }
 
 fn latest_circulating_supply(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u128> {
     state
         .essentials
-        .get_latest_circulating_supply(GetLatestCirculatingSupplyParams { alkane: *token })
+        .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
+            blockhash: StateAt::Latest, alkane: *token })
         .map(|res| res.supply)
 }
 
 fn latest_total_minted(state: &OylApiState, token: &SchemaAlkaneId) -> Result<u128> {
     state
         .essentials
-        .get_latest_total_minted(GetLatestTotalMintedParams { alkane: *token })
+        .get_latest_total_minted(GetLatestTotalMintedParams {
+            blockhash: StateAt::Latest, alkane: *token })
         .map(|res| res.total_minted)
 }
 
@@ -3246,7 +3336,8 @@ fn collect_amm_history_items(
     };
     let entries = state
         .ammdata
-        .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })?
+        .get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })?
         .entries;
 
     let mut total = 0usize;
@@ -3262,6 +3353,7 @@ fn collect_amm_history_items(
             }
         }
         let res = state.ammdata.get_activity_entry(GetActivityEntryParams {
+            blockhash: StateAt::Latest,
             pool: entry.pool,
             ts: entry.ts,
             seq: entry.seq,
@@ -3305,7 +3397,8 @@ fn amm_history_items_to_values(
         let defs = if let Some(defs) = defs_cache.get(&pool) {
             *defs
         } else {
-            let defs_resp = state.ammdata.get_pool_defs(GetPoolDefsParams { pool })?;
+            let defs_resp = state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool })?;
             let Some(defs) = defs_resp.defs else {
                 continue;
             };
@@ -3348,7 +3441,8 @@ fn amm_history_items_to_values(
                 } else {
                     let supply = state
                         .ammdata
-                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })?
+                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool })?
                         .supply;
                     lp_supply_cache.insert(pool, supply);
                     supply
@@ -3384,7 +3478,8 @@ fn amm_history_items_to_values(
                 } else {
                     let supply = state
                         .ammdata
-                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })?
+                        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool })?
                         .supply;
                     lp_supply_cache.insert(pool, supply);
                     supply
@@ -3420,7 +3515,8 @@ fn amm_history_items_to_values(
                 } else {
                     let info = state
                         .ammdata
-                        .get_pool_creation_info(GetPoolCreationInfoParams { pool })?
+                        .get_pool_creation_info(GetPoolCreationInfoParams {
+            blockhash: StateAt::Latest, pool })?
                         .info;
                     creation_cache.insert(pool, info.clone());
                     info
@@ -3489,7 +3585,8 @@ fn build_token_pair(
     pool: SchemaAlkaneId,
     meta_cache: &mut HashMap<SchemaAlkaneId, TokenMeta>,
 ) -> Result<Option<TokenPairComputed>> {
-    let defs = state.ammdata.get_pool_defs(GetPoolDefsParams { pool })?;
+    let defs = state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool })?;
     let Some(defs) = defs.defs else {
         return Ok(None);
     };
@@ -3498,7 +3595,8 @@ fn build_token_pair(
     let reserve0 = balances.remove(&defs.base_alkane_id).unwrap_or(0);
     let reserve1 = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
-    let metrics = state.ammdata.get_pool_metrics(GetPoolMetricsParams { pool })?.metrics;
+    let metrics = state.ammdata.get_pool_metrics(GetPoolMetricsParams {
+            blockhash: StateAt::Latest, pool })?.metrics;
 
     let token0_meta = get_token_meta(state, meta_cache, &defs.base_alkane_id)?;
     let token1_meta = get_token_meta(state, meta_cache, &defs.quote_alkane_id)?;
@@ -3562,7 +3660,8 @@ fn get_token_meta(
 
     let rec = state
         .essentials
-        .get_creation_record(GetCreationRecordParams { alkane: *id })?
+        .get_creation_record(GetCreationRecordParams {
+            blockhash: StateAt::Latest, alkane: *id })?
         .record;
     let name = rec.as_ref().and_then(|r| r.names.first().cloned()).unwrap_or_default();
     let symbol_raw = rec.as_ref().and_then(|r| r.symbols.first().cloned()).unwrap_or_default();
@@ -3648,12 +3747,14 @@ fn fetch_records_for_query(
             let by_name = state
                 .essentials
                 .get_alkane_ids_by_name_prefix(GetAlkaneIdsByNamePrefixParams {
+            blockhash: StateAt::Latest,
                     prefix: norm.clone(),
                 })?
                 .ids;
             let by_symbol = state
                 .essentials
-                .get_alkane_ids_by_symbol_prefix(GetAlkaneIdsBySymbolPrefixParams { prefix: norm })?
+                .get_alkane_ids_by_symbol_prefix(GetAlkaneIdsBySymbolPrefixParams {
+            blockhash: StateAt::Latest, prefix: norm })?
                 .ids;
             for id in by_name.into_iter().chain(by_symbol.into_iter()) {
                 ids.insert(id);
@@ -3662,7 +3763,9 @@ fn fetch_records_for_query(
     } else {
         return Ok(state
             .essentials
-            .get_creation_records_ordered(GetCreationRecordsOrderedParams)?
+            .get_creation_records_ordered(GetCreationRecordsOrderedParams {
+                blockhash: StateAt::Latest,
+            })?
             .records);
     }
 
@@ -3673,6 +3776,7 @@ fn fetch_records_for_query(
     let recs = state
         .essentials
         .get_creation_records_by_id(GetCreationRecordsByIdParams {
+            blockhash: StateAt::Latest,
             alkanes: ids.iter().copied().collect(),
         })?
         .records;
@@ -3731,6 +3835,7 @@ fn search_by_holders_scan(
     let ids = state
         .essentials
         .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            blockhash: StateAt::Latest,
             offset: 0,
             limit: scan_limit,
             desc: true,
@@ -3742,7 +3847,8 @@ fn search_by_holders_scan(
 
     let records = state
         .essentials
-        .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: ids.clone() })?
+        .get_creation_records_by_id(GetCreationRecordsByIdParams {
+            blockhash: StateAt::Latest, alkanes: ids.clone() })?
         .records;
 
     let mut out: Vec<SchemaAlkaneId> = Vec::new();
@@ -3783,6 +3889,7 @@ fn filter_ids_with_derived_metrics(
         state
             .ammdata
             .get_token_derived_metrics_by_id(GetTokenDerivedMetricsByIdParams {
+            blockhash: StateAt::Latest,
                 tokens: ids.clone(),
                 quote,
             })?;
@@ -3849,7 +3956,8 @@ fn token_metrics_multi(
     }
     let res = state
         .ammdata
-        .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.to_vec() })?;
+        .get_token_metrics_by_id(GetTokenMetricsByIdParams {
+            blockhash: StateAt::Latest, tokens: ids.to_vec() })?;
     Ok(res.metrics.into_iter().map(|m| m.unwrap_or_default()).collect())
 }
 
@@ -3859,7 +3967,8 @@ fn holders_counts_multi(state: &OylApiState, ids: &[SchemaAlkaneId]) -> Result<V
     }
     let res = state
         .essentials
-        .get_holders_counts_by_id(GetHoldersCountsByIdParams { alkanes: ids.to_vec() })?;
+        .get_holders_counts_by_id(GetHoldersCountsByIdParams {
+            blockhash: StateAt::Latest, alkanes: ids.to_vec() })?;
     Ok(res.counts)
 }
 
@@ -3881,6 +3990,7 @@ fn collect_missing_tokens(
         let page = state
             .essentials
             .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+            blockhash: StateAt::Latest,
                 offset: creation_offset,
                 limit: chunk as u64,
                 desc,
@@ -3893,7 +4003,8 @@ fn collect_missing_tokens(
         let ids: Vec<SchemaAlkaneId> = page.iter().map(|rec| rec.alkane).collect();
         let metrics = state
             .ammdata
-            .get_token_metrics_by_id(GetTokenMetricsByIdParams { tokens: ids.clone() })?
+            .get_token_metrics_by_id(GetTokenMetricsByIdParams {
+            blockhash: StateAt::Latest, tokens: ids.clone() })?
             .metrics;
         if metrics.len() != ids.len() {
             break;
@@ -3937,7 +4048,8 @@ fn fetch_sorted_alkane_ids_no_query(
         AlkaneSortIndex::Holders => {
             let ids = state
                 .essentials
-                .get_holders_ordered_page(GetHoldersOrderedPageParams { offset, limit, desc })?
+                .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            blockhash: StateAt::Latest, offset, limit, desc })?
                 .ids;
             Ok(ids)
         }
@@ -3945,6 +4057,7 @@ fn fetch_sorted_alkane_ids_no_query(
             let metrics_count = state
                 .ammdata
                 .get_token_derived_metrics_index_count(GetTokenDerivedMetricsIndexCountParams {
+            blockhash: StateAt::Latest,
                     quote,
                 })?
                 .count;
@@ -3955,6 +4068,7 @@ fn fetch_sorted_alkane_ids_no_query(
             let ids = state
                 .ammdata
                 .get_token_derived_metrics_index_page(GetTokenDerivedMetricsIndexPageParams {
+            blockhash: StateAt::Latest,
                     quote,
                     field,
                     offset,
@@ -3967,7 +4081,9 @@ fn fetch_sorted_alkane_ids_no_query(
         AlkaneSortIndex::Metrics(field) => {
             let metrics_count = state
                 .ammdata
-                .get_token_metrics_index_count(GetTokenMetricsIndexCountParams)?
+                .get_token_metrics_index_count(GetTokenMetricsIndexCountParams {
+                    blockhash: StateAt::Latest,
+                })?
                 .count;
             let missing_count = total.saturating_sub(metrics_count);
 
@@ -3978,6 +4094,7 @@ fn fetch_sorted_alkane_ids_no_query(
                 let ids = state
                     .ammdata
                     .get_token_metrics_index_page(GetTokenMetricsIndexPageParams {
+            blockhash: StateAt::Latest,
                         field,
                         offset: off,
                         limit: lim,
@@ -3995,6 +4112,7 @@ fn fetch_sorted_alkane_ids_no_query(
                 let fallback: Vec<SchemaAlkaneId> = state
                     .essentials
                     .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+            blockhash: StateAt::Latest,
                         offset,
                         limit,
                         desc,
@@ -4155,6 +4273,7 @@ fn build_alkane_token(
         let derived_metrics = state
             .ammdata
             .get_token_derived_metrics(GetTokenDerivedMetricsParams {
+            blockhash: StateAt::Latest,
                 token: rec.alkane,
                 quote: *quote,
             })?
@@ -4278,7 +4397,8 @@ fn load_pool_details_snapshot(
 ) -> Option<PoolDetailsComputed> {
     state
         .ammdata
-        .get_pool_details_snapshot(GetPoolDetailsSnapshotParams { pool })
+        .get_pool_details_snapshot(GetPoolDetailsSnapshotParams {
+            blockhash: StateAt::Latest, pool })
         .ok()
         .and_then(|res| res.snapshot)
         .and_then(|snap| pool_details_from_snapshot(&snap))
@@ -4378,7 +4498,8 @@ fn build_pool_details(
     if !skip_factory_check {
         if let Some(factory_id) = factory {
             let factory_match =
-                state.ammdata.get_pool_factory(GetPoolFactoryParams { pool })?.factory;
+                state.ammdata.get_pool_factory(GetPoolFactoryParams {
+            blockhash: StateAt::Latest, pool })?.factory;
             if let Some(found) = factory_match {
                 if found != factory_id {
                     return Ok(None);
@@ -4386,7 +4507,8 @@ fn build_pool_details(
             } else {
                 let pools = state
                     .ammdata
-                    .get_factory_pools(GetFactoryPoolsParams { factory: factory_id })?
+                    .get_factory_pools(GetFactoryPoolsParams {
+            blockhash: StateAt::Latest, factory: factory_id })?
                     .pools;
                 if !pools.contains(&pool) {
                     return Ok(None);
@@ -4395,7 +4517,8 @@ fn build_pool_details(
         }
     }
 
-    let defs = state.ammdata.get_pool_defs(GetPoolDefsParams { pool })?.defs;
+    let defs = state.ammdata.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool })?.defs;
     let Some(defs) = defs else {
         return Ok(None);
     };
@@ -4417,9 +4540,11 @@ fn build_pool_details(
     };
     let pool_name = pool_name_display(&format!("{token0_label} / {token1_label}"));
 
-    let mut metrics = state.ammdata.get_pool_metrics(GetPoolMetricsParams { pool })?.metrics;
+    let mut metrics = state.ammdata.get_pool_metrics(GetPoolMetricsParams {
+            blockhash: StateAt::Latest, pool })?.metrics;
     let pool_metrics_v2 =
-        state.ammdata.get_pool_metrics_v2(GetPoolMetricsV2Params { pool })?.metrics;
+        state.ammdata.get_pool_metrics_v2(GetPoolMetricsV2Params {
+            blockhash: StateAt::Latest, pool })?.metrics;
     if metrics.tvl_change_24h.is_empty() {
         metrics.tvl_change_24h = "0".to_string();
     }
@@ -4481,7 +4606,8 @@ fn build_pool_details(
 
     let mut lp_supply = state
         .ammdata
-        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams { pool })?
+        .get_pool_lp_supply_latest(GetPoolLpSupplyLatestParams {
+            blockhash: StateAt::Latest, pool })?
         .supply;
     if lp_supply == 0 {
         lp_supply = latest_circulating_supply(state, &pool)?;
@@ -4490,7 +4616,8 @@ fn build_pool_details(
     let lp_value_sats = if lp_supply == 0 { 0 } else { pool_tvl_sats.saturating_div(lp_supply) };
     let lp_value_usd = if lp_supply == 0 { 0 } else { pool_tvl_usd.saturating_div(lp_supply) };
 
-    let creation = state.ammdata.get_pool_creation_info(GetPoolCreationInfoParams { pool })?.info;
+    let creation = state.ammdata.get_pool_creation_info(GetPoolCreationInfoParams {
+            blockhash: StateAt::Latest, pool })?.info;
     let (creator_address, creation_height, initial_token0_amount, initial_token1_amount) =
         if let Some(info) = creation {
             let creator = if info.creator_spk.is_empty() {
@@ -4605,7 +4732,8 @@ fn search_pools(state: &OylApiState, query: &str) -> Result<Vec<Value>> {
     let norm = normalize_query(query);
     let matches = state
         .ammdata
-        .get_pool_ids_by_name_prefix(GetPoolIdsByNamePrefixParams { prefix: norm })?
+        .get_pool_ids_by_name_prefix(GetPoolIdsByNamePrefixParams {
+            blockhash: StateAt::Latest, prefix: norm })?
         .ids;
     for id in matches {
         pool_ids.insert(id);
@@ -4617,7 +4745,9 @@ fn search_pools(state: &OylApiState, query: &str) -> Result<Vec<Value>> {
 
     let snapshot = state
         .ammdata
-        .get_reserves_snapshot(GetReservesSnapshotParams)?
+        .get_reserves_snapshot(GetReservesSnapshotParams {
+            blockhash: StateAt::Latest,
+        })?
         .snapshot
         .unwrap_or_default();
 
@@ -4647,6 +4777,7 @@ fn alkane_label(state: &OylApiState, id: &SchemaAlkaneId) -> Result<String> {
     let rec = state
         .essentials
         .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+            blockhash: StateAt::Latest,
             alkane: *id,
         })?
         .record;

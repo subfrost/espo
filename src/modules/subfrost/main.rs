@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use super::consts::get_frbtc_alkane;
 use super::rpc::register_rpc;
 use super::schemas::SchemaWrapEventV1;
@@ -40,23 +41,28 @@ impl Subfrost {
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
-        let resp = self.provider().get_index_height(GetIndexHeightParams)?;
+        let resp = self.provider().get_index_height(GetIndexHeightParams {
+            blockhash: StateAt::Latest,
+        })?;
         Ok(resp.height)
     }
 
-    fn persist_index_height(&self, height: u32) -> Result<()> {
+    fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
         self.provider()
-            .set_index_height(SetIndexHeightParams { height })
+            .set_index_height(SetIndexHeightParams {
+                blockhash,
+                height,
+            })
             .map_err(|e| anyhow!("[SUBFROST] rocksdb put(/index_height) failed: {e}"))
     }
 
-    fn set_index_height(&self, new_height: u32) -> Result<()> {
+    fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
                 eprintln!("[SUBFROST] index height rollback detected ({} -> {})", prev, new_height);
             }
         }
-        self.persist_index_height(new_height)?;
+        self.persist_index_height(new_height, blockhash)?;
         *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
@@ -95,6 +101,7 @@ impl EspoModule for Subfrost {
         let provider = self.provider();
         let table = provider.table();
         let height = block.height;
+        let block_hash = block.block_header.block_hash();
         if let Some(prev) = *self.index_height.read().unwrap() {
             if height <= prev {
                 eprintln!("[SUBFROST] skipping already indexed block #{height} (last={prev})");
@@ -237,6 +244,7 @@ impl EspoModule for Subfrost {
             if unwrap_delta_all > 0 || unwrap_delta_success > 0 {
                 let prev_all = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
+                        blockhash: StateAt::Block(block_hash),
                         successful: false,
                         height: None,
                         height_present: false,
@@ -245,6 +253,7 @@ impl EspoModule for Subfrost {
                     .unwrap_or(0);
                 let prev_success = provider
                     .get_unwrap_total_latest(super::storage::GetUnwrapTotalLatestParams {
+                        blockhash: StateAt::Block(block_hash),
                         successful: true,
                         height: None,
                         height_present: false,
@@ -281,7 +290,11 @@ impl EspoModule for Subfrost {
             }
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
-            let _ = provider.set_batch(SetBatchParams { puts, deletes: Vec::new() });
+            let _ = provider.set_batch(SetBatchParams {
+                blockhash: StateAt::Latest,
+                puts,
+                deletes: Vec::new(),
+            });
             debug::log_elapsed(module, "write_batch", timer);
         }
 
@@ -290,7 +303,7 @@ impl EspoModule for Subfrost {
             block.height, wrap_count, unwrap_count
         );
         let timer = debug::start_if(debug);
-        self.set_index_height(block.height)?;
+        self.set_index_height(block.height, StateAt::Latest)?;
         debug::log_elapsed(module, "finalize", timer);
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",

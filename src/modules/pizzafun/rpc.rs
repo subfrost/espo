@@ -1,10 +1,14 @@
+use crate::runtime::state_at::StateAt;
 use crate::config::get_last_safe_tip;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::schemas::SchemaAlkaneId;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use super::storage::{PizzafunProvider, SeriesEntry, normalize_series_id};
+use super::storage::{
+    GetSeriesByAlkaneParams, GetSeriesByAlkanesParams, GetSeriesByIdParams,
+    GetSeriesByIdsParams, PizzafunProvider, SeriesEntry, normalize_series_id,
+};
 
 #[inline]
 fn log_rpc(method: &str, msg: &str) {
@@ -87,7 +91,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                             }
                         };
 
-                        let entry = match view.get_series_by_alkane(&alk) {
+                        let entry = match view.get_series_by_alkane(GetSeriesByAlkaneParams {
+                            blockhash: StateAt::Latest,
+                            alkane: alk,
+                        }) {
                             Ok(Some(entry)) => entry,
                             Ok(None) => return json!({"ok": false, "error": "not_found"}),
                             Err(e) => {
@@ -158,7 +165,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         }
 
                         let mut out: Vec<Value> = Vec::with_capacity(ids.len());
-                        let results = match view.get_series_by_alkanes(&lookup) {
+                        let results = match view.get_series_by_alkanes(GetSeriesByAlkanesParams {
+                            blockhash: StateAt::Latest,
+                            alkanes: lookup.clone(),
+                        }) {
                             Ok(res) => res,
                             Err(e) => {
                                 log_rpc(
@@ -230,7 +240,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                             }
                         };
 
-                        let entry = match view.get_series_by_id(&series_id) {
+                        let entry = match view.get_series_by_id(GetSeriesByIdParams {
+                            blockhash: StateAt::Latest,
+                            series_id: series_id.clone(),
+                        }) {
                             Ok(Some(entry)) => entry,
                             Ok(None) => return json!({"ok": false, "error": "not_found"}),
                             Err(e) => {
@@ -301,7 +314,10 @@ pub(crate) fn register_rpc(reg: RpcNsRegistrar, provider: Arc<PizzafunProvider>)
                         }
 
                         let mut out: Vec<Value> = Vec::with_capacity(ids.len());
-                        let results = match view.get_series_by_ids(&lookup) {
+                        let results = match view.get_series_by_ids(GetSeriesByIdsParams {
+                            blockhash: StateAt::Latest,
+                            series_ids: lookup.clone(),
+                        }) {
                             Ok(res) => res,
                             Err(e) => {
                                 log_rpc(

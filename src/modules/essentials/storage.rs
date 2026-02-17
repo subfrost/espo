@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::alkanes::trace::{
     prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
 };
@@ -1525,6 +1526,16 @@ impl EssentialsProvider {
         }
     }
 
+    fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
+        match blockhash {
+            Some(blockhash) => self
+                .mdb
+                .get_at_blockhash(&blockhash, key)
+                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
+            None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
+        }
+    }
+
     fn raw_blob_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.blob_mdb.get(key).map_err(|e| anyhow!("blob_mdb.get failed: {e}"))
     }
@@ -1542,14 +1553,35 @@ impl EssentialsProvider {
         }
     }
 
+    fn raw_multi_get_at(
+        &self,
+        keys: &[Vec<u8>],
+        blockhash: Option<BlockHash>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match blockhash {
+            Some(blockhash) => {
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    out.push(self.raw_get_at(key, Some(blockhash))?);
+                }
+                Ok(out)
+            }
+            None => self.mdb.multi_get(keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}")),
+        }
+    }
+
     fn raw_blob_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         self.blob_mdb
             .multi_get(keys)
             .map_err(|e| anyhow!("blob_mdb.multi_get failed: {e}"))
     }
 
-    fn raw_scan_prefix_entries(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut entries = match self.view_blockhash {
+    fn raw_scan_prefix_entries_at(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut entries = match blockhash {
             Some(blockhash) => self
                 .mdb
                 .scan_prefix_entries_at_blockhash(&blockhash, prefix)
@@ -1563,8 +1595,12 @@ impl EssentialsProvider {
         Ok(entries)
     }
 
-    fn raw_scan_prefix_keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut keys = match self.view_blockhash {
+    fn raw_scan_prefix_keys_at(
+        &self,
+        prefix: &[u8],
+        blockhash: Option<BlockHash>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut keys = match blockhash {
             Some(blockhash) => self
                 .mdb
                 .scan_prefix_keys_at_blockhash(&blockhash, prefix)
@@ -1579,12 +1615,12 @@ impl EssentialsProvider {
     }
 
     pub fn get_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
-        let value = self.raw_get(&params.key)?;
+        let value = self.raw_get_at(&params.key, params.blockhash.resolve(self.view_blockhash))?;
         Ok(GetRawValueResult { value })
     }
 
     pub fn get_multi_values(&self, params: GetMultiValuesParams) -> Result<GetMultiValuesResult> {
-        let values = self.raw_multi_get(&params.keys)?;
+        let values = self.raw_multi_get_at(&params.keys, params.blockhash.resolve(self.view_blockhash))?;
         Ok(GetMultiValuesResult { values })
     }
 
@@ -1602,7 +1638,7 @@ impl EssentialsProvider {
         &self,
         params: GetListKeysByPrefixParams,
     ) -> Result<GetListKeysByPrefixResult> {
-        let keys = self.raw_scan_prefix_keys(&params.prefix)?;
+        let keys = self.raw_scan_prefix_keys_at(&params.prefix, params.blockhash.resolve(self.view_blockhash))?;
         Ok(GetListKeysByPrefixResult { keys })
     }
 
@@ -1610,7 +1646,8 @@ impl EssentialsProvider {
         &self,
         params: GetListEntriesDescParams,
     ) -> Result<GetListEntriesDescResult> {
-        let mut entries = self.raw_scan_prefix_entries(&params.prefix)?;
+        let mut entries =
+            self.raw_scan_prefix_entries_at(&params.prefix, params.blockhash.resolve(self.view_blockhash))?;
         entries.reverse();
         Ok(GetListEntriesDescResult { entries })
     }
@@ -1621,7 +1658,7 @@ impl EssentialsProvider {
     ) -> Result<GetListEntriesDescCursorResult> {
         let list = ListPointer::root(self.mdb.as_ref()).select(&params.prefix);
         let cursor_page: CursorScanPage = list.scan_desc_cursor_page(
-            self.view_blockhash.as_ref(),
+            params.blockhash.resolve(self.view_blockhash).as_ref(),
             params.cursor.as_deref(),
             params.limit.max(1),
         )?;
@@ -1634,13 +1671,14 @@ impl EssentialsProvider {
 
     pub fn set_raw_value(&self, params: SetRawValueParams) -> Result<()> {
         self.set_batch(SetBatchParams {
+            blockhash: params.blockhash,
             puts: vec![(params.key, params.value)],
             deletes: Vec::new(),
         })
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
-        if self.view_blockhash.is_some() {
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
             return Err(anyhow!("cannot_write_historical_view"));
         }
         let batch_progress = std::env::var_os("ESPO_BATCH_PROGRESS").is_some();
@@ -1691,16 +1729,16 @@ impl EssentialsProvider {
         res
     }
 
-    pub fn set_blob_values_if_missing(&self, puts: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
-        if puts.is_empty() {
+    pub fn set_blob_values_if_missing(&self, params: SetBlobValuesIfMissingParams) -> Result<()> {
+        if params.puts.is_empty() {
             return Ok(());
         }
-        if self.view_blockhash.is_some() {
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
             return Err(anyhow!("cannot_write_historical_view"));
         }
 
-        let mut dedup: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(puts.len());
-        for (k, v) in puts {
+        let mut dedup: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(params.puts.len());
+        for (k, v) in params.puts {
             dedup.entry(k).or_insert(v);
         }
         if dedup.is_empty() {
@@ -1738,10 +1776,12 @@ impl EssentialsProvider {
             .map_err(|e| anyhow!("blob_mdb.bulk_write failed: {e}"))
     }
 
-    pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+    pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
-        let Some(bytes) = table.INDEX_HEIGHT.get()? else {
+        let Some(bytes) =
+            self.raw_get_at(table.INDEX_HEIGHT.key(), params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(GetIndexHeightResult { height: None });
         };
         if bytes.len() != 4 {
@@ -1754,6 +1794,9 @@ impl EssentialsProvider {
 
     pub fn set_index_height(&self, params: SetIndexHeightParams) -> Result<()> {
         crate::debug_timer_log!("set_index_height");
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
         let table = self.table();
         table
             .INDEX_HEIGHT
@@ -1802,6 +1845,7 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_creation_records_ordered");
         let table = self.table();
         let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
             prefix: table.alkane_creation_ordered_prefix(),
         }) {
             Ok(v) => v.entries,
@@ -1824,11 +1868,13 @@ impl EssentialsProvider {
         let table = self.table();
         let prefix = table.alkane_creation_ordered_prefix();
         let mut keys = if params.desc {
-            self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })
+            self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
                 .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
                 .unwrap_or_default()
         } else {
-            self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+            self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
                 .map(|resp| resp.keys)
                 .unwrap_or_default()
         };
@@ -1862,6 +1908,7 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_alkane_ids_by_name_prefix");
         let table = self.table();
         let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest,
             prefix: table.alkane_name_index_prefix(&params.prefix),
         }) {
             Ok(v) => v.keys,
@@ -1887,7 +1934,8 @@ impl EssentialsProvider {
         let table = self.table();
         let prefix = table.alkane_name_index_prefix(&params.prefix);
         let mut keys = self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
             .map(|v| v.keys)
             .unwrap_or_default();
         keys.sort();
@@ -1920,6 +1968,7 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_alkane_ids_by_symbol_prefix");
         let table = self.table();
         let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest,
             prefix: table.alkane_symbol_index_prefix(&params.prefix),
         }) {
             Ok(v) => v.keys,
@@ -1945,7 +1994,8 @@ impl EssentialsProvider {
         let table = self.table();
         let prefix = table.alkane_symbol_index_prefix(&params.prefix);
         let mut keys = self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
             .map(|v| v.keys)
             .unwrap_or_default();
         keys.sort();
@@ -2000,7 +2050,8 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_holders_count");
         let table = self.table();
         let count = self
-            .get_raw_value(GetRawValueParams { key: table.holders_count_key(&params.alkane) })
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.holders_count_key(&params.alkane) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| HoldersCountEntry::try_from_slice(&raw).ok())
@@ -2037,11 +2088,13 @@ impl EssentialsProvider {
         let table = self.table();
         let prefix = table.alkane_holders_ordered_prefix();
         let mut keys = if params.desc {
-            self.get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })
+            self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
                 .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
                 .unwrap_or_default()
         } else {
-            self.get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+            self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
                 .map(|resp| resp.keys)
                 .unwrap_or_default()
         };
@@ -2075,6 +2128,7 @@ impl EssentialsProvider {
         let table = self.table();
         let supply = self
             .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest,
                 key: table.circulating_supply_latest_key(&params.alkane),
             })
             .ok()
@@ -2091,7 +2145,8 @@ impl EssentialsProvider {
         crate::debug_timer_log!("get_latest_total_minted");
         let table = self.table();
         let total_minted = self
-            .get_raw_value(GetRawValueParams { key: table.total_minted_latest_key(&params.alkane) })
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.total_minted_latest_key(&params.alkane) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_u128_value(&raw).ok())
@@ -2107,6 +2162,7 @@ impl EssentialsProvider {
         let table = self.table();
         let supply = self
             .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest,
                 key: table.circulating_supply_key(&params.alkane, params.height),
             })
             .ok()
@@ -2124,7 +2180,8 @@ impl EssentialsProvider {
         let table = self.table();
         let key = table.kv_row_key(&params.alkane, &params.key);
         let value = self
-            .get_raw_value(GetRawValueParams { key })?
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key })?
             .value
             .map(|raw| split_txid_value(&raw).1.to_vec());
         Ok(GetAlkaneStorageValueResult { value })
@@ -2180,6 +2237,7 @@ impl EssentialsProvider {
         let has_more = if let Some(addr) = address {
             let pending = self
                 .get_mempool_pending_for_address(GetMempoolPendingForAddressParams {
+            blockhash: StateAt::Latest,
                     address: addr.clone(),
                 })
                 .map(|resp| resp.entries)
@@ -2204,11 +2262,13 @@ impl EssentialsProvider {
             pending_len > offset + items.len()
         } else {
             let seen_page = self
-                .get_mempool_seen_page(GetMempoolSeenPageParams { page, limit })
+                .get_mempool_seen_page(GetMempoolSeenPageParams {
+            blockhash: StateAt::Latest, page, limit })
                 .unwrap_or(GetMempoolSeenPageResult { txids: Vec::new(), has_more: false });
             for txid in seen_page.txids {
                 let entry = self
-                    .get_mempool_entry(GetMempoolEntryParams { txid })
+                    .get_mempool_entry(GetMempoolEntryParams {
+            blockhash: StateAt::Latest, txid })
                     .ok()
                     .and_then(|resp| resp.entry);
                 let Some(entry) = entry else { continue };
@@ -2271,7 +2331,8 @@ impl EssentialsProvider {
         } else {
             let scan_pref = table.dir_list_prefix(&alk);
             let rel_keys = match self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: scan_pref })
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: scan_pref })
             {
                 Ok(v) => v.keys,
                 Err(_) => Vec::new(),
@@ -2301,7 +2362,8 @@ impl EssentialsProvider {
         for k in window.iter() {
             let kv_key = table.kv_row_key(&alk, k);
             let (last_txid_val, value_hex, value_str_val, value_u128_val) =
-                match self.get_raw_value(GetRawValueParams { key: kv_key }) {
+                match self.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: kv_key }) {
                     Ok(resp) => {
                         if let Some(v) = resp.value {
                             let (ltxid_opt, raw) = split_txid_value(&v);
@@ -2366,11 +2428,17 @@ impl EssentialsProvider {
         let offset = limit.saturating_mul(page.saturating_sub(1));
 
         let table = self.table();
-        let total = self.get_creation_count(GetCreationCountParams).map(|r| r.count).unwrap_or(0);
+        let total = self
+            .get_creation_count(GetCreationCountParams {
+                blockhash: StateAt::Latest,
+            })
+            .map(|r| r.count)
+            .unwrap_or(0);
 
         let mut items: Vec<Value> = Vec::new();
         let mut seen: usize = 0;
         let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
             prefix: table.alkane_creation_ordered_prefix(),
         }) {
             Ok(v) => v.entries,
@@ -2388,6 +2456,7 @@ impl EssentialsProvider {
                 Ok(rec) => {
                     let holder_count = self
                         .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest,
                             key: table.holders_count_key(&rec.alkane),
                         })
                         .ok()
@@ -2451,7 +2520,8 @@ impl EssentialsProvider {
             });
         };
 
-        let record = match self.get_creation_record(GetCreationRecordParams { alkane: alk }) {
+        let record = match self.get_creation_record(GetCreationRecordParams {
+            blockhash: StateAt::Latest, alkane: alk }) {
             Ok(resp) => match resp.record {
                 Some(r) => r,
                 None => {
@@ -2471,7 +2541,8 @@ impl EssentialsProvider {
         let holder_count = get_holders_for_alkane(self, alk, 1, 1)
             .map(|(total, _, _)| total as u64)
             .unwrap_or_else(|_| {
-                self.get_raw_value(GetRawValueParams { key: table.holders_count_key(&alk) })
+                self.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.holders_count_key(&alk) })
                     .ok()
                     .and_then(|resp| resp.value)
                     .and_then(|b| HoldersCountEntry::try_from_slice(&b).ok())
@@ -2511,7 +2582,8 @@ impl EssentialsProvider {
         };
         let height = height as u32;
         let summary = self
-            .get_block_summary(GetBlockSummaryParams { height })
+            .get_block_summary(GetBlockSummaryParams {
+            blockhash: StateAt::Latest, height })
             .ok()
             .and_then(|resp| resp.summary);
 
@@ -2720,12 +2792,14 @@ impl EssentialsProvider {
                 }
             };
             let supply = self
-                .get_circulating_supply(GetCirculatingSupplyParams { alkane, height: height_u32 })?
+                .get_circulating_supply(GetCirculatingSupplyParams {
+            blockhash: StateAt::Latest, alkane, height: height_u32 })?
                 .supply;
             (supply, json!(height_val))
         } else {
             let supply = self
-                .get_latest_circulating_supply(GetLatestCirculatingSupplyParams { alkane })?
+                .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
+            blockhash: StateAt::Latest, alkane })?
                 .supply;
             (supply, Value::String("latest".to_string()))
         };
@@ -2829,7 +2903,8 @@ impl EssentialsProvider {
             pref.push(b'/');
 
             let keys = self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: pref.clone() })
                 .map(|v| v.keys)
                 .unwrap_or_default();
 
@@ -3070,6 +3145,7 @@ impl EssentialsProvider {
 
         let (keys_desc, total_opt, has_more, next_cursor_raw) = if cursor_bytes.is_some() {
             let page_data = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+            blockhash: StateAt::Latest,
                 prefix: prefix.clone(),
                 cursor: cursor_bytes.clone(),
                 limit,
@@ -3078,7 +3154,8 @@ impl EssentialsProvider {
             (keys, None, page_data.has_more, page_data.next_cursor)
         } else {
             let mut all_keys = self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
                 .map(|v| v.keys)
                 .unwrap_or_default();
             all_keys.sort();
@@ -3192,6 +3269,7 @@ impl EssentialsProvider {
 
         let (keys_desc, total_opt, has_more, next_cursor_raw) = if cursor_bytes.is_some() {
             let page_data = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
+            blockhash: StateAt::Latest,
                 prefix: prefix.clone(),
                 cursor: cursor_bytes.clone(),
                 limit,
@@ -3200,7 +3278,8 @@ impl EssentialsProvider {
             (keys, None, page_data.has_more, page_data.next_cursor)
         } else {
             let mut all_keys = self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: prefix.clone() })
+                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })
                 .map(|v| v.keys)
                 .unwrap_or_default();
             all_keys.sort();
@@ -3394,7 +3473,8 @@ impl EssentialsProvider {
         let table = self.table();
         let count: u64 = match HoldersCountEntry::try_from_slice(
             &self
-                .get_raw_value(GetRawValueParams { key: table.holders_count_key(&alkane) })
+                .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.holders_count_key(&alkane) })
                 .ok()
                 .and_then(|resp| resp.value)
                 .unwrap_or_else(Vec::new),
@@ -3436,7 +3516,8 @@ impl EssentialsProvider {
         pref.push(b'/');
 
         let keys = self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: pref.clone() })
+            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: pref.clone() })
             .map(|v| v.keys)
             .unwrap_or_default();
 
@@ -3593,7 +3674,8 @@ impl EssentialsProvider {
 
         let table = self.table();
         let total = self
-            .get_raw_value(GetRawValueParams { key: table.alkane_block_len_key(height) })
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.alkane_block_len_key(height) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|b| {
@@ -3626,7 +3708,8 @@ impl EssentialsProvider {
             keys.push(table.alkane_block_txid_key(height, idx as u64));
         }
         let vals = self
-            .get_multi_values(GetMultiValuesParams { keys })
+            .get_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest, keys })
             .map(|r| r.values)
             .unwrap_or_default();
         let mut txids: Vec<String> = Vec::new();
@@ -3674,7 +3757,8 @@ impl EssentialsProvider {
 
         let table = self.table();
         let total = self
-            .get_raw_value(GetRawValueParams { key: table.alkane_address_len_key(&address) })
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.alkane_address_len_key(&address) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|b| {
@@ -3710,7 +3794,8 @@ impl EssentialsProvider {
             keys.push(table.alkane_address_txid_key(&address, rev_idx as u64));
         }
         let vals = self
-            .get_multi_values(GetMultiValuesParams { keys })
+            .get_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest, keys })
             .map(|r| r.values)
             .unwrap_or_default();
 
@@ -3866,7 +3951,8 @@ impl EssentialsProvider {
         let table = self.table();
 
         let mut confirmed_total = if only_alkane_txs {
-            self.get_raw_value(GetRawValueParams { key: table.alkane_address_len_key(&address) })
+            self.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.alkane_address_len_key(&address) })
                 .ok()
                 .and_then(|resp| resp.value)
                 .and_then(|b| {
@@ -3896,7 +3982,8 @@ impl EssentialsProvider {
                         txid_keys.push(table.alkane_address_txid_key(&address, rev_idx as u64));
                     }
                     let txid_vals = self
-                        .get_multi_values(GetMultiValuesParams { keys: txid_keys })
+                        .get_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest, keys: txid_keys })
                         .ok()
                         .map(|resp| resp.values)
                         .unwrap_or_default();
@@ -4084,7 +4171,8 @@ impl EssentialsProvider {
     ) -> Result<RpcGetAlkaneLatestTracesResult> {
         let table = self.table();
         let len = self
-            .get_raw_value(GetRawValueParams { key: table.latest_traces_length_key() })
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: table.latest_traces_length_key() })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|b| {
@@ -4104,7 +4192,8 @@ impl EssentialsProvider {
             for idx in 0..len {
                 keys.push(table.latest_traces_idx_key(idx));
             }
-            let values = self.get_multi_values(GetMultiValuesParams { keys }).ok().map(|r| r.values);
+            let values = self.get_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest, keys }).ok().map(|r| r.values);
             if let Some(values) = values {
                 for v in values.into_iter().flatten() {
                     if v.len() != 32 {
@@ -4133,6 +4222,8 @@ impl EssentialsProvider {
 }
 
 pub struct GetRawValueParams {
+    pub blockhash: StateAt,
+
     pub key: Vec<u8>,
 }
 
@@ -4141,6 +4232,8 @@ pub struct GetRawValueResult {
 }
 
 pub struct GetMultiValuesParams {
+    pub blockhash: StateAt,
+
     pub keys: Vec<Vec<u8>>,
 }
 
@@ -4149,6 +4242,8 @@ pub struct GetMultiValuesResult {
 }
 
 pub struct GetListKeysByPrefixParams {
+    pub blockhash: StateAt,
+
     pub prefix: Vec<u8>,
 }
 
@@ -4157,6 +4252,8 @@ pub struct GetListKeysByPrefixResult {
 }
 
 pub struct GetListEntriesDescParams {
+    pub blockhash: StateAt,
+
     pub prefix: Vec<u8>,
 }
 
@@ -4165,6 +4262,8 @@ pub struct GetListEntriesDescResult {
 }
 
 pub struct GetListEntriesDescCursorParams {
+    pub blockhash: StateAt,
+
     pub prefix: Vec<u8>,
     pub cursor: Option<Vec<u8>>,
     pub limit: usize,
@@ -4177,26 +4276,42 @@ pub struct GetListEntriesDescCursorResult {
 }
 
 pub struct SetRawValueParams {
+    pub blockhash: StateAt,
+
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
 
 pub struct SetBatchParams {
+    pub blockhash: StateAt,
+
     pub puts: Vec<(Vec<u8>, Vec<u8>)>,
     pub deletes: Vec<Vec<u8>>,
 }
 
-pub struct GetIndexHeightParams;
+pub struct SetBlobValuesIfMissingParams {
+    pub blockhash: StateAt,
+
+    pub puts: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+pub struct GetIndexHeightParams {
+    pub blockhash: StateAt,
+}
 
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
 
 pub struct SetIndexHeightParams {
+    pub blockhash: StateAt,
+
     pub height: u32,
 }
 
 pub struct GetCreationRecordParams {
+    pub blockhash: StateAt,
+
     pub alkane: SchemaAlkaneId,
 }
 
@@ -4205,6 +4320,8 @@ pub struct GetCreationRecordResult {
 }
 
 pub struct GetCreationRecordsByIdParams {
+    pub blockhash: StateAt,
+
     pub alkanes: Vec<SchemaAlkaneId>,
 }
 
@@ -4212,13 +4329,17 @@ pub struct GetCreationRecordsByIdResult {
     pub records: Vec<Option<AlkaneCreationRecord>>,
 }
 
-pub struct GetCreationRecordsOrderedParams;
+pub struct GetCreationRecordsOrderedParams {
+    pub blockhash: StateAt,
+}
 
 pub struct GetCreationRecordsOrderedResult {
     pub records: Vec<AlkaneCreationRecord>,
 }
 
 pub struct GetCreationRecordsOrderedPageParams {
+    pub blockhash: StateAt,
+
     pub offset: u64,
     pub limit: u64,
     pub desc: bool,
@@ -4229,6 +4350,8 @@ pub struct GetCreationRecordsOrderedPageResult {
 }
 
 pub struct GetAlkaneIdsByNamePrefixParams {
+    pub blockhash: StateAt,
+
     pub prefix: String,
 }
 
@@ -4237,12 +4360,16 @@ pub struct GetAlkaneIdsByNamePrefixResult {
 }
 
 pub struct GetAlkaneIdsByNamePrefixPageParams {
+    pub blockhash: StateAt,
+
     pub prefix: String,
     pub offset: u64,
     pub limit: u64,
 }
 
 pub struct GetAlkaneIdsBySymbolPrefixParams {
+    pub blockhash: StateAt,
+
     pub prefix: String,
 }
 
@@ -4251,18 +4378,24 @@ pub struct GetAlkaneIdsBySymbolPrefixResult {
 }
 
 pub struct GetAlkaneIdsBySymbolPrefixPageParams {
+    pub blockhash: StateAt,
+
     pub prefix: String,
     pub offset: u64,
     pub limit: u64,
 }
 
-pub struct GetCreationCountParams;
+pub struct GetCreationCountParams {
+    pub blockhash: StateAt,
+}
 
 pub struct GetCreationCountResult {
     pub count: u64,
 }
 
 pub struct GetHoldersCountParams {
+    pub blockhash: StateAt,
+
     pub alkane: SchemaAlkaneId,
 }
 
@@ -4271,6 +4404,8 @@ pub struct GetHoldersCountResult {
 }
 
 pub struct GetHoldersCountsByIdParams {
+    pub blockhash: StateAt,
+
     pub alkanes: Vec<SchemaAlkaneId>,
 }
 
@@ -4279,6 +4414,8 @@ pub struct GetHoldersCountsByIdResult {
 }
 
 pub struct GetHoldersOrderedPageParams {
+    pub blockhash: StateAt,
+
     pub offset: u64,
     pub limit: u64,
     pub desc: bool,
@@ -4289,6 +4426,8 @@ pub struct GetHoldersOrderedPageResult {
 }
 
 pub struct GetCirculatingSupplyParams {
+    pub blockhash: StateAt,
+
     pub alkane: SchemaAlkaneId,
     pub height: u32,
 }
@@ -4298,6 +4437,8 @@ pub struct GetCirculatingSupplyResult {
 }
 
 pub struct GetLatestCirculatingSupplyParams {
+    pub blockhash: StateAt,
+
     pub alkane: SchemaAlkaneId,
 }
 
@@ -4306,6 +4447,8 @@ pub struct GetLatestCirculatingSupplyResult {
 }
 
 pub struct GetLatestTotalMintedParams {
+    pub blockhash: StateAt,
+
     pub alkane: SchemaAlkaneId,
 }
 
@@ -4314,6 +4457,8 @@ pub struct GetLatestTotalMintedResult {
 }
 
 pub struct GetAlkaneStorageValueParams {
+    pub blockhash: StateAt,
+
     pub alkane: SchemaAlkaneId,
     pub key: Vec<u8>,
 }
@@ -4323,6 +4468,8 @@ pub struct GetAlkaneStorageValueResult {
 }
 
 pub struct GetBlockSummaryParams {
+    pub blockhash: StateAt,
+
     pub height: u32,
 }
 
@@ -4331,6 +4478,8 @@ pub struct GetBlockSummaryResult {
 }
 
 pub struct GetMempoolSeenPageParams {
+    pub blockhash: StateAt,
+
     pub page: usize,
     pub limit: usize,
 }
@@ -4341,6 +4490,8 @@ pub struct GetMempoolSeenPageResult {
 }
 
 pub struct GetMempoolEntryParams {
+    pub blockhash: StateAt,
+
     pub txid: Txid,
 }
 
@@ -4349,6 +4500,8 @@ pub struct GetMempoolEntryResult {
 }
 
 pub struct GetMempoolPendingForAddressParams {
+    pub blockhash: StateAt,
+
     pub address: String,
 }
 
@@ -5082,7 +5235,8 @@ pub(crate) fn load_tx_packed_outflow_v2(
     let (blockhash, tx_idx, _height) = resolve_tx_locator_candidate_v2(provider, &txid_arr)?;
     let table = provider.table();
     let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
-    let row_raw = provider.get_blob_raw_value(GetRawValueParams { key: row_key }).ok()?.value?;
+    let row_raw = provider.get_blob_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: row_key }).ok()?.value?;
     decode_tx_packed_outflow_row_v2(&row_raw).ok()
 }
 

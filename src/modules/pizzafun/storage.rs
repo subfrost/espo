@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
 use crate::runtime::tree_db::get_global_tree_db;
@@ -130,14 +131,43 @@ impl<'a> PizzafunTable<'a> {
     }
 }
 
-pub struct GetIndexHeightParams;
+pub struct GetIndexHeightParams {
+    pub blockhash: StateAt,
+}
 
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
 
 pub struct SetIndexHeightParams {
+    pub blockhash: StateAt,
+
     pub height: u32,
+}
+
+pub struct GetSeriesByIdParams {
+    pub blockhash: StateAt,
+    pub series_id: String,
+}
+
+pub struct GetSeriesByIdsParams {
+    pub blockhash: StateAt,
+    pub series_ids: Vec<String>,
+}
+
+pub struct GetSeriesByAlkaneParams {
+    pub blockhash: StateAt,
+    pub alkane: SchemaAlkaneId,
+}
+
+pub struct GetSeriesByAlkanesParams {
+    pub blockhash: StateAt,
+    pub alkanes: Vec<SchemaAlkaneId>,
+}
+
+pub struct GetSeriesEntriesByNameParams {
+    pub blockhash: StateAt,
+    pub name_norm: String,
 }
 
 #[derive(Clone)]
@@ -183,8 +213,8 @@ impl PizzafunProvider {
         self.mdb.as_ref()
     }
 
-    fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.view_blockhash {
+    fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
+        match blockhash {
             Some(blockhash) => self
                 .mdb
                 .get_at_blockhash(&blockhash, key)
@@ -193,12 +223,16 @@ impl PizzafunProvider {
         }
     }
 
-    fn raw_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
-        match self.view_blockhash {
-            Some(_blockhash) => {
+    fn raw_multi_get_at(
+        &self,
+        keys: &[Vec<u8>],
+        blockhash: Option<BlockHash>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match blockhash {
+            Some(blockhash) => {
                 let mut out = Vec::with_capacity(keys.len());
                 for key in keys {
-                    out.push(self.raw_get(key)?);
+                    out.push(self.raw_get_at(key, Some(blockhash))?);
                 }
                 Ok(out)
             }
@@ -221,10 +255,10 @@ impl PizzafunProvider {
         Ok(keys)
     }
 
-    fn read_series_ids_all(&self) -> Result<Vec<String>> {
+    fn read_series_ids_all(&self, blockhash: Option<BlockHash>) -> Result<Vec<String>> {
         let table = self.table();
         let entry_prefix = table.series_all_entry_prefix();
-        let keys = self.raw_scan_prefix_keys(&entry_prefix)?;
+        let keys = self.with_view_blockhash(blockhash).raw_scan_prefix_keys(&entry_prefix)?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             let Some(suffix) = key.strip_prefix(entry_prefix.as_slice()) else {
@@ -243,7 +277,7 @@ impl PizzafunProvider {
         ids: &[String],
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
         let table = self.table();
-        let existing_ids = self.read_series_ids_all()?;
+        let existing_ids = self.read_series_ids_all(None)?;
         let existing_set: HashSet<String> = existing_ids.into_iter().collect();
         let next_set: HashSet<String> = ids.iter().cloned().collect();
 
@@ -264,7 +298,7 @@ impl PizzafunProvider {
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
-        let Some(bytes) = self.raw_get(table.INDEX_HEIGHT.key())? else {
+        let Some(bytes) = self.raw_get_at(table.INDEX_HEIGHT.key(), _params.blockhash.resolve(self.view_blockhash))? else {
             return Ok(GetIndexHeightResult { height: None });
         };
         if bytes.len() != 4 {
@@ -277,23 +311,30 @@ impl PizzafunProvider {
 
     pub fn set_index_height(&self, params: SetIndexHeightParams) -> Result<()> {
         crate::debug_timer_log!("pizzafun.set_index_height");
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
         let table = self.table();
         table.INDEX_HEIGHT.put(&params.height.to_le_bytes())
     }
 
-    pub fn get_series_by_id(&self, series_id: &str) -> Result<Option<SeriesEntry>> {
+    pub fn get_series_by_id(&self, params: GetSeriesByIdParams) -> Result<Option<SeriesEntry>> {
         let table = self.table();
-        let key = table.series_by_id_key(series_id);
-        let Some(bytes) = self.raw_get(&key)? else {
+        let key = table.series_by_id_key(&params.series_id);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))? else {
             return Ok(None);
         };
         Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
     }
 
-    pub fn get_series_by_ids(&self, series_ids: &[String]) -> Result<Vec<Option<SeriesEntry>>> {
+    pub fn get_series_by_ids(
+        &self,
+        params: GetSeriesByIdsParams,
+    ) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> = series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
-        let raw = self.raw_multi_get(&keys)?;
+        let keys: Vec<Vec<u8>> =
+            params.series_ids.iter().map(|s| table.series_by_id_key(s)).collect();
+        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             match item {
@@ -304,10 +345,13 @@ impl PizzafunProvider {
         Ok(out)
     }
 
-    pub fn get_series_by_alkane(&self, alkane: &SchemaAlkaneId) -> Result<Option<SeriesEntry>> {
+    pub fn get_series_by_alkane(
+        &self,
+        params: GetSeriesByAlkaneParams,
+    ) -> Result<Option<SeriesEntry>> {
         let table = self.table();
-        let key = table.series_by_alkane_key(alkane);
-        let Some(bytes) = self.raw_get(&key)? else {
+        let key = table.series_by_alkane_key(&params.alkane);
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))? else {
             return Ok(None);
         };
         Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
@@ -315,11 +359,12 @@ impl PizzafunProvider {
 
     pub fn get_series_by_alkanes(
         &self,
-        alkanes: &[SchemaAlkaneId],
+        params: GetSeriesByAlkanesParams,
     ) -> Result<Vec<Option<SeriesEntry>>> {
         let table = self.table();
-        let keys: Vec<Vec<u8>> = alkanes.iter().map(|a| table.series_by_alkane_key(a)).collect();
-        let raw = self.raw_multi_get(&keys)?;
+        let keys: Vec<Vec<u8>> =
+            params.alkanes.iter().map(|a| table.series_by_alkane_key(a)).collect();
+        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             match item {
@@ -330,16 +375,19 @@ impl PizzafunProvider {
         Ok(out)
     }
 
-    pub fn get_series_entries_by_name(&self, name_norm: &str) -> Result<Vec<SeriesEntry>> {
+    pub fn get_series_entries_by_name(
+        &self,
+        params: GetSeriesEntriesByNameParams,
+    ) -> Result<Vec<SeriesEntry>> {
         let table = self.table();
-        let mut lookup_names: Vec<String> = vec![name_norm.to_string()];
-        if let Some(series_base) = series_id_base_from_name(name_norm) {
-            if series_base != name_norm {
+        let mut lookup_names: Vec<String> = vec![params.name_norm.clone()];
+        if let Some(series_base) = series_id_base_from_name(&params.name_norm) {
+            if series_base != params.name_norm {
                 lookup_names.push(series_base);
             }
         }
 
-        let all_ids = self.read_series_ids_all()?;
+        let all_ids = self.read_series_ids_all(params.blockhash.resolve(self.view_blockhash))?;
         let mut filtered_ids: Vec<String> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
         for series_id in all_ids {
@@ -355,7 +403,7 @@ impl PizzafunProvider {
         }
 
         let keys: Vec<Vec<u8>> = filtered_ids.iter().map(|id| table.series_by_id_key(id)).collect();
-        let raw = self.raw_multi_get(&keys)?;
+        let raw = self.raw_multi_get_at(&keys, params.blockhash.resolve(self.view_blockhash))?;
         let mut out = Vec::with_capacity(raw.len());
         for item in raw {
             if let Some(bytes) = item {
@@ -371,7 +419,7 @@ impl PizzafunProvider {
         updated: &[SeriesEntry],
     ) -> Result<()> {
         let table = self.table();
-        let mut series_ids = self.read_series_ids_all()?;
+        let mut series_ids = self.read_series_ids_all(None)?;
         let existing_ids: HashSet<String> = existing.iter().map(|e| e.series_id.clone()).collect();
         series_ids.retain(|id| !existing_ids.contains(id));
         let mut seen_ids: HashSet<String> = series_ids.iter().cloned().collect();
@@ -413,10 +461,13 @@ impl PizzafunProvider {
 
     pub fn replace_series_entries(&self, entries: &[SeriesEntry], height: u32) -> Result<()> {
         let table = self.table();
-        let existing_ids = self.read_series_ids_all()?;
+        let existing_ids = self.read_series_ids_all(None)?;
         let mut deletes: Vec<Vec<u8>> = Vec::new();
         if !existing_ids.is_empty() {
-            let existing_rows = self.get_series_by_ids(&existing_ids)?;
+            let existing_rows = self.get_series_by_ids(GetSeriesByIdsParams {
+                blockhash: StateAt::Latest,
+                series_ids: existing_ids.clone(),
+            })?;
             for (idx, maybe_entry) in existing_rows.into_iter().enumerate() {
                 let Some(entry) = maybe_entry else { continue };
                 if let Some(series_id) = existing_ids.get(idx) {

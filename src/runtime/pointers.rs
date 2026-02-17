@@ -5,8 +5,14 @@ use bitcoin::BlockHash;
 pub trait KeyValuePointer {
     fn key(&self) -> &[u8];
     fn get(&self) -> Result<Option<Vec<u8>>>;
+    fn get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>>;
     fn put(&self, value: &[u8]) -> Result<()>;
     fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>>;
+    fn multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>>;
     fn bulk_write<F>(&self, build: F) -> Result<()>
     where
         F: FnOnce(&mut MdbBatch<'_>);
@@ -15,8 +21,14 @@ pub trait KeyValuePointer {
 pub trait ListBasedPointer {
     fn key(&self) -> &[u8];
     fn get(&self) -> Result<Option<Vec<u8>>>;
+    fn get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>>;
     fn put(&self, value: &[u8]) -> Result<()>;
     fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>>;
+    fn multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>>;
     fn bulk_write<F>(&self, build: F) -> Result<()>
     where
         F: FnOnce(&mut MdbBatch<'_>);
@@ -77,6 +89,12 @@ impl<'a> KvPointer<'a> {
         self.mdb.get(&self.key).map_err(|e| anyhow!("mdb.get failed: {e}"))
     }
 
+    pub fn get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.mdb
+            .get_at_blockhash(blockhash, &self.key)
+            .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}"))
+    }
+
     pub fn put(&self, value: &[u8]) -> Result<()> {
         self.mdb.put(&self.key, value).map_err(|e| anyhow!("mdb.put failed: {e}"))
     }
@@ -91,6 +109,30 @@ impl<'a> KvPointer<'a> {
             })
             .collect();
         self.mdb.multi_get(&full_keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))
+    }
+
+    pub fn multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let full_keys: Vec<Vec<u8>> = keys
+            .iter()
+            .map(|k| {
+                let mut key = self.key.clone();
+                key.extend_from_slice(k);
+                key
+            })
+            .collect();
+        let mut out = Vec::with_capacity(full_keys.len());
+        for key in &full_keys {
+            out.push(
+                self.mdb
+                    .get_at_blockhash(blockhash, key)
+                    .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}"))?,
+            );
+        }
+        Ok(out)
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -110,12 +152,24 @@ impl<'a> KeyValuePointer for KvPointer<'a> {
         self.get()
     }
 
+    fn get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.get_at_blockhash(blockhash)
+    }
+
     fn put(&self, value: &[u8]) -> Result<()> {
         self.put(value)
     }
 
     fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         self.multi_get(keys)
+    }
+
+    fn multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.multi_get_at_blockhash(blockhash, keys)
     }
 
     fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -165,6 +219,12 @@ impl<'a> ListPointer<'a> {
         self.mdb.get(&self.key).map_err(|e| anyhow!("mdb.get failed: {e}"))
     }
 
+    pub fn get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.mdb
+            .get_at_blockhash(blockhash, &self.key)
+            .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}"))
+    }
+
     pub fn put(&self, value: &[u8]) -> Result<()> {
         self.mdb.put(&self.key, value).map_err(|e| anyhow!("mdb.put failed: {e}"))
     }
@@ -179,6 +239,30 @@ impl<'a> ListPointer<'a> {
             })
             .collect();
         self.mdb.multi_get(&full_keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}"))
+    }
+
+    pub fn multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let full_keys: Vec<Vec<u8>> = keys
+            .iter()
+            .map(|k| {
+                let mut key = self.key.clone();
+                key.extend_from_slice(k);
+                key
+            })
+            .collect();
+        let mut out = Vec::with_capacity(full_keys.len());
+        for key in &full_keys {
+            out.push(
+                self.mdb
+                    .get_at_blockhash(blockhash, key)
+                    .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}"))?,
+            );
+        }
+        Ok(out)
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -239,12 +323,24 @@ impl<'a> ListBasedPointer for ListPointer<'a> {
         self.get()
     }
 
+    fn get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.get_at_blockhash(blockhash)
+    }
+
     fn put(&self, value: &[u8]) -> Result<()> {
         self.put(value)
     }
 
     fn multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         self.multi_get(keys)
+    }
+
+    fn multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.multi_get_at_blockhash(blockhash, keys)
     }
 
     fn bulk_write<F>(&self, build: F) -> Result<()>
@@ -304,12 +400,24 @@ impl<'a> ListNonMutatePointer<'a> {
         self.locator.get()
     }
 
+    pub fn locator_get_at_blockhash(&self, blockhash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        self.locator.get_at_blockhash(blockhash)
+    }
+
     pub fn blob_get(&self) -> Result<Option<Vec<u8>>> {
         self.blob.get()
     }
 
     pub fn locator_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         self.locator.multi_get(keys)
+    }
+
+    pub fn locator_multi_get_at_blockhash(
+        &self,
+        blockhash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        self.locator.multi_get_at_blockhash(blockhash, keys)
     }
 
     pub fn blob_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {

@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use super::schemas::{active_timeframes, ActivityKind, SchemaCandleV1, SchemaMarketDefs};
 use super::storage::{
     AmmDataProvider, GetListEntriesDescParams, GetPoolDefsParams, GetRawValueParams,
@@ -30,7 +31,7 @@ use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::rpc::register_rpc;
@@ -76,7 +77,8 @@ pub(crate) fn lookup_proxy_target(
 ) -> Option<SchemaAlkaneId> {
     let lookup = |key: &[u8]| {
         essentials
-            .get_alkane_storage_value(GetAlkaneStorageValueParams { alkane, key: key.to_vec() })
+            .get_alkane_storage_value(GetAlkaneStorageValueParams {
+            blockhash: StateAt::Latest, alkane, key: key.to_vec() })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_kv_implementation(&raw))
@@ -379,7 +381,8 @@ pub(crate) fn pool_trade_windows(
     let mut out = PoolTradeWindows::default();
 
     for (k, v) in provider
-        .get_list_entries_desc(GetListEntriesDescParams { prefix: prefix.clone() })?
+        .get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest, prefix: prefix.clone() })?
         .entries
     {
         let Some((ts, seq)) = decode_ts_seq_from_index(prefix_len, &k, &v) else {
@@ -390,7 +393,8 @@ pub(crate) fn pool_trade_windows(
         }
 
         let key = activity_key_for(pool, ts, seq);
-        let Some(raw) = provider.get_raw_value(GetRawValueParams { key })?.value else {
+        let Some(raw) = provider.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key })?.value else {
             continue;
         };
         let activity = match decode_activity_v1(&raw) {
@@ -456,14 +460,16 @@ pub(crate) fn token_trade_windows(
     full_history: bool,
 ) -> Result<TokenTradeWindows> {
     let pools = provider
-        .get_token_pools(GetTokenPoolsParams { token: *token })
+        .get_token_pools(GetTokenPoolsParams {
+            blockhash: StateAt::Latest, token: *token })
         .map(|res| res.pools)
         .unwrap_or_default();
 
     let mut out = TokenTradeWindows::default();
     for pool in pools {
         let defs = pools_map.get(&pool).cloned().or_else(|| {
-            provider.get_pool_defs(GetPoolDefsParams { pool }).ok().and_then(|res| res.defs)
+            provider.get_pool_defs(GetPoolDefsParams {
+            blockhash: StateAt::Latest, pool }).ok().and_then(|res| res.defs)
         });
         let Some(defs) = defs else { continue };
 
@@ -526,7 +532,10 @@ pub(crate) fn load_balance_txs_by_height(
     let table = essentials.table();
     let prefix = table.alkane_balance_txs_by_height_log_prefix(height);
     let entries = essentials
-        .get_list_entries_desc(EssentialsGetListEntriesDescParams { prefix: prefix.clone() })?
+        .get_list_entries_desc(EssentialsGetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        })?
         .entries;
 
     let mut parsed_with_idx: BTreeMap<SchemaAlkaneId, Vec<(u32, AlkaneBalanceTxEntry)>> =
@@ -553,7 +562,8 @@ pub(crate) fn load_balance_txs_by_height(
 pub struct AmmData {
     provider: Option<Arc<AmmDataProvider>>,
     index_height: Arc<std::sync::RwLock<Option<u32>>>,
-    factories_bootstrapped: AtomicBool,
+    factory_bootstrap_creation_count: AtomicU64,
+    pool_bootstrap_creation_count: AtomicU64,
 }
 
 impl AmmData {
@@ -561,7 +571,8 @@ impl AmmData {
         Self {
             provider: None,
             index_height: Arc::new(std::sync::RwLock::new(None)),
-            factories_bootstrapped: AtomicBool::new(false),
+            factory_bootstrap_creation_count: AtomicU64::new(0),
+            pool_bootstrap_creation_count: AtomicU64::new(0),
         }
     }
 
@@ -571,23 +582,29 @@ impl AmmData {
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
-        let resp = self.provider().get_index_height(super::storage::GetIndexHeightParams)?;
+        let resp =
+            self.provider().get_index_height(super::storage::GetIndexHeightParams {
+                blockhash: StateAt::Latest,
+            })?;
         Ok(resp.height)
     }
 
-    fn persist_index_height(&self, height: u32) -> Result<()> {
+    fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
         self.provider()
-            .set_index_height(super::storage::SetIndexHeightParams { height })
+            .set_index_height(super::storage::SetIndexHeightParams {
+                blockhash,
+                height,
+            })
             .map_err(|e| anyhow!("[AMMDATA] rocksdb put(/index_height) failed: {e}"))
     }
 
-    fn set_index_height(&self, new_height: u32) -> Result<()> {
+    fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
                 eprintln!("[AMMDATA] index height rollback detected ({} -> {})", prev, new_height);
             }
         }
-        self.persist_index_height(new_height)?;
+        self.persist_index_height(new_height, blockhash)?;
         *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
@@ -626,6 +643,7 @@ impl EspoModule for AmmData {
         let debug = debug_enabled();
         let module = self.get_name();
         let block_ts = block.block_header.time as u64;
+        let block_hash = block.block_header.block_hash();
         let height = block.height;
         println!("[AMMDATA] Indexing block #{height} for candles and activity...");
         if let Some(prev) = *self.index_height.read().unwrap() {
@@ -635,8 +653,16 @@ impl EspoModule for AmmData {
             }
         }
 
-        let provider = self.provider();
+        let write_provider = self.provider();
+        let read_provider = write_provider.with_view_blockhash(Some(block_hash));
+        let provider = &read_provider;
         let essentials = provider.essentials();
+        let creation_count = essentials
+            .get_creation_count(crate::modules::essentials::storage::GetCreationCountParams {
+                blockhash: StateAt::Latest,
+            })
+            .map(|r| r.count)
+            .unwrap_or(0);
         let search_cfg = AmmDataConfig::load_from_global_config().ok();
         let search_index_enabled =
             search_cfg.as_ref().map(|c| c.search_index_enabled).unwrap_or(false);
@@ -658,7 +684,7 @@ impl EspoModule for AmmData {
 
         let timer = debug::start_if(debug);
         let reserves_snapshot =
-            crate::modules::ammdata::utils::index_snapshot::load_reserves_snapshot(provider)?;
+            crate::modules::ammdata::utils::index_snapshot::load_reserves_snapshot(&provider)?;
         let pools_map = crate::modules::ammdata::utils::index_snapshot::pools_map_from_snapshot(
             &reserves_snapshot,
         );
@@ -681,10 +707,31 @@ impl EspoModule for AmmData {
                 &block,
                 provider,
                 essentials,
-                &self.factories_bootstrapped,
+                essentials,
+                creation_count,
+                &self.factory_bootstrap_creation_count,
             )?;
         state.amm_factory_writes = amm_factory_writes;
         debug::log_elapsed(module, "load_factories", timer);
+
+        let last_pool_bootstrap = self.pool_bootstrap_creation_count.load(Ordering::Relaxed);
+        if creation_count > last_pool_bootstrap {
+            let timer = debug::start_if(debug);
+            let boot_cnt =
+                crate::modules::ammdata::utils::index_pools::bootstrap_pools_from_creation_records(
+                    provider,
+                    essentials,
+                    essentials,
+                    &canonical_quote_units,
+                    &amm_factories,
+                    &mut state,
+                )?;
+            if boot_cnt > 0 {
+                eprintln!("[AMMDATA] bootstrapped {boot_cnt} pools from creation records");
+            }
+            self.pool_bootstrap_creation_count.store(creation_count, Ordering::Relaxed);
+            debug::log_elapsed(module, "bootstrap_pools_from_creation_records", timer);
+        }
 
         let frames = active_timeframes();
 
@@ -787,8 +834,12 @@ impl EspoModule for AmmData {
         );
 
         if finalize.should_write {
-            provider
-                .set_batch(SetBatchParams { puts: finalize.puts, deletes: finalize.deletes })
+            write_provider
+                .set_batch(SetBatchParams {
+                    blockhash: StateAt::Latest,
+                    puts: finalize.puts,
+                    deletes: finalize.deletes,
+                })
                 .map_err(|e| anyhow!("[AMMDATA] set_batch failed at height {}: {e}", height))?;
         }
 
@@ -798,7 +849,7 @@ impl EspoModule for AmmData {
             block.height,
             block.transactions.len()
         );
-        self.set_index_height(block.height)?;
+        self.set_index_height(block.height, StateAt::Latest)?;
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),

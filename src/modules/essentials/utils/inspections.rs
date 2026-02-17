@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
     EspoSandshrewLikeTraceStatus,
@@ -138,6 +139,7 @@ pub fn load_inspection(
     // helper here for call sites that expect it.
     let rec = provider
         .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+            blockhash: StateAt::Latest,
             alkane: *alkane,
         })?
         .record;

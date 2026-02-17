@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use super::consts::KEY_INDEX_HEIGHT;
 use super::schemas::SchemaWrapEventV1;
 use crate::runtime::mdb::{Mdb, MdbBatch};
@@ -222,6 +223,16 @@ impl SubfrostProvider {
         }
     }
 
+    fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
+        match blockhash {
+            Some(blockhash) => self
+                .mdb
+                .get_at_blockhash(&blockhash, key)
+                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
+            None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
+        }
+    }
+
     fn raw_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         match self.view_blockhash {
             Some(_blockhash) => {
@@ -285,11 +296,14 @@ impl SubfrostProvider {
     }
 
     pub fn get_raw_value(&self, params: GetRawValueParams) -> Result<GetRawValueResult> {
-        let value = self.raw_get(&params.key)?;
+        let value = self.raw_get_at(&params.key, params.blockhash.resolve(self.view_blockhash))?;
         Ok(GetRawValueResult { value })
     }
 
     pub fn set_batch(&self, params: SetBatchParams) -> Result<()> {
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
         let (puts, deletes) = dedupe_batch_ops(params.puts, params.deletes);
         self.mdb
             .bulk_write(|wb: &mut MdbBatch<'_>| {
@@ -371,7 +385,10 @@ impl SubfrostProvider {
         params: GetWrapEventsByAddressParams,
     ) -> Result<GetWrapEventsResult> {
         crate::debug_timer_log!("get_wrap_events_by_address");
-        let view = self.with_height(params.height, params.height_present)?;
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
         let table = view.table();
         let prefix = table.wrap_events_by_address_prefix(&params.address_spk);
         read_events_from_list(&view, &prefix, params.offset, params.limit, params.successful)
@@ -382,7 +399,10 @@ impl SubfrostProvider {
         params: GetUnwrapEventsByAddressParams,
     ) -> Result<GetWrapEventsResult> {
         crate::debug_timer_log!("get_unwrap_events_by_address");
-        let view = self.with_height(params.height, params.height_present)?;
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
         let table = view.table();
         let prefix = table.unwrap_events_by_address_prefix(&params.address_spk);
         read_events_from_list(&view, &prefix, params.offset, params.limit, params.successful)
@@ -393,7 +413,10 @@ impl SubfrostProvider {
         params: GetWrapEventsAllParams,
     ) -> Result<GetWrapEventsResult> {
         crate::debug_timer_log!("get_wrap_events_all");
-        let view = self.with_height(params.height, params.height_present)?;
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
         let table = view.table();
         let prefix = table.WRAP_EVENTS_ALL.key().to_vec();
         read_events_from_list(&view, &prefix, params.offset, params.limit, params.successful)
@@ -404,7 +427,10 @@ impl SubfrostProvider {
         params: GetUnwrapEventsAllParams,
     ) -> Result<GetWrapEventsResult> {
         crate::debug_timer_log!("get_unwrap_events_all");
-        let view = self.with_height(params.height, params.height_present)?;
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
         let table = view.table();
         let prefix = table.UNWRAP_EVENTS_ALL.key().to_vec();
         read_events_from_list(&view, &prefix, params.offset, params.limit, params.successful)
@@ -415,7 +441,10 @@ impl SubfrostProvider {
         params: GetUnwrapTotalLatestParams,
     ) -> Result<GetUnwrapTotalLatestResult> {
         crate::debug_timer_log!("get_unwrap_total_latest");
-        let view = self.with_height(params.height, params.height_present)?;
+        let view = match params.blockhash {
+            StateAt::Block(blockhash) => self.with_view_blockhash(Some(blockhash)),
+            StateAt::Latest => self.with_height(params.height, params.height_present)?,
+        };
         let table = view.table();
         let key = table.unwrap_total_latest_key(params.successful);
         let total = view.raw_get(&key)?.and_then(|v| decode_u128_value(&v)).unwrap_or(0);
@@ -427,7 +456,8 @@ impl SubfrostProvider {
         params: GetUnwrapTotalAtOrBeforeParams,
     ) -> Result<GetUnwrapTotalAtOrBeforeResult> {
         crate::debug_timer_log!("get_unwrap_total_at_or_before");
-        let points = self.read_unwrap_total_points_all(params.successful)?;
+        let view = self.with_view_blockhash(params.blockhash.resolve(self.view_blockhash));
+        let points = view.read_unwrap_total_points_all(params.successful)?;
         if points.is_empty() {
             return Ok(GetUnwrapTotalAtOrBeforeResult { total: None });
         }
@@ -486,6 +516,8 @@ fn read_events_from_list(
 }
 
 pub struct GetRawValueParams {
+    pub blockhash: StateAt,
+
     pub key: Vec<u8>,
 }
 
@@ -494,6 +526,8 @@ pub struct GetRawValueResult {
 }
 
 pub struct SetBatchParams {
+    pub blockhash: StateAt,
+
     pub deletes: Vec<Vec<u8>>,
     pub puts: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -508,17 +542,23 @@ pub struct BuildUnwrapTotalPointAppendsParams {
     pub points: Vec<UnwrapTotalPoint>,
 }
 
-pub struct GetIndexHeightParams;
+pub struct GetIndexHeightParams {
+    pub blockhash: StateAt,
+}
 
 pub struct GetIndexHeightResult {
     pub height: Option<u32>,
 }
 
 pub struct SetIndexHeightParams {
+    pub blockhash: StateAt,
+
     pub height: u32,
 }
 
 pub struct GetWrapEventsByAddressParams {
+    pub blockhash: StateAt,
+
     pub address_spk: Vec<u8>,
     pub offset: usize,
     pub limit: usize,
@@ -528,6 +568,8 @@ pub struct GetWrapEventsByAddressParams {
 }
 
 pub struct GetUnwrapEventsByAddressParams {
+    pub blockhash: StateAt,
+
     pub address_spk: Vec<u8>,
     pub offset: usize,
     pub limit: usize,
@@ -537,6 +579,8 @@ pub struct GetUnwrapEventsByAddressParams {
 }
 
 pub struct GetWrapEventsAllParams {
+    pub blockhash: StateAt,
+
     pub offset: usize,
     pub limit: usize,
     pub successful: Option<bool>,
@@ -545,6 +589,8 @@ pub struct GetWrapEventsAllParams {
 }
 
 pub struct GetUnwrapEventsAllParams {
+    pub blockhash: StateAt,
+
     pub offset: usize,
     pub limit: usize,
     pub successful: Option<bool>,
@@ -553,6 +599,8 @@ pub struct GetUnwrapEventsAllParams {
 }
 
 pub struct GetUnwrapTotalLatestParams {
+    pub blockhash: StateAt,
+
     pub successful: bool,
     pub height: Option<u64>,
     pub height_present: bool,
@@ -563,6 +611,8 @@ pub struct GetUnwrapTotalLatestResult {
 }
 
 pub struct GetUnwrapTotalAtOrBeforeParams {
+    pub blockhash: StateAt,
+
     pub height: u32,
     pub successful: bool,
 }

@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::alkanes::trace::EspoBlock;
 use crate::config::{debug_enabled, get_espo_db, get_network};
 use crate::debug;
@@ -22,8 +23,8 @@ use std::sync::{Arc, RwLock};
 use super::consts::PRIORITY_SERIES_ALKANES;
 use super::rpc;
 use super::storage::{
-    GetIndexHeightParams as PizzafunGetIndexHeightParams, PizzafunProvider, SeriesEntry,
-    series_id_base_from_name,
+    GetIndexHeightParams as PizzafunGetIndexHeightParams, GetSeriesEntriesByNameParams,
+    PizzafunProvider, SeriesEntry, series_id_base_from_name,
 };
 
 fn parse_alkane_id_str(s: &str) -> Option<SchemaAlkaneId> {
@@ -76,13 +77,17 @@ impl Pizzafun {
     fn load_essentials_index_height(&self) -> Option<u32> {
         let resp = self
             .essentials_provider()
-            .get_index_height(EssentialsGetIndexHeightParams)
+            .get_index_height(EssentialsGetIndexHeightParams {
+                blockhash: StateAt::Latest,
+            })
             .ok()?;
         resp.height
     }
 
     fn load_index_height(&self) -> Option<u32> {
-        if let Ok(resp) = self.provider().get_index_height(PizzafunGetIndexHeightParams) {
+        if let Ok(resp) = self.provider().get_index_height(PizzafunGetIndexHeightParams {
+            blockhash: StateAt::Latest,
+        }) {
             if resp.height.is_some() {
                 return resp.height;
             }
@@ -151,6 +156,7 @@ impl EspoModule for Pizzafun {
         let t0 = std::time::Instant::now();
         let debug = debug_enabled();
         let module = self.get_name();
+        let block_hash = block.block_header.block_hash();
 
         let timer = debug::start_if(debug);
         let mut new_alkanes: Vec<SchemaAlkaneId> = created_alkanes_from_block(&block);
@@ -168,7 +174,10 @@ impl EspoModule for Pizzafun {
         if !new_alkanes.is_empty() {
             let records = self
                 .essentials_provider()
-                .get_creation_records_by_id(GetCreationRecordsByIdParams { alkanes: new_alkanes })?
+                .get_creation_records_by_id(GetCreationRecordsByIdParams {
+                    blockhash: StateAt::Block(block_hash),
+                    alkanes: new_alkanes,
+                })?
                 .records;
 
             let mut by_name: HashMap<String, Vec<SeriesEntry>> = HashMap::new();
@@ -186,7 +195,11 @@ impl EspoModule for Pizzafun {
                 let priority_index = Self::priority_index_map();
                 for (name, mut new_entries) in by_name {
                     let Some(series_base) = series_id_base_from_name(&name) else { continue };
-                    let existing = self.provider().get_series_entries_by_name(&name)?;
+                    let existing =
+                        self.provider().get_series_entries_by_name(GetSeriesEntriesByNameParams {
+                            blockhash: StateAt::Block(block_hash),
+                            name_norm: name.clone(),
+                        })?;
                     if !existing.is_empty() {
                         let mut existing_ids: HashSet<SchemaAlkaneId> =
                             existing.iter().map(|e| e.alkane_id).collect();
@@ -222,7 +235,10 @@ impl EspoModule for Pizzafun {
 
         let timer = debug::start_if(debug);
         self.provider()
-            .set_index_height(super::storage::SetIndexHeightParams { height: block.height })?;
+            .set_index_height(super::storage::SetIndexHeightParams {
+                blockhash: StateAt::Latest,
+                height: block.height,
+            })?;
         *self.index_height.write().expect("pizzafun index height lock poisoned") =
             Some(block.height);
         debug::log_elapsed(module, "store_height", timer);

@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
 use crate::modules::ammdata::storage::{AmmDataProvider, GetReservesSnapshotParams};
 use crate::schemas::SchemaAlkaneId;
@@ -8,7 +9,9 @@ pub fn load_reserves_snapshot(
     provider: &AmmDataProvider,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
     let snapshot = provider
-        .get_reserves_snapshot(GetReservesSnapshotParams)?
+        .get_reserves_snapshot(GetReservesSnapshotParams {
+            blockhash: StateAt::Latest,
+        })?
         .snapshot
         .unwrap_or_default();
     Ok(snapshot)

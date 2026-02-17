@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use axum::extract::{Query, State};
 use axum::response::Html;
 use borsh::BorshDeserialize;
@@ -172,6 +173,7 @@ pub async fn alkanes_page(
         (SortField::Age, SortDir::Desc) => {
             let records = provider
                 .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+            blockhash: StateAt::Latest,
                     offset: offset as u64,
                     limit: limit as u64,
                     desc: true,
@@ -186,6 +188,7 @@ pub async fn alkanes_page(
         (SortField::Age, SortDir::Asc) => {
             let records = provider
                 .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
+            blockhash: StateAt::Latest,
                     offset: offset as u64,
                     limit: limit as u64,
                     desc: false,
@@ -200,6 +203,7 @@ pub async fn alkanes_page(
         (SortField::Holders, SortDir::Desc) => {
             let ids = provider
                 .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            blockhash: StateAt::Latest,
                     offset: offset as u64,
                     limit: limit as u64,
                     desc: true,
@@ -218,6 +222,7 @@ pub async fn alkanes_page(
         (SortField::Holders, SortDir::Asc) => {
             let ids = provider
                 .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            blockhash: StateAt::Latest,
                     offset: offset as u64,
                     limit: limit as u64,
                     desc: false,

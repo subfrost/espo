@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::modules::ammdata::storage::{AmmDataProvider, GetRawValueParams, encode_pool_snapshot};
 use crate::modules::ammdata::utils::activity::{
     decode_u64_be, encode_u64_be, idx_count_key, idx_count_key_group,
@@ -66,7 +67,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         let count_k_rel = idx_count_key(&pool);
 
         let current = if let Some(v) =
-            provider.get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?.value
+            provider.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: count_k_rel.clone() })?.value
         {
             decode_u64_be(&v).unwrap_or(0)
         } else {
@@ -81,7 +83,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         let count_k_rel = idx_count_key_group(&pool, group);
 
         let current = if let Some(v) =
-            provider.get_raw_value(GetRawValueParams { key: count_k_rel.clone() })?.value
+            provider.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: count_k_rel.clone() })?.value
         {
             decode_u64_be(&v).unwrap_or(0)
         } else {
@@ -95,7 +98,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     if state.token_metrics_index_new > 0 {
         let count_key = table.token_metrics_index_count_key();
         let current = provider
-            .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: count_key.clone() })?
             .value
             .and_then(|raw| {
                 if raw.len() == 8 {
@@ -116,7 +120,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     if state.pool_metrics_index_new > 0 {
         let count_key = table.pool_metrics_index_count_key();
         let current = provider
-            .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: count_key.clone() })?
             .value
             .and_then(|raw| {
                 if raw.len() == 8 {
@@ -141,7 +146,8 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
             }
             let count_key = table.token_derived_metrics_index_count_key(quote);
             let current = provider
-                .get_raw_value(GetRawValueParams { key: count_key.clone() })?
+                .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: count_key.clone() })?
                 .value
                 .and_then(|raw| {
                     if raw.len() == 8 {

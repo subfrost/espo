@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::State;
 use axum::response::Html;
@@ -43,6 +44,7 @@ fn load_top_alkanes_by_holders(
     let provider = EssentialsProvider::new(Arc::new(mdb.clone()));
     let ids = provider
         .get_holders_ordered_page(GetHoldersOrderedPageParams {
+            blockhash: StateAt::Latest,
             offset: 0,
             limit: limit as u64,
             desc: true,

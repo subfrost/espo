@@ -1,7 +1,7 @@
+use bitcoin::hashes::{sha256, Hash as _};
 use bitcoin::BlockHash;
-use bitcoin::hashes::{Hash as _, sha256};
 use borsh::{BorshDeserialize, BorshSerialize};
-use rocksdb::{DB, Direction, Error as RocksError, IteratorMode, WriteBatch};
+use rocksdb::{Direction, Error as RocksError, IteratorMode, WriteBatch, DB};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -455,6 +455,14 @@ impl VersionedTreeDb {
         &self,
         block_hash: &[u8; 32],
     ) -> Result<Option<[u8; 32]>, RocksError> {
+        {
+            let st = self.state.read().expect("tree state poisoned");
+            if let Some(ctx) = st.current_block {
+                if &ctx.block_hash == block_hash {
+                    return Ok(Some(ctx.working_root));
+                }
+            }
+        }
         let Some(bytes) = self.db.get(block_root_key(block_hash))? else {
             return Ok(None);
         };
@@ -755,11 +763,7 @@ impl VersionedTreeDb {
         Ok(())
     }
 
-    fn retain_reachable_pending_nodes(
-        &self,
-        root: [u8; 32],
-        batch_ctx: &mut BatchWriteContext,
-    ) {
+    fn retain_reachable_pending_nodes(&self, root: [u8; 32], batch_ctx: &mut BatchWriteContext) {
         if batch_ctx.pending_nodes.is_empty() {
             return;
         }
@@ -857,10 +861,8 @@ impl VersionedTreeDb {
                     }
                     Err(idx) => {
                         if let Some(next) = value {
-                            leaf.entries.insert(
-                                idx,
-                                LeafEntry { key: key.to_vec(), value: Some(next) },
-                            );
+                            leaf.entries
+                                .insert(idx, LeafEntry { key: key.to_vec(), value: Some(next) });
                             changed = true;
                         }
                     }
@@ -877,8 +879,8 @@ impl VersionedTreeDb {
                 }
 
                 if leaf.entries.len() <= MAX_LEAF_ENTRIES {
-                    let new_id =
-                        self.store_node_with_ctx(&BptreeNode::Leaf(leaf), batch_ctx.as_deref_mut())?;
+                    let new_id = self
+                        .store_node_with_ctx(&BptreeNode::Leaf(leaf), batch_ctx.as_deref_mut())?;
                     return Ok(MutationResult { outcome: MutationOutcome::Node(new_id) });
                 }
 
@@ -929,8 +931,10 @@ impl VersionedTreeDb {
                 }
 
                 if internal.keys.len() <= MAX_INTERNAL_KEYS {
-                    let new_id = self
-                        .store_node_with_ctx(&BptreeNode::Internal(internal), batch_ctx.as_deref_mut())?;
+                    let new_id = self.store_node_with_ctx(
+                        &BptreeNode::Internal(internal),
+                        batch_ctx.as_deref_mut(),
+                    )?;
                     return Ok(MutationResult { outcome: MutationOutcome::Node(new_id) });
                 }
 
@@ -945,7 +949,10 @@ impl VersionedTreeDb {
                 let right_children = internal.children[mid + 1..].to_vec();
 
                 let left_id = self.store_node_with_ctx(
-                    &BptreeNode::Internal(InternalNode { keys: left_keys, children: left_children }),
+                    &BptreeNode::Internal(InternalNode {
+                        keys: left_keys,
+                        children: left_children,
+                    }),
                     batch_ctx.as_deref_mut(),
                 )?;
                 let right_id = self.store_node_with_ctx(
@@ -1071,7 +1078,6 @@ impl VersionedTreeDb {
         }
         Ok(id)
     }
-
 }
 
 pub fn is_tree_internal_key(full_key: &[u8]) -> bool {
@@ -1193,5 +1199,23 @@ mod tests {
         let r2 = tree.root_for_blockhash(&h2).expect("root h2").expect("root exists");
         assert_eq!(tree.get_at_root(r1, key).expect("get h1"), Some(vec![1]));
         assert_eq!(tree.get_at_root(r2, key).expect("get h2"), Some(vec![2]));
+    }
+
+    #[test]
+    fn root_for_in_progress_blockhash_is_visible() {
+        let (_dir, tree) = new_tree();
+        let key = b"essentials:/in-progress";
+        let value = vec![9u8];
+
+        let genesis = BlockHash::from_byte_array([0u8; 32]);
+        let h1 = BlockHash::from_byte_array([7u8; 32]);
+
+        tree.begin_block(1, &h1, &genesis).expect("begin block");
+        tree.apply_batch(&[(key.to_vec(), Some(value.clone()))]).expect("apply");
+
+        let in_progress_root = tree.root_for_blockhash(&h1).expect("root lookup").expect("root");
+        assert_eq!(tree.get_at_root(in_progress_root, key).expect("get in-progress"), Some(value),);
+
+        tree.finish_block().expect("finish block");
     }
 }

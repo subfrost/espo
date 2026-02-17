@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use crate::alkanes::trace::{EspoBlock, EspoSandshrewLikeTraceEvent};
 use crate::config::{debug_enabled, get_metashrew, get_network};
 use crate::debug;
@@ -114,16 +115,21 @@ impl Essentials {
     fn load_index_height(&self) -> Result<Option<u32>> {
         let resp = self
             .provider()
-            .get_index_height(crate::modules::essentials::storage::GetIndexHeightParams)?;
+            .get_index_height(crate::modules::essentials::storage::GetIndexHeightParams {
+                blockhash: StateAt::Latest,
+            })?;
         Ok(resp.height)
     }
 
-    fn persist_index_height(&self, height: u32) -> Result<()> {
+    fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
         self.provider()
-            .set_index_height(crate::modules::essentials::storage::SetIndexHeightParams { height })
+            .set_index_height(crate::modules::essentials::storage::SetIndexHeightParams {
+                blockhash,
+                height,
+            })
     }
 
-    fn set_index_height(&self, new_height: u32) -> Result<()> {
+    fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
         if let Some(prev) = *self.index_height.read().unwrap() {
             if new_height < prev {
                 eprintln!(
@@ -132,7 +138,7 @@ impl Essentials {
                 );
             }
         }
-        self.persist_index_height(new_height)?;
+        self.persist_index_height(new_height, blockhash)?;
         *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
@@ -173,6 +179,7 @@ impl EspoModule for Essentials {
         let provider = self.provider();
         let table = provider.table();
         let height = block.height;
+        let block_hash = block.block_header.block_hash();
         if let Some(prev) = *self.index_height.read().unwrap() {
             if height <= prev {
                 eprintln!("[ESSENTIALS] skipping already indexed block #{height} (last={prev})");
@@ -437,7 +444,10 @@ impl EspoModule for Essentials {
                         } else {
                             let key = table.orbital_collection_name_key(&factory_id);
                             let name = provider
-                                .get_raw_value(GetRawValueParams { key })
+                                .get_raw_value(GetRawValueParams {
+                                    blockhash: StateAt::Block(block_hash),
+                                    key,
+                                })
                                 .ok()
                                 .and_then(|resp| resp.value)
                                 .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -531,7 +541,10 @@ impl EspoModule for Essentials {
             let alkanes: Vec<SchemaAlkaneId> = created_records.iter().map(|r| r.alkane).collect();
             let existing = provider
                 .get_creation_records_by_id(
-                    crate::modules::essentials::storage::GetCreationRecordsByIdParams { alkanes },
+                    crate::modules::essentials::storage::GetCreationRecordsByIdParams {
+                        blockhash: StateAt::Block(block_hash),
+                        alkanes,
+                    },
                 )?
                 .records;
             let id_keys: Vec<Vec<u8>> = created_records
@@ -630,6 +643,7 @@ impl EspoModule for Essentials {
             }
             let Some(mut rec) = provider
                 .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
+                    blockhash: StateAt::Block(block_hash),
                     alkane: *alk,
                 })
                 .ok()
@@ -712,7 +726,9 @@ impl EspoModule for Essentials {
         let mut creation_count_row: Option<[u8; 8]> = None;
         if new_creations_added > 0 {
             let current = provider
-                .get_creation_count(crate::modules::essentials::storage::GetCreationCountParams)?
+                .get_creation_count(crate::modules::essentials::storage::GetCreationCountParams {
+                    blockhash: StateAt::Block(block_hash),
+                })?
                 .count;
             let updated = current.saturating_add(new_creations_added);
             creation_count_row = Some(updated.to_le_bytes());
@@ -763,6 +779,7 @@ impl EspoModule for Essentials {
         debug::log_elapsed(module, "prepare_batch", timer);
         let timer = debug::start_if(debug);
         if let Err(e) = provider.set_batch(crate::modules::essentials::storage::SetBatchParams {
+            blockhash: StateAt::Latest,
             puts,
             deletes: Vec::new(),
         }) {
@@ -788,7 +805,7 @@ impl EspoModule for Essentials {
             "[ESSENTIALS] block #{} indexed {} key/value updates (deduped); new alkanes {}",
             block.height, total_pairs_dedup, new_alkanes_saved
         );
-        self.set_index_height(block.height)?;
+        self.set_index_height(block.height, StateAt::Latest)?;
         eprintln!(
             "[indexer] module={} height={} index_block done in {:?}",
             self.get_name(),

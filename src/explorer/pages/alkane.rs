@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use hex;
@@ -28,7 +29,7 @@ use crate::modules::essentials::utils::balances::{
     get_transfer_volume_for_alkane,
 };
 use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
-use crate::modules::pizzafun::storage::PizzafunProvider;
+use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
 use std::collections::HashSet;
@@ -130,7 +131,14 @@ pub async fn alkane_page(
         let series_id = {
             let pizzafun_mdb = Arc::new(Mdb::from_db(Arc::clone(&db), b"pizzafun:"));
             let pizzafun = PizzafunProvider::new(pizzafun_mdb);
-            pizzafun.get_series_by_alkane(&alk).ok().flatten().map(|e| e.series_id)
+            pizzafun
+                .get_series_by_alkane(GetSeriesByAlkaneParams {
+                    blockhash: StateAt::Latest,
+                    alkane: alk,
+                })
+                .ok()
+                .flatten()
+                .map(|e| e.series_id)
         };
 
         let has_market_chart = {
@@ -153,7 +161,8 @@ pub async fn alkane_page(
 
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
                 amm_provider
-                    .get_list_keys_by_prefix(GetListKeysByPrefixParams { prefix: rel_prefix })
+                    .get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest, prefix: rel_prefix })
                     .map(|res| !res.keys.is_empty())
                     .unwrap_or(false)
             };
@@ -756,7 +765,8 @@ fn proxy_target_from_db(
 ) -> Option<SchemaAlkaneId> {
     let lookup = |key| {
         provider
-            .get_raw_value(GetRawValueParams { key: kv_row_key(alk, key) })
+            .get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest, key: kv_row_key(alk, key) })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| {

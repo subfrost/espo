@@ -1,3 +1,4 @@
+use crate::runtime::state_at::StateAt;
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
@@ -48,7 +49,9 @@ pub fn fetch_all_pools(
     provider: &AmmDataProvider,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
     provider
-        .get_reserves_snapshot(GetReservesSnapshotParams)?
+        .get_reserves_snapshot(GetReservesSnapshotParams {
+            blockhash: StateAt::Latest,
+        })?
         .snapshot
         .ok_or(anyhow!("AMMDATA ERROR: Failed to fetch all pools"))
 }
