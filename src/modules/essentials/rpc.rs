@@ -728,6 +728,26 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
     }
 
     {
+        let reg_debug_timers = reg.clone();
+        tokio::spawn(async move {
+            reg_debug_timers
+                .register("get_debug_timer_totals", move |_cx, payload| async move {
+                    let limit = payload.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+                    let snapshot = crate::debug::get_timer_totals(limit);
+                    json!({
+                        "ok": true,
+                        "timers": snapshot.entries,
+                        "returned": snapshot.entries.len(),
+                        "total_entries": snapshot.total_entries,
+                        "total_ms": snapshot.total_ms,
+                        "total_calls": snapshot.total_calls,
+                    })
+                })
+                .await;
+        });
+    }
+
+    {
         let reg_ping = reg.clone();
         let mdb_ping = Arc::clone(&mdb);
         tokio::spawn(async move {

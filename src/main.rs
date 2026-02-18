@@ -370,6 +370,12 @@ async fn run_indexer_loop(
                             }
                         }
                     }
+                    if let Err(e) = crate::debug::flush_timer_totals() {
+                        eprintln!(
+                            "[debug] failed to flush timer totals at height {}: {}",
+                            next_height, e
+                        );
+                    }
 
                     match purge_confirmed_txids(&block_txids) {
                         Ok(removed) => {
