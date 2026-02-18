@@ -46,12 +46,11 @@ use crate::explorer::run_explorer;
 use crate::{
     alkanes::{trace::get_espo_block, utils::get_safe_tip},
     config::{
-        get_aof_manager, get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config,
-        init_config, update_safe_tip,
+        get_bitcoind_rpc_client, get_config, get_espo_db, get_module_config, init_config,
+        update_safe_tip,
     },
     consts::alkanes_genesis_block,
     modules::defs::ModuleRegistry,
-    runtime::aof::AOF_REORG_DEPTH,
     runtime::mdb::Mdb,
     runtime::mempool::{
         purge_confirmed_from_chain, purge_confirmed_txids, reset_mempool_store, run_mempool_service,
@@ -64,9 +63,7 @@ use bitcoincore_rpc::RpcApi;
 pub use espo::{ESPO_HEIGHT, SAFE_TIP};
 use tokio::runtime::Builder as TokioBuilder;
 
-fn should_watch_for_reorg(next_height: u32, safe_tip: u32) -> bool {
-    safe_tip.saturating_sub(next_height) <= AOF_REORG_DEPTH
-}
+const NO_REWIND: u32 = u32::MAX;
 
 fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> std::io::Result<()> {
     let db_root = Path::new(db_path);
@@ -91,58 +88,106 @@ fn run_debug_backup(db_path: &str, backup: &DebugBackupConfig, block: u32) -> st
     Ok(())
 }
 
-fn check_and_handle_reorg(next_height: u32, safe_tip: u32) -> Option<u32> {
-    if !should_watch_for_reorg(next_height, safe_tip) {
+fn detect_first_divergence_height(
+    indexed_tip: u32,
+    safe_tip: u32,
+    genesis_height: u32,
+) -> Option<u32> {
+    let Some(tree) = get_global_tree_db() else { return None };
+    let check_tip = indexed_tip.min(safe_tip);
+    if check_tip < genesis_height {
         return None;
     }
-    let Some(tree) = get_global_tree_db() else { return None };
-
     let rpc = get_bitcoind_rpc_client();
-    let from_height = safe_tip.saturating_sub(AOF_REORG_DEPTH.saturating_sub(1));
-    let mut mismatch_from: Option<u32> = None;
-    for h in from_height..=safe_tip {
+
+    let mut h = check_tip;
+    loop {
         let chain_hash = match rpc.get_block_hash(h as u64) {
             Ok(hash) => hash,
             Err(e) => {
-                eprintln!("[tree] failed to fetch block hash for {}: {e:?}", h);
+                eprintln!("[reorg] failed to fetch chain hash at {}: {e:?}", h);
                 return None;
             }
         };
         let indexed_hash = match tree.blockhash_for_height(h) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[tree] failed to fetch indexed hash for {}: {e:?}", h);
+                eprintln!("[reorg] failed to read indexed hash at {}: {e:?}", h);
                 return None;
             }
         };
-        match indexed_hash {
-            Some(stored) if stored == chain_hash => {}
-            _ => {
-                mismatch_from = Some(h);
-                break;
+
+        if matches!(indexed_hash, Some(stored) if stored == chain_hash) {
+            if h == check_tip {
+                return None;
+            }
+            return Some(h.saturating_add(1));
+        }
+
+        if h == genesis_height {
+            return Some(genesis_height);
+        }
+        h = h.saturating_sub(1);
+    }
+}
+
+async fn run_reorg_poller(
+    rewind_target: Arc<AtomicU32>,
+    shutdown_requested: Arc<AtomicBool>,
+    genesis_height: u32,
+) {
+    const REORG_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+    loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let safe_tip = match get_safe_tip() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[reorg] failed to fetch safe tip: {e:?}");
+                tokio::time::sleep(REORG_POLL_INTERVAL).await;
+                continue;
+            }
+        };
+        update_safe_tip(safe_tip);
+
+        let indexed_tip = ESPO_HEIGHT
+            .get()
+            .map(|h| h.load(Ordering::Relaxed).saturating_sub(1))
+            .unwrap_or(genesis_height.saturating_sub(1));
+
+        if indexed_tip < safe_tip {
+            tokio::time::sleep(REORG_POLL_INTERVAL).await;
+            continue;
+        }
+
+        if let Some(divergence_height) =
+            detect_first_divergence_height(indexed_tip, safe_tip, genesis_height)
+        {
+            let mut current = rewind_target.load(Ordering::Relaxed);
+            while divergence_height < current {
+                match rewind_target.compare_exchange(
+                    current,
+                    divergence_height,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        eprintln!(
+                            "[reorg] detected divergence at height {} (indexed_tip={}, safe_tip={})",
+                            divergence_height, indexed_tip, safe_tip
+                        );
+                        break;
+                    }
+                    Err(observed) => current = observed,
+                }
             }
         }
+
+        tokio::time::sleep(REORG_POLL_INTERVAL).await;
     }
-    let Some(rewind_height) = mismatch_from else {
-        return None;
-    };
-
-    let old_tip = next_height.saturating_sub(1);
-    eprintln!(
-        "[tree] detected reorg near height {} (safe tip {}); rewinding to {}",
-        next_height, safe_tip, rewind_height
-    );
-
-    if let Err(e) = tree.pin_active_root_until_height(old_tip) {
-        eprintln!("[tree] failed to pin active root through height {}: {e:?}", old_tip);
-        return None;
-    }
-
-    if let Err(e) = reset_mempool_store() {
-        eprintln!("[mempool] failed to reset store after reorg: {e:?}");
-    }
-
-    Some(rewind_height)
 }
 
 fn run_safe_tip_hook(script: &str, next_height: u32, tip: u32) {
@@ -189,10 +234,13 @@ async fn run_indexer_loop(
     shutdown_requested: Arc<AtomicBool>,
 ) {
     const POLL_INTERVAL: Duration = Duration::from_secs(5);
+    let genesis_height = alkanes_genesis_block(network);
+    let rewind_target = Arc::new(AtomicU32::new(NO_REWIND));
     let mut last_tip: Option<u32> = None;
     let mut mempool_started = false;
     let mut logged_start = false;
     let mut safe_tip_hook_ran = false;
+    let mut reorg_poller_started = false;
     if cfg.reset_mempool_on_startup {
         if let Err(e) = reset_mempool_store() {
             eprintln!("[mempool] failed to reset store on startup: {e:?}");
@@ -213,6 +261,18 @@ async fn run_indexer_loop(
     loop {
         if shutdown_requested.load(Ordering::Relaxed) {
             break;
+        }
+
+        let requested_rewind = rewind_target.swap(NO_REWIND, Ordering::SeqCst);
+        if requested_rewind != NO_REWIND && requested_rewind < next_height {
+            next_height = requested_rewind;
+            if let Some(h) = ESPO_HEIGHT.get() {
+                h.store(next_height, Ordering::Relaxed);
+            }
+            if let Err(e) = reset_mempool_store() {
+                eprintln!("[mempool] failed to reset store after reorg switch: {e:?}");
+            }
+            eprintln!("[reorg] switching indexer to height {}", next_height);
         }
 
         if let Err(e) = metashrew_sdb.catch_up_now() {
@@ -367,14 +427,15 @@ async fn run_indexer_loop(
                     run_safe_tip_hook(script, next_height, tip);
                 }
             }
-            if let Some(new_next) = check_and_handle_reorg(next_height, tip) {
-                if new_next < next_height {
-                    next_height = new_next;
-                    if let Some(h) = ESPO_HEIGHT.get() {
-                        h.store(next_height, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    eprintln!("[aof] rollback complete, restarting from height {}", next_height);
-                }
+            if !reorg_poller_started {
+                reorg_poller_started = true;
+                let shutdown_for_poller = shutdown_requested.clone();
+                let rewind_target_for_poller = rewind_target.clone();
+                tokio::spawn(async move {
+                    eprintln!("[reorg] poller started (10s cadence) after reaching safe tip");
+                    run_reorg_poller(rewind_target_for_poller, shutdown_for_poller, genesis_height)
+                        .await;
+                });
             }
             // Caught up; chill then poll again
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -420,35 +481,8 @@ async fn main() -> Result<()> {
     }
     let metashrew_sdb = get_metashrew_sdb();
 
-    if cfg.simulate_reorg {
-        if view_only {
-            eprintln!("[aof] simulate-reorg ignored in view-only mode");
-        } else {
-            match get_aof_manager() {
-                Some(aof) => match aof.revert_all_blocks() {
-                    Ok(Some(h)) => {
-                        eprintln!(
-                            "[aof] simulate-reorg: reverted through height {}, will reindex",
-                            h
-                        );
-                        if let Err(e) = reset_mempool_store() {
-                            eprintln!(
-                                "[mempool] failed to reset store after simulated reorg: {e:?}"
-                            );
-                        }
-                    }
-                    Ok(None) => eprintln!("[aof] simulate-reorg set but no AOF logs to revert"),
-                    Err(e) => eprintln!("[aof] simulate-reorg failed: {e:?}"),
-                },
-                None => {
-                    eprintln!("[aof] simulate-reorg set but AOF is disabled; nothing to revert")
-                }
-            }
-        }
-    }
-
     // Build module registry with the global ESPO DB
-    let mut mods = ModuleRegistry::with_db_and_aof(get_espo_db(), get_aof_manager());
+    let mut mods = ModuleRegistry::with_db(get_espo_db());
     // Essentials must run before any optional modules.
     mods.register_module(Essentials::new());
     mods.register_module(Pizzafun::new());

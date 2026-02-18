@@ -1,4 +1,3 @@
-use crate::runtime::state_at::StateAt;
 use super::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaMarketDefs,
     SchemaPoolCreationInfoV1, SchemaPoolDetailsSnapshot, SchemaPoolMetricsV1, SchemaPoolMetricsV2,
@@ -23,6 +22,7 @@ use crate::modules::ammdata::utils::pathfinder::{
 use crate::modules::essentials::storage::EssentialsProvider;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListPointer};
+use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
@@ -96,6 +96,8 @@ pub struct AmmDataTable<'a> {
     pub POOL_NAME_INDEX: ListPointer<'a>,
     // Factory + pool indices.
     pub AMM_FACTORIES: ListPointer<'a>,
+    pub FACTORY_BOOTSTRAP_CREATION_COUNT: KvPointer<'a>,
+    pub POOL_BOOTSTRAP_CREATION_COUNT: KvPointer<'a>,
     pub FACTORY_POOLS: ListPointer<'a>,
     pub POOL_FACTORY: KvPointer<'a>,
     pub POOL_METRICS: KvPointer<'a>,
@@ -146,6 +148,8 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_DERIVED_SEARCH_INDEX: root.list_keyword("/token_search_index/derived/v1/"),
             POOL_NAME_INDEX: root.list_keyword("/pool_name_index/"),
             AMM_FACTORIES: root.list_keyword("/amm_factories/v1/"),
+            FACTORY_BOOTSTRAP_CREATION_COUNT: root.keyword("/bootstrap/factories/creation_count/v1"),
+            POOL_BOOTSTRAP_CREATION_COUNT: root.keyword("/bootstrap/pools/creation_count/v1"),
             FACTORY_POOLS: root.list_keyword("/factory_pools/v1/"),
             POOL_FACTORY: root.keyword("/pool_factory/v1/"),
             POOL_METRICS: root.keyword("/pool_metrics/v1/"),
@@ -919,6 +923,14 @@ impl<'a> AmmDataTable<'a> {
         self.AMM_FACTORIES.select(&suffix).key().to_vec()
     }
 
+    pub fn factory_bootstrap_creation_count_key(&self) -> Vec<u8> {
+        self.FACTORY_BOOTSTRAP_CREATION_COUNT.key().to_vec()
+    }
+
+    pub fn pool_bootstrap_creation_count_key(&self) -> Vec<u8> {
+        self.POOL_BOOTSTRAP_CREATION_COUNT.key().to_vec()
+    }
+
     pub fn factory_pools_key(&self, factory: &SchemaAlkaneId, pool: &SchemaAlkaneId) -> Vec<u8> {
         let mut suffix = Vec::with_capacity(12 + 1 + 12);
         suffix.extend_from_slice(&factory.block.to_be_bytes());
@@ -1287,12 +1299,13 @@ fn read_address_pool_events(
     offset: usize,
     limit: usize,
 ) -> Result<GetAddressPoolEventsPageResult> {
-    let entries =
-        match provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() }) {
-            Ok(v) => v.entries,
-            Err(_) => Vec::new(),
-        };
+    let entries = match provider.get_list_entries_desc(GetListEntriesDescParams {
+        blockhash: StateAt::Latest,
+        prefix: prefix.clone(),
+    }) {
+        Ok(v) => v.entries,
+        Err(_) => Vec::new(),
+    };
 
     let mut parsed: Vec<AddressPoolEventEntry> = Vec::new();
     for (k, _v) in entries {
@@ -1330,12 +1343,13 @@ fn read_amm_history(
     limit: usize,
     kind_filter: Option<ActivityKind>,
 ) -> Result<GetAmmHistoryPageResult> {
-    let entries =
-        match provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() }) {
-            Ok(v) => v.entries,
-            Err(_) => Vec::new(),
-        };
+    let entries = match provider.get_list_entries_desc(GetListEntriesDescParams {
+        blockhash: StateAt::Latest,
+        prefix: prefix.clone(),
+    }) {
+        Ok(v) => v.entries,
+        Err(_) => Vec::new(),
+    };
 
     let mut total = 0usize;
     let mut out = Vec::new();
@@ -1429,7 +1443,10 @@ impl AmmDataProvider {
 
     /// Load the most recent BTC/USD price recorded by the ammdata indexer.
     /// This is intended for read-paths (RPC / API), so it never calls external price feeds.
-    pub fn get_latest_btc_usd_price(&self, params: GetLatestBtcUsdPriceParams) -> Result<Option<u128>> {
+    pub fn get_latest_btc_usd_price(
+        &self,
+        params: GetLatestBtcUsdPriceParams,
+    ) -> Result<Option<u128>> {
         let table = self.table();
         let rel_prefix = table.btc_usd_price_prefix();
         let entries = self
@@ -1453,16 +1470,6 @@ impl AmmDataProvider {
         self.essentials.as_ref()
     }
 
-    fn raw_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.view_blockhash {
-            Some(blockhash) => self
-                .mdb
-                .get_at_blockhash(&blockhash, key)
-                .map_err(|e| anyhow!("mdb.get_at_blockhash failed: {e}")),
-            None => self.mdb.get(key).map_err(|e| anyhow!("mdb.get failed: {e}")),
-        }
-    }
-
     fn raw_get_at(&self, key: &[u8], blockhash: Option<BlockHash>) -> Result<Option<Vec<u8>>> {
         match blockhash {
             Some(blockhash) => self
@@ -1475,13 +1482,7 @@ impl AmmDataProvider {
 
     fn raw_multi_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
         match self.view_blockhash {
-            Some(_) => {
-                let mut out = Vec::with_capacity(keys.len());
-                for key in keys {
-                    out.push(self.raw_get(key)?);
-                }
-                Ok(out)
-            }
+            Some(blockhash) => self.raw_multi_get_at(keys, Some(blockhash)),
             None => self.mdb.multi_get(keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}")),
         }
     }
@@ -1492,13 +1493,10 @@ impl AmmDataProvider {
         blockhash: Option<BlockHash>,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         match blockhash {
-            Some(blockhash) => {
-                let mut out = Vec::with_capacity(keys.len());
-                for key in keys {
-                    out.push(self.raw_get_at(key, Some(blockhash))?);
-                }
-                Ok(out)
-            }
+            Some(blockhash) => self
+                .mdb
+                .multi_get_at_blockhash(&blockhash, keys)
+                .map_err(|e| anyhow!("mdb.multi_get_at_blockhash failed: {e}")),
             None => self.mdb.multi_get(keys).map_err(|e| anyhow!("mdb.multi_get failed: {e}")),
         }
     }
@@ -1528,7 +1526,8 @@ impl AmmDataProvider {
     }
 
     pub fn get_multi_values(&self, params: GetMultiValuesParams) -> Result<GetMultiValuesResult> {
-        let values = self.raw_multi_get_at(&params.keys, params.blockhash.resolve(self.view_blockhash))?;
+        let values =
+            self.raw_multi_get_at(&params.keys, params.blockhash.resolve(self.view_blockhash))?;
         Ok(GetMultiValuesResult { values })
     }
 
@@ -1536,7 +1535,10 @@ impl AmmDataProvider {
         &self,
         params: GetListKeysByPrefixParams,
     ) -> Result<GetListKeysByPrefixResult> {
-        let keys = self.raw_scan_prefix_keys_at(&params.prefix, params.blockhash.resolve(self.view_blockhash))?;
+        let keys = self.raw_scan_prefix_keys_at(
+            &params.prefix,
+            params.blockhash.resolve(self.view_blockhash),
+        )?;
         Ok(GetListKeysByPrefixResult { keys })
     }
 
@@ -1600,8 +1602,8 @@ impl AmmDataProvider {
     pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
-        let Some(bytes) =
-            self.raw_get_at(table.INDEX_HEIGHT.key(), params.blockhash.resolve(self.view_blockhash))?
+        let Some(bytes) = self
+            .raw_get_at(table.INDEX_HEIGHT.key(), params.blockhash.resolve(self.view_blockhash))?
         else {
             return Ok(GetIndexHeightResult { height: None });
         };
@@ -1678,8 +1680,7 @@ impl AmmDataProvider {
                 puts.push((table.reserves_snapshot_pool_key(pool), enc));
             }
         }
-        self.set_batch(SetBatchParams {
-            blockhash: StateAt::Latest, puts, deletes: Vec::new() })
+        self.set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes: Vec::new() })
     }
 
     pub fn get_canonical_pools(
@@ -1691,7 +1692,9 @@ impl AmmDataProvider {
         let prefix = table.canonical_pool_token_prefix(&params.token);
         let keys = self
             .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
             .map(|v| v.keys)
             .unwrap_or_default();
         if keys.is_empty() {
@@ -1699,7 +1702,9 @@ impl AmmDataProvider {
         }
         let values = self
             .get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: keys.clone() })
+                blockhash: StateAt::Latest,
+                keys: keys.clone(),
+            })
             .map(|v| v.values)
             .unwrap_or_default();
 
@@ -1731,8 +1736,7 @@ impl AmmDataProvider {
         let table = self.table();
         let prefix = table.token_usd_candle_ns_prefix(&params.token, params.timeframe);
         let entries = self
-            .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix })
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })
             .ok()
             .map(|resp| resp.entries)
             .unwrap_or_default();
@@ -1752,7 +1756,9 @@ impl AmmDataProvider {
         let table = self.table();
         let metrics = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.token_metrics_key(&params.token) })
+                blockhash: StateAt::Latest,
+                key: table.token_metrics_key(&params.token),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_token_metrics(&raw).ok())
@@ -1768,7 +1774,7 @@ impl AmmDataProvider {
         let table = self.table();
         let metrics = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                blockhash: StateAt::Latest,
                 key: table.token_derived_metrics_key(&params.token, &params.quote),
             })
             .ok()
@@ -1829,14 +1835,18 @@ impl AmmDataProvider {
         let prefix = table.token_metrics_index_prefix(params.field);
         let keys = if params.desc {
             self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default()
         } else {
             self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.keys)
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.keys)
+            .unwrap_or_default()
         };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
@@ -1866,14 +1876,18 @@ impl AmmDataProvider {
         let prefix = table.token_derived_metrics_index_prefix(&params.quote, params.field);
         let keys = if params.desc {
             self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default()
         } else {
             self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.keys)
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.keys)
+            .unwrap_or_default()
         };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
@@ -1904,7 +1918,9 @@ impl AmmDataProvider {
         let table = self.table();
         let count = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.token_metrics_index_count_key() })
+                blockhash: StateAt::Latest,
+                key: table.token_metrics_index_count_key(),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| {
@@ -1928,7 +1944,7 @@ impl AmmDataProvider {
         let table = self.table();
         let count = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                blockhash: StateAt::Latest,
                 key: table.token_derived_metrics_index_count_key(&params.quote),
             })?
             .value
@@ -1954,14 +1970,18 @@ impl AmmDataProvider {
         let prefix = table.token_search_index_prefix(params.field, &params.prefix);
         let keys = if params.desc {
             self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default()
         } else {
             self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.keys)
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.keys)
+            .unwrap_or_default()
         };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
@@ -1992,14 +2012,18 @@ impl AmmDataProvider {
             table.token_derived_search_index_prefix(&params.quote, params.field, &params.prefix);
         let keys = if params.desc {
             self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.entries.into_iter().map(|(k, _)| k).collect())
+            .unwrap_or_default()
         } else {
             self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-                .map(|resp| resp.keys)
-                .unwrap_or_default()
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.keys)
+            .unwrap_or_default()
         };
         let mut out: Vec<SchemaAlkaneId> = Vec::new();
         let mut skipped: u64 = 0;
@@ -2076,10 +2100,10 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_factory_pools");
         let table = self.table();
         let prefix = table.factory_pools_prefix(&params.factory);
-        let keys = match self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-        {
+        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        }) {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -2097,7 +2121,9 @@ impl AmmDataProvider {
         let table = self.table();
         let defs = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.pools_key(&params.pool) })
+                blockhash: StateAt::Latest,
+                key: table.pools_key(&params.pool),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| SchemaMarketDefs::try_from_slice(&raw).ok());
@@ -2109,7 +2135,9 @@ impl AmmDataProvider {
         let table = self.table();
         let factory = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.pool_factory_key(&params.pool) })
+                blockhash: StateAt::Latest,
+                key: table.pool_factory_key(&params.pool),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_alkane_id_be(&raw));
@@ -2121,7 +2149,9 @@ impl AmmDataProvider {
         let table = self.table();
         let metrics = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.pool_metrics_key(&params.pool) })
+                blockhash: StateAt::Latest,
+                key: table.pool_metrics_key(&params.pool),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_pool_metrics(&raw).ok())
@@ -2137,7 +2167,9 @@ impl AmmDataProvider {
         let table = self.table();
         let metrics = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.pool_metrics_v2_key(&params.pool) })
+                blockhash: StateAt::Latest,
+                key: table.pool_metrics_v2_key(&params.pool),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_pool_metrics_v2(&raw).ok());
@@ -2152,7 +2184,9 @@ impl AmmDataProvider {
         let table = self.table();
         let info = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.pool_creation_info_key(&params.pool) })
+                blockhash: StateAt::Latest,
+                key: table.pool_creation_info_key(&params.pool),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_pool_creation_info(&raw).ok());
@@ -2167,7 +2201,9 @@ impl AmmDataProvider {
         let table = self.table();
         let supply = self
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.pool_lp_supply_latest_key(&params.pool) })
+                blockhash: StateAt::Latest,
+                key: table.pool_lp_supply_latest_key(&params.pool),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| decode_u128_value(&raw).ok())
@@ -2195,7 +2231,9 @@ impl AmmDataProvider {
         ];
         let values = self
             .get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: keys.clone() })
+                blockhash: StateAt::Latest,
+                keys: keys.clone(),
+            })
             .ok()
             .map(|resp| resp.values)
             .unwrap_or_default();
@@ -2240,8 +2278,9 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_pool_activity_entries");
         let table = self.table();
         let prefix = table.activity_ns_prefix(&params.pool);
-        let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix }) {
+        let entries = match self
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })
+        {
             Ok(v) => v.entries,
             Err(_) => Vec::new(),
         };
@@ -2291,8 +2330,7 @@ impl AmmDataProvider {
         let table = self.table();
         let key = table.activity_key(&params.pool, params.ts, params.seq);
         let entry = self
-            .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
             .value
             .and_then(|raw| decode_activity_v1(&raw).ok());
         Ok(GetActivityEntryResult { entry })
@@ -2305,12 +2343,13 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_swaps_page");
         let table = self.table();
         let prefix = table.token_swaps_prefix(&params.token);
-        let entries =
-            match self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() }) {
-                Ok(v) => v.entries,
-                Err(_) => Vec::new(),
-            };
+        let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
 
         let mut parsed: Vec<TokenSwapEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2347,12 +2386,13 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_pool_creations_page");
         let table = self.table();
         let prefix = table.pool_creations_prefix();
-        let entries =
-            match self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() }) {
-                Ok(v) => v.entries,
-                Err(_) => Vec::new(),
-            };
+        let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
 
         let mut parsed: Vec<PoolCreationEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2389,12 +2429,13 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_address_pool_swaps_page");
         let table = self.table();
         let prefix = table.address_pool_swaps_prefix(&params.address_spk, &params.pool);
-        let entries =
-            match self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() }) {
-                Ok(v) => v.entries,
-                Err(_) => Vec::new(),
-            };
+        let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
 
         let mut parsed: Vec<AddressPoolSwapEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2424,12 +2465,13 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_address_token_swaps_page");
         let table = self.table();
         let prefix = table.address_token_swaps_prefix(&params.address_spk, &params.token);
-        let entries =
-            match self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() }) {
-                Ok(v) => v.entries,
-                Err(_) => Vec::new(),
-            };
+        let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        }) {
+            Ok(v) => v.entries,
+            Err(_) => Vec::new(),
+        };
 
         let mut parsed: Vec<AddressTokenSwapEntry> = Vec::new();
         for (k, _v) in entries {
@@ -2514,10 +2556,10 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_token_pools");
         let table = self.table();
         let prefix = table.token_pools_prefix(&params.token);
-        let keys = match self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })
-        {
+        let keys = match self.get_list_keys_by_prefix(GetListKeysByPrefixParams {
+            blockhash: StateAt::Latest,
+            prefix: prefix.clone(),
+        }) {
             Ok(v) => v.keys,
             Err(_) => Vec::new(),
         };
@@ -2541,8 +2583,9 @@ impl AmmDataProvider {
         crate::debug_timer_log!("get_tvl_versioned_at_or_before");
         let table = self.table();
         let prefix = table.tvl_versioned_prefix(&params.pool);
-        let entries = match self.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix }) {
+        let entries = match self
+            .get_list_entries_desc(GetListEntriesDescParams { blockhash: StateAt::Latest, prefix })
+        {
             Ok(v) => v.entries,
             Err(_) => Vec::new(),
         };
@@ -2568,16 +2611,21 @@ impl AmmDataProvider {
         for cq in canonical_quotes(get_network()) {
             unit_map.insert(cq.id, cq.unit);
         }
-        let pools =
-            self.get_canonical_pools(GetCanonicalPoolsParams {
-            blockhash: StateAt::Latest, token: params.token })?.pools;
+        let pools = self
+            .get_canonical_pools(GetCanonicalPoolsParams {
+                blockhash: StateAt::Latest,
+                token: params.token,
+            })?
+            .pools;
         for entry in pools {
             let unit = match unit_map.get(&entry.quote_id) {
                 Some(u) => *u,
                 None => continue,
             };
             let defs = match self.get_pool_defs(GetPoolDefsParams {
-            blockhash: StateAt::Latest, pool: entry.pool_id }) {
+                blockhash: StateAt::Latest,
+                pool: entry.pool_id,
+            }) {
                 Ok(res) => res.defs,
                 Err(_) => None,
             };
@@ -3082,16 +3130,15 @@ impl AmmDataProvider {
         &self,
         params: RpcGetAmmFactoriesParams,
     ) -> Result<RpcGetAmmFactoriesResult> {
-        let mut factories = match self.get_amm_factories(GetAmmFactoriesParams {
-            blockhash: StateAt::Latest,
-        }) {
-            Ok(res) => res.factories,
-            Err(e) => {
-                return Ok(RpcGetAmmFactoriesResult {
-                    value: json!({ "ok": false, "error": format!("read_failed: {e}") }),
-                });
-            }
-        };
+        let mut factories =
+            match self.get_amm_factories(GetAmmFactoriesParams { blockhash: StateAt::Latest }) {
+                Ok(res) => res.factories,
+                Err(e) => {
+                    return Ok(RpcGetAmmFactoriesResult {
+                        value: json!({ "ok": false, "error": format!("read_failed: {e}") }),
+                    });
+                }
+            };
 
         factories.sort();
         let total = factories.len();
@@ -4216,7 +4263,9 @@ fn read_token_usd_candles_v1(
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
         .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: logical })?
+            blockhash: StateAt::Latest,
+            prefix: logical,
+        })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4313,7 +4362,9 @@ fn read_token_derived_usd_candles_v1(
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
         .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: logical })?
+            blockhash: StateAt::Latest,
+            prefix: logical,
+        })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4410,7 +4461,9 @@ fn read_token_derived_mcusd_candles_v1(
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
         .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: logical })?
+            blockhash: StateAt::Latest,
+            prefix: logical,
+        })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4506,7 +4559,9 @@ fn read_token_mcusd_candles_v1(
     let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
     for (k, v) in provider
         .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: logical })?
+            blockhash: StateAt::Latest,
+            prefix: logical,
+        })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -4601,7 +4656,9 @@ fn read_btc_usd_line_v1(
     let mut per_bucket: BTreeMap<u64, u128> = BTreeMap::new();
     for (k, v) in provider
         .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: logical })?
+            blockhash: StateAt::Latest,
+            prefix: logical,
+        })?
         .entries
     {
         if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {

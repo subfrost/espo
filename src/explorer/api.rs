@@ -274,7 +274,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
                 AmmDataProvider::new(ammdata_mdb, Arc::new(essentials_provider.clone()));
             let ids = ammdata_provider
                 .get_token_search_index_page(GetTokenSearchIndexPageParams {
-            blockhash: StateAt::Latest,
+                    blockhash: StateAt::Latest,
                     field: SearchIndexField::Holders,
                     prefix: query_norm.clone(),
                     offset: 0,
@@ -305,7 +305,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         if !used_search_index {
             let entries = essentials_provider
                 .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest,
+                    blockhash: StateAt::Latest,
                     prefix: table.alkane_holders_ordered_prefix(),
                 })
                 .map(|res| res.entries)
@@ -345,7 +345,7 @@ pub async fn search_guess(Query(q): Query<SearchGuessQuery>) -> Json<SearchGuess
         if matches < 5 {
             let ids = essentials_provider
                 .get_alkane_ids_by_name_prefix_page(GetAlkaneIdsByNamePrefixPageParams {
-            blockhash: StateAt::Latest,
+                    blockhash: StateAt::Latest,
                     prefix: query_norm.clone(),
                     offset: 0,
                     limit: 5,

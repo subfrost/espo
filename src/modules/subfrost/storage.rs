@@ -1,8 +1,8 @@
-use crate::runtime::state_at::StateAt;
 use super::consts::KEY_INDEX_HEIGHT;
 use super::schemas::SchemaWrapEventV1;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
+use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use anyhow::{Result, anyhow};
 use bitcoin::BlockHash;
@@ -360,10 +360,12 @@ impl SubfrostProvider {
         Ok(puts)
     }
 
-    pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
+    pub fn get_index_height(&self, params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("get_index_height");
         let table = self.table();
-        let Some(bytes) = self.raw_get(table.INDEX_HEIGHT.key())? else {
+        let Some(bytes) =
+            self.raw_get_at(table.INDEX_HEIGHT.key(), params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(GetIndexHeightResult { height: None });
         };
         if bytes.len() != 4 {
@@ -376,6 +378,9 @@ impl SubfrostProvider {
 
     pub fn set_index_height(&self, params: SetIndexHeightParams) -> Result<()> {
         crate::debug_timer_log!("set_index_height");
+        if params.blockhash.resolve(self.view_blockhash).is_some() {
+            return Err(anyhow!("cannot_write_historical_view"));
+        }
         let table = self.table();
         table.INDEX_HEIGHT.put(&params.height.to_le_bytes())
     }

@@ -1,26 +1,26 @@
-use crate::runtime::state_at::StateAt;
 use crate::alkanes::trace::{
     EspoBlock, EspoSandshrewLikeTraceEvent, EspoSandshrewLikeTraceShortId,
 };
-use crate::config::get_electrum_like;
+use crate::config::{debug_enabled, get_electrum_like};
 use crate::modules::ammdata::consts::CanonicalQuoteUnit;
 use crate::modules::ammdata::schemas::{
     ActivityKind, SchemaActivityV1, SchemaCanonicalPoolEntry, SchemaPoolCreationInfoV1,
 };
 use crate::modules::ammdata::storage::{
-    encode_pool_creation_info, encode_u128_value, AmmDataProvider,
+    AmmDataProvider, encode_pool_creation_info, encode_u128_value,
 };
 use crate::modules::ammdata::utils::index_state::IndexState;
 use crate::modules::ammdata::utils::reserves::{
-    extract_new_pools_from_espo_transaction, NewPoolInfo,
+    NewPoolInfo, extract_new_pools_from_espo_transaction,
 };
 use crate::modules::essentials::storage::{
-    load_tx_summary_v2, EssentialsProvider, GetCreationRecordParams,
-    GetCreationRecordsOrderedParams, GetLatestCirculatingSupplyParams,
+    EssentialsProvider, GetCreationIdsInBlockParams, GetCreationRecordParams,
+    GetLatestCirculatingSupplyParams, load_tx_summary_v2,
 };
 use crate::modules::essentials::utils::balances::{
     clean_espo_sandshrew_like_trace, get_alkane_balances,
 };
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::consensus::encode::deserialize;
@@ -98,6 +98,8 @@ fn parse_pool_defs_from_creation_summary(
 }
 
 pub fn bootstrap_pools_from_creation_records(
+    blockhash: StateAt,
+    height: u32,
     provider: &AmmDataProvider,
     essentials_meta: &EssentialsProvider,
     essentials_balances: &EssentialsProvider,
@@ -110,18 +112,35 @@ pub fn bootstrap_pools_from_creation_records(
     }
 
     let table = provider.table();
-    let records = essentials_meta
-        .get_creation_records_ordered(GetCreationRecordsOrderedParams {
-            blockhash: StateAt::Latest,
-        })?
-        .records;
-
+    let created_alkanes = essentials_meta
+        .get_creation_ids_in_block(GetCreationIdsInBlockParams {
+            blockhash: blockhash.clone(),
+            height,
+        })
+        .map(|resp| resp.alkanes)
+        .unwrap_or_default();
+    if created_alkanes.is_empty() {
+        return Ok(0);
+    }
     let mut inserted = 0usize;
-    for rec in records {
-        let pool_id = rec.alkane;
+    let mut scanned = 0usize;
+    let load_started = std::time::Instant::now();
+
+    for pool_id in created_alkanes {
+        scanned = scanned.saturating_add(1);
         if state.pools_map.contains_key(&pool_id) {
             continue;
         }
+        let Some(rec) = essentials_meta
+            .get_creation_record(GetCreationRecordParams {
+                blockhash: blockhash.clone(),
+                alkane: pool_id,
+            })
+            .ok()
+            .and_then(|resp| resp.record)
+        else {
+            continue;
+        };
 
         let txid = Txid::from_byte_array(rec.txid);
         let Some(summary) = load_tx_summary_v2(essentials_meta, &txid) else {
@@ -170,7 +189,8 @@ pub fn bootstrap_pools_from_creation_records(
             .push((table.pool_factory_key(&pool_id), factory_bytes));
 
         let mut pool_balances =
-            get_alkane_balances(essentials_balances, &pool_id).unwrap_or_default();
+            get_alkane_balances(blockhash.clone(), essentials_balances, &pool_id)
+                .unwrap_or_default();
         let base_reserve = pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
         let quote_reserve = pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
         state.reserves_snapshot.insert(
@@ -198,7 +218,12 @@ pub fn bootstrap_pools_from_creation_records(
                 .push(SchemaCanonicalPoolEntry { pool_id, quote_id: defs.base_alkane_id });
         }
 
-        let pool_label = get_alkane_label(essentials_meta, &mut state.alkane_label_cache, &pool_id);
+        let pool_label = get_alkane_label(
+            blockhash.clone(),
+            essentials_meta,
+            &mut state.alkane_label_cache,
+            &pool_id,
+        );
         let pool_name = crate::modules::ammdata::strip_lp_suffix(&pool_label);
         let pool_name_norm = pool_name.trim().to_ascii_lowercase();
         if !pool_name_norm.is_empty() {
@@ -210,10 +235,23 @@ pub fn bootstrap_pools_from_creation_records(
         inserted = inserted.saturating_add(1);
     }
 
+    let load_elapsed_ms = load_started.elapsed().as_millis();
+    if debug_enabled() || load_elapsed_ms >= 250 {
+        eprintln!(
+            "[debug] module=ammdata fn=bootstrap_pools_from_creation_records stage=load_creation_records blockhash={:?} height={} scanned={} inserted={} elapsed_ms={}",
+            blockhash,
+            height,
+            scanned,
+            inserted,
+            load_elapsed_ms
+        );
+    }
+
     Ok(inserted)
 }
 
 pub fn discover_new_pools(
+    blockhash: StateAt,
     block: &EspoBlock,
     block_ts: u64,
     height: u32,
@@ -303,6 +341,9 @@ pub fn discover_new_pools(
                 if !seen_new_pools.insert((pool_id.block, pool_id.tx)) {
                     continue;
                 }
+                if state.pools_map.contains_key(&pool_id) {
+                    continue;
+                }
                 let factory_from_call = pool_factory_by_id.get(&pool_id).copied();
                 let factory_id = factory_from_call.or(factory_id);
                 let factory_ok = factory_id.map(|id| amm_factories.contains(&id)).unwrap_or(false);
@@ -343,8 +384,12 @@ pub fn discover_new_pools(
                         .push(SchemaCanonicalPoolEntry { pool_id, quote_id: defs.base_alkane_id });
                 }
 
-                let pool_label =
-                    get_alkane_label(essentials, &mut state.alkane_label_cache, &pool_id);
+                let pool_label = get_alkane_label(
+                    blockhash.clone(),
+                    essentials,
+                    &mut state.alkane_label_cache,
+                    &pool_id,
+                );
                 let pool_name = crate::modules::ammdata::strip_lp_suffix(&pool_label);
                 let pool_name_norm = pool_name.trim().to_ascii_lowercase();
                 if !pool_name_norm.is_empty() {
@@ -410,13 +455,13 @@ pub fn discover_new_pools(
                 }
 
                 let mut pool_balances =
-                    get_alkane_balances(essentials, &pool_id).unwrap_or_default();
+                    get_alkane_balances(StateAt::Latest, essentials, &pool_id).unwrap_or_default();
                 let initial_token0_amount = pool_balances.remove(&defs.base_alkane_id).unwrap_or(0);
                 let initial_token1_amount =
                     pool_balances.remove(&defs.quote_alkane_id).unwrap_or(0);
                 let initial_lp_supply = essentials
                     .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
-            blockhash: StateAt::Latest,
+                        blockhash: StateAt::Latest,
                         alkane: pool_id,
                     })
                     .map(|res| res.supply)
@@ -510,6 +555,7 @@ pub fn discover_new_pools(
 }
 
 pub(crate) fn get_alkane_label(
+    blockhash: StateAt,
     essentials: &EssentialsProvider,
     cache: &mut HashMap<SchemaAlkaneId, String>,
     alkane: &SchemaAlkaneId,
@@ -519,7 +565,9 @@ pub(crate) fn get_alkane_label(
     }
     let label = essentials
         .get_creation_record(GetCreationRecordParams {
-            blockhash: StateAt::Latest, alkane: *alkane })
+            blockhash: blockhash.clone(),
+            alkane: *alkane,
+        })
         .ok()
         .and_then(|resp| resp.record)
         .and_then(|rec| rec.symbols.first().cloned().or_else(|| rec.names.first().cloned()))

@@ -49,9 +49,7 @@ pub fn fetch_all_pools(
     provider: &AmmDataProvider,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
     provider
-        .get_reserves_snapshot(GetReservesSnapshotParams {
-            blockhash: StateAt::Latest,
-        })?
+        .get_reserves_snapshot(GetReservesSnapshotParams { blockhash: StateAt::Latest })?
         .snapshot
         .ok_or(anyhow!("AMMDATA ERROR: Failed to fetch all pools"))
 }

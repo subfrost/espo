@@ -1,7 +1,8 @@
-use crate::runtime::state_at::StateAt;
 use crate::modules::ammdata::config::{DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE};
-use crate::modules::ammdata::price_feeds::{PriceFeed, UniswapPriceFeed};
+use crate::modules::ammdata::price_feeds::{
+    PriceFeed, UniswapPriceFeed, get_historical_btc_usd_price,
+};
 use crate::modules::ammdata::schemas::{
     SchemaCandleV1, SchemaCanonicalPoolEntry, SchemaFullCandleV1, SchemaTokenMetricsV1, Timeframe,
 };
@@ -17,6 +18,7 @@ use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetCreationRecordParams, GetRawValueParams as EssentialsGetRawValueParams,
 };
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,6 +30,7 @@ pub fn derive_token_data(
     essentials: &EssentialsProvider,
     canonical_quote_units: &HashMap<SchemaAlkaneId, CanonicalQuoteUnit>,
     derived_quotes: &[DerivedQuoteConfig],
+    use_historical_backfill: bool,
     search_index_enabled: bool,
     search_prefix_min: usize,
     search_prefix_max: usize,
@@ -43,30 +46,44 @@ pub fn derive_token_data(
     // ---------- btc/usd price ----------
     if state.has_trades {
         let mut price: Option<u128> = None;
-        match UniswapPriceFeed::from_global_config() {
-            Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
-                Ok(v) => price = Some(v),
+        if use_historical_backfill {
+            match get_historical_btc_usd_price(height as u64) {
+                Ok(Some(v)) => price = Some(v),
+                Ok(None) => {}
                 Err(e) => {
-                    eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
+                    eprintln!(
+                        "[AMMDATA] btc/usd historical backfill failed at height {height}: {e:?}"
+                    );
                 }
-            },
-            Err(e) => {
-                eprintln!("[AMMDATA] btc/usd price_feed init failed at height {height}: {e:?}")
             }
+        }
+        if price.is_none() {
+            match UniswapPriceFeed::from_global_config() {
+                Ok(feed) => match feed.get_bitcoin_price_usd_at_block_height(height as u64) {
+                    Ok(v) => price = Some(v),
+                    Err(e) => {
+                        eprintln!("[AMMDATA] btc/usd price_feed failed at height {height}: {e:?}");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[AMMDATA] btc/usd price_feed init failed at height {height}: {e:?}")
+                }
+            };
         }
 
         if price.is_none() {
             let key = table.btc_usd_price_key(height as u64);
             price = provider
-                .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
                 .value
                 .and_then(|raw| decode_u128_value(&raw).ok());
         }
         if price.is_none() {
             let prefix = table.btc_usd_price_prefix();
             if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix }) {
+                blockhash: StateAt::Latest,
+                prefix,
+            }) {
                 if let Some((_k, v)) = resp.entries.into_iter().next() {
                     price = decode_u128_value(&v).ok();
                 }
@@ -135,8 +152,10 @@ pub fn derive_token_data(
             return Ok(Some(*c));
         }
         let key = table.candle_key(pool, tf, bucket_ts);
-        if let Some(raw) = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?.value {
+        if let Some(raw) = provider
+            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+            .value
+        {
             return Ok(Some(decode_full_candle_v1(&raw)?));
         }
         Ok(None)
@@ -272,19 +291,20 @@ pub fn derive_token_data(
                     _ => continue,
                 };
 
-                let existing = if let Some(c) =
-                    token_usd_candle_overrides.get(&(*token, *tf, *bucket_ts))
-                {
-                    Some(*c)
-                } else {
-                    let key = table.token_usd_candle_key(token, *tf, *bucket_ts);
-                    if let Some(raw) = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?.value {
-                        Some(decode_candle_v1(&raw)?)
+                let existing =
+                    if let Some(c) = token_usd_candle_overrides.get(&(*token, *tf, *bucket_ts)) {
+                        Some(*c)
                     } else {
-                        None
-                    }
-                };
+                        let key = table.token_usd_candle_key(token, *tf, *bucket_ts);
+                        if let Some(raw) = provider
+                            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+                            .value
+                        {
+                            Some(decode_candle_v1(&raw)?)
+                        } else {
+                            None
+                        }
+                    };
 
                 let mut open = if let Some(prev) = existing {
                     prev.open
@@ -296,8 +316,7 @@ pub fn derive_token_data(
                     } else {
                         let key = table.token_usd_candle_key(token, *tf, prev_bucket);
                         provider
-                            .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?
+                            .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
                             .value
                             .and_then(|raw| decode_candle_v1(&raw).ok())
                             .map(|c| c.close)
@@ -434,10 +453,10 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.candle_ns_prefix(pool, tf);
-                if let Ok(resp) =
-                    provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix })
-                {
+                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
+                    blockhash: StateAt::Latest,
+                    prefix,
+                }) {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -466,10 +485,10 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.token_usd_candle_ns_prefix(token, tf);
-                if let Ok(resp) =
-                    provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix })
-                {
+                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
+                    blockhash: StateAt::Latest,
+                    prefix,
+                }) {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -503,10 +522,10 @@ pub fn derive_token_data(
                     }
                 }
                 let prefix = table.token_derived_usd_candle_ns_prefix(token, quote, tf);
-                if let Ok(resp) =
-                    provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix })
-                {
+                if let Ok(resp) = provider.get_list_entries_desc(GetListEntriesDescParams {
+                    blockhash: StateAt::Latest,
+                    prefix,
+                }) {
                     for (k, v) in resp.entries {
                         let Some(ts) = parse_ts(&k) else { continue };
                         if ts > target {
@@ -532,8 +551,10 @@ pub fn derive_token_data(
                     return Ok(Some(*c));
                 }
                 let key = table.token_usd_candle_key(token, tf, bucket_ts);
-                if let Some(raw) = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?.value {
+                if let Some(raw) = provider
+                    .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+                    .value
+                {
                     return Ok(Some(decode_candle_v1(&raw)?));
                 }
                 Ok(None)
@@ -876,10 +897,7 @@ pub fn derive_token_data(
                 let table_e = essentials.table();
                 let key = table_e.circulating_supply_latest_key(token);
                 let v = essentials
-                    .get_raw_value(EssentialsGetRawValueParams {
-                        blockhash: StateAt::Latest,
-                        key,
-                    })?
+                    .get_raw_value(EssentialsGetRawValueParams { blockhash: StateAt::Latest, key })?
                     .value
                     .and_then(|raw| {
                         crate::modules::essentials::storage::decode_u128_value(&raw).ok()
@@ -910,10 +928,7 @@ pub fn derive_token_data(
                 let table_e = essentials.table();
                 let key = table_e.circulating_supply_latest_key(token);
                 let v = essentials
-                    .get_raw_value(EssentialsGetRawValueParams {
-                        blockhash: StateAt::Latest,
-                        key,
-                    })?
+                    .get_raw_value(EssentialsGetRawValueParams { blockhash: StateAt::Latest, key })?
                     .value
                     .and_then(|raw| {
                         crate::modules::essentials::storage::decode_u128_value(&raw).ok()
@@ -978,7 +993,9 @@ pub fn derive_token_data(
             let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
             for (k, v) in provider
                 .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })?
+                    blockhash: StateAt::Latest,
+                    prefix: prefix.clone(),
+                })?
                 .entries
             {
                 if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -1036,10 +1053,7 @@ pub fn derive_token_data(
                 let table_e = essentials.table();
                 let key = table_e.circulating_supply_latest_key(token);
                 essentials
-                    .get_raw_value(EssentialsGetRawValueParams {
-                        blockhash: StateAt::Latest,
-                        key,
-                    })?
+                    .get_raw_value(EssentialsGetRawValueParams { blockhash: StateAt::Latest, key })?
                     .value
                     .and_then(|v| crate::modules::essentials::storage::decode_u128_value(&v).ok())
                     .unwrap_or(0)
@@ -1050,9 +1064,10 @@ pub fn derive_token_data(
             let marketcap_usd = fdv_usd;
 
             let metrics_key = table.token_metrics_key(token);
-            let prev_raw =
-                provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: metrics_key.clone() })?;
+            let prev_raw = provider.get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: metrics_key.clone(),
+            })?;
             let prev_metrics =
                 prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
@@ -1216,7 +1231,9 @@ pub fn derive_token_data(
             if search_index_enabled {
                 let rec = essentials
                     .get_creation_record(GetCreationRecordParams {
-            blockhash: StateAt::Latest, alkane: *token })
+                        blockhash: StateAt::Latest,
+                        alkane: *token,
+                    })
                     .ok()
                     .and_then(|resp| resp.record);
                 if let Some(rec) = rec {
@@ -1345,7 +1362,9 @@ pub fn derive_token_data(
             let mut per_bucket: BTreeMap<u64, SchemaCandleV1> = BTreeMap::new();
             for (k, v) in provider
                 .get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix: prefix.clone() })?
+                    blockhash: StateAt::Latest,
+                    prefix: prefix.clone(),
+                })?
                 .entries
             {
                 if let Some(ts_bytes) = k.rsplit(|&b| b == b':').next() {
@@ -1409,10 +1428,7 @@ pub fn derive_token_data(
                 let table_e = essentials.table();
                 let key = table_e.circulating_supply_latest_key(token);
                 let v = essentials
-                    .get_raw_value(EssentialsGetRawValueParams {
-                        blockhash: StateAt::Latest,
-                        key,
-                    })?
+                    .get_raw_value(EssentialsGetRawValueParams { blockhash: StateAt::Latest, key })?
                     .value
                     .and_then(|raw| {
                         crate::modules::essentials::storage::decode_u128_value(&raw).ok()
@@ -1427,9 +1443,10 @@ pub fn derive_token_data(
             let marketcap_usd = fdv_usd;
 
             let metrics_key = table.token_derived_metrics_key(token, quote);
-            let prev_raw =
-                provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: metrics_key.clone() })?;
+            let prev_raw = provider.get_raw_value(GetRawValueParams {
+                blockhash: StateAt::Latest,
+                key: metrics_key.clone(),
+            })?;
             let prev_metrics =
                 prev_raw.value.as_ref().and_then(|raw| decode_token_metrics(raw).ok());
 
@@ -1604,7 +1621,9 @@ pub fn derive_token_data(
             if search_index_enabled {
                 let rec = essentials
                     .get_creation_record(GetCreationRecordParams {
-            blockhash: StateAt::Latest, alkane: *token })
+                        blockhash: StateAt::Latest,
+                        alkane: *token,
+                    })
                     .ok()
                     .and_then(|resp| resp.record);
                 if let Some(rec) = rec {

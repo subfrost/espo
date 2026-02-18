@@ -34,6 +34,7 @@ use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load
 use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent_batch,
 };
+use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 
 fn format_with_commas(n: u64) -> String {
@@ -415,9 +416,12 @@ pub async fn block_page(
     }
     all_outpoints.sort();
     all_outpoints.dedup();
-    let outpoint_map =
-        get_outpoint_balances_with_spent_batch(&state.essentials_provider(), &all_outpoints)
-            .unwrap_or_default();
+    let outpoint_map = get_outpoint_balances_with_spent_batch(
+        StateAt::Latest,
+        &state.essentials_provider(),
+        &all_outpoints,
+    )
+    .unwrap_or_default();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };

@@ -29,6 +29,7 @@ use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_outpoint_balances_with_spent,
 };
 use crate::runtime::mempool::pending_by_txid;
+use crate::runtime::state_at::StateAt;
 
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
@@ -224,7 +225,7 @@ pub async fn tx_page(
     }
 
     let outpoint_fn = |txid: &Txid, vout: u32| -> OutpointLookup {
-        get_outpoint_balances_with_spent(&state.essentials_provider(), txid, vout)
+        get_outpoint_balances_with_spent(StateAt::Latest, &state.essentials_provider(), txid, vout)
             .unwrap_or_default()
     };
     let outspends_fn = |txid: &Txid| -> Vec<Option<Txid>> {

@@ -1,8 +1,7 @@
-use crate::runtime::state_at::StateAt;
 use super::defs::{EspoTraceType, SignedU128, SignedU128MapExt};
 use super::utils::{
-    compute_nets, is_op_return, parse_protostones, parse_short_id, schema_id_from_parts,
-    transfers_to_sheet, tx_has_op_return, u128_to_u32, Unallocated,
+    Unallocated, compute_nets, is_op_return, parse_protostones, parse_short_id,
+    schema_id_from_parts, transfers_to_sheet, tx_has_op_return, u128_to_u32,
 };
 use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
@@ -17,19 +16,19 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
-    decode_balances_vec, decode_outpoint_row_v2, decode_u128_value, encode_alkane_balance_tx_entry,
-    encode_outpoint_row_v2, encode_tx_packed_outflow_row_v2, encode_u128_value, encode_vec,
-    get_holders_count_encoded,
-    mk_outpoint, spk_to_address_str, AddressActivityEntry, AddressAmountEntry,
-    AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
+    AddressActivityEntry, AddressAmountEntry, AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry,
+    HolderEntry, HolderId, decode_balances_vec, decode_outpoint_row_v2, decode_u128_value,
+    encode_alkane_balance_tx_entry, encode_outpoint_row_v2, encode_tx_packed_outflow_row_v2,
+    encode_u128_value, encode_vec, get_holders_count_encoded, mk_outpoint, spk_to_address_str,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, SetBatchParams,
     SetBlobValuesIfMissingParams,
 };
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
@@ -370,11 +369,7 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     // Find the nearest NORMAL frame in the current stack (delegates/statics are skipped).
     fn nearest_normal_owner(stack: &[Frame]) -> Option<SchemaAlkaneId> {
         stack.iter().rev().find_map(|frame| {
-            if matches!(frame.kind, FrameKind::Normal) {
-                Some(frame.owner)
-            } else {
-                None
-            }
+            if matches!(frame.kind, FrameKind::Normal) { Some(frame.owner) } else { None }
         })
     }
 
@@ -944,12 +939,14 @@ pub fn bulk_update_balances_for_block(
     provider: &EssentialsProvider,
     block: &EspoBlock,
 ) -> Result<()> {
+    crate::debug_timer_log!("bulk_update_balances_for_block.total");
     let debug = debug_enabled();
     let module = "essentials.balances";
     let network = get_network();
     let table = provider.table();
     let blockhash = block.block_header.block_hash().to_byte_array();
-    let mut tx_index_by_txid: HashMap<[u8; 32], u32> = HashMap::with_capacity(block.transactions.len());
+    let mut tx_index_by_txid: HashMap<[u8; 32], u32> =
+        HashMap::with_capacity(block.transactions.len());
     for (tx_idx, atx) in block.transactions.iter().enumerate() {
         tx_index_by_txid.insert(atx.transaction.compute_txid().to_byte_array(), tx_idx as u32);
     }
@@ -1140,7 +1137,8 @@ pub fn bulk_update_balances_for_block(
             })
             .collect();
 
-        let mut lookup_outpoints: Vec<(Txid, u32)> = Vec::with_capacity(filtered_external_inputs.len());
+        let mut lookup_outpoints: Vec<(Txid, u32)> =
+            Vec::with_capacity(filtered_external_inputs.len());
         for op in &filtered_external_inputs {
             if op.txid.len() != 32 {
                 continue;
@@ -1149,7 +1147,8 @@ pub fn bulk_update_balances_for_block(
             txid_arr.copy_from_slice(&op.txid);
             lookup_outpoints.push((Txid::from_byte_array(txid_arr), op.vout));
         }
-        let lookups = get_outpoint_balances_with_spent_batch(provider, &lookup_outpoints)?;
+        let lookups =
+            get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
         for (txid, vout) in lookup_outpoints {
             let Some(lookup) = lookups.get(&(txid, vout)) else {
                 continue;
@@ -1698,7 +1697,9 @@ pub fn bulk_update_balances_for_block(
             let mut amounts: BTreeMap<SchemaAlkaneId, u128> = BTreeMap::new();
             let bal_len = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.alkane_balance_list_len_key(owner) })?
+                    blockhash: StateAt::Latest,
+                    key: table.alkane_balance_list_len_key(owner),
+                })?
                 .value
                 .and_then(|bytes| {
                     if bytes.len() == 4 {
@@ -1715,9 +1716,12 @@ pub fn bulk_update_balances_for_block(
                 for idx in 0..bal_len {
                     idx_keys.push(table.alkane_balance_list_idx_key(owner, idx));
                 }
-                let idx_vals =
-                    provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+                let idx_vals = provider
+                    .get_multi_values(GetMultiValuesParams {
+                        blockhash: StateAt::Latest,
+                        keys: idx_keys,
+                    })?
+                    .values;
                 let mut tokens = Vec::new();
                 let mut bal_keys = Vec::new();
                 for idx_val in idx_vals {
@@ -1734,9 +1738,12 @@ pub fn bulk_update_balances_for_block(
                     bal_keys.push(table.alkane_balance_key(owner, &token));
                     tokens.push(token);
                 }
-                let vals =
-                    provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: bal_keys })?.values;
+                let vals = provider
+                    .get_multi_values(GetMultiValuesParams {
+                        blockhash: StateAt::Latest,
+                        keys: bal_keys,
+                    })?
+                    .values;
                 for (token, value) in tokens.into_iter().zip(vals.into_iter()) {
                     let Some(bytes) = value else { continue };
                     let Ok(amount) = decode_u128_value(&bytes) else {
@@ -1800,8 +1807,9 @@ pub fn bulk_update_balances_for_block(
         for addr in &addrs {
             keys.push(table.alkane_address_len_key(addr));
         }
-        let existing = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys })?.values;
+        let existing = provider
+            .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+            .values;
         for (idx, addr) in addrs.iter().enumerate() {
             let len = existing
                 .get(idx)
@@ -1824,7 +1832,9 @@ pub fn bulk_update_balances_for_block(
     let timer = debug::start_if(debug);
     let latest_traces_prev_len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.latest_traces_length_key() })?
+            blockhash: StateAt::Latest,
+            key: table.latest_traces_length_key(),
+        })?
         .value
         .and_then(|b| {
             if b.len() == 4 {
@@ -1842,8 +1852,9 @@ pub fn bulk_update_balances_for_block(
         for idx in 0..latest_traces_prev_len {
             keys.push(table.latest_traces_idx_key(idx));
         }
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+            .values;
         for val in vals.into_iter().flatten() {
             if val.len() != 32 {
                 continue;
@@ -2003,9 +2014,7 @@ pub fn bulk_update_balances_for_block(
             }
         }
         if let Some(ref spk_bytes) = row.uspk_val {
-            addr_spk_updates
-                .entry(row.addr.clone())
-                .or_insert_with(|| spk_bytes.clone());
+            addr_spk_updates.entry(row.addr.clone()).or_insert_with(|| spk_bytes.clone());
         }
     }
 
@@ -2013,8 +2022,12 @@ pub fn bulk_update_balances_for_block(
         let mut addrs: Vec<String> = addr_spk_updates.keys().cloned().collect();
         addrs.sort();
         let keys: Vec<Vec<u8>> = addrs.iter().map(|a| table.addr_spk_key(a)).collect();
-        let existing = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: keys.clone() })?.values;
+        let existing = provider
+            .get_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: keys.clone(),
+            })?
+            .values;
         for (idx, addr) in addrs.into_iter().enumerate() {
             let Some(next) = addr_spk_updates.remove(&addr) else {
                 continue;
@@ -2047,8 +2060,9 @@ pub fn bulk_update_balances_for_block(
     for (address, per_token) in &address_balance_delta {
         for (token, delta) in per_token {
             let key = table.address_balance_key(address, token);
-            let current_raw = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: key.clone() })?.value;
+            let current_raw = provider
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
+                .value;
             let current =
                 current_raw.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
             let (is_negative, mag) = delta.as_parts();
@@ -2083,7 +2097,9 @@ pub fn bulk_update_balances_for_block(
         }
         let len = provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.address_balance_list_len_key(&address) })?
+                blockhash: StateAt::Latest,
+                key: table.address_balance_list_len_key(&address),
+            })?
             .value
             .and_then(|bytes| {
                 if bytes.len() == 4 {
@@ -2102,9 +2118,12 @@ pub fn bulk_update_balances_for_block(
             for idx in 0..len {
                 idx_keys.push(table.address_balance_list_idx_key(&address, idx));
             }
-            let idx_vals =
-                provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+            let idx_vals = provider
+                .get_multi_values(GetMultiValuesParams {
+                    blockhash: StateAt::Latest,
+                    keys: idx_keys,
+                })?
+                .values;
             for idx_val in idx_vals {
                 let Some(raw) = idx_val else { continue };
                 if raw.len() != 12 {
@@ -2126,9 +2145,12 @@ pub fn bulk_update_balances_for_block(
             for token in &existing_tokens {
                 balance_keys.push(table.address_balance_key(&address, token));
             }
-            let balance_vals =
-                provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: balance_keys })?.values;
+            let balance_vals = provider
+                .get_multi_values(GetMultiValuesParams {
+                    blockhash: StateAt::Latest,
+                    keys: balance_keys,
+                })?
+                .values;
             for (token, val) in existing_tokens.into_iter().zip(balance_vals.into_iter()) {
                 let amount = val.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
                 if amount == 0 {
@@ -2230,7 +2252,7 @@ pub fn bulk_update_balances_for_block(
             for token in &changed_tokens {
                 let current = provider
                     .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                        blockhash: StateAt::Latest,
                         key: table.alkane_balance_key(owner, token),
                     })?
                     .value
@@ -2246,7 +2268,9 @@ pub fn bulk_update_balances_for_block(
 
             let len = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.alkane_balance_list_len_key(owner) })?
+                    blockhash: StateAt::Latest,
+                    key: table.alkane_balance_list_len_key(owner),
+                })?
                 .value
                 .and_then(|bytes| {
                     if bytes.len() == 4 {
@@ -2265,9 +2289,12 @@ pub fn bulk_update_balances_for_block(
                 for idx in 0..len {
                     idx_keys.push(table.alkane_balance_list_idx_key(owner, idx));
                 }
-                let idx_vals =
-                    provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+                let idx_vals = provider
+                    .get_multi_values(GetMultiValuesParams {
+                        blockhash: StateAt::Latest,
+                        keys: idx_keys,
+                    })?
+                    .values;
                 for idx_val in idx_vals {
                     let Some(raw) = idx_val else { continue };
                     if raw.len() != 12 {
@@ -2289,9 +2316,12 @@ pub fn bulk_update_balances_for_block(
                 for token in &existing_tokens {
                     balance_keys.push(table.alkane_balance_key(owner, token));
                 }
-                let balance_vals =
-                    provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: balance_keys })?.values;
+                let balance_vals = provider
+                    .get_multi_values(GetMultiValuesParams {
+                        blockhash: StateAt::Latest,
+                        keys: balance_keys,
+                    })?
+                    .values;
                 for (token, val) in existing_tokens.into_iter().zip(balance_vals.into_iter()) {
                     let amount =
                         val.as_ref().and_then(|raw| decode_u128_value(raw).ok()).unwrap_or(0);
@@ -2361,7 +2391,9 @@ pub fn bulk_update_balances_for_block(
             let height_len_key = table.alkane_balance_by_height_list_len_key(owner, &token);
             let height_len = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: height_len_key.clone() })?
+                    blockhash: StateAt::Latest,
+                    key: height_len_key.clone(),
+                })?
                 .value
                 .and_then(|bytes| {
                     if bytes.len() == 4 {
@@ -2544,7 +2576,9 @@ pub fn bulk_update_balances_for_block(
         let mut had_zero_in_existing_list = false;
         let holder_len = provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.holder_list_len_key(alkane) })?
+                blockhash: StateAt::Latest,
+                key: table.holder_list_len_key(alkane),
+            })?
             .value
             .and_then(|bytes| {
                 if bytes.len() == 4 {
@@ -2561,9 +2595,12 @@ pub fn bulk_update_balances_for_block(
             for idx in 0..holder_len {
                 idx_keys.push(table.holder_list_idx_key(alkane, idx));
             }
-            let idx_vals =
-                provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+            let idx_vals = provider
+                .get_multi_values(GetMultiValuesParams {
+                    blockhash: StateAt::Latest,
+                    keys: idx_keys,
+                })?
+                .values;
             let mut holders = Vec::new();
             let mut holder_keys = Vec::new();
             for idx_val in idx_vals {
@@ -2588,9 +2625,12 @@ pub fn bulk_update_balances_for_block(
                 holder_keys.push(table.holder_key(alkane, &holder));
                 holders.push(holder);
             }
-            let holder_vals =
-                provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: holder_keys })?.values;
+            let holder_vals = provider
+                .get_multi_values(GetMultiValuesParams {
+                    blockhash: StateAt::Latest,
+                    keys: holder_keys,
+                })?
+                .values;
             for (holder, value) in holders.into_iter().zip(holder_vals.into_iter()) {
                 let Some(bytes) = value else { continue };
                 let Ok(amount) = decode_u128_value(&bytes) else {
@@ -2638,7 +2678,7 @@ pub fn bulk_update_balances_for_block(
         if search_index_enabled {
             let rec = provider
                 .get_creation_record(crate::modules::essentials::storage::GetCreationRecordParams {
-            blockhash: StateAt::Latest,
+                    blockhash: StateAt::Latest,
                     alkane: *alkane,
                 })
                 .ok()
@@ -2686,7 +2726,9 @@ pub fn bulk_update_balances_for_block(
         let supply_latest_key = table.circulating_supply_latest_key(alkane);
         let prev_supply = provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: supply_latest_key.clone() })?
+                blockhash: StateAt::Latest,
+                key: supply_latest_key.clone(),
+            })?
             .value
             .and_then(|v| decode_u128_value(&v).ok())
             .unwrap_or(0);
@@ -2793,8 +2835,9 @@ pub fn bulk_update_balances_for_block(
     for (alkane, per_addr) in transfer_volume_delta.iter() {
         for (addr, delta) in per_addr {
             let key = table.transfer_volume_entry_key(alkane, addr);
-            let prev_raw = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: key.clone() })?.value;
+            let prev_raw = provider
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
+                .value;
             let had_row = prev_raw.is_some();
             let prev =
                 prev_raw.as_ref().and_then(|bytes| decode_u128_value(bytes).ok()).unwrap_or(0);
@@ -2810,7 +2853,9 @@ pub fn bulk_update_balances_for_block(
         }
         let len = provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.transfer_volume_list_len_key(&alkane) })?
+                blockhash: StateAt::Latest,
+                key: table.transfer_volume_list_len_key(&alkane),
+            })?
             .value
             .and_then(|bytes| {
                 if bytes.len() == 4 {
@@ -2840,8 +2885,9 @@ pub fn bulk_update_balances_for_block(
     for (alkane, per_addr) in total_received_delta.iter() {
         for (addr, delta) in per_addr {
             let key = table.total_received_entry_key(alkane, addr);
-            let prev_raw = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: key.clone() })?.value;
+            let prev_raw = provider
+                .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: key.clone() })?
+                .value;
             let had_row = prev_raw.is_some();
             let prev =
                 prev_raw.as_ref().and_then(|bytes| decode_u128_value(bytes).ok()).unwrap_or(0);
@@ -2857,7 +2903,9 @@ pub fn bulk_update_balances_for_block(
         }
         let len = provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.total_received_list_len_key(&alkane) })?
+                blockhash: StateAt::Latest,
+                key: table.total_received_list_len_key(&alkane),
+            })?
             .value
             .and_then(|bytes| {
                 if bytes.len() == 4 {
@@ -2893,9 +2941,12 @@ pub fn bulk_update_balances_for_block(
             if let Some(per_alk) = address_activity_transfer_delta.get(&addr) {
                 for (alk, delta) in per_alk {
                     let key = table.address_activity_transfer_key(&addr, alk);
-                    let prev_raw =
-                        provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: key.clone() })?.value;
+                    let prev_raw = provider
+                        .get_raw_value(GetRawValueParams {
+                            blockhash: StateAt::Latest,
+                            key: key.clone(),
+                        })?
+                        .value;
                     let had_row = prev_raw.is_some();
                     let prev = prev_raw
                         .as_ref()
@@ -2910,9 +2961,12 @@ pub fn bulk_update_balances_for_block(
             if let Some(per_alk) = address_activity_received_delta.get(&addr) {
                 for (alk, delta) in per_alk {
                     let key = table.address_activity_total_received_key(&addr, alk);
-                    let prev_raw =
-                        provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: key.clone() })?.value;
+                    let prev_raw = provider
+                        .get_raw_value(GetRawValueParams {
+                            blockhash: StateAt::Latest,
+                            key: key.clone(),
+                        })?
+                        .value;
                     let had_row = prev_raw.is_some();
                     let prev = prev_raw
                         .as_ref()
@@ -2931,7 +2985,7 @@ pub fn bulk_update_balances_for_block(
             }
             let len = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                    blockhash: StateAt::Latest,
                     key: table.address_activity_transfer_list_len_key(&addr),
                 })?
                 .value
@@ -2973,7 +3027,7 @@ pub fn bulk_update_balances_for_block(
             }
             let len = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                    blockhash: StateAt::Latest,
                     key: table.address_activity_total_received_list_len_key(&addr),
                 })?
                 .value
@@ -3018,7 +3072,9 @@ pub fn bulk_update_balances_for_block(
         let latest_key = table.total_minted_latest_key(alkane);
         let prev_total = provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: latest_key.clone() })?
+                blockhash: StateAt::Latest,
+                key: latest_key.clone(),
+            })?
             .value
             .and_then(|v| decode_u128_value(&v).ok())
             .unwrap_or(0);
@@ -3217,7 +3273,7 @@ pub fn bulk_update_balances_for_block(
                         cached.clone()
                     } else {
                         let hlen = match provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                            blockhash: StateAt::Latest,
                             key: table.alkane_balance_by_height_list_len_key(owner, token),
                         }) {
                             Ok(v) => v
@@ -3243,10 +3299,10 @@ pub fn bulk_update_balances_for_block(
                                 table.alkane_balance_by_height_list_idx_key(owner, token, idx),
                             );
                         }
-                        let hidx_vals = match provider
-                            .get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: hidx_keys })
-                        {
+                        let hidx_vals = match provider.get_multi_values(GetMultiValuesParams {
+                            blockhash: StateAt::Latest,
+                            keys: hidx_keys,
+                        }) {
                             Ok(v) => v.values,
                             Err(_) => Vec::new(),
                         };
@@ -3269,10 +3325,10 @@ pub fn bulk_update_balances_for_block(
                             .iter()
                             .map(|h| table.alkane_balance_by_height_key(owner, token, *h))
                             .collect();
-                        let value_rows = match provider
-                            .get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: value_keys })
-                        {
+                        let value_rows = match provider.get_multi_values(GetMultiValuesParams {
+                            blockhash: StateAt::Latest,
+                            keys: value_keys,
+                        }) {
                             Ok(v) => v.values,
                             Err(_) => Vec::new(),
                         };
@@ -3326,11 +3382,7 @@ pub fn bulk_update_balances_for_block(
                         let (start, balance) = snapshots[idx];
                         let end = if idx + 1 < snapshots.len() {
                             let next_start = snapshots[idx + 1].0;
-                            if next_start == 0 {
-                                0
-                            } else {
-                                next_start.saturating_sub(1)
-                            }
+                            if next_start == 0 { 0 } else { next_start.saturating_sub(1) }
                         } else {
                             current_height
                         };
@@ -3519,13 +3571,10 @@ pub fn bulk_update_balances_for_block(
         blockhash: StateAt::Latest,
         puts: blob_puts,
     })?;
-    provider.set_batch(SetBatchParams {
-        blockhash: StateAt::Latest,
-        puts,
-        deletes,
-    })?;
+    provider.set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes })?;
     debug::log_elapsed(module, "write_batch", timer);
 
+    let search_index_timer = debug::start_if(debug);
     if search_index_enabled && (!ammdata_puts.is_empty() || !ammdata_deletes.is_empty()) {
         let mdb = ammdata_mdb();
         let res = mdb.bulk_write(|wb| {
@@ -3543,6 +3592,7 @@ pub fn bulk_update_balances_for_block(
             );
         }
     }
+    debug::log_elapsed(module, "write_ammdata_search_index", search_index_timer);
 
     let minus_total: u128 = stat_minus_by_alk.values().copied().sum();
     let plus_total: u128 = stat_plus_by_alk.values().copied().sum();
@@ -3577,13 +3627,16 @@ fn lookup_self_balance(alk: &SchemaAlkaneId) -> Option<u128> {
 }
 
 pub fn get_balance_for_address(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     address: &str,
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.address_balance_list_len_key(address) })?
+            blockhash,
+            key: table.address_balance_list_len_key(address),
+        })?
         .value
         .and_then(|bytes| {
             if bytes.len() == 4 {
@@ -3603,8 +3656,9 @@ pub fn get_balance_for_address(
     for idx in 0..len {
         idx_keys.push(table.address_balance_list_idx_key(address, idx));
     }
-    let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+    let idx_vals = provider
+        .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+        .values;
     let mut tokens = Vec::new();
     let mut bal_keys = Vec::new();
     for idx_val in idx_vals {
@@ -3621,8 +3675,9 @@ pub fn get_balance_for_address(
         bal_keys.push(table.address_balance_key(address, &token));
         tokens.push(token);
     }
-    let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: bal_keys })?.values;
+    let vals = provider
+        .get_multi_values(GetMultiValuesParams { blockhash, keys: bal_keys })?
+        .values;
 
     let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
     for (token, v) in tokens.into_iter().zip(vals.into_iter()) {
@@ -3639,6 +3694,7 @@ pub fn get_balance_for_address(
 }
 
 pub fn get_alkane_balances(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     owner: &SchemaAlkaneId,
 ) -> Result<HashMap<SchemaAlkaneId, u128>> {
@@ -3646,7 +3702,9 @@ pub fn get_alkane_balances(
     let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
     let len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.alkane_balance_list_len_key(owner) })?
+            blockhash,
+            key: table.alkane_balance_list_len_key(owner),
+        })?
         .value
         .and_then(|bytes| {
             if bytes.len() == 4 {
@@ -3663,8 +3721,9 @@ pub fn get_alkane_balances(
         for idx in 0..len {
             idx_keys.push(table.alkane_balance_list_idx_key(owner, idx));
         }
-        let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
         let mut tokens = Vec::new();
         let mut bal_keys = Vec::new();
         for idx_val in idx_vals {
@@ -3681,8 +3740,9 @@ pub fn get_alkane_balances(
             bal_keys.push(table.alkane_balance_key(owner, &token));
             tokens.push(token);
         }
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: bal_keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: bal_keys })?
+            .values;
         for (token, value) in tokens.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
             let Ok(amount) = decode_u128_value(&bytes) else {
@@ -3710,6 +3770,7 @@ pub fn get_alkane_balances(
 }
 
 pub fn get_alkane_balances_at_or_before(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     owner: &SchemaAlkaneId,
     height: u32,
@@ -3719,7 +3780,9 @@ pub fn get_alkane_balances_at_or_before(
     let mut resolved_height: Option<u32> = None;
     let token_len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.alkane_balance_list_len_key(owner) })?
+            blockhash,
+            key: table.alkane_balance_list_len_key(owner),
+        })?
         .value
         .and_then(|bytes| {
             if bytes.len() == 4 {
@@ -3736,9 +3799,9 @@ pub fn get_alkane_balances_at_or_before(
         for idx in 0..token_len {
             token_idx_keys.push(table.alkane_balance_list_idx_key(owner, idx));
         }
-        let token_idx_vals =
-            provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: token_idx_keys })?.values;
+        let token_idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: token_idx_keys })?
+            .values;
         let mut tokens = Vec::new();
         for token_raw in token_idx_vals.into_iter().flatten() {
             if token_raw.len() != 12 {
@@ -3762,7 +3825,7 @@ pub fn get_alkane_balances_at_or_before(
         for token in tokens {
             let hlen = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                    blockhash,
                     key: table.alkane_balance_by_height_list_len_key(owner, &token),
                 })?
                 .value
@@ -3784,9 +3847,9 @@ pub fn get_alkane_balances_at_or_before(
             for idx in 0..hlen {
                 hidx_keys.push(table.alkane_balance_by_height_list_idx_key(owner, &token, idx));
             }
-            let hidx_vals =
-                provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: hidx_keys })?.values;
+            let hidx_vals = provider
+                .get_multi_values(GetMultiValuesParams { blockhash, keys: hidx_keys })?
+                .values;
             let mut best_height: Option<u32> = None;
             for hraw in hidx_vals.into_iter().flatten() {
                 if hraw.len() != 4 {
@@ -3803,7 +3866,7 @@ pub fn get_alkane_balances_at_or_before(
             };
             let amount = provider
                 .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+                    blockhash,
                     key: table.alkane_balance_by_height_key(owner, &token, found_height),
                 })?
                 .value
@@ -3844,6 +3907,7 @@ fn resolve_outpoint_create_position_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
+    blockhash: StateAt,
 ) -> Result<Option<([u8; 32], u32)>> {
     let table = provider.table();
     let prefix = table.outpoint_create_candidate_prefix_from_parts(txid.as_byte_array(), vout)?;
@@ -3851,7 +3915,7 @@ fn resolve_outpoint_create_position_v2(
     if keys.is_empty() {
         return Ok(None);
     }
-    let target_blockhash = provider.resolved_view_blockhash();
+    let target_blockhash = blockhash.resolve(provider.resolved_view_blockhash());
     let mut best: Option<(u32, u32, [u8; 32])> = None;
     for key in keys {
         let Some((key_txid, key_vout, height, idx, blockhash)) =
@@ -3877,6 +3941,7 @@ fn resolve_outpoint_spent_by_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
+    blockhash: StateAt,
 ) -> Result<Option<Txid>> {
     let table = provider.table();
     let prefix = table.outpoint_spend_event_prefix_from_parts(txid.as_byte_array(), vout)?;
@@ -3884,7 +3949,7 @@ fn resolve_outpoint_spent_by_v2(
     if entries.is_empty() {
         return Ok(None);
     }
-    let target_blockhash = provider.resolved_view_blockhash();
+    let target_blockhash = blockhash.resolve(provider.resolved_view_blockhash());
     let mut best: Option<(u32, u32, Txid)> = None;
     for (key, value) in entries {
         let Some((key_txid, key_vout, height, idx, blockhash)) =
@@ -3914,15 +3979,18 @@ fn load_outpoint_row_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
+    blockhash: StateAt,
 ) -> Result<Option<crate::modules::essentials::storage::OutpointRowV2>> {
     let table = provider.table();
-    let Some((blockhash, tx_idx)) = resolve_outpoint_create_position_v2(provider, txid, vout)?
+    let Some((row_blockhash, tx_idx)) =
+        resolve_outpoint_create_position_v2(provider, txid, vout, blockhash)?
     else {
         return Ok(None);
     };
-    let row_key = table.outpoint_row_key(&blockhash, tx_idx, vout);
-    let row_raw = provider.get_blob_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: row_key })?.value;
+    let row_key = table.outpoint_row_key(&row_blockhash, tx_idx, vout);
+    let row_raw = provider
+        .get_blob_raw_value(GetRawValueParams { blockhash, key: row_key })?
+        .value;
     let Some(row_raw) = row_raw else {
         return Ok(None);
     };
@@ -3930,32 +3998,35 @@ fn load_outpoint_row_v2(
 }
 
 pub fn get_outpoint_balances(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
 ) -> Result<Vec<BalanceEntry>> {
-    Ok(load_outpoint_row_v2(provider, txid, vout)?
+    Ok(load_outpoint_row_v2(provider, txid, vout, blockhash)?
         .map(|row| row.balances)
         .unwrap_or_default())
 }
 
 pub fn get_outpoint_address(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
 ) -> Result<Option<String>> {
-    Ok(load_outpoint_row_v2(provider, txid, vout)?
+    Ok(load_outpoint_row_v2(provider, txid, vout, blockhash)?
         .map(|row| row.address)
         .filter(|addr| !addr.is_empty()))
 }
 
 pub fn get_outpoint_balances_with_spent(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
 ) -> Result<OutpointLookup> {
-    let spent_by = resolve_outpoint_spent_by_v2(provider, txid, vout)?;
-    let row = load_outpoint_row_v2(provider, txid, vout)?;
+    let spent_by = resolve_outpoint_spent_by_v2(provider, txid, vout, blockhash)?;
+    let row = load_outpoint_row_v2(provider, txid, vout, blockhash)?;
     let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
     let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
     let spk = row
@@ -3965,13 +4036,14 @@ pub fn get_outpoint_balances_with_spent(
 }
 
 pub fn get_outpoint_balances_with_spent_batch(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
     let mut out: HashMap<(Txid, u32), OutpointLookup> = HashMap::new();
     for (txid, vout) in outpoints {
-        let spent_by = resolve_outpoint_spent_by_v2(provider, txid, *vout)?;
-        let row = load_outpoint_row_v2(provider, txid, *vout)?;
+        let spent_by = resolve_outpoint_spent_by_v2(provider, txid, *vout, blockhash)?;
+        let row = load_outpoint_row_v2(provider, txid, *vout, blockhash)?;
         let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
         let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
         let spk = row.as_ref().and_then(|r| {
@@ -3984,6 +4056,7 @@ pub fn get_outpoint_balances_with_spent_batch(
 }
 
 pub fn get_holders_for_alkane(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     alk: SchemaAlkaneId,
     page: usize,
@@ -3991,8 +4064,7 @@ pub fn get_holders_for_alkane(
 ) -> Result<(usize /*total*/, u128 /*supply*/, Vec<HolderEntry>)> {
     let table = provider.table();
     let len = provider
-        .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.holder_list_len_key(&alk) })?
+        .get_raw_value(GetRawValueParams { blockhash, key: table.holder_list_len_key(&alk) })?
         .value
         .and_then(|bytes| {
             if bytes.len() == 4 {
@@ -4011,8 +4083,9 @@ pub fn get_holders_for_alkane(
         for idx in 0..len {
             idx_keys.push(table.holder_list_idx_key(&alk, idx));
         }
-        let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
         let mut holders = Vec::new();
         let mut holder_keys = Vec::new();
         for idx_val in idx_vals {
@@ -4038,8 +4111,9 @@ pub fn get_holders_for_alkane(
             holders.push(holder);
         }
 
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: holder_keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: holder_keys })?
+            .values;
         for (holder, value) in holders.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
             let Ok(amount) = decode_u128_value(&bytes) else {
@@ -4078,6 +4152,7 @@ pub fn get_holders_for_alkane(
 }
 
 pub fn get_transfer_volume_for_alkane(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     alk: SchemaAlkaneId,
     page: usize,
@@ -4086,7 +4161,9 @@ pub fn get_transfer_volume_for_alkane(
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.transfer_volume_list_len_key(&alk) })?
+            blockhash,
+            key: table.transfer_volume_list_len_key(&alk),
+        })?
         .value
         .and_then(|bytes| {
             if bytes.len() == 4 {
@@ -4104,8 +4181,9 @@ pub fn get_transfer_volume_for_alkane(
         for idx in 0..len {
             idx_keys.push(table.transfer_volume_list_idx_key(&alk, idx));
         }
-        let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
         let mut addrs = Vec::new();
         let mut value_keys = Vec::new();
         for idx_val in idx_vals {
@@ -4116,8 +4194,9 @@ pub fn get_transfer_volume_for_alkane(
             value_keys.push(table.transfer_volume_entry_key(&alk, &addr));
             addrs.push(addr);
         }
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: value_keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: value_keys })?
+            .values;
         for (address, value) in addrs.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
             let Ok(amount) = decode_u128_value(&bytes) else {
@@ -4140,6 +4219,7 @@ pub fn get_transfer_volume_for_alkane(
 }
 
 pub fn get_total_received_for_alkane(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     alk: SchemaAlkaneId,
     page: usize,
@@ -4148,7 +4228,9 @@ pub fn get_total_received_for_alkane(
     let table = provider.table();
     let len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: table.total_received_list_len_key(&alk) })?
+            blockhash,
+            key: table.total_received_list_len_key(&alk),
+        })?
         .value
         .and_then(|bytes| {
             if bytes.len() == 4 {
@@ -4166,8 +4248,9 @@ pub fn get_total_received_for_alkane(
         for idx in 0..len {
             idx_keys.push(table.total_received_list_idx_key(&alk, idx));
         }
-        let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
         let mut addrs = Vec::new();
         let mut value_keys = Vec::new();
         for idx_val in idx_vals {
@@ -4178,8 +4261,9 @@ pub fn get_total_received_for_alkane(
             value_keys.push(table.total_received_entry_key(&alk, &addr));
             addrs.push(addr);
         }
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: value_keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: value_keys })?
+            .values;
         for (address, value) in addrs.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
             let Ok(amount) = decode_u128_value(&bytes) else {
@@ -4202,6 +4286,7 @@ pub fn get_total_received_for_alkane(
 }
 
 pub fn get_address_activity_for_address(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     address: &str,
 ) -> Result<AddressActivityEntry> {
@@ -4210,7 +4295,7 @@ pub fn get_address_activity_for_address(
 
     let transfer_len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+            blockhash,
             key: table.address_activity_transfer_list_len_key(address),
         })?
         .value
@@ -4229,8 +4314,9 @@ pub fn get_address_activity_for_address(
         for idx in 0..transfer_len {
             idx_keys.push(table.address_activity_transfer_list_idx_key(address, idx));
         }
-        let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
         let mut tokens = Vec::new();
         let mut value_keys = Vec::new();
         for idx_val in idx_vals {
@@ -4247,8 +4333,9 @@ pub fn get_address_activity_for_address(
             value_keys.push(table.address_activity_transfer_key(address, &alk));
             tokens.push(alk);
         }
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: value_keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: value_keys })?
+            .values;
         for (alk, value) in tokens.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
             let Ok(amount) = decode_u128_value(&bytes) else {
@@ -4262,7 +4349,7 @@ pub fn get_address_activity_for_address(
 
     let received_len = provider
         .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
+            blockhash,
             key: table.address_activity_total_received_list_len_key(address),
         })?
         .value
@@ -4281,8 +4368,9 @@ pub fn get_address_activity_for_address(
         for idx in 0..received_len {
             idx_keys.push(table.address_activity_total_received_list_idx_key(address, idx));
         }
-        let idx_vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: idx_keys })?.values;
+        let idx_vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: idx_keys })?
+            .values;
         let mut tokens = Vec::new();
         let mut value_keys = Vec::new();
         for idx_val in idx_vals {
@@ -4299,8 +4387,9 @@ pub fn get_address_activity_for_address(
             value_keys.push(table.address_activity_total_received_key(address, &alk));
             tokens.push(alk);
         }
-        let vals = provider.get_multi_values(GetMultiValuesParams {
-            blockhash: StateAt::Latest, keys: value_keys })?.values;
+        let vals = provider
+            .get_multi_values(GetMultiValuesParams { blockhash, keys: value_keys })?
+            .values;
         for (alk, value) in tokens.into_iter().zip(vals.into_iter()) {
             let Some(bytes) = value else { continue };
             let Ok(amount) = decode_u128_value(&bytes) else {
@@ -4315,12 +4404,12 @@ pub fn get_address_activity_for_address(
 }
 
 pub fn get_scriptpubkey_for_address(
+    blockhash: StateAt,
     provider: &EssentialsProvider,
     addr: &str,
 ) -> Result<Option<ScriptBuf>> {
     let table = provider.table();
     let key = table.addr_spk_key(addr);
-    let v = provider.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key })?.value;
+    let v = provider.get_raw_value(GetRawValueParams { blockhash, key })?.value;
     Ok(v.map(ScriptBuf::from))
 }

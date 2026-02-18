@@ -31,6 +31,7 @@ use crate::modules::essentials::utils::balances::{
     OutpointLookup, get_balance_for_address, get_outpoint_balances_with_spent_batch,
 };
 use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
+use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};
 
@@ -155,7 +156,8 @@ pub async fn address_page(
         .ok();
 
     let balances =
-        get_balance_for_address(&state.essentials_provider(), &address_str).unwrap_or_default();
+        get_balance_for_address(StateAt::Latest, &state.essentials_provider(), &address_str)
+            .unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -447,9 +449,12 @@ pub async fn address_page(
     }
     all_outpoints.sort();
     all_outpoints.dedup();
-    let outpoint_map =
-        get_outpoint_balances_with_spent_batch(&state.essentials_provider(), &all_outpoints)
-            .unwrap_or_default();
+    let outpoint_map = get_outpoint_balances_with_spent_batch(
+        StateAt::Latest,
+        &state.essentials_provider(),
+        &all_outpoints,
+    )
+    .unwrap_or_default();
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };

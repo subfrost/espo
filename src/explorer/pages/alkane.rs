@@ -98,7 +98,8 @@ pub async fn alkane_page(
     let creation_height = creation_record.as_ref().map(|r| r.creation_height);
     let creation_txid = creation_record.as_ref().map(|r| hex::encode(r.txid));
 
-    let balances_map = get_alkane_balances(&state.essentials_provider(), &alk).unwrap_or_default();
+    let balances_map = get_alkane_balances(StateAt::Latest, &state.essentials_provider(), &alk)
+        .unwrap_or_default();
     let mut balance_entries: Vec<BalanceEntry> = balances_map
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -108,11 +109,8 @@ pub async fn alkane_page(
     });
 
     let (total, circulating_supply, holders) =
-        get_holders_for_alkane(&state.essentials_provider(), alk, page, limit).unwrap_or((
-            0,
-            0,
-            Vec::new(),
-        ));
+        get_holders_for_alkane(StateAt::Latest, &state.essentials_provider(), alk, page, limit)
+            .unwrap_or((0, 0, Vec::new()));
     let off = limit.saturating_mul(page.saturating_sub(1));
     let holders_len = holders.len();
     let has_prev = page > 1;
@@ -162,7 +160,9 @@ pub async fn alkane_page(
             let has_prefix = |rel_prefix: Vec<u8>| -> bool {
                 amm_provider
                     .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-            blockhash: StateAt::Latest, prefix: rel_prefix })
+                        blockhash: StateAt::Latest,
+                        prefix: rel_prefix,
+                    })
                     .map(|res| !res.keys.is_empty())
                     .unwrap_or(false)
             };
@@ -277,15 +277,25 @@ pub async fn alkane_page(
 
     let (activity_total, activity_entries, activity_label) = match tab {
         AlkaneTab::TransferVolume => {
-            let (total, entries) =
-                get_transfer_volume_for_alkane(&state.essentials_provider(), alk, page, limit)
-                    .unwrap_or((0, Vec::new()));
+            let (total, entries) = get_transfer_volume_for_alkane(
+                StateAt::Latest,
+                &state.essentials_provider(),
+                alk,
+                page,
+                limit,
+            )
+            .unwrap_or((0, Vec::new()));
             (total, entries, "Transfer volume")
         }
         AlkaneTab::TotalReceived => {
-            let (total, entries) =
-                get_total_received_for_alkane(&state.essentials_provider(), alk, page, limit)
-                    .unwrap_or((0, Vec::new()));
+            let (total, entries) = get_total_received_for_alkane(
+                StateAt::Latest,
+                &state.essentials_provider(),
+                alk,
+                page,
+                limit,
+            )
+            .unwrap_or((0, Vec::new()));
             (total, entries, "Total received")
         }
         _ => (0, Vec::new(), "Transfer volume"),
@@ -670,8 +680,9 @@ fn url_escape_component(raw: &str) -> String {
 
 fn pizza_tv_iframe_src(series_id: &str) -> String {
     let symbol = url_escape_component(series_id);
+    let base = crate::config::get_explorer_pizza_tv_endpoint().trim_end_matches('/');
     format!(
-        "https://tv.pizza.fun/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
+        "{base}/?symbol={symbol}&timeframe=1d&type=mcap&pool=all&quote=usd&metaprotocol=alkanes&theme=espo"
     )
 }
 
@@ -766,7 +777,9 @@ fn proxy_target_from_db(
     let lookup = |key| {
         provider
             .get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest, key: kv_row_key(alk, key) })
+                blockhash: StateAt::Latest,
+                key: kv_row_key(alk, key),
+            })
             .ok()
             .and_then(|resp| resp.value)
             .and_then(|raw| {

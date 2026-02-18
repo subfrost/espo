@@ -92,7 +92,6 @@ mod tests {
             reset_mempool_on_startup: false,
             view_only: true,
             db_path: db_path.to_str().unwrap().to_string(),
-            enable_aof: false,
             sdb_poll_ms: 100,
             indexer_block_delay_ms: 0,
             port: 9090,
@@ -106,7 +105,7 @@ mod tests {
             debug_backup: None,
             safe_tip_hook_script: None,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
-            simulate_reorg: false,
+            compact_tx_trace_rows: true,
             explorer_networks: None,
             modules: std::collections::HashMap::new(),
         };

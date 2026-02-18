@@ -3,10 +3,8 @@ use rocksdb::{
     BlockBasedOptions, Cache, DB, Direction, Error as RocksError, IteratorMode, Options,
     ReadOptions, WriteBatch,
 };
-use std::collections::{HashMap, HashSet};
 use std::{path::Path, sync::Arc};
 
-use crate::runtime::aof::AofManager;
 use crate::runtime::tree_db::{get_global_tree_db, is_tree_internal_key};
 
 /// ===== Cache / open-time tuning =====
@@ -23,8 +21,6 @@ pub const BLOOM_BITS_PER_KEY: f64 = 10.0;
 pub struct Mdb {
     db: Arc<DB>,
     prefix: Vec<u8>,
-    namespace_label: String,
-    aof: Option<Arc<AofManager>>,
     versioned: bool,
 }
 
@@ -33,42 +29,23 @@ impl Mdb {
         matches!(prefix, b"essentials:" | b"ammdata:" | b"subfrost:" | b"pizzafun:" | b"oylapi:")
     }
 
-    fn from_parts(
-        db: Arc<DB>,
-        prefix: impl AsRef<[u8]>,
-        aof: Option<Arc<AofManager>>,
-        label: Option<String>,
-        versioned: bool,
-    ) -> Self {
+    fn from_parts(db: Arc<DB>, prefix: impl AsRef<[u8]>, versioned: bool) -> Self {
         let prefix_vec = prefix.as_ref().to_vec();
-        let namespace_label = label.unwrap_or_else(|| {
-            String::from_utf8(prefix_vec.clone()).unwrap_or_else(|_| hex::encode(&prefix_vec))
-        });
-        Self { db, prefix: prefix_vec, namespace_label, aof, versioned }
+        Self { db, prefix: prefix_vec, versioned }
     }
 
     pub fn from_db(db: Arc<DB>, prefix: impl AsRef<[u8]>) -> Self {
         // Back-compat constructor (no custom options)
         let p = prefix.as_ref().to_vec();
         let versioned = Self::should_enable_versioned_namespace(&p);
-        Self::from_parts(db, p, None, None, versioned)
-    }
-
-    pub fn from_db_with_aof(
-        db: Arc<DB>,
-        prefix: impl AsRef<[u8]>,
-        aof: Option<Arc<AofManager>>,
-        label: Option<String>,
-    ) -> Self {
-        Self::from_parts(db, prefix, aof, label, true)
+        Self::from_parts(db, p, versioned)
     }
 
     /// Clone this handle onto the same underlying RocksDB with a different namespace prefix.
-    /// The returned namespace does not carry AOF wiring.
-    pub fn clone_with_prefix_no_aof(&self, prefix: impl AsRef<[u8]>) -> Self {
+    pub fn clone_with_prefix(&self, prefix: impl AsRef<[u8]>) -> Self {
         let p = prefix.as_ref().to_vec();
         let versioned = Self::should_enable_versioned_namespace(&p);
-        Self::from_parts(Arc::clone(&self.db), p, None, None, versioned)
+        Self::from_parts(Arc::clone(&self.db), p, versioned)
     }
 
     pub fn open(path: impl AsRef<Path>, prefix: impl AsRef<[u8]>) -> Result<Self, RocksError> {
@@ -94,7 +71,7 @@ impl Mdb {
 
         let p = prefix.as_ref().to_vec();
         let versioned = Self::should_enable_versioned_namespace(&p);
-        let mdb = Self::from_parts(Arc::new(db), p, None, None, versioned);
+        let mdb = Self::from_parts(Arc::new(db), p, versioned);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace(); // best-effort
         }
@@ -120,7 +97,7 @@ impl Mdb {
         let db = DB::open_for_read_only(&opts, path, error_if_log_file_exist)?;
         let p = prefix.as_ref().to_vec();
         let versioned = Self::should_enable_versioned_namespace(&p);
-        let mdb = Self::from_parts(Arc::new(db), p, None, None, versioned);
+        let mdb = Self::from_parts(Arc::new(db), p, versioned);
         if WARM_CACHE_ON_OPEN {
             let _ = mdb.warm_up_namespace();
         }
@@ -308,6 +285,25 @@ impl Mdb {
         Ok(out)
     }
 
+    pub fn multi_get_at_blockhash(
+        &self,
+        block_hash: &BlockHash,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, RocksError> {
+        if let Some(tree) = self.versioned_manager() {
+            let Some(root) = tree.root_for_blockhash(block_hash)? else {
+                return Ok(vec![None; keys.len()]);
+            };
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                let prefixed = self.prefixed(key);
+                out.push(tree.get_at_root(root, &prefixed)?);
+            }
+            return Ok(out);
+        }
+        self.multi_get(keys)
+    }
+
     pub fn put(&self, k: &[u8], v: &[u8]) -> Result<(), RocksError> {
         let prefixed = self.prefixed(k);
         if let Some(tree) = self.versioned_manager() {
@@ -316,12 +312,7 @@ impl Mdb {
             }
             return tree.put(&prefixed, v);
         }
-        let prev = if self.aof.is_some() { self.db.get(&prefixed)? } else { None };
-        self.db.put(&prefixed, v)?;
-        if let Some(aof) = &self.aof {
-            aof.record_put(&self.namespace_label, prefixed, prev.map(|p| p.to_vec()), v.to_vec());
-        }
-        Ok(())
+        self.db.put(&prefixed, v)
     }
 
     pub fn delete(&self, k: &[u8]) -> Result<(), RocksError> {
@@ -332,12 +323,7 @@ impl Mdb {
             }
             return tree.delete(&prefixed);
         }
-        let prev = if self.aof.is_some() { self.db.get(&prefixed)? } else { None };
-        self.db.delete(&prefixed)?;
-        if let Some(aof) = &self.aof {
-            aof.record_delete(&self.namespace_label, prefixed, prev.map(|p| p.to_vec()));
-        }
-        Ok(())
+        self.db.delete(&prefixed)
     }
 
     pub fn bulk_write<F>(&self, build: F) -> Result<(), RocksError>
@@ -350,7 +336,6 @@ impl Mdb {
                 let mut mb = MdbBatch {
                     mdb: self,
                     wb: None,
-                    pending_ops: None,
                     versioned_changes: Some(&mut versioned_changes),
                 };
                 build(&mut mb);
@@ -359,34 +344,11 @@ impl Mdb {
         }
 
         let mut wb = WriteBatch::default();
-        let mut pending_ops: Vec<PendingChange> = Vec::new();
         {
-            let mut mb = MdbBatch {
-                mdb: self,
-                wb: Some(&mut wb),
-                pending_ops: self.aof.as_ref().map(|_| &mut pending_ops),
-                versioned_changes: None,
-            };
+            let mut mb = MdbBatch { mdb: self, wb: Some(&mut wb), versioned_changes: None };
             build(&mut mb);
         }
-        let prev_map = if self.aof.is_some() && !pending_ops.is_empty() {
-            self.load_previous_values(&pending_ops)?
-        } else {
-            HashMap::new()
-        };
-
-        self.db.write(wb)?;
-
-        if let Some(aof) = &self.aof {
-            for op in pending_ops {
-                let prev = prev_map.get(&op.key).cloned().unwrap_or(None);
-                match op.value {
-                    Some(v) => aof.record_put(&self.namespace_label, op.key, prev, v),
-                    None => aof.record_delete(&self.namespace_label, op.key, prev),
-                }
-            }
-        }
-        Ok(())
+        self.db.write(wb)
     }
 
     /// Iterate forward over raw DB starting from namespaced key `start` (inclusive).
@@ -424,39 +386,6 @@ impl Mdb {
         self.versioned_manager().is_some()
     }
 
-    fn load_previous_values(
-        &self,
-        pending_ops: &[PendingChange],
-    ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, RocksError> {
-        let mut unique: Vec<Vec<u8>> = Vec::new();
-        let mut seen: HashSet<Vec<u8>> = HashSet::new();
-
-        for op in pending_ops {
-            if seen.insert(op.key.clone()) {
-                unique.push(op.key.clone());
-            }
-        }
-
-        let mut out = HashMap::new();
-        if unique.is_empty() {
-            return Ok(out);
-        }
-
-        let results = self.db.multi_get(unique.clone());
-        for (idx, res) in results.into_iter().enumerate() {
-            match res {
-                Ok(Some(slice)) => {
-                    out.insert(unique[idx].clone(), Some(slice.to_vec()));
-                }
-                Ok(None) => {
-                    out.insert(unique[idx].clone(), None);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(out)
-    }
-
     fn versioned_manager(&self) -> Option<Arc<crate::runtime::tree_db::VersionedTreeDb>> {
         if !self.versioned {
             return None;
@@ -465,15 +394,9 @@ impl Mdb {
     }
 }
 
-struct PendingChange {
-    key: Vec<u8>,
-    value: Option<Vec<u8>>,
-}
-
 pub struct MdbBatch<'a> {
     mdb: &'a Mdb,
     wb: Option<&'a mut WriteBatch>,
-    pending_ops: Option<&'a mut Vec<PendingChange>>,
     versioned_changes: Option<&'a mut Vec<(Vec<u8>, Option<Vec<u8>>)>>,
 }
 
@@ -485,9 +408,6 @@ impl<'a> MdbBatch<'a> {
             buf.push((key, Some(v.to_vec())));
             return;
         }
-        if let Some(buf) = self.pending_ops.as_mut() {
-            buf.push(PendingChange { key: key.clone(), value: Some(v.to_vec()) });
-        }
         if let Some(wb) = self.wb.as_mut() {
             wb.put(key, v);
         }
@@ -498,9 +418,6 @@ impl<'a> MdbBatch<'a> {
         if let Some(buf) = self.versioned_changes.as_mut() {
             buf.push((key, None));
             return;
-        }
-        if let Some(buf) = self.pending_ops.as_mut() {
-            buf.push(PendingChange { key: key.clone(), value: None });
         }
         if let Some(wb) = self.wb.as_mut() {
             wb.delete(key);

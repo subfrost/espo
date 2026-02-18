@@ -1,10 +1,10 @@
-use crate::runtime::state_at::StateAt;
 use crate::config::get_network;
 use crate::modules::defs::RpcNsRegistrar;
 use crate::modules::subfrost::storage::{
     GetUnwrapEventsAllParams, GetUnwrapEventsByAddressParams, GetWrapEventsAllParams,
     GetWrapEventsByAddressParams, SubfrostProvider,
 };
+use crate::runtime::state_at::StateAt;
 use bitcoin::Address;
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -36,7 +36,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                         Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
                     };
                     view.get_wrap_events_by_address(GetWrapEventsByAddressParams {
-            blockhash: StateAt::Latest,
+                        blockhash: StateAt::Latest,
                         address_spk: spk,
                         offset,
                         limit: count,
@@ -75,7 +75,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                         Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
                     };
                     view.get_unwrap_events_by_address(GetUnwrapEventsByAddressParams {
-            blockhash: StateAt::Latest,
+                        blockhash: StateAt::Latest,
                         address_spk: spk,
                         offset,
                         limit: count,
@@ -108,7 +108,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                         Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
                     };
                     view.get_wrap_events_all(GetWrapEventsAllParams {
-            blockhash: StateAt::Latest,
+                        blockhash: StateAt::Latest,
                         offset,
                         limit: count,
                         successful,
@@ -140,7 +140,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<SubfrostProvider>) {
                         Err(_) => return json!({ "ok": false, "error": "invalid_height" }),
                     };
                     view.get_unwrap_events_all(GetUnwrapEventsAllParams {
-            blockhash: StateAt::Latest,
+                        blockhash: StateAt::Latest,
                         offset,
                         limit: count,
                         successful,

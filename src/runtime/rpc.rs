@@ -1,7 +1,5 @@
 use crate::{
-    config::get_espo_next_height,
-    modules::defs::RpcRegistry,
-    runtime::tree_db::get_global_tree_db,
+    config::get_espo_next_height, modules::defs::RpcRegistry, runtime::tree_db::get_global_tree_db,
 };
 use axum::{
     Router,
@@ -298,9 +296,7 @@ async fn get_method_line_chart_response(
         return invalid_params(id, "range_min must be <= range_max");
     }
     if range_min < default_min || range_max > default_max {
-        let detail = format!(
-            "range must be inside indexed bounds [{default_min}, {default_max}]"
-        );
+        let detail = format!("range must be inside indexed bounds [{default_min}, {default_max}]");
         return invalid_params(id, &detail);
     }
 

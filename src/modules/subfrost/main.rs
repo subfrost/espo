@@ -1,4 +1,3 @@
-use crate::runtime::state_at::StateAt;
 use super::consts::get_frbtc_alkane;
 use super::rpc::register_rpc;
 use super::schemas::SchemaWrapEventV1;
@@ -15,6 +14,7 @@ use crate::debug;
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::utils::balances::clean_espo_sandshrew_like_trace;
 use crate::runtime::mdb::Mdb;
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
 use bitcoin::consensus::deserialize;
@@ -41,18 +41,15 @@ impl Subfrost {
     }
 
     fn load_index_height(&self) -> Result<Option<u32>> {
-        let resp = self.provider().get_index_height(GetIndexHeightParams {
-            blockhash: StateAt::Latest,
-        })?;
+        let resp = self
+            .provider()
+            .get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })?;
         Ok(resp.height)
     }
 
     fn persist_index_height(&self, height: u32, blockhash: StateAt) -> Result<()> {
         self.provider()
-            .set_index_height(SetIndexHeightParams {
-                blockhash,
-                height,
-            })
+            .set_index_height(SetIndexHeightParams { blockhash, height })
             .map_err(|e| anyhow!("[SUBFROST] rocksdb put(/index_height) failed: {e}"))
     }
 
@@ -290,11 +287,13 @@ impl EspoModule for Subfrost {
             }
             debug::log_elapsed(module, "update_totals", timer);
             let timer = debug::start_if(debug);
-            let _ = provider.set_batch(SetBatchParams {
-                blockhash: StateAt::Latest,
-                puts,
-                deletes: Vec::new(),
-            });
+            provider
+                .set_batch(SetBatchParams {
+                    blockhash: StateAt::Latest,
+                    puts,
+                    deletes: Vec::new(),
+                })
+                .map_err(|e| anyhow!("[SUBFROST] set_batch failed at height {}: {e}", height))?;
             debug::log_elapsed(module, "write_batch", timer);
         }
 

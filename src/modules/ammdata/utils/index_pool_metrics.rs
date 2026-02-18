@@ -1,4 +1,3 @@
-use crate::runtime::state_at::StateAt;
 use crate::modules::ammdata::consts::{AMOUNT_SCALE, CanonicalQuoteUnit};
 use crate::modules::ammdata::schemas::{SchemaPoolMetricsV1, SchemaPoolMetricsV2, Timeframe};
 use crate::modules::ammdata::storage::{
@@ -10,6 +9,7 @@ use crate::modules::ammdata::storage::{
 use crate::modules::ammdata::utils::candles::bucket_start_for;
 use crate::modules::ammdata::utils::index_state::IndexState;
 use crate::modules::essentials::storage::{EssentialsProvider, GetLatestCirculatingSupplyParams};
+use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::Result;
 use bitcoin::Network;
@@ -17,6 +17,7 @@ use serde_json::json;
 use std::collections::HashMap;
 
 pub fn derive_pool_metrics(
+    blockhash: StateAt,
     block_ts: u64,
     height: u32,
     provider: &AmmDataProvider,
@@ -42,7 +43,9 @@ pub fn derive_pool_metrics(
             let key = table.candle_key(pool, tf, bucket_ts);
             if let Some(raw) = provider
                 .get_raw_value(crate::modules::ammdata::storage::GetRawValueParams {
-            blockhash: StateAt::Latest, key })?
+                    blockhash: blockhash.clone(),
+                    key,
+                })?
                 .value
             {
                 return Ok(Some(decode_full_candle_v1(&raw)?));
@@ -87,7 +90,9 @@ pub fn derive_pool_metrics(
             .or_else(|| {
                 provider
                     .get_token_metrics(GetTokenMetricsParams {
-            blockhash: StateAt::Latest, token: *token })
+                        blockhash: blockhash.clone(),
+                        token: *token,
+                    })
                     .ok()
                     .map(|res| res.metrics)
             })
@@ -131,10 +136,10 @@ pub fn derive_pool_metrics(
                     };
                 } else {
                     let prefix = table.candle_ns_prefix(&entry.pool_id, Timeframe::M10);
-                    if let Ok(res) =
-                        provider.get_list_entries_desc(GetListEntriesDescParams {
-            blockhash: StateAt::Latest, prefix })
-                    {
+                    if let Ok(res) = provider.get_list_entries_desc(GetListEntriesDescParams {
+                        blockhash: StateAt::Latest,
+                        prefix,
+                    }) {
                         if let Some((_k, v)) = res.entries.into_iter().next() {
                             if let Ok(candle) = decode_full_candle_v1(&v) {
                                 price = if use_base_price {
@@ -156,7 +161,7 @@ pub fn derive_pool_metrics(
     let tvl_at_height = |pool: &SchemaAlkaneId, h: u32| -> u128 {
         provider
             .get_tvl_versioned_at_or_before(GetTvlVersionedAtOrBeforeParams {
-            blockhash: StateAt::Latest,
+                blockhash: StateAt::Latest,
                 pool: *pool,
                 height: h,
             })
@@ -173,9 +178,12 @@ pub fn derive_pool_metrics(
     for pool in state.pools_touched.iter() {
         let Some(defs) = state.pools_map.get(pool) else { continue };
 
-        let mut balances =
-            crate::modules::essentials::utils::balances::get_alkane_balances(essentials, pool)
-                .unwrap_or_default();
+        let mut balances = crate::modules::essentials::utils::balances::get_alkane_balances(
+            StateAt::Latest,
+            essentials,
+            pool,
+        )
+        .unwrap_or_default();
         let token0_amount = balances.remove(&defs.base_alkane_id).unwrap_or(0);
         let token1_amount = balances.remove(&defs.quote_alkane_id).unwrap_or(0);
 
@@ -212,8 +220,7 @@ pub fn derive_pool_metrics(
         let pool_tvl_sats = token0_tvl_sats.saturating_add(token1_tvl_sats);
 
         let prev_pool_metrics = provider
-            .get_pool_metrics_v2(GetPoolMetricsV2Params {
-            blockhash: StateAt::Latest, pool: *pool })
+            .get_pool_metrics_v2(GetPoolMetricsV2Params { blockhash: StateAt::Latest, pool: *pool })
             .ok()
             .and_then(|res| res.metrics);
         let full_history = prev_pool_metrics.is_none();
@@ -458,7 +465,9 @@ pub fn derive_pool_metrics(
 
         let lp_supply = essentials
             .get_latest_circulating_supply(GetLatestCirculatingSupplyParams {
-            blockhash: StateAt::Latest, alkane: *pool })
+                blockhash: blockhash.clone(),
+                alkane: *pool,
+            })
             .map(|res| res.supply)
             .unwrap_or(0);
         state
@@ -468,6 +477,7 @@ pub fn derive_pool_metrics(
         let pool_label =
             crate::modules::ammdata::pool_name_display(&crate::modules::ammdata::strip_lp_suffix(
                 &crate::modules::ammdata::utils::index_pools::get_alkane_label(
+                    blockhash.clone(),
                     essentials,
                     &mut state.alkane_label_cache,
                     pool,
@@ -477,7 +487,9 @@ pub fn derive_pool_metrics(
         let creation_info = state.pool_creation_info_cache.get(pool).cloned().or_else(|| {
             provider
                 .get_pool_creation_info(GetPoolCreationInfoParams {
-            blockhash: StateAt::Latest, pool: *pool })
+                    blockhash: blockhash.clone(),
+                    pool: *pool,
+                })
                 .ok()
                 .and_then(|res| res.info)
         });

@@ -1,6 +1,6 @@
-use crate::runtime::state_at::StateAt;
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{KvPointer, ListPointer};
+use crate::runtime::state_at::StateAt;
 use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use anyhow::{Result, anyhow};
@@ -298,7 +298,9 @@ impl PizzafunProvider {
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
-        let Some(bytes) = self.raw_get_at(table.INDEX_HEIGHT.key(), _params.blockhash.resolve(self.view_blockhash))? else {
+        let Some(bytes) = self
+            .raw_get_at(table.INDEX_HEIGHT.key(), _params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(GetIndexHeightResult { height: None });
         };
         if bytes.len() != 4 {
@@ -321,7 +323,8 @@ impl PizzafunProvider {
     pub fn get_series_by_id(&self, params: GetSeriesByIdParams) -> Result<Option<SeriesEntry>> {
         let table = self.table();
         let key = table.series_by_id_key(&params.series_id);
-        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))? else {
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(None);
         };
         Ok(Some(SeriesEntry::try_from_slice(&bytes)?))
@@ -351,7 +354,8 @@ impl PizzafunProvider {
     ) -> Result<Option<SeriesEntry>> {
         let table = self.table();
         let key = table.series_by_alkane_key(&params.alkane);
-        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))? else {
+        let Some(bytes) = self.raw_get_at(&key, params.blockhash.resolve(self.view_blockhash))?
+        else {
             return Ok(None);
         };
         Ok(Some(SeriesEntry::try_from_slice(&bytes)?))

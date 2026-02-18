@@ -1,7 +1,7 @@
-use bitcoin::hashes::{sha256, Hash as _};
 use bitcoin::BlockHash;
+use bitcoin::hashes::{Hash as _, sha256};
 use borsh::{BorshDeserialize, BorshSerialize};
-use rocksdb::{Direction, Error as RocksError, IteratorMode, WriteBatch, DB};
+use rocksdb::{DB, Direction, Error as RocksError, IteratorMode, WriteBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
