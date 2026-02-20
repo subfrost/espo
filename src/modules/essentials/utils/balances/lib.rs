@@ -1058,7 +1058,7 @@ pub fn bulk_update_balances_for_block(
     for atx in &block.transactions {
         let tx = &atx.transaction;
         if !tx_has_op_return(tx) {
-            continue; // no OP_RETURN → no Alkanes activity on its outputs
+            continue; // no OP_RETURN -> no Alkanes activity on its outputs
         }
         let txid = tx.compute_txid();
         for (vout, _o) in tx.output.iter().enumerate() {
@@ -1091,9 +1091,9 @@ pub fn bulk_update_balances_for_block(
     debug::log_elapsed(module, "pass_a_collect_outpoints", timer);
     // ---------- Pass B: fetch external inputs (batch read) ----------
     let timer = debug::start_if(debug);
-    let mut balances_by_outpoint: HashMap<(Vec<u8>, u32), Vec<BalanceEntry>> = HashMap::new();
-    let mut addr_by_outpoint: HashMap<(Vec<u8>, u32), String> = HashMap::new();
-    let mut spk_by_outpoint: HashMap<(Vec<u8>, u32), ScriptBuf> = HashMap::new();
+    let mut balances_by_outpoint: HashMap<(Txid, u32), Vec<BalanceEntry>> = HashMap::new();
+    let mut addr_by_outpoint: HashMap<(Txid, u32), String> = HashMap::new();
+    let mut spk_by_outpoint: HashMap<(Txid, u32), ScriptBuf> = HashMap::new();
 
     if !external_inputs_vec.is_empty() {
         // Prefilter external inputs by prev txids that are indexed as alkane txs.
@@ -1147,8 +1147,7 @@ pub fn bulk_update_balances_for_block(
             txid_arr.copy_from_slice(&op.txid);
             lookup_outpoints.push((Txid::from_byte_array(txid_arr), op.vout));
         }
-        let lookups =
-            get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
+        let lookups = get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
         for (txid, vout) in lookup_outpoints {
             let Some(lookup) = lookups.get(&(txid, vout)) else {
                 continue;
@@ -1156,18 +1155,18 @@ pub fn bulk_update_balances_for_block(
             if lookup.spent_by.is_some() {
                 continue;
             }
-            let key = (txid.to_byte_array().to_vec(), vout);
+            let key = (txid, vout);
             if !lookup.balances.is_empty() {
-                balances_by_outpoint.insert(key.clone(), lookup.balances.clone());
+                balances_by_outpoint.insert(key, lookup.balances.clone());
             }
             if let Some(addr) = lookup.address.as_ref() {
                 if !addr.is_empty() {
-                    addr_by_outpoint.insert(key.clone(), addr.clone());
+                    addr_by_outpoint.insert((txid, vout), addr.clone());
                 }
             }
             if let Some(spk) = lookup.spk.as_ref() {
                 if !spk.is_empty() {
-                    spk_by_outpoint.insert(key, spk.clone());
+                    spk_by_outpoint.insert((txid, vout), spk.clone());
                 }
             }
         }
@@ -1285,7 +1284,7 @@ pub fn bulk_update_balances_for_block(
                 input.previous_output.vout,
                 None,
             );
-            let in_key = (in_op.txid.clone(), in_op.vout);
+            let in_key = (input.previous_output.txid, input.previous_output.vout);
             let in_str = in_op.as_outpoint_string();
 
             if !input.previous_output.is_null() {
@@ -1675,6 +1674,20 @@ pub fn bulk_update_balances_for_block(
     }
 
     debug::log_elapsed(module, "process_transactions_loop", process_timer);
+    if debug {
+        eprintln!(
+            "[balances] process loop stats: spent_outpoints={} ephem_outpoints={} consumed_ephem={} addr_balance_delta_addrs={} holders_delta_alkanes={} alkane_balance_delta_owners={} tx_summaries={} block_txids={} latest_trace_txids={}",
+            spent_outpoints.len(),
+            ephem_outpoint_balances.len(),
+            consumed_ephem_outpoints.len(),
+            address_balance_delta.len(),
+            holders_delta.len(),
+            alkane_balance_delta.len(),
+            alkane_tx_summaries.len(),
+            alkane_block_txids.len(),
+            latest_trace_txids.len()
+        );
+    }
 
     // Ensure txid indexes are recorded for every alkane/token delta we are about to persist.
     for ((owner, token), entry) in &alkane_balance_delta_src {
@@ -1797,6 +1810,15 @@ pub fn bulk_update_balances_for_block(
         }
     }
     debug::log_elapsed(module, "process_transactions_build_balance_rows", timer);
+    if debug {
+        eprintln!(
+            "[balances] balance rows stats: owners={} tx_entries_owner={} tx_entries_pair={} delta_src={}",
+            alkane_balances_rows.len(),
+            alkane_balance_tx_entries.len(),
+            alkane_balance_tx_entries_by_token.len(),
+            alkane_balance_delta_src.len()
+        );
+    }
 
     let timer = debug::start_if(debug);
     let mut address_offsets: HashMap<String, u64> = HashMap::new();
@@ -1939,6 +1961,15 @@ pub fn bulk_update_balances_for_block(
         new_rows.push(row);
     }
     debug::log_elapsed(module, "process_transactions_build_new_rows", timer);
+    if debug {
+        let spent_rows = new_rows.iter().filter(|r| r.outpoint.tx_spent.is_some()).count();
+        eprintln!(
+            "[balances] new_rows stats: total={} spent={} unspent={}",
+            new_rows.len(),
+            spent_rows,
+            new_rows.len().saturating_sub(spent_rows)
+        );
+    }
 
     // ---- single write-batch ----
     let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -1982,7 +2013,8 @@ pub fn bulk_update_balances_for_block(
                 block.height,
                 tx_idx,
                 &blockhash,
-            ) else {
+            )
+            else {
                 continue;
             };
             blob_puts.push((candidate_key, Vec::new()));
@@ -3097,45 +3129,8 @@ pub fn bulk_update_balances_for_block(
     let check_balances = strict_check_alkane_balances();
     let check_utxos = strict_check_utxos();
     if check_balances || check_utxos {
-        let metashrew = get_metashrew();
-        let height_u64 = block.height as u64;
-        let metashrew_sdb = get_metashrew_sdb();
-        metashrew_sdb
-            .catch_up_now()
-            .context("metashrew catch_up before strict checks")?;
-        let sdb = metashrew_sdb.as_ref();
-
-        let mut balance_mismatches: Vec<(SchemaAlkaneId, SchemaAlkaneId, u128, u128)> = Vec::new();
+        let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();
         if check_balances {
-            let balances_from_rows = |owner: &SchemaAlkaneId| -> HashMap<SchemaAlkaneId, u128> {
-                let entries = alkane_balances_rows.get(owner).unwrap_or_else(|| {
-                    panic!(
-                        "[balances][strict] missing prewrite balances (owner={}:{})",
-                        owner.block, owner.tx
-                    )
-                });
-                let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
-                for entry in entries {
-                    if entry.amount == 0 {
-                        continue;
-                    }
-                    *agg.entry(entry.alkane).or_default() =
-                        agg.get(&entry.alkane).copied().unwrap_or(0).saturating_add(entry.amount);
-                }
-                if let Some(self_balance) = lookup_self_balance(owner) {
-                    if self_balance == 0 {
-                        agg.remove(owner);
-                    } else {
-                        agg.insert(*owner, self_balance);
-                    }
-                }
-                agg
-            };
-
-            let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
-                HashMap::new();
-
-            let mut changed_pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> = Vec::new();
             for (owner, per_token) in &alkane_balance_delta {
                 for (token, delta) in per_token {
                     if delta.is_zero() {
@@ -3146,6 +3141,64 @@ pub fn bulk_update_balances_for_block(
             }
             changed_pairs.sort();
             changed_pairs.dedup();
+        }
+        let unspent_rows_count = if check_utxos {
+            new_rows.iter().filter(|row| row.outpoint.tx_spent.is_none()).count()
+        } else {
+            0
+        };
+        let check_balances_now = check_balances && !changed_pairs.is_empty();
+        let check_utxos_now = check_utxos && unspent_rows_count > 0;
+        if !check_balances_now && !check_utxos_now {
+            if debug {
+                eprintln!(
+                    "[balances][strict] skipped: changed_pairs={} unspent_rows={}",
+                    changed_pairs.len(),
+                    unspent_rows_count
+                );
+            }
+        } else {
+            let metashrew = get_metashrew();
+            let height_u64 = block.height as u64;
+            let metashrew_sdb = get_metashrew_sdb();
+            metashrew_sdb
+                .catch_up_now()
+                .context("metashrew catch_up before strict checks")?;
+            let sdb = metashrew_sdb.as_ref();
+
+            let mut balance_mismatches: Vec<(SchemaAlkaneId, SchemaAlkaneId, u128, u128)> =
+                Vec::new();
+            if check_balances_now {
+                let balances_from_rows = |owner: &SchemaAlkaneId| -> HashMap<SchemaAlkaneId, u128> {
+                    let entries = alkane_balances_rows.get(owner).unwrap_or_else(|| {
+                        panic!(
+                            "[balances][strict] missing prewrite balances (owner={}:{})",
+                            owner.block, owner.tx
+                        )
+                    });
+                    let mut agg: HashMap<SchemaAlkaneId, u128> = HashMap::new();
+                    for entry in entries {
+                        if entry.amount == 0 {
+                            continue;
+                        }
+                        *agg.entry(entry.alkane).or_default() = agg
+                            .get(&entry.alkane)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(entry.amount);
+                    }
+                    if let Some(self_balance) = lookup_self_balance(owner) {
+                        if self_balance == 0 {
+                            agg.remove(owner);
+                        } else {
+                            agg.insert(*owner, self_balance);
+                        }
+                    }
+                    agg
+                };
+
+            let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
+                HashMap::new();
 
             for (owner, token) in changed_pairs {
                 if !local_cache.contains_key(&owner) {
@@ -3177,14 +3230,14 @@ pub fn bulk_update_balances_for_block(
             }
         }
 
-        struct UtxoMismatch {
-            outpoint: EspoOutpoint,
-            addr: String,
-            local: BTreeMap<SchemaAlkaneId, u128>,
-            metashrew: BTreeMap<SchemaAlkaneId, u128>,
-        }
-        let mut utxo_mismatches: Vec<UtxoMismatch> = Vec::new();
-        if check_utxos {
+            struct UtxoMismatch {
+                outpoint: EspoOutpoint,
+                addr: String,
+                local: BTreeMap<SchemaAlkaneId, u128>,
+                metashrew: BTreeMap<SchemaAlkaneId, u128>,
+            }
+            let mut utxo_mismatches: Vec<UtxoMismatch> = Vec::new();
+            if check_utxos_now {
             let to_balance_map = |entries: &[BalanceEntry]| -> BTreeMap<SchemaAlkaneId, u128> {
                 let mut out = BTreeMap::new();
                 for entry in entries {
@@ -3257,8 +3310,8 @@ pub fn bulk_update_balances_for_block(
             }
         }
 
-        if !balance_mismatches.is_empty() || !utxo_mismatches.is_empty() {
-            if check_balances {
+            if !balance_mismatches.is_empty() || !utxo_mismatches.is_empty() {
+                if check_balances_now {
                 let mut height_history_cache: HashMap<
                     (SchemaAlkaneId, SchemaAlkaneId),
                     Vec<(u32, u128)>,
@@ -3518,7 +3571,7 @@ pub fn bulk_update_balances_for_block(
                 }
             }
 
-            if check_utxos {
+                if check_utxos_now {
                 let fmt_sheet = |sheet: &BTreeMap<SchemaAlkaneId, u128>| -> String {
                     if sheet.is_empty() {
                         return "empty".to_string();
@@ -3540,12 +3593,13 @@ pub fn bulk_update_balances_for_block(
                 }
             }
 
-            panic!(
-                "[balances][strict] metashrew mismatch at height {} (alkanes={} utxos={})",
-                height_u64,
-                balance_mismatches.len(),
-                utxo_mismatches.len()
-            );
+                panic!(
+                    "[balances][strict] metashrew mismatch at height {} (alkanes={} utxos={})",
+                    height_u64,
+                    balance_mismatches.len(),
+                    utxo_mismatches.len()
+                );
+            }
         }
     }
     debug::log_elapsed(module, "strict_mode_checks", timer);
@@ -3918,7 +3972,7 @@ fn resolve_outpoint_create_position_v2(
     let target_blockhash = blockhash.resolve(provider.resolved_view_blockhash());
     let mut best: Option<(u32, u32, [u8; 32])> = None;
     for key in keys {
-        let Some((key_txid, key_vout, height, idx, blockhash)) =
+        let Some((key_txid, key_vout, height, idx, candidate_blockhash)) =
             table.parse_outpoint_create_candidate_key(&key)
         else {
             continue;
@@ -3926,12 +3980,12 @@ fn resolve_outpoint_create_position_v2(
         if key_vout != vout || key_txid.as_slice() != txid.as_byte_array() {
             continue;
         }
-        if !candidate_visible_in_view(provider, blockhash, target_blockhash)? {
+        if !candidate_visible_in_view(provider, candidate_blockhash, target_blockhash)? {
             continue;
         }
         match best {
             Some((best_h, best_idx, _)) if (height, idx) <= (best_h, best_idx) => {}
-            _ => best = Some((height, idx, blockhash)),
+            _ => best = Some((height, idx, candidate_blockhash)),
         }
     }
     Ok(best.map(|(_h, idx, bh)| (bh, idx)))
@@ -3952,7 +4006,7 @@ fn resolve_outpoint_spent_by_v2(
     let target_blockhash = blockhash.resolve(provider.resolved_view_blockhash());
     let mut best: Option<(u32, u32, Txid)> = None;
     for (key, value) in entries {
-        let Some((key_txid, key_vout, height, idx, blockhash)) =
+        let Some((key_txid, key_vout, height, idx, candidate_blockhash)) =
             table.parse_outpoint_spend_event_key(&key)
         else {
             continue;
@@ -3960,10 +4014,11 @@ fn resolve_outpoint_spent_by_v2(
         if key_vout != vout || key_txid.as_slice() != txid.as_byte_array() {
             continue;
         }
-        if !candidate_visible_in_view(provider, blockhash, target_blockhash)? {
+        if !candidate_visible_in_view(provider, candidate_blockhash, target_blockhash)? {
             continue;
         }
-        let Some(spent_by) = (if value.len() == 32 { Txid::from_slice(&value).ok() } else { None })
+        let Some(spent_by) =
+            (if value.len() == 32 { Txid::from_slice(&value).ok() } else { None })
         else {
             continue;
         };
@@ -4035,6 +4090,24 @@ pub fn get_outpoint_balances_with_spent(
     Ok(OutpointLookup { balances, spent_by, address, spk })
 }
 
+pub fn get_outpoint_rows_batch(
+    blockhash: StateAt,
+    provider: &EssentialsProvider,
+    outpoints: &[(Txid, u32)],
+) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    let mut out: HashMap<(Txid, u32), OutpointLookup> = HashMap::new();
+    for (txid, vout) in outpoints {
+        let row = load_outpoint_row_v2(provider, txid, *vout, blockhash)?;
+        let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
+        let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
+        let spk = row.as_ref().and_then(|r| {
+            if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) }
+        });
+        out.insert((*txid, *vout), OutpointLookup { balances, spent_by: None, address, spk });
+    }
+    Ok(out)
+}
+
 pub fn get_outpoint_balances_with_spent_batch(
     blockhash: StateAt,
     provider: &EssentialsProvider,
@@ -4051,7 +4124,6 @@ pub fn get_outpoint_balances_with_spent_batch(
         });
         out.insert((*txid, *vout), OutpointLookup { balances, spent_by, address, spk });
     }
-
     Ok(out)
 }
 
