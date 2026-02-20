@@ -1,13 +1,13 @@
 use crate::alkanes::trace::{
-    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
+    prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
 };
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew, get_network};
 use crate::modules::essentials::utils::balances::{
-    SignedU128, get_address_activity_for_address, get_alkane_balances,
-    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
-    get_outpoint_address, get_total_received_for_alkane, get_transfer_volume_for_alkane,
+    get_address_activity_for_address, get_alkane_balances, get_alkane_balances_at_or_before,
+    get_balance_for_address, get_holders_for_alkane, get_outpoint_address,
+    get_total_received_for_alkane, get_transfer_volume_for_alkane, SignedU128,
 };
-use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
+use crate::modules::essentials::utils::inspections::{inspection_to_json, AlkaneCreationRecord};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -21,13 +21,13 @@ use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{Value, json, map::Map};
+use serde_json::{json, map::Map, Value};
 
 use crate::runtime::mempool::{
-    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
+    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address, MempoolEntry,
 };
 use crate::utils::electrum_like::AddressHistoryEntry;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use hex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -1859,7 +1859,9 @@ impl EssentialsProvider {
         let started = Instant::now();
         let debug = creation_debug_enabled();
         let slow_threshold_ms: u128 = 250;
-        let total = self.get_creation_count(GetCreationCountParams { blockhash: params.blockhash })?.count;
+        let total = self
+            .get_creation_count(GetCreationCountParams { blockhash: params.blockhash })?
+            .count;
         if total == 0 {
             if debug {
                 eprintln!(
@@ -1915,7 +1917,9 @@ impl EssentialsProvider {
         let at_blockhash = params.blockhash.resolve(self.view_blockhash);
         let table = self.table();
         let count_started = Instant::now();
-        let total = self.get_creation_count(GetCreationCountParams { blockhash: params.blockhash })?.count;
+        let total = self
+            .get_creation_count(GetCreationCountParams { blockhash: params.blockhash })?
+            .count;
         let count_elapsed_ms = count_started.elapsed().as_millis();
         let (start_seq, end_seq, reverse) =
             creation_seq_bounds(total, params.offset, params.limit, params.desc);
@@ -1939,9 +1943,8 @@ impl EssentialsProvider {
             return Ok(GetCreationRecordsOrderedPageResult { records: Vec::new() });
         }
 
-        let mut seq_keys: Vec<Vec<u8>> = (start_seq..end_seq)
-            .map(|seq| table.alkane_creation_seq_key(seq))
-            .collect();
+        let mut seq_keys: Vec<Vec<u8>> =
+            (start_seq..end_seq).map(|seq| table.alkane_creation_seq_key(seq)).collect();
         if reverse {
             seq_keys.reverse();
         }
@@ -2541,7 +2544,11 @@ impl EssentialsProvider {
             let key_str_val = utf8_or_null(k);
 
             let top_key = if try_decode_utf8 {
-                if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
+                if let Value::String(s) = &key_str_val {
+                    s.clone()
+                } else {
+                    key_hex.clone()
+                }
             } else {
                 key_hex.clone()
             };
@@ -4182,7 +4189,11 @@ impl EssentialsProvider {
                                         return None;
                                     }
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h { Some(tip - h + 1) } else { None }
+                                        if tip >= h {
+                                            Some(tip - h + 1)
+                                        } else {
+                                            None
+                                        }
                                     })
                                 });
                             let traces = summary
@@ -4240,7 +4251,11 @@ impl EssentialsProvider {
                                 let summary = load_tx_summary_v2(self, txid);
                                 let confirmations = entries_for_page[idx].height.and_then(|h| {
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h { Some(tip - h + 1) } else { None }
+                                        if tip >= h {
+                                            Some(tip - h + 1)
+                                        } else {
+                                            None
+                                        }
                                     })
                                 });
                                 let traces = summary
@@ -5398,8 +5413,28 @@ pub(crate) fn load_tx_packed_outflow_v2(
 ) -> Option<TxPackedOutflowRowV2> {
     let mut txid_arr = [0u8; 32];
     txid_arr.copy_from_slice(txid.as_byte_array());
-    let (blockhash, tx_idx, _height) = resolve_tx_locator_candidate_v2(provider, &txid_arr)?;
     let table = provider.table();
+    let pos_key = table.tx_packed_outflow_pos_key(&txid_arr);
+    if let Some(raw_pos) = provider
+        .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: pos_key })
+        .ok()?
+        .value
+    {
+        if let Ok((blockhash, tx_idx)) = decode_tx_packed_outflow_pos_v2(&raw_pos) {
+            let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
+            if let Some(row_raw) = provider
+                .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
+                .ok()?
+                .value
+            {
+                if let Ok(decoded) = decode_tx_packed_outflow_row_v2(&row_raw) {
+                    return Some(decoded);
+                }
+            }
+        }
+    }
+
+    let (blockhash, tx_idx, _height) = resolve_tx_locator_candidate_v2(provider, &txid_arr)?;
     let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
     let row_raw = provider
         .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
@@ -5518,7 +5553,11 @@ fn enriched_transaction_json(
     let has_protostones = !protostones.is_empty();
     let alkanes_traces = render.traces.as_ref().and_then(|traces| {
         let vals = traces.iter().map(enriched_trace_to_value).collect::<Vec<_>>();
-        if vals.is_empty() { None } else { Some(Value::Array(vals)) }
+        if vals.is_empty() {
+            None
+        } else {
+            Some(Value::Array(vals))
+        }
     });
 
     let mut out = Map::new();
@@ -5775,7 +5814,7 @@ mod tests {
     use super::*;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
     use bitcoin::BlockHash;
-    use rocksdb::{DB, Options};
+    use rocksdb::{Options, DB};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -5875,10 +5914,7 @@ mod tests {
                 desc: false,
             })
             .expect("asc page");
-        assert_eq!(
-            asc_page.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(),
-            vec![0, 1]
-        );
+        assert_eq!(asc_page.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![0, 1]);
 
         let asc_tail = provider
             .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
@@ -5888,10 +5924,7 @@ mod tests {
                 desc: false,
             })
             .expect("asc tail");
-        assert_eq!(
-            asc_tail.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(),
-            vec![4]
-        );
+        assert_eq!(asc_tail.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![4]);
 
         let desc_page = provider
             .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
@@ -5901,10 +5934,7 @@ mod tests {
                 desc: true,
             })
             .expect("desc page");
-        assert_eq!(
-            desc_page.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(),
-            vec![4, 3]
-        );
+        assert_eq!(desc_page.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![4, 3]);
 
         let desc_tail = provider
             .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
@@ -5914,10 +5944,7 @@ mod tests {
                 desc: true,
             })
             .expect("desc tail");
-        assert_eq!(
-            desc_tail.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(),
-            vec![0]
-        );
+        assert_eq!(desc_tail.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![0]);
 
         let desc_empty = provider
             .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
@@ -5962,7 +5989,8 @@ mod tests {
         let db = Arc::new(DB::open(&opts, dir.path()).expect("open rocksdb"));
         init_global_tree_db(Arc::clone(&db)).expect("init tree db");
 
-        let provider = EssentialsProvider::new(Arc::new(Mdb::from_db(Arc::clone(&db), b"essentials:")));
+        let provider =
+            EssentialsProvider::new(Arc::new(Mdb::from_db(Arc::clone(&db), b"essentials:")));
         let tree = get_global_tree_db().expect("global tree");
 
         let genesis = BlockHash::from_byte_array([0u8; 32]);
@@ -5985,10 +6013,7 @@ mod tests {
                 desc: true,
             })
             .expect("h1 page");
-        assert_eq!(
-            h1_latest.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(),
-            vec![0]
-        );
+        assert_eq!(h1_latest.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![0]);
 
         let h1_offset = provider
             .get_creation_records_ordered_page(GetCreationRecordsOrderedPageParams {
@@ -6008,9 +6033,6 @@ mod tests {
                 desc: true,
             })
             .expect("h2 page");
-        assert_eq!(
-            h2_latest.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(),
-            vec![1, 0]
-        );
+        assert_eq!(h2_latest.records.iter().map(|r| r.alkane.tx).collect::<Vec<_>>(), vec![1, 0]);
     }
 }

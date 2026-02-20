@@ -2,11 +2,11 @@ use crate::runtime::state_at::StateAt;
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::State;
 use axum::response::Html;
-use bitcoin::Txid;
 use bitcoin::hashes::Hash;
+use bitcoin::Txid;
 use bitcoincore_rpc::RpcApi;
 use borsh::BorshDeserialize;
-use maud::{Markup, html};
+use maud::{html, Markup};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -15,13 +15,13 @@ use crate::config::{get_bitcoind_rpc_client, get_espo_next_height};
 use crate::explorer::components::block_carousel::block_carousel;
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::icon_right;
-use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
+use crate::explorer::components::table::{alkanes_table, AlkaneTableRow};
 use crate::explorer::components::tx_view::{alkane_icon_url, render_trace_summaries};
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    AlkaneTxSummary, EssentialsProvider, EssentialsTable, GetHoldersOrderedPageParams,
-    HoldersCountEntry, load_creation_record, load_tx_summary_v2,
+    load_creation_record, load_tx_summary_v2, AlkaneTxSummary, EssentialsProvider, EssentialsTable,
+    GetHoldersOrderedPageParams, HoldersCountEntry,
 };
 use crate::schemas::EspoOutpoint;
 use std::sync::Arc;

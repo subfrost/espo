@@ -1,10 +1,10 @@
-use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 use crate::config::{get_explorer_networks, get_network};
-use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
+use crate::explorer::components::dropdown::{dropdown, DropdownItem, DropdownProps};
 use crate::explorer::components::footer::footer;
 use crate::explorer::components::svg_assets::{
     dots, icon_btc, icon_search, icon_signet, icon_testnet, logo_espo,
@@ -234,7 +234,11 @@ fn network_key(network: bitcoin::Network) -> &'static str {
         bitcoin::Network::Signet => "signet",
         _ => {
             let tag = network.to_string();
-            if tag == "testnet4" { "testnet4" } else { "testnet3" }
+            if tag == "testnet4" {
+                "testnet4"
+            } else {
+                "testnet3"
+            }
         }
     }
 }

@@ -2,21 +2,21 @@ use crate::runtime::state_at::StateAt;
 use axum::extract::{Query, State};
 use axum::response::Html;
 use borsh::BorshDeserialize;
-use maud::{Markup, html};
+use maud::{html, Markup};
 use serde::Deserialize;
 
-use crate::explorer::components::dropdown::{DropdownItem, DropdownProps, dropdown};
+use crate::explorer::components::dropdown::{dropdown, DropdownItem, DropdownProps};
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
     icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::table::{AlkaneTableRow, alkanes_table};
+use crate::explorer::components::table::{alkanes_table, AlkaneTableRow};
 use crate::explorer::components::tx_view::alkane_icon_url;
 use crate::explorer::pages::state::ExplorerState;
 use crate::explorer::paths::explorer_path;
 use crate::modules::essentials::storage::{
-    EssentialsTable, GetCreationRecordsOrderedPageParams, GetHoldersOrderedPageParams,
-    HoldersCountEntry, load_creation_record,
+    load_creation_record, EssentialsTable, GetCreationRecordsOrderedPageParams,
+    GetHoldersOrderedPageParams, HoldersCountEntry,
 };
 use crate::modules::essentials::utils::inspections::AlkaneCreationRecord;
 

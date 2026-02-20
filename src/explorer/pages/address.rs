@@ -6,7 +6,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Network, Transaction, Txid};
 use bitcoincore_rpc::RpcApi;
-use maud::html;
+use maud::{html, Markup, PreEscaped};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -15,22 +15,24 @@ use std::time::{Duration, Instant};
 use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like};
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
-use crate::explorer::components::header::{HeaderProps, HeaderSummaryItem, header, header_scripts};
+use crate::explorer::components::header::{header, header_scripts, HeaderProps, HeaderSummaryItem};
 use crate::explorer::components::layout::layout;
 use crate::explorer::components::svg_assets::{
     icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
-use crate::explorer::components::tx_view::{TxPill, TxPillTone, render_tx};
+use crate::explorer::components::tx_view::{
+    alkane_meta, render_tx, AlkaneMetaCache, TxPill, TxPillTone,
+};
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
-use crate::explorer::paths::explorer_path;
+use crate::explorer::paths::{explorer_base_path, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
-use crate::modules::essentials::storage::{AlkaneTxSummary, EssentialsTable, load_tx_summary_v2};
+use crate::modules::essentials::storage::{load_tx_summary_v2, AlkaneTxSummary, EssentialsTable};
 use crate::modules::essentials::utils::balances::{
-    OutpointLookup, get_balance_for_address, get_outpoint_balances_with_spent_batch,
+    get_balance_for_address, get_outpoint_rows_batch, OutpointLookup,
 };
-use crate::runtime::mempool::{MempoolEntry, pending_by_txid, pending_for_address};
+use crate::runtime::mempool::{pending_by_txid, pending_for_address, MempoolEntry};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::EspoOutpoint;
 use crate::utils::electrum_like::{AddressHistoryEntry, ElectrumLikeBackend};
@@ -60,6 +62,16 @@ fn format_with_commas(n: u64) -> String {
         i -= 3;
     }
     s
+}
+
+fn log_address_page_perf(address: &str, step: &str, started: Instant, detail: &str) {
+    eprintln!(
+        "[address_page][perf] address={} step={} elapsed_ms={} {}",
+        address,
+        step,
+        started.elapsed().as_millis(),
+        detail
+    );
 }
 
 fn address_type_label(address: &Address) -> Option<&'static str> {
@@ -146,18 +158,45 @@ pub async fn address_page(
 
     let electrum_like = get_electrum_like();
     let address_str = address.to_string();
+    eprintln!(
+        "[address_page][perf] address={} request_start page={} limit={} traces_only={} cursor_present={} stack_depth={}",
+        address_str,
+        page,
+        limit,
+        traces_only,
+        cursor_txid.is_some(),
+        cursor_stack.len()
+    );
     let table = EssentialsTable::new(&state.essentials_mdb);
     let essentials_provider = state.essentials_provider();
+    let address_stats_t0 = Instant::now();
     let address_stats = electrum_like
         .address_stats(&address)
         .map_err(|e| {
             eprintln!("[address_page] failed to fetch address stats for {address_str}: {e}");
         })
         .ok();
+    log_address_page_perf(
+        &address_str,
+        "electrum_like.address_stats",
+        address_stats_t0,
+        &format!(
+            "ok={} backend={:?}",
+            address_stats.is_some(),
+            address_stats.as_ref().map(|s| s.backend)
+        ),
+    );
 
+    let balances_t0 = Instant::now();
     let balances =
         get_balance_for_address(StateAt::Latest, &state.essentials_provider(), &address_str)
             .unwrap_or_default();
+    log_address_page_perf(
+        &address_str,
+        "essentials.get_balance_for_address",
+        balances_t0,
+        &format!("alkanes={}", balances.len()),
+    );
     let mut balance_entries: Vec<BalanceEntry> = balances
         .into_iter()
         .map(|(alk, amt)| BalanceEntry { alkane: alk, amount: amt })
@@ -165,10 +204,40 @@ pub async fn address_page(
     balance_entries.sort_by(|a, b| {
         a.alkane.block.cmp(&b.alkane.block).then_with(|| a.alkane.tx.cmp(&b.alkane.tx))
     });
+    let chart_tokens_t0 = Instant::now();
+    let mut chart_meta_cache: AlkaneMetaCache = HashMap::new();
+    let chart_tokens: Vec<(String, String, String, String)> = balance_entries
+        .iter()
+        .map(|entry| {
+            let alkane_id = format!("{}:{}", entry.alkane.block, entry.alkane.tx);
+            let meta = alkane_meta(&entry.alkane, &mut chart_meta_cache, &state.essentials_mdb);
+            let label = if meta.name.known && meta.name.value != alkane_id {
+                format!("{} ({})", meta.name.value, alkane_id)
+            } else {
+                alkane_id.clone()
+            };
+            (alkane_id, label, meta.name.value.clone(), meta.symbol.clone())
+        })
+        .collect();
+    let default_chart_alkane = chart_tokens.first().map(|(id, _, _, _)| id.clone());
+    log_address_page_perf(
+        &address_str,
+        "build_chart_tokens",
+        chart_tokens_t0,
+        &format!("tokens={}", chart_tokens.len()),
+    );
 
+    let chain_tip_t0 = Instant::now();
     let chain_tip = get_bitcoind_rpc_client().get_blockchain_info().ok().map(|i| i.blocks as u64);
+    log_address_page_perf(
+        &address_str,
+        "bitcoind.get_blockchain_info",
+        chain_tip_t0,
+        &format!("tip={:?}", chain_tip),
+    );
 
     let off = limit.saturating_mul(page.saturating_sub(1));
+    let pending_t0 = Instant::now();
     let mut pending_entries: Vec<MempoolEntry> = pending_for_address(&address_str);
     pending_entries.sort_by(|a, b| b.txid.cmp(&a.txid));
     let pending_filtered: Vec<MempoolEntry> = pending_entries
@@ -176,6 +245,12 @@ pub async fn address_page(
         .filter(|e| !traces_only || e.traces.as_ref().map_or(false, |t| !t.is_empty()))
         .collect();
     let pending_total = pending_filtered.len();
+    log_address_page_perf(
+        &address_str,
+        "mempool.pending_for_address",
+        pending_t0,
+        &format!("pending_filtered={}", pending_total),
+    );
     let pending_set: HashSet<Txid> = pending_filtered.iter().map(|e| e.txid).collect();
 
     let mut tx_renders: Vec<AddressTxRender> = Vec::new();
@@ -205,6 +280,7 @@ pub async fn address_page(
 
     let mut next_cursor: Option<Txid> = None;
     if traces_only {
+        let confirmed_total_t0 = Instant::now();
         let confirmed_total = state
             .essentials_mdb
             .get(&table.alkane_address_len_key(&address_str))
@@ -220,6 +296,12 @@ pub async fn address_page(
                 }
             })
             .unwrap_or(0);
+        log_address_page_perf(
+            &address_str,
+            "essentials_mdb.get_alkane_address_len",
+            confirmed_total_t0,
+            &format!("confirmed_total={}", confirmed_total),
+        );
         let confirmed_slice_start = confirmed_offset.min(confirmed_total);
         let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
@@ -229,7 +311,14 @@ pub async fn address_page(
                 let rev_idx = confirmed_total - 1 - idx;
                 txid_keys.push(table.alkane_address_txid_key(&address_str, rev_idx as u64));
             }
+            let txid_multi_get_t0 = Instant::now();
             let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
+            log_address_page_perf(
+                &address_str,
+                "essentials_mdb.multi_get_alkane_address_txids",
+                txid_multi_get_t0,
+                &format!("keys={} vals={}", txid_keys.len(), txid_vals.len()),
+            );
             let mut txids: Vec<Txid> = Vec::new();
             for v in txid_vals {
                 let Some(bytes) = v else { continue };
@@ -241,7 +330,19 @@ pub async fn address_page(
                 }
             }
 
+            let raw_txs_t0 = Instant::now();
             let raw_txs = electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+            log_address_page_perf(
+                &address_str,
+                "electrum_like.batch_transaction_get_raw.traces_only",
+                raw_txs_t0,
+                &format!("txids={} raws={}", txids.len(), raw_txs.len()),
+            );
+
+            let decode_and_summary_t0 = Instant::now();
+            let mut decode_failures = 0usize;
+            let mut summary_hits = 0usize;
+            let mut traces_hits = 0usize;
 
             for (idx, txid) in txids.iter().enumerate() {
                 let raw = raw_txs.get(idx).cloned().unwrap_or_default();
@@ -252,10 +353,14 @@ pub async fn address_page(
                     Ok(t) => t,
                     Err(e) => {
                         eprintln!("[address_page] failed to decode tx {}: {e}", txid);
+                        decode_failures = decode_failures.saturating_add(1);
                         continue;
                     }
                 };
                 let summary = load_tx_summary_v2(&essentials_provider, txid);
+                if summary.is_some() {
+                    summary_hits = summary_hits.saturating_add(1);
+                }
                 let confirmations = summary.as_ref().and_then(|s| {
                     let h = s.height as u64;
                     chain_tip.and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
@@ -264,6 +369,9 @@ pub async fn address_page(
                     .as_ref()
                     .map(|s| traces_from_summary(txid, s))
                     .filter(|t| !t.is_empty());
+                if traces.is_some() {
+                    traces_hits = traces_hits.saturating_add(1);
+                }
 
                 tx_renders.push(AddressTxRender {
                     txid: *txid,
@@ -273,10 +381,34 @@ pub async fn address_page(
                     is_mempool: false,
                 });
             }
+            log_address_page_perf(
+                &address_str,
+                "decode_and_summary.traces_only",
+                decode_and_summary_t0,
+                &format!(
+                    "txids={} rendered={} summary_hits={} traces_hits={} decode_failures={}",
+                    txids.len(),
+                    tx_renders.len(),
+                    summary_hits,
+                    traces_hits,
+                    decode_failures
+                ),
+            );
         }
 
         tx_total = pending_total + confirmed_total;
         tx_has_next = (off + tx_renders.len()) < tx_total;
+        log_address_page_perf(
+            &address_str,
+            "traces_only.pagination",
+            start_time,
+            &format!(
+                "tx_total={} tx_renders={} has_next={}",
+                tx_total,
+                tx_renders.len(),
+                tx_has_next
+            ),
+        );
     } else {
         match address_stats.as_ref().map(|s| s.backend) {
             Some(ElectrumLikeBackend::ElectrumRpc) => {
@@ -288,12 +420,25 @@ pub async fn address_page(
             }
             _ => {
                 let fetch_limit = remaining_slots.max(1);
+                let history_page_t0 = Instant::now();
                 match electrum_like.address_history_page_cursor(
                     &address,
                     cursor_txid.as_ref(),
                     fetch_limit,
                 ) {
                     Ok(hist_page) => {
+                        log_address_page_perf(
+                            &address_str,
+                            "electrum_like.address_history_page_cursor",
+                            history_page_t0,
+                            &format!(
+                                "entries={} total={:?} has_more={} fetch_limit={}",
+                                hist_page.entries.len(),
+                                hist_page.total,
+                                hist_page.has_more,
+                                fetch_limit
+                            ),
+                        );
                         let entries: Vec<AddressHistoryEntry> = hist_page
                             .entries
                             .into_iter()
@@ -303,8 +448,20 @@ pub async fn address_page(
                             hist_page.total.unwrap_or(entries.len()).max(entries.len());
                         let txids: Vec<Txid> =
                             entries.iter().take(remaining_slots).map(|h| h.txid).collect();
+                        let raw_txs_t0 = Instant::now();
                         let raw_txs =
                             electrum_like.batch_transaction_get_raw(&txids).unwrap_or_default();
+                        log_address_page_perf(
+                            &address_str,
+                            "electrum_like.batch_transaction_get_raw.full_history",
+                            raw_txs_t0,
+                            &format!("txids={} raws={}", txids.len(), raw_txs.len()),
+                        );
+
+                        let decode_and_summary_t0 = Instant::now();
+                        let mut decode_failures = 0usize;
+                        let mut summary_hits = 0usize;
+                        let mut traces_hits = 0usize;
 
                         for (idx, entry) in entries.iter().take(remaining_slots).enumerate() {
                             let raw = raw_txs.get(idx).cloned().unwrap_or_default();
@@ -318,14 +475,21 @@ pub async fn address_page(
                                         "[address_page] failed to decode tx {}: {e}",
                                         entry.txid
                                     );
+                                    decode_failures = decode_failures.saturating_add(1);
                                     continue;
                                 }
                             };
                             let summary = load_tx_summary_v2(&essentials_provider, &entry.txid);
+                            if summary.is_some() {
+                                summary_hits = summary_hits.saturating_add(1);
+                            }
                             let traces = summary
                                 .as_ref()
                                 .map(|s| traces_from_summary(&entry.txid, s))
                                 .filter(|t| !t.is_empty());
+                            if traces.is_some() {
+                                traces_hits = traces_hits.saturating_add(1);
+                            }
                             let confirmations = entry.height.and_then(|h| {
                                 chain_tip
                                     .and_then(|tip| if tip >= h { Some(tip - h + 1) } else { None })
@@ -338,12 +502,31 @@ pub async fn address_page(
                                 is_mempool: false,
                             });
                         }
+                        log_address_page_perf(
+                            &address_str,
+                            "decode_and_summary.full_history",
+                            decode_and_summary_t0,
+                            &format!(
+                                "entries={} rendered={} summary_hits={} traces_hits={} decode_failures={}",
+                                entries.len(),
+                                tx_renders.len(),
+                                summary_hits,
+                                traces_hits,
+                                decode_failures
+                            ),
+                        );
 
                         next_cursor = entries.last().map(|e| e.txid);
                         tx_total = pending_total + confirmed_total;
                         tx_has_next = (off + tx_renders.len()) < tx_total || hist_page.has_more;
                     }
                     Err(e) => {
+                        log_address_page_perf(
+                            &address_str,
+                            "electrum_like.address_history_page_cursor",
+                            history_page_t0,
+                            &format!("error={}", e),
+                        );
                         eprintln!(
                             "[address_page] failed to fetch address history for {address_str}: {e}"
                         );
@@ -356,6 +539,12 @@ pub async fn address_page(
     }
 
     if start_time.elapsed() > timeout {
+        log_address_page_perf(
+            &address_str,
+            "timeout_guard",
+            start_time,
+            &format!("timed_out_at_ms={}", start_time.elapsed().as_millis()),
+        );
         return layout(
             "Address",
             html! { p class="error" { "Address has too many transactions to render quickly." } },
@@ -420,11 +609,22 @@ pub async fn address_page(
     prev_txids.dedup();
     let mut prev_map: HashMap<Txid, Transaction> = HashMap::new();
     if !prev_txids.is_empty() {
+        let prev_raw_t0 = Instant::now();
         let raw_prev = electrum_like.batch_transaction_get_raw(&prev_txids).unwrap_or_default();
+        log_address_page_perf(
+            &address_str,
+            "electrum_like.batch_transaction_get_raw.prev_txids",
+            prev_raw_t0,
+            &format!("prev_txids={} raws={}", prev_txids.len(), raw_prev.len()),
+        );
+        let prev_decode_t0 = Instant::now();
+        let mut prev_decode_failures = 0usize;
+        let mut prev_from_mempool = 0usize;
         for (i, raw) in raw_prev.into_iter().enumerate() {
             if raw.is_empty() {
                 if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
                     prev_map.insert(prev_txids[i], mempool_prev.tx);
+                    prev_from_mempool = prev_from_mempool.saturating_add(1);
                 }
                 continue;
             }
@@ -432,29 +632,70 @@ pub async fn address_page(
                 prev_map.insert(prev_txids[i], prev_tx);
             } else if let Some(mempool_prev) = pending_by_txid(&prev_txids[i]) {
                 prev_map.insert(prev_txids[i], mempool_prev.tx);
+                prev_from_mempool = prev_from_mempool.saturating_add(1);
+            } else {
+                prev_decode_failures = prev_decode_failures.saturating_add(1);
             }
         }
+        log_address_page_perf(
+            &address_str,
+            "decode_prev_txs",
+            prev_decode_t0,
+            &format!(
+                "resolved={} decode_failures={} mempool_fallbacks={}",
+                prev_map.len(),
+                prev_decode_failures,
+                prev_from_mempool
+            ),
+        );
     }
 
     let mut all_outpoints: Vec<(Txid, u32)> = Vec::new();
+    let mut input_outpoint_candidates = 0usize;
+    let mut input_outpoints_selected = 0usize;
     for item in &tx_renders {
         for (vout, _) in item.tx.output.iter().enumerate() {
             all_outpoints.push((item.txid, vout as u32));
         }
         for vin in &item.tx.input {
             if !vin.previous_output.is_null() {
-                all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+                input_outpoint_candidates = input_outpoint_candidates.saturating_add(1);
+                let Some(prev_tx) = prev_map.get(&vin.previous_output.txid) else {
+                    continue;
+                };
+                let Some(prev_out) = prev_tx.output.get(vin.previous_output.vout as usize) else {
+                    continue;
+                };
+                let belongs_to_address =
+                    Address::from_script(prev_out.script_pubkey.as_script(), state.network)
+                        .ok()
+                        .map(|a| a.to_string() == address_str)
+                        .unwrap_or(false);
+                if belongs_to_address {
+                    all_outpoints.push((vin.previous_output.txid, vin.previous_output.vout));
+                    input_outpoints_selected = input_outpoints_selected.saturating_add(1);
+                }
             }
         }
     }
     all_outpoints.sort();
     all_outpoints.dedup();
-    let outpoint_map = get_outpoint_balances_with_spent_batch(
-        StateAt::Latest,
-        &state.essentials_provider(),
-        &all_outpoints,
-    )
-    .unwrap_or_default();
+    let outpoints_batch_t0 = Instant::now();
+    let outpoint_map =
+        get_outpoint_rows_batch(StateAt::Latest, &state.essentials_provider(), &all_outpoints)
+            .unwrap_or_default();
+    log_address_page_perf(
+        &address_str,
+        "essentials.get_outpoint_rows_batch",
+        outpoints_batch_t0,
+        &format!(
+            "requested_outpoints={} returned={} input_candidates={} input_selected={}",
+            all_outpoints.len(),
+            outpoint_map.len(),
+            input_outpoint_candidates,
+            input_outpoints_selected
+        ),
+    );
     let outpoint_fn = move |txid: &Txid, vout: u32| -> OutpointLookup {
         outpoint_map.get(&(*txid, vout)).cloned().unwrap_or_default()
     };
@@ -462,18 +703,33 @@ pub async fn address_page(
         let mut dedup = tx_renders.iter().map(|t| t.txid).collect::<Vec<_>>();
         dedup.sort();
         dedup.dedup();
+        let outspends_t0 = Instant::now();
         let fetched = electrum_like.batch_transaction_get_outspends(&dedup).unwrap_or_default();
+        log_address_page_perf(
+            &address_str,
+            "electrum_like.batch_transaction_get_outspends",
+            outspends_t0,
+            &format!("txids={} rows={}", dedup.len(), fetched.len()),
+        );
         dedup.into_iter().zip(fetched.into_iter()).collect()
     };
+    let outspends_rows = outspends_map.len();
     let outspends_fn = move |txid: &Txid| -> Vec<Option<Txid>> {
         outspends_map.get(txid).cloned().unwrap_or_default()
     };
 
+    let balances_markup_t0 = Instant::now();
     let balances_markup = if balance_entries.is_empty() {
         html! { p class="muted" { "No alkanes tracked for this address." } }
     } else {
         render_alkane_balance_cards(&balance_entries, &state.essentials_mdb)
     };
+    log_address_page_perf(
+        &address_str,
+        "render_alkane_balance_cards",
+        balances_markup_t0,
+        &format!("entries={}", balance_entries.len()),
+    );
 
     let mut summary_items: Vec<HeaderSummaryItem> = Vec::new();
     summary_items.push(HeaderSummaryItem {
@@ -513,6 +769,7 @@ pub async fn address_page(
         },
     });
 
+    let header_t0 = Instant::now();
     let header_markup = header(HeaderProps {
         title: "Address".to_string(),
         id: Some(address_str.clone()),
@@ -522,10 +779,30 @@ pub async fn address_page(
         cta: None,
         hero_class: Some("tx-hero-address".to_string()),
     });
+    log_address_page_perf(
+        &address_str,
+        "render_header",
+        header_t0,
+        &format!("summary_items={}", 4),
+    );
 
     let mempool_url = mempool_address_url(state.network, &address_str);
-
-    layout(
+    log_address_page_perf(
+        &address_str,
+        "address_page.pre_layout",
+        start_time,
+        &format!(
+            "tx_total={} tx_renders={} prev_map={} outpoint_rows={} outspends_rows={} mempool_url={}",
+            tx_total,
+            tx_renders.len(),
+            prev_map.len(),
+            all_outpoints.len(),
+            outspends_rows,
+            mempool_url.is_some()
+        ),
+    );
+    let layout_t0 = Instant::now();
+    let page = layout(
         &format!("Address {address_str}"),
         html! {
             (header_markup)
@@ -540,6 +817,41 @@ pub async fn address_page(
 
             h2 class="h2" { "Alkane Balances" }
             (balances_markup)
+            @if let Some(default_alkane) = default_chart_alkane.as_ref() {
+                div
+                    class="card address-balance-chart-card"
+                    data-address-chart=""
+                    data-address=(address_str.clone())
+                    data-default-alkane=(default_alkane)
+                    data-default-range="all"
+                {
+                    div class="address-balance-chart-head" {
+                        h2 class="h2" { "Balance History" }
+                        div class="address-balance-chart-controls" {
+                            label class="address-balance-chart-label" for="address-balance-token" { "Alkane" }
+                            select id="address-balance-token" class="address-balance-select" data-address-chart-token="" {
+                                @for (alkane_id, label, asset_name, symbol) in chart_tokens.iter() {
+                                    option value=(alkane_id) data-name=(asset_name) data-symbol=(symbol) { (label) }
+                                }
+                            }
+                        }
+                    }
+                    div class="address-balance-chart-summary" {
+                        div class="address-balance-chart-main" {
+                            div class="address-balance-chart-value mono" data-address-chart-value { "—" }
+                        }
+                    }
+                    div class="address-balance-chart-plot" data-address-chart-root {
+                        div class="address-balance-chart-loading" data-address-chart-loading { "Loading chart..." }
+                    }
+                    div class="address-balance-chart-tabs" {
+                        button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
+                        button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
+                        button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
+                        button type="button" class="address-balance-chart-tab active" data-range="all" { "All" }
+                    }
+                }
+            }
 
             div class="card" {
                 div class="row" {
@@ -626,6 +938,336 @@ pub async fn address_page(
             }
 
             (header_scripts())
+            (address_chart_scripts())
         },
-    )
+    );
+    log_address_page_perf(
+        &address_str,
+        "render_layout",
+        layout_t0,
+        &format!("total_ms={}", start_time.elapsed().as_millis()),
+    );
+    page
+}
+
+fn address_chart_scripts() -> Markup {
+    let base_path_js = format!("{:?}", explorer_base_path());
+    let script = r#"
+<script>
+(() => {
+  const basePath = __BASE_PATH__;
+  const basePrefix = basePath === '/' ? '' : basePath;
+  const card = document.querySelector('[data-address-chart]');
+  if (!card) return;
+
+  const address = card.dataset.address || '';
+  if (!address) return;
+
+  let activeAlkane = card.dataset.defaultAlkane || '';
+  if (!activeAlkane) return;
+
+  const root = card.querySelector('[data-address-chart-root]');
+  const loadingEl = card.querySelector('[data-address-chart-loading]');
+  const valueEl = card.querySelector('[data-address-chart-value]');
+  const selectEl = card.querySelector('[data-address-chart-token]');
+  const tabs = Array.from(card.querySelectorAll('[data-range]'));
+  const defaultRange = (card.dataset.defaultRange || 'all').toLowerCase();
+
+  let activeRange = defaultRange;
+  let activeSymbol = '';
+  let chart = null;
+  let canvas = null;
+  let loading = false;
+
+  const selectedAssetName = () => {
+    const option = selectEl && selectEl.selectedOptions && selectEl.selectedOptions[0];
+    if (!option) return activeAlkane;
+    const assetName = (option.dataset && option.dataset.name) || option.textContent || activeAlkane;
+    return (assetName || activeAlkane).trim();
+  };
+
+  const syncSelectedMeta = () => {
+    const option = selectEl && selectEl.selectedOptions && selectEl.selectedOptions[0];
+    activeSymbol = option && option.dataset ? (option.dataset.symbol || '').trim() : '';
+    if (valueEl) valueEl.textContent = selectedAssetName();
+  };
+
+  const formatAmount = (value, maxDigits = 8) => {
+    if (!Number.isFinite(value)) return '0';
+    return new Intl.NumberFormat('en-US', {
+      maximumFractionDigits: maxDigits
+    }).format(value);
+  };
+
+  const formatBlock = (height) => {
+    if (!Number.isFinite(height)) return 'Block';
+    return `Block ${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(height)}`;
+  };
+
+  const formatTooltipAmount = (value) => {
+    const amount = formatAmount(value, 8);
+    return activeSymbol ? `${amount} ${activeSymbol}` : amount;
+  };
+
+  const setActiveTab = (range) => {
+    tabs.forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.range === range);
+    });
+  };
+
+  const ensureScript = (src) => new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      if (existing.dataset.loaded === '1') {
+        resolve();
+      } else {
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.dataset.chartLib = '1';
+    script.addEventListener(
+      'load',
+      () => {
+        script.dataset.loaded = '1';
+        resolve();
+      },
+      { once: true }
+    );
+    script.addEventListener('error', () => reject(new Error('load_failed')), { once: true });
+    document.head.appendChild(script);
+  });
+
+  const loadChartJs = async () => {
+    if (window.Chart) return;
+    await ensureScript('https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js');
+  };
+
+  const resolveColor = (cssVar, fallback) => {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
+    return value || fallback;
+  };
+
+  const ensureCanvas = () => {
+    if (!root) return null;
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.setAttribute('aria-label', 'Address balance history');
+      canvas.setAttribute('role', 'img');
+      root.replaceChildren(canvas);
+    }
+    return canvas.getContext('2d');
+  };
+
+  const clearChart = () => {
+    if (chart) {
+      chart.destroy();
+      chart = null;
+    }
+    if (canvas) {
+      canvas.remove();
+      canvas = null;
+    }
+  };
+
+  const setLoadingText = (message) => {
+    if (!loadingEl) return;
+    loadingEl.textContent = message;
+    loadingEl.style.display = '';
+  };
+
+  const hideLoading = () => {
+    if (loadingEl) loadingEl.style.display = 'none';
+  };
+
+  const renderChart = (points, isUp) => {
+    if (!window.Chart) return;
+    const ctx = ensureCanvas();
+    if (!ctx) return;
+
+    const lineColor = isUp
+      ? resolveColor('--chart-green', '#33e183')
+      : resolveColor('--chart-red', '#ff5555');
+    const tooltipBg = resolveColor('--panel3', '#1f2228');
+    const tooltipText = resolveColor('--text', '#ffffff');
+    const labels = points.map((p) => p.height);
+    const values = points.map((p) => p.value);
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const span = Math.max(maxValue - minValue, Math.abs(maxValue) || 1);
+    const pad = span * 0.12;
+    const yMin = minValue - pad;
+    const yMax = maxValue + pad;
+
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.data.datasets[0].borderColor = lineColor;
+      chart.options.scales.y.min = yMin;
+      chart.options.scales.y.max = yMax;
+      chart.update('none');
+      return;
+    }
+
+    chart = new window.Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            data: values,
+            borderColor: lineColor,
+            borderWidth: 3,
+            pointRadius: 0,
+            tension: 0.35,
+            cubicInterpolationMode: 'monotone',
+            fill: false
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            enabled: true,
+            displayColors: false,
+            backgroundColor: tooltipBg,
+            borderWidth: 0,
+            titleColor: tooltipText,
+            bodyColor: tooltipText,
+            callbacks: {
+              title: (items) => {
+                const raw = Number(items && items[0] ? items[0].label : NaN);
+                return formatBlock(raw);
+              },
+              label: (item) => {
+                const value =
+                  item && item.parsed && typeof item.parsed.y === 'number'
+                    ? item.parsed.y
+                    : item.parsed;
+                return formatTooltipAmount(Number(value));
+              }
+            }
+          }
+        },
+        interaction: {
+          mode: 'index',
+          intersect: false
+        },
+        hover: {
+          mode: 'index',
+          intersect: false
+        },
+        scales: {
+          x: { display: false },
+          y: {
+            display: false,
+            min: yMin,
+            max: yMax
+          }
+        }
+      }
+    });
+  };
+
+  const fetchRange = async (range) => {
+    const params = new URLSearchParams({
+      address,
+      alkane: activeAlkane,
+      range
+    });
+    const res = await fetch(`${basePrefix}/api/address/chart?${params.toString()}`);
+    const data = await res.json();
+    if (!data || !data.ok) return null;
+    return data;
+  };
+
+  const updateCard = (data, range, canRender) => {
+    const points = Array.isArray(data && data.points) ? data.points.slice() : [];
+    syncSelectedMeta();
+    if (points.length === 0) {
+      clearChart();
+      card.removeAttribute('data-tone');
+      setLoadingText('No chart data for this selection');
+      return;
+    }
+
+    points.sort((a, b) => a.height - b.height);
+    const first = Number(points[0].value);
+    const last = Number(points[points.length - 1].value);
+    const change = points.length > 1 && first !== 0 ? ((last - first) / Math.abs(first)) * 100 : 0;
+    const isUp = change >= 0;
+    card.dataset.tone = isUp ? 'up' : 'down';
+    hideLoading();
+
+    if (canRender) {
+      renderChart(points, isUp);
+    } else {
+      clearChart();
+      setLoadingText('Chart unavailable');
+    }
+  };
+
+  const load = async (range) => {
+    if (loading) return;
+    loading = true;
+    setLoadingText('Loading chart...');
+    try {
+      const data = await fetchRange(range);
+      if (!data) {
+        clearChart();
+        setLoadingText('Chart unavailable');
+        return;
+      }
+
+      let canRender = true;
+      try {
+        await loadChartJs();
+      } catch (_) {
+        canRender = false;
+      }
+      updateCard(data, range, canRender);
+    } catch (_) {
+      clearChart();
+      setLoadingText('Chart unavailable');
+    } finally {
+      loading = false;
+    }
+  };
+
+  if (selectEl) {
+    selectEl.addEventListener('change', () => {
+      const selected = (selectEl.value || '').trim();
+      if (!selected || selected === activeAlkane) return;
+      activeAlkane = selected;
+      syncSelectedMeta();
+      load(activeRange);
+    });
+  }
+
+  tabs.forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const range = (tab.dataset.range || '').toLowerCase();
+      if (!range || range === activeRange) return;
+      activeRange = range;
+      setActiveTab(range);
+      load(range);
+    });
+  });
+
+  setActiveTab(activeRange);
+  syncSelectedMeta();
+  load(activeRange);
+})();
+</script>
+"#;
+
+    PreEscaped(script.replace("__BASE_PATH__", &base_path_js))
 }

@@ -6,9 +6,9 @@ pub mod paths;
 
 use std::net::SocketAddr;
 
-use api::{alkane_chart, carousel_blocks, search_guess, simulate_contract};
-use axum::Router;
+use api::{address_chart, alkane_chart, carousel_blocks, search_guess, simulate_contract};
 use axum::routing::{get, post};
+use axum::Router;
 use pages::address::address_page;
 use pages::alkane::alkane_page;
 use pages::alkanes::alkanes_page;
@@ -35,6 +35,7 @@ pub fn explorer_router(state: ExplorerState) -> Router {
         .route("/api/search/guess", get(search_guess))
         .route("/api/alkane/simulate", post(simulate_contract))
         .route("/api/alkane/chart", get(alkane_chart))
+        .route("/api/address/chart", get(address_chart))
         .route("/static/style.css", get(style))
         .with_state(state)
 }

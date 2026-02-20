@@ -1541,6 +1541,137 @@ a:hover {
 .switch-input:checked + .switch-slider::before {
   transform: translateX(20px);
 }
+.address-balance-chart-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+.address-balance-chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.address-balance-chart-controls {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.address-balance-chart-label {
+  color: var(--muted2);
+  font-size: 13px;
+  font-weight: 700;
+}
+.address-balance-select {
+  appearance: none;
+  border: 1px solid var(--panel3);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: var(--panel2);
+  color: var(--text);
+  font-weight: 600;
+  font-size: 13px;
+  min-width: 190px;
+}
+.address-balance-select:focus {
+  outline: 1px solid var(--link);
+  outline-offset: 0;
+}
+.address-balance-chart-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+.address-balance-chart-main,
+.address-balance-chart-side {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.address-balance-chart-side {
+  text-align: right;
+}
+.address-balance-chart-value {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.address-balance-chart-change {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+.address-balance-chart-sub {
+  color: var(--muted2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.address-balance-chart-card[data-tone="up"] .address-balance-chart-change {
+  color: var(--chart-green);
+}
+.address-balance-chart-card[data-tone="down"] .address-balance-chart-change {
+  color: var(--chart-red);
+}
+.address-balance-chart-plot {
+  position: relative;
+  height: 250px;
+  border-radius: 10px;
+  background: var(--panel2);
+  overflow: hidden;
+}
+.address-balance-chart-plot canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+.address-balance-chart-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--muted2);
+}
+.address-balance-chart-tabs {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.address-balance-chart-tab {
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--muted2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.address-balance-chart-tab.active,
+.address-balance-chart-tab:hover {
+  color: var(--text);
+  background: var(--panel2);
+}
+@media (max-width: 720px) {
+  .address-balance-chart-controls {
+    width: 100%;
+    margin-left: 0;
+  }
+  .address-balance-select {
+    width: 100%;
+  }
+  .address-balance-chart-side {
+    text-align: left;
+  }
+}
 .trace-summary {
   background: var(--panel2);
   border-radius: 8px;

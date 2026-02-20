@@ -1,7 +1,7 @@
 use super::defs::{EspoTraceType, SignedU128, SignedU128MapExt};
 use super::utils::{
-    Unallocated, compute_nets, is_op_return, parse_protostones, parse_short_id,
-    schema_id_from_parts, transfers_to_sheet, tx_has_op_return, u128_to_u32,
+    compute_nets, is_op_return, parse_protostones, parse_short_id, schema_id_from_parts,
+    transfers_to_sheet, tx_has_op_return, u128_to_u32, Unallocated,
 };
 use crate::alkanes::trace::{
     EspoBlock, EspoHostFunctionValues, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent,
@@ -16,10 +16,11 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
-    AddressActivityEntry, AddressAmountEntry, AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry,
-    HolderEntry, HolderId, decode_balances_vec, decode_outpoint_row_v2, decode_u128_value,
-    encode_alkane_balance_tx_entry, encode_outpoint_row_v2, encode_tx_packed_outflow_row_v2,
-    encode_u128_value, encode_vec, get_holders_count_encoded, mk_outpoint, spk_to_address_str,
+    decode_balances_vec, decode_outpoint_pos_v2, decode_outpoint_row_v2, decode_u128_value,
+    encode_alkane_balance_tx_entry, encode_outpoint_pos_v2, encode_outpoint_row_v2,
+    encode_tx_packed_outflow_pos_v2, encode_tx_packed_outflow_row_v2, encode_u128_value,
+    encode_vec, get_holders_count_encoded, mk_outpoint, spk_to_address_str, AddressActivityEntry,
+    AddressAmountEntry, AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, SetBatchParams,
@@ -28,7 +29,7 @@ use crate::modules::essentials::storage::{
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use bitcoin::block::Header;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
@@ -369,7 +370,11 @@ pub(crate) fn accumulate_alkane_balance_deltas(
     // Find the nearest NORMAL frame in the current stack (delegates/statics are skipped).
     fn nearest_normal_owner(stack: &[Frame]) -> Option<SchemaAlkaneId> {
         stack.iter().rev().find_map(|frame| {
-            if matches!(frame.kind, FrameKind::Normal) { Some(frame.owner) } else { None }
+            if matches!(frame.kind, FrameKind::Normal) {
+                Some(frame.owner)
+            } else {
+                None
+            }
         })
     }
 
@@ -1147,7 +1152,8 @@ pub fn bulk_update_balances_for_block(
             txid_arr.copy_from_slice(&op.txid);
             lookup_outpoints.push((Txid::from_byte_array(txid_arr), op.vout));
         }
-        let lookups = get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
+        let lookups =
+            get_outpoint_balances_with_spent_batch(StateAt::Latest, provider, &lookup_outpoints)?;
         for (txid, vout) in lookup_outpoints {
             let Some(lookup) = lookups.get(&(txid, vout)) else {
                 continue;
@@ -2013,8 +2019,7 @@ pub fn bulk_update_balances_for_block(
                 block.height,
                 tx_idx,
                 &blockhash,
-            )
-            else {
+            ) else {
                 continue;
             };
             blob_puts.push((candidate_key, Vec::new()));
@@ -2026,10 +2031,20 @@ pub fn bulk_update_balances_for_block(
             };
             let row_key = table.outpoint_row_key(&blockhash, tx_idx, row.outpoint.vout);
             blob_puts.push((row_key, row_blob));
+            if let Ok(pos_key) =
+                table.outpoint_pos_key_from_parts(&row.outpoint.txid, row.outpoint.vout)
+            {
+                puts.push((pos_key, encode_outpoint_pos_v2(&blockhash, tx_idx, row.outpoint.vout)));
+            }
         }
 
         if let Some(ref spent_by) = row.outpoint.tx_spent {
             if spent_by.len() == 32 {
+                if let Ok(spent_by_key) =
+                    table.outpoint_spent_by_key_from_parts(&row.outpoint.txid, row.outpoint.vout)
+                {
+                    puts.push((spent_by_key, spent_by.clone()));
+                }
                 let mut spender_arr = [0u8; 32];
                 spender_arr.copy_from_slice(spent_by);
                 if let Some(spend_tx_idx) = tx_index_by_txid.get(&spender_arr).copied() {
@@ -2541,6 +2556,8 @@ pub fn bulk_update_balances_for_block(
         };
         let summary_marker_key = table.tx_summary_marker_key(&summary.txid);
         blob_puts.push((summary_marker_key, vec![1]));
+        let tx_pos_key = table.tx_packed_outflow_pos_key(&summary.txid);
+        puts.push((tx_pos_key, encode_tx_packed_outflow_pos_v2(&blockhash, tx_idx)));
         let candidate_key =
             table.tx_locator_candidate_key(&summary.txid, summary.height, tx_idx, &blockhash);
         blob_puts.push((candidate_key, Vec::new()));
@@ -3197,38 +3214,38 @@ pub fn bulk_update_balances_for_block(
                     agg
                 };
 
-            let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
-                HashMap::new();
+                let mut local_cache: HashMap<SchemaAlkaneId, HashMap<SchemaAlkaneId, u128>> =
+                    HashMap::new();
 
-            for (owner, token) in changed_pairs {
-                if !local_cache.contains_key(&owner) {
-                    let balances = balances_from_rows(&owner);
-                    local_cache.insert(owner, balances);
-                }
-                let local_balance =
-                    local_cache.get(&owner).and_then(|m| m.get(&token).copied()).unwrap_or(0);
+                for (owner, token) in changed_pairs {
+                    if !local_cache.contains_key(&owner) {
+                        let balances = balances_from_rows(&owner);
+                        local_cache.insert(owner, balances);
+                    }
+                    let local_balance =
+                        local_cache.get(&owner).and_then(|m| m.get(&token).copied()).unwrap_or(0);
 
-                let metashrew_balance = match metashrew.get_reserves_for_alkane_with_db(
-                    sdb,
-                    &owner,
-                    &token,
-                    Some(height_u64),
-                ) {
-                    Ok(Some(bal)) => bal,
-                    Ok(None) => 0,
-                    Err(e) => {
-                        panic!(
+                    let metashrew_balance = match metashrew.get_reserves_for_alkane_with_db(
+                        sdb,
+                        &owner,
+                        &token,
+                        Some(height_u64),
+                    ) {
+                        Ok(Some(bal)) => bal,
+                        Ok(None) => 0,
+                        Err(e) => {
+                            panic!(
                             "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
                             owner.block, owner.tx, token.block, token.tx, height_u64
                         );
-                    }
-                };
+                        }
+                    };
 
-                if local_balance != metashrew_balance {
-                    balance_mismatches.push((owner, token, local_balance, metashrew_balance));
+                    if local_balance != metashrew_balance {
+                        balance_mismatches.push((owner, token, local_balance, metashrew_balance));
+                    }
                 }
             }
-        }
 
             struct UtxoMismatch {
                 outpoint: EspoOutpoint,
@@ -3238,278 +3255,293 @@ pub fn bulk_update_balances_for_block(
             }
             let mut utxo_mismatches: Vec<UtxoMismatch> = Vec::new();
             if check_utxos_now {
-            let to_balance_map = |entries: &[BalanceEntry]| -> BTreeMap<SchemaAlkaneId, u128> {
-                let mut out = BTreeMap::new();
-                for entry in entries {
-                    if entry.amount == 0 {
+                let to_balance_map = |entries: &[BalanceEntry]| -> BTreeMap<SchemaAlkaneId, u128> {
+                    let mut out = BTreeMap::new();
+                    for entry in entries {
+                        if entry.amount == 0 {
+                            continue;
+                        }
+                        *out.entry(entry.alkane).or_default() = out
+                            .get(&entry.alkane)
+                            .copied()
+                            .unwrap_or(0u128)
+                            .saturating_add(entry.amount);
+                    }
+                    out
+                };
+                let parse_txid = |txid_bytes: &[u8]| -> Result<Txid> {
+                    if txid_bytes.len() != 32 {
+                        return Err(anyhow!("invalid txid length {}", txid_bytes.len()));
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(txid_bytes);
+                    Ok(Txid::from_byte_array(arr))
+                };
+
+                for row in &new_rows {
+                    if row.outpoint.tx_spent.is_some() {
                         continue;
                     }
-                    *out.entry(entry.alkane).or_default() = out
-                        .get(&entry.alkane)
-                        .copied()
-                        .unwrap_or(0u128)
-                        .saturating_add(entry.amount);
-                }
-                out
-            };
-            let parse_txid = |txid_bytes: &[u8]| -> Result<Txid> {
-                if txid_bytes.len() != 32 {
-                    return Err(anyhow!("invalid txid length {}", txid_bytes.len()));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(txid_bytes);
-                Ok(Txid::from_byte_array(arr))
-            };
-
-            for row in &new_rows {
-                if row.outpoint.tx_spent.is_some() {
-                    continue;
-                }
-                let txid = parse_txid(&row.outpoint.txid).unwrap_or_else(|e| {
-                    panic!(
-                        "[balances][strict] invalid outpoint txid bytes ({}:{}): {e}",
-                        row.outpoint.as_outpoint_string(),
-                        row.outpoint.vout
-                    )
-                });
-                let local_entries = decode_balances_vec(&row.enc_balances).unwrap_or_default();
-                let local_map = to_balance_map(&local_entries);
-
-                let meta_entries = metashrew
-                    .get_outpoint_alkane_balances_with_db(sdb, &txid, row.outpoint.vout)
-                    .unwrap_or_else(|e| {
+                    let txid = parse_txid(&row.outpoint.txid).unwrap_or_else(|e| {
                         panic!(
-                            "[balances][strict] metashrew outpoint lookup failed ({}:{}): {e:?}",
+                            "[balances][strict] invalid outpoint txid bytes ({}:{}): {e}",
                             row.outpoint.as_outpoint_string(),
                             row.outpoint.vout
                         )
                     });
-                let mut meta_map = BTreeMap::new();
-                for (id, amount) in meta_entries {
-                    if amount == 0 {
-                        continue;
-                    }
-                    let schema = schema_id_from_parts(id.block, id.tx).unwrap_or_else(|e| {
-                        panic!(
-                            "[balances][strict] invalid metashrew alkane id ({}:{}): {e:?}",
-                            id.block, id.tx
-                        )
-                    });
-                    *meta_map.entry(schema).or_default() =
-                        meta_map.get(&schema).copied().unwrap_or(0u128).saturating_add(amount);
-                }
+                    let local_entries = decode_balances_vec(&row.enc_balances).unwrap_or_default();
+                    let local_map = to_balance_map(&local_entries);
 
-                if local_map != meta_map {
-                    utxo_mismatches.push(UtxoMismatch {
-                        outpoint: row.outpoint.clone(),
-                        addr: row.addr.clone(),
-                        local: local_map,
-                        metashrew: meta_map,
-                    });
+                    let meta_entries = metashrew
+                        .get_outpoint_alkane_balances_with_db(sdb, &txid, row.outpoint.vout)
+                        .unwrap_or_else(|e| {
+                            panic!(
+                            "[balances][strict] metashrew outpoint lookup failed ({}:{}): {e:?}",
+                            row.outpoint.as_outpoint_string(),
+                            row.outpoint.vout
+                        )
+                        });
+                    let mut meta_map = BTreeMap::new();
+                    for (id, amount) in meta_entries {
+                        if amount == 0 {
+                            continue;
+                        }
+                        let schema = schema_id_from_parts(id.block, id.tx).unwrap_or_else(|e| {
+                            panic!(
+                                "[balances][strict] invalid metashrew alkane id ({}:{}): {e:?}",
+                                id.block, id.tx
+                            )
+                        });
+                        *meta_map.entry(schema).or_default() =
+                            meta_map.get(&schema).copied().unwrap_or(0u128).saturating_add(amount);
+                    }
+
+                    if local_map != meta_map {
+                        utxo_mismatches.push(UtxoMismatch {
+                            outpoint: row.outpoint.clone(),
+                            addr: row.addr.clone(),
+                            local: local_map,
+                            metashrew: meta_map,
+                        });
+                    }
                 }
             }
-        }
 
             if !balance_mismatches.is_empty() || !utxo_mismatches.is_empty() {
                 if check_balances_now {
-                let mut height_history_cache: HashMap<
-                    (SchemaAlkaneId, SchemaAlkaneId),
-                    Vec<(u32, u128)>,
-                > = HashMap::new();
+                    let mut height_history_cache: HashMap<
+                        (SchemaAlkaneId, SchemaAlkaneId),
+                        Vec<(u32, u128)>,
+                    > = HashMap::new();
 
-                let mut find_mismatch_origin = |owner: &SchemaAlkaneId,
-                                                token: &SchemaAlkaneId,
-                                                current_balance: u128|
-                 -> Option<(u32, u128, u128, bool)> {
-                    let history = if let Some(cached) = height_history_cache.get(&(*owner, *token))
-                    {
-                        cached.clone()
-                    } else {
-                        let hlen = match provider.get_raw_value(GetRawValueParams {
-                            blockhash: StateAt::Latest,
-                            key: table.alkane_balance_by_height_list_len_key(owner, token),
-                        }) {
-                            Ok(v) => v
-                                .value
-                                .and_then(|bytes| {
-                                    if bytes.len() == 4 {
-                                        let mut arr = [0u8; 4];
-                                        arr.copy_from_slice(&bytes);
-                                        Some(u32::from_le_bytes(arr))
-                                    } else {
-                                        None
+                    let mut find_mismatch_origin =
+                        |owner: &SchemaAlkaneId,
+                         token: &SchemaAlkaneId,
+                         current_balance: u128|
+                         -> Option<(u32, u128, u128, bool)> {
+                            let history = if let Some(cached) =
+                                height_history_cache.get(&(*owner, *token))
+                            {
+                                cached.clone()
+                            } else {
+                                let hlen = match provider.get_raw_value(GetRawValueParams {
+                                    blockhash: StateAt::Latest,
+                                    key: table.alkane_balance_by_height_list_len_key(owner, token),
+                                }) {
+                                    Ok(v) => v
+                                        .value
+                                        .and_then(|bytes| {
+                                            if bytes.len() == 4 {
+                                                let mut arr = [0u8; 4];
+                                                arr.copy_from_slice(&bytes);
+                                                Some(u32::from_le_bytes(arr))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or(0),
+                                    Err(_) => 0,
+                                };
+                                if hlen == 0 {
+                                    return None;
+                                }
+                                let mut hidx_keys = Vec::with_capacity(hlen as usize);
+                                for idx in 0..hlen {
+                                    hidx_keys.push(
+                                        table.alkane_balance_by_height_list_idx_key(
+                                            owner, token, idx,
+                                        ),
+                                    );
+                                }
+                                let hidx_vals =
+                                    match provider.get_multi_values(GetMultiValuesParams {
+                                        blockhash: StateAt::Latest,
+                                        keys: hidx_keys,
+                                    }) {
+                                        Ok(v) => v.values,
+                                        Err(_) => Vec::new(),
+                                    };
+                                if hidx_vals.is_empty() {
+                                    return None;
+                                }
+                                let mut heights: Vec<u32> = Vec::new();
+                                for hraw in hidx_vals.into_iter().flatten() {
+                                    if hraw.len() != 4 {
+                                        continue;
                                     }
-                                })
-                                .unwrap_or(0),
-                            Err(_) => 0,
-                        };
-                        if hlen == 0 {
-                            return None;
-                        }
-                        let mut hidx_keys = Vec::with_capacity(hlen as usize);
-                        for idx in 0..hlen {
-                            hidx_keys.push(
-                                table.alkane_balance_by_height_list_idx_key(owner, token, idx),
-                            );
-                        }
-                        let hidx_vals = match provider.get_multi_values(GetMultiValuesParams {
-                            blockhash: StateAt::Latest,
-                            keys: hidx_keys,
-                        }) {
-                            Ok(v) => v.values,
-                            Err(_) => Vec::new(),
-                        };
-                        if hidx_vals.is_empty() {
-                            return None;
-                        }
-                        let mut heights: Vec<u32> = Vec::new();
-                        for hraw in hidx_vals.into_iter().flatten() {
-                            if hraw.len() != 4 {
-                                continue;
-                            }
-                            heights.push(u32::from_be_bytes([hraw[0], hraw[1], hraw[2], hraw[3]]));
-                        }
-                        if heights.is_empty() {
-                            return None;
-                        }
-                        heights.sort_unstable();
-                        heights.dedup();
-                        let value_keys: Vec<Vec<u8>> = heights
-                            .iter()
-                            .map(|h| table.alkane_balance_by_height_key(owner, token, *h))
-                            .collect();
-                        let value_rows = match provider.get_multi_values(GetMultiValuesParams {
-                            blockhash: StateAt::Latest,
-                            keys: value_keys,
-                        }) {
-                            Ok(v) => v.values,
-                            Err(_) => Vec::new(),
-                        };
-                        let mut entries_by_height: Vec<(u32, u128)> = Vec::new();
-                        for (height, value) in heights.iter().copied().zip(value_rows.into_iter()) {
-                            let Some(bytes) = value else {
-                                continue;
+                                    heights.push(u32::from_be_bytes([
+                                        hraw[0], hraw[1], hraw[2], hraw[3],
+                                    ]));
+                                }
+                                if heights.is_empty() {
+                                    return None;
+                                }
+                                heights.sort_unstable();
+                                heights.dedup();
+                                let value_keys: Vec<Vec<u8>> = heights
+                                    .iter()
+                                    .map(|h| table.alkane_balance_by_height_key(owner, token, *h))
+                                    .collect();
+                                let value_rows =
+                                    match provider.get_multi_values(GetMultiValuesParams {
+                                        blockhash: StateAt::Latest,
+                                        keys: value_keys,
+                                    }) {
+                                        Ok(v) => v.values,
+                                        Err(_) => Vec::new(),
+                                    };
+                                let mut entries_by_height: Vec<(u32, u128)> = Vec::new();
+                                for (height, value) in
+                                    heights.iter().copied().zip(value_rows.into_iter())
+                                {
+                                    let Some(bytes) = value else {
+                                        continue;
+                                    };
+                                    if let Ok(amount) = decode_u128_value(&bytes) {
+                                        entries_by_height.push((height, amount));
+                                    }
+                                }
+                                if entries_by_height.is_empty() {
+                                    return None;
+                                }
+                                entries_by_height.sort_by_key(|(h, _)| *h);
+                                entries_by_height.dedup_by_key(|(h, _)| *h);
+                                height_history_cache
+                                    .insert((*owner, *token), entries_by_height.clone());
+                                entries_by_height
                             };
-                            if let Ok(amount) = decode_u128_value(&bytes) {
-                                entries_by_height.push((height, amount));
+
+                            if history.is_empty() {
+                                return None;
                             }
-                        }
-                        if entries_by_height.is_empty() {
-                            return None;
-                        }
-                        entries_by_height.sort_by_key(|(h, _)| *h);
-                        entries_by_height.dedup_by_key(|(h, _)| *h);
-                        height_history_cache.insert((*owner, *token), entries_by_height.clone());
-                        entries_by_height
-                    };
+                            let mut snapshots = history;
+                            let current_height = block.height;
+                            snapshots.retain(|(h, _)| *h <= current_height);
+                            if snapshots.is_empty() {
+                                return None;
+                            }
 
-                    if history.is_empty() {
-                        return None;
-                    }
-                    let mut snapshots = history;
-                    let current_height = block.height;
-                    snapshots.retain(|(h, _)| *h <= current_height);
-                    if snapshots.is_empty() {
-                        return None;
-                    }
+                            if let Some(last) = snapshots.last_mut() {
+                                if last.0 == current_height {
+                                    last.1 = current_balance;
+                                } else if last.0 < current_height {
+                                    snapshots.push((current_height, current_balance));
+                                }
+                            } else {
+                                return None;
+                            }
 
-                    if let Some(last) = snapshots.last_mut() {
-                        if last.0 == current_height {
-                            last.1 = current_balance;
-                        } else if last.0 < current_height {
-                            snapshots.push((current_height, current_balance));
-                        }
-                    } else {
-                        return None;
-                    }
+                            #[derive(Clone, Copy)]
+                            struct Segment {
+                                start: u32,
+                                end: u32,
+                                balance: u128,
+                            }
 
-                    #[derive(Clone, Copy)]
-                    struct Segment {
-                        start: u32,
-                        end: u32,
-                        balance: u128,
-                    }
+                            let mut segments: Vec<Segment> = Vec::with_capacity(snapshots.len());
+                            for idx in 0..snapshots.len() {
+                                let (start, balance) = snapshots[idx];
+                                let end = if idx + 1 < snapshots.len() {
+                                    let next_start = snapshots[idx + 1].0;
+                                    if next_start == 0 {
+                                        0
+                                    } else {
+                                        next_start.saturating_sub(1)
+                                    }
+                                } else {
+                                    current_height
+                                };
+                                if end < start {
+                                    continue;
+                                }
+                                segments.push(Segment { start, end, balance });
+                            }
 
-                    let mut segments: Vec<Segment> = Vec::with_capacity(snapshots.len());
-                    for idx in 0..snapshots.len() {
-                        let (start, balance) = snapshots[idx];
-                        let end = if idx + 1 < snapshots.len() {
-                            let next_start = snapshots[idx + 1].0;
-                            if next_start == 0 { 0 } else { next_start.saturating_sub(1) }
-                        } else {
-                            current_height
-                        };
-                        if end < start {
-                            continue;
-                        }
-                        segments.push(Segment { start, end, balance });
-                    }
+                            if segments.is_empty() {
+                                return None;
+                            }
 
-                    if segments.is_empty() {
-                        return None;
-                    }
-
-                    let mut meta_cache: HashMap<u32, u128> = HashMap::new();
-                    let mut metashrew_at = |height: u32| -> u128 {
-                        if let Some(val) = meta_cache.get(&height).copied() {
-                            return val;
-                        }
-                        let height_u64 = height as u64;
-                        let value = match metashrew.get_reserves_for_alkane_with_db(
-                            sdb,
-                            owner,
-                            token,
-                            Some(height_u64),
-                        ) {
-                            Ok(Some(bal)) => bal,
-                            Ok(None) => 0,
-                            Err(e) => {
-                                panic!(
+                            let mut meta_cache: HashMap<u32, u128> = HashMap::new();
+                            let mut metashrew_at = |height: u32| -> u128 {
+                                if let Some(val) = meta_cache.get(&height).copied() {
+                                    return val;
+                                }
+                                let height_u64 = height as u64;
+                                let value = match metashrew.get_reserves_for_alkane_with_db(
+                                    sdb,
+                                    owner,
+                                    token,
+                                    Some(height_u64),
+                                ) {
+                                    Ok(Some(bal)) => bal,
+                                    Ok(None) => 0,
+                                    Err(e) => {
+                                        panic!(
                                     "[balances][strict] metashrew lookup failed (owner={}:{}, token={}:{}, height={}): {e:?}",
                                     owner.block, owner.tx, token.block, token.tx, height_u64
                                 );
-                            }
-                        };
-                        meta_cache.insert(height, value);
-                        value
-                    };
+                                    }
+                                };
+                                meta_cache.insert(height, value);
+                                value
+                            };
 
-                    for idx in (0..segments.len()).rev() {
-                        let seg = segments[idx];
-                        let meta_start = metashrew_at(seg.start);
-                        if meta_start == seg.balance {
-                            let mut lo = seg.start;
-                            let mut hi = seg.end;
-                            while lo < hi {
-                                let mid = lo + (hi - lo) / 2;
-                                let meta_mid = metashrew_at(mid);
-                                if meta_mid == seg.balance {
-                                    lo = mid + 1;
-                                } else {
-                                    hi = mid;
+                            for idx in (0..segments.len()).rev() {
+                                let seg = segments[idx];
+                                let meta_start = metashrew_at(seg.start);
+                                if meta_start == seg.balance {
+                                    let mut lo = seg.start;
+                                    let mut hi = seg.end;
+                                    while lo < hi {
+                                        let mid = lo + (hi - lo) / 2;
+                                        let meta_mid = metashrew_at(mid);
+                                        if meta_mid == seg.balance {
+                                            lo = mid + 1;
+                                        } else {
+                                            hi = mid;
+                                        }
+                                    }
+                                    let meta_at = metashrew_at(lo);
+                                    return Some((lo, seg.balance, meta_at, true));
+                                }
+
+                                if idx == 0 || seg.start == 0 {
+                                    return Some((seg.start, seg.balance, meta_start, false));
+                                }
+
+                                let prev_end = seg.start - 1;
+                                let prev_balance = segments[idx - 1].balance;
+                                let meta_prev_end = metashrew_at(prev_end);
+                                if meta_prev_end == prev_balance {
+                                    return Some((seg.start, seg.balance, meta_start, true));
                                 }
                             }
-                            let meta_at = metashrew_at(lo);
-                            return Some((lo, seg.balance, meta_at, true));
-                        }
 
-                        if idx == 0 || seg.start == 0 {
-                            return Some((seg.start, seg.balance, meta_start, false));
-                        }
+                            None
+                        };
 
-                        let prev_end = seg.start - 1;
-                        let prev_balance = segments[idx - 1].balance;
-                        let meta_prev_end = metashrew_at(prev_end);
-                        if meta_prev_end == prev_balance {
-                            return Some((seg.start, seg.balance, meta_start, true));
-                        }
-                    }
-
-                    None
-                };
-
-                for (owner, token, local_balance, metashrew_balance) in &balance_mismatches {
-                    eprintln!(
+                    for (owner, token, local_balance, metashrew_balance) in &balance_mismatches {
+                        eprintln!(
                         "[balances][strict] mismatch height={} owner={}:{} token={}:{} local={} metashrew={}",
                         height_u64,
                         owner.block,
@@ -3520,32 +3552,35 @@ pub fn bulk_update_balances_for_block(
                         metashrew_balance
                     );
 
-                    let mut txids: Vec<String> = alkane_balance_tx_entries_by_token
-                        .get(&(*owner, *token))
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .map(|entry| Txid::from_byte_array(entry.txid).to_string())
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    txids.sort();
-                    txids.dedup();
+                        let mut txids: Vec<String> = alkane_balance_tx_entries_by_token
+                            .get(&(*owner, *token))
+                            .map(|entries| {
+                                entries
+                                    .iter()
+                                    .map(|entry| Txid::from_byte_array(entry.txid).to_string())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        txids.sort();
+                        txids.dedup();
 
-                    if txids.is_empty() {
-                        eprintln!(
+                        if txids.is_empty() {
+                            eprintln!(
                             "[balances][strict] balance-change txids: none (owner={}:{}, token={}:{})",
                             owner.block, owner.tx, token.block, token.tx
                         );
-                    } else {
-                        eprintln!("[balances][strict] balance-change txids: {}", txids.join(","));
-                    }
-
-                    if let Some((first_height, local_at, meta_at, exact)) =
-                        find_mismatch_origin(owner, token, *local_balance)
-                    {
-                        if exact {
+                        } else {
                             eprintln!(
+                                "[balances][strict] balance-change txids: {}",
+                                txids.join(",")
+                            );
+                        }
+
+                        if let Some((first_height, local_at, meta_at, exact)) =
+                            find_mismatch_origin(owner, token, *local_balance)
+                        {
+                            if exact {
+                                eprintln!(
                                 "[balances][strict] mismatch origin height={} owner={}:{} token={}:{} local={} metashrew={}",
                                 first_height,
                                 owner.block,
@@ -3555,8 +3590,8 @@ pub fn bulk_update_balances_for_block(
                                 local_at,
                                 meta_at
                             );
-                        } else {
-                            eprintln!(
+                            } else {
+                                eprintln!(
                                 "[balances][strict] mismatch origin at or before height={} owner={}:{} token={}:{} local={} metashrew={}",
                                 first_height,
                                 owner.block,
@@ -3566,32 +3601,32 @@ pub fn bulk_update_balances_for_block(
                                 local_at,
                                 meta_at
                             );
+                            }
                         }
                     }
                 }
-            }
 
                 if check_utxos_now {
-                let fmt_sheet = |sheet: &BTreeMap<SchemaAlkaneId, u128>| -> String {
-                    if sheet.is_empty() {
-                        return "empty".to_string();
-                    }
-                    sheet
-                        .iter()
-                        .map(|(id, amt)| format!("{}:{}={}", id.block, id.tx, amt))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                for mismatch in &utxo_mismatches {
-                    eprintln!(
+                    let fmt_sheet = |sheet: &BTreeMap<SchemaAlkaneId, u128>| -> String {
+                        if sheet.is_empty() {
+                            return "empty".to_string();
+                        }
+                        sheet
+                            .iter()
+                            .map(|(id, amt)| format!("{}:{}={}", id.block, id.tx, amt))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    for mismatch in &utxo_mismatches {
+                        eprintln!(
                         "[balances][strict] utxo mismatch outpoint={} addr={} local=[{}] metashrew=[{}]",
                         mismatch.outpoint.as_outpoint_string(),
                         mismatch.addr,
                         fmt_sheet(&mismatch.local),
                         fmt_sheet(&mismatch.metashrew)
                     );
+                    }
                 }
-            }
 
                 panic!(
                     "[balances][strict] metashrew mismatch at height {} (alkanes={} utxos={})",
@@ -3998,6 +4033,17 @@ fn resolve_outpoint_spent_by_v2(
     blockhash: StateAt,
 ) -> Result<Option<Txid>> {
     let table = provider.table();
+    if let Ok(spent_key) = table.outpoint_spent_by_key_from_parts(txid.as_byte_array(), vout) {
+        if let Some(raw) =
+            provider.get_raw_value(GetRawValueParams { blockhash, key: spent_key })?.value
+        {
+            if raw.len() == 32 {
+                if let Ok(txid) = Txid::from_slice(&raw) {
+                    return Ok(Some(txid));
+                }
+            }
+        }
+    }
     let prefix = table.outpoint_spend_event_prefix_from_parts(txid.as_byte_array(), vout)?;
     let entries = provider.blob_mdb().scan_prefix_entries(&prefix)?;
     if entries.is_empty() {
@@ -4017,8 +4063,7 @@ fn resolve_outpoint_spent_by_v2(
         if !candidate_visible_in_view(provider, candidate_blockhash, target_blockhash)? {
             continue;
         }
-        let Some(spent_by) =
-            (if value.len() == 32 { Txid::from_slice(&value).ok() } else { None })
+        let Some(spent_by) = (if value.len() == 32 { Txid::from_slice(&value).ok() } else { None })
         else {
             continue;
         };
@@ -4037,6 +4082,23 @@ fn load_outpoint_row_v2(
     blockhash: StateAt,
 ) -> Result<Option<crate::modules::essentials::storage::OutpointRowV2>> {
     let table = provider.table();
+    if let Ok(pos_key) = table.outpoint_pos_key_from_parts(txid.as_byte_array(), vout) {
+        if let Some(raw_pos) =
+            provider.get_raw_value(GetRawValueParams { blockhash, key: pos_key })?.value
+        {
+            if let Ok((row_blockhash, tx_idx, row_vout)) = decode_outpoint_pos_v2(&raw_pos) {
+                let row_key = table.outpoint_row_key(&row_blockhash, tx_idx, row_vout);
+                if let Some(row_raw) = provider
+                    .get_blob_raw_value(GetRawValueParams { blockhash, key: row_key })?
+                    .value
+                {
+                    if let Ok(row) = decode_outpoint_row_v2(&row_raw) {
+                        return Ok(Some(row));
+                    }
+                }
+            }
+        }
+    }
     let Some((row_blockhash, tx_idx)) =
         resolve_outpoint_create_position_v2(provider, txid, vout, blockhash)?
     else {
@@ -4084,9 +4146,13 @@ pub fn get_outpoint_balances_with_spent(
     let row = load_outpoint_row_v2(provider, txid, vout, blockhash)?;
     let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
     let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
-    let spk = row
-        .as_ref()
-        .and_then(|r| if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) });
+    let spk = row.as_ref().and_then(|r| {
+        if r.spk.is_empty() {
+            None
+        } else {
+            Some(ScriptBuf::from(r.spk.clone()))
+        }
+    });
     Ok(OutpointLookup { balances, spent_by, address, spk })
 }
 
@@ -4101,7 +4167,11 @@ pub fn get_outpoint_rows_batch(
         let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
         let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
         let spk = row.as_ref().and_then(|r| {
-            if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) }
+            if r.spk.is_empty() {
+                None
+            } else {
+                Some(ScriptBuf::from(r.spk.clone()))
+            }
         });
         out.insert((*txid, *vout), OutpointLookup { balances, spent_by: None, address, spk });
     }
@@ -4120,7 +4190,11 @@ pub fn get_outpoint_balances_with_spent_batch(
         let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
         let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
         let spk = row.as_ref().and_then(|r| {
-            if r.spk.is_empty() { None } else { Some(ScriptBuf::from(r.spk.clone())) }
+            if r.spk.is_empty() {
+                None
+            } else {
+                Some(ScriptBuf::from(r.spk.clone()))
+            }
         });
         out.insert((*txid, *vout), OutpointLookup { balances, spent_by, address, spk });
     }

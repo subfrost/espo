@@ -1,23 +1,26 @@
 use crate::runtime::state_at::StateAt;
-use axum::Json;
 use axum::extract::Query;
+use axum::Json;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::config::{get_espo_next_height, get_metashrew_rpc_url, get_network};
-use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
+use crate::config::{get_config, get_espo_next_height, get_metashrew_rpc_url, get_network};
+use crate::explorer::components::tx_view::{alkane_meta, AlkaneMetaCache};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
+use crate::explorer::pages::common::ALKANE_SCALE;
 use crate::explorer::paths::explorer_path;
 use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    BlockSummary, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
-    GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
+    get_cached_block_summary, load_creation_record, BlockSummary, EssentialsProvider,
+    EssentialsTable, GetAlkaneIdsByNamePrefixPageParams, GetListEntriesDescParams,
+    HoldersCountEntry,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
+use crate::runtime::tree_db::get_global_tree_db;
 use crate::schemas::SchemaAlkaneId;
 use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId as SupportAlkaneId;
@@ -26,8 +29,8 @@ use alkanes_support::proto::alkanes::{
 };
 use anyhow::Context;
 use bitcoin::blockdata::block::Header;
-use bitcoin::consensus::Encodable;
 use bitcoin::consensus::encode::deserialize;
+use bitcoin::consensus::Encodable;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
@@ -38,7 +41,7 @@ use ordinals::Runestone;
 use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
@@ -114,6 +117,28 @@ pub struct AlkaneChartResponse {
     pub source: Option<String>,
     pub quote: Option<String>,
     pub candles: Vec<AlkaneChartPoint>,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AddressChartQuery {
+    pub address: Option<String>,
+    pub alkane: Option<String>,
+    pub range: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AddressChartPoint {
+    pub height: u32,
+    pub value: f64,
+}
+
+#[derive(Serialize)]
+pub struct AddressChartResponse {
+    pub ok: bool,
+    pub available: bool,
+    pub range: String,
+    pub points: Vec<AddressChartPoint>,
     pub error: Option<String>,
 }
 
@@ -647,6 +672,157 @@ pub async fn alkane_chart(Query(q): Query<AlkaneChartQuery>) -> Json<AlkaneChart
     })
 }
 
+pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressChartResponse> {
+    let Some(address_raw) = q.address.as_deref() else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_address".to_string()),
+        });
+    };
+    let Some(alkane_raw) = q.alkane.as_deref() else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+    let Some(alkane) = parse_alkane_id(alkane_raw) else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+    let address = match Address::from_str(address_raw.trim())
+        .ok()
+        .and_then(|a| a.require_network(get_network()).ok())
+    {
+        Some(addr) => addr.to_string(),
+        None => {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range: "1d".to_string(),
+                points: Vec::new(),
+                error: Some("missing_or_invalid_address".to_string()),
+            });
+        }
+    };
+
+    let range = normalize_address_chart_range(q.range.as_deref());
+    let (lookback_blocks, range_interval) = address_chart_range_params(&range);
+    let Some((indexed_min, indexed_max)) =
+        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+    else {
+        return Json(AddressChartResponse {
+            ok: true,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: None,
+        });
+    };
+
+    let chain_tip = (get_espo_next_height().saturating_sub(1)) as u32;
+    let range_max = chain_tip.min(indexed_max);
+    let range_min = match lookback_blocks {
+        Some(lookback) => range_max.saturating_sub(lookback).max(indexed_min),
+        None => indexed_min,
+    };
+    if range_min > range_max {
+        return Json(AddressChartResponse {
+            ok: true,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: None,
+        });
+    }
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": format!("address-chart:{}:{}:{}", address, alkane.block, alkane.tx),
+        "method": "get_method_line_chart",
+        "params": {
+            "method": "essentials.get_address_balances",
+            "body": {
+                "address": address,
+            },
+            "range_min": range_min,
+            "range_max": range_max,
+            "range_interval": range_interval,
+            "key": format!("balances.{}", alkane_id_str(&alkane)),
+        },
+    });
+
+    let rpc_url = format!("http://127.0.0.1:{}/rpc", get_config().port);
+    let resp_json: Value = match Client::new().post(&rpc_url).json(&body).send().await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok) => match ok.json().await {
+                Ok(v) => v,
+                Err(_) => {
+                    return Json(AddressChartResponse {
+                        ok: false,
+                        available: false,
+                        range,
+                        points: Vec::new(),
+                        error: Some("response_decode_failed".to_string()),
+                    });
+                }
+            },
+            Err(_) => {
+                return Json(AddressChartResponse {
+                    ok: false,
+                    available: false,
+                    range,
+                    points: Vec::new(),
+                    error: Some("metashrew_http_error".to_string()),
+                });
+            }
+        },
+        Err(_) => {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("metashrew_request_failed".to_string()),
+            });
+        }
+    };
+
+    if let Some(err) = resp_json.get("error") {
+        let detail = err
+            .get("data")
+            .and_then(|d| d.get("detail"))
+            .and_then(|d| d.as_str())
+            .map(str::to_string);
+        let message = err.get("message").and_then(|m| m.as_str()).map(str::to_string);
+        let fallback = err.as_str().map(str::to_string);
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: detail.or(message).or(fallback).or(Some("line_chart_failed".to_string())),
+        });
+    }
+
+    let points = parse_address_chart_points(
+        resp_json.get("result").and_then(|r| r.get("points")).and_then(|v| v.as_array()),
+    );
+    let available = !points.is_empty();
+
+    Json(AddressChartResponse { ok: true, available, range, points, error: None })
+}
+
 #[derive(Deserialize)]
 pub struct SimulateRequest {
     pub alkane: String,
@@ -1140,7 +1316,11 @@ fn decode_support_alkane_ids_prefixed(bytes: &[u8], total: usize) -> Option<Alka
         let schema = schema_from_support_id(parsed)?;
         ids.push(schema);
     }
-    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
+    if ids.is_empty() {
+        None
+    } else {
+        Some(AlkaneDecodeResult { ids, total })
+    }
 }
 
 fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
@@ -1161,7 +1341,11 @@ fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
             ids.push(schema);
         }
     }
-    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
+    if ids.is_empty() {
+        None
+    } else {
+        Some(AlkaneDecodeResult { ids, total })
+    }
 }
 
 fn decode_proto_alkane_id(bytes: &[u8]) -> Option<SchemaAlkaneId> {
@@ -1180,7 +1364,11 @@ fn schema_from_support_id(id: SupportAlkaneId) -> Option<SchemaAlkaneId> {
 }
 
 fn validate_schema_alkane(id: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
-    if (id.block as u128) <= MAX_ALKANE_BLOCK { Some(id) } else { None }
+    if (id.block as u128) <= MAX_ALKANE_BLOCK {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<String> {
@@ -1243,6 +1431,25 @@ fn chart_range_params(range: &str) -> (&'static str, u64) {
     }
 }
 
+fn normalize_address_chart_range(raw: Option<&str>) -> String {
+    match raw.unwrap_or("all").trim().to_ascii_lowercase().as_str() {
+        "1d" | "24h" => "1d".to_string(),
+        "1w" | "7d" => "1w".to_string(),
+        "1m" | "30d" => "1m".to_string(),
+        "all" | "max" | "3m" | "90d" => "all".to_string(),
+        _ => "all".to_string(),
+    }
+}
+
+fn address_chart_range_params(range: &str) -> (Option<u32>, u32) {
+    match range {
+        "1d" => (Some(144), 1),
+        "1w" => (Some(144 * 7), 7),
+        "1m" => (Some(144 * 30), 30),
+        _ => (None, 500),
+    }
+}
+
 fn alkane_id_str(id: &SchemaAlkaneId) -> String {
     format!("{}:{}", id.block, id.tx)
 }
@@ -1285,6 +1492,29 @@ fn parse_candles(value: &Value) -> Vec<AlkaneChartPoint> {
                     let ts = item.get("ts").and_then(|v| v.as_u64())?;
                     let close = item.get("close").and_then(|v| v.as_f64())?;
                     Some(AlkaneChartPoint { ts, close })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_address_chart_points(points: Option<&Vec<Value>>) -> Vec<AddressChartPoint> {
+    points
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|point| {
+                    let height_u64 = point.get("height").and_then(|v| v.as_u64())?;
+                    let height = u32::try_from(height_u64).ok()?;
+                    let value = point.get("value")?;
+                    let raw_value = match value {
+                        Value::Number(n) => n.as_f64(),
+                        Value::String(s) => s.trim().parse::<f64>().ok(),
+                        _ => None,
+                    }?;
+                    if !raw_value.is_finite() {
+                        return None;
+                    }
+                    Some(AddressChartPoint { height, value: raw_value / (ALKANE_SCALE as f64) })
                 })
                 .collect()
         })
