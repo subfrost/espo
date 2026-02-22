@@ -127,6 +127,13 @@ pub struct AddressChartQuery {
     pub range: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct AlkaneBalanceChartQuery {
+    pub alkane: Option<String>,
+    pub balance_alkane: Option<String>,
+    pub range: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct AddressChartPoint {
     pub height: u32,
@@ -759,6 +766,159 @@ pub async fn address_chart(Query(q): Query<AddressChartQuery>) -> Json<AddressCh
             "range_max": range_max,
             "range_interval": range_interval,
             "key": format!("balances.{}", alkane_id_str(&alkane)),
+        },
+    });
+
+    let rpc_url = format!("http://127.0.0.1:{}/rpc", get_config().port);
+    let resp_json: Value = match Client::new().post(&rpc_url).json(&body).send().await {
+        Ok(resp) => match resp.error_for_status() {
+            Ok(ok) => match ok.json().await {
+                Ok(v) => v,
+                Err(_) => {
+                    return Json(AddressChartResponse {
+                        ok: false,
+                        available: false,
+                        range,
+                        points: Vec::new(),
+                        error: Some("response_decode_failed".to_string()),
+                    });
+                }
+            },
+            Err(_) => {
+                return Json(AddressChartResponse {
+                    ok: false,
+                    available: false,
+                    range,
+                    points: Vec::new(),
+                    error: Some("metashrew_http_error".to_string()),
+                });
+            }
+        },
+        Err(_) => {
+            return Json(AddressChartResponse {
+                ok: false,
+                available: false,
+                range,
+                points: Vec::new(),
+                error: Some("metashrew_request_failed".to_string()),
+            });
+        }
+    };
+
+    if let Some(err) = resp_json.get("error") {
+        let detail = err
+            .get("data")
+            .and_then(|d| d.get("detail"))
+            .and_then(|d| d.as_str())
+            .map(str::to_string);
+        let message = err.get("message").and_then(|m| m.as_str()).map(str::to_string);
+        let fallback = err.as_str().map(str::to_string);
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: detail.or(message).or(fallback).or(Some("line_chart_failed".to_string())),
+        });
+    }
+
+    let points = parse_address_chart_points(
+        resp_json.get("result").and_then(|r| r.get("points")).and_then(|v| v.as_array()),
+    );
+    let available = !points.is_empty();
+
+    Json(AddressChartResponse { ok: true, available, range, points, error: None })
+}
+
+pub async fn alkane_balance_chart(
+    Query(q): Query<AlkaneBalanceChartQuery>,
+) -> Json<AddressChartResponse> {
+    let Some(alkane_raw) = q.alkane.as_deref() else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+    let Some(balance_alkane_raw) = q.balance_alkane.as_deref() else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_balance_alkane".to_string()),
+        });
+    };
+    let Some(alkane) = parse_alkane_id(alkane_raw) else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_alkane".to_string()),
+        });
+    };
+    let Some(balance_alkane) = parse_alkane_id(balance_alkane_raw) else {
+        return Json(AddressChartResponse {
+            ok: false,
+            available: false,
+            range: "1d".to_string(),
+            points: Vec::new(),
+            error: Some("missing_or_invalid_balance_alkane".to_string()),
+        });
+    };
+
+    let range = normalize_address_chart_range(q.range.as_deref());
+    let (lookback_blocks, range_interval) = address_chart_range_params(&range);
+    let Some((indexed_min, indexed_max)) =
+        get_global_tree_db().and_then(|db| db.indexed_height_bounds().ok().flatten())
+    else {
+        return Json(AddressChartResponse {
+            ok: true,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: None,
+        });
+    };
+
+    let chain_tip = (get_espo_next_height().saturating_sub(1)) as u32;
+    let range_max = chain_tip.min(indexed_max);
+    let range_min = match lookback_blocks {
+        Some(lookback) => range_max.saturating_sub(lookback).max(indexed_min),
+        None => indexed_min,
+    };
+    if range_min > range_max {
+        return Json(AddressChartResponse {
+            ok: true,
+            available: false,
+            range,
+            points: Vec::new(),
+            error: None,
+        });
+    }
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": format!(
+            "alkane-balance-chart:{}:{}:{}:{}",
+            alkane.block,
+            alkane.tx,
+            balance_alkane.block,
+            balance_alkane.tx
+        ),
+        "method": "get_method_line_chart",
+        "params": {
+            "method": "essentials.get_alkane_balances",
+            "body": {
+                "alkane": alkane_id_str(&alkane),
+            },
+            "range_min": range_min,
+            "range_max": range_max,
+            "range_interval": range_interval,
+            "key": format!("balances.{}", alkane_id_str(&balance_alkane)),
         },
     });
 

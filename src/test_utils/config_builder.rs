@@ -48,6 +48,7 @@ impl TestConfigBuilder {
             safe_tip_hook_script: None,
             block_source_mode: BlockFetchMode::RpcOnly,
             compact_tx_trace_rows: true,
+            address_index_chunk_size: 512,
             explorer_networks: None,
             modules: HashMap::new(),
         };

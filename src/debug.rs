@@ -263,6 +263,30 @@ pub fn flush_timer_totals() -> Result<(), String> {
     flush_dirty_locked(&mut guard)
 }
 
+pub fn reset_timer_totals() -> Result<usize, String> {
+    let mut guard = timer_state().lock().unwrap_or_else(|e| e.into_inner());
+    ensure_loaded_locked(&mut guard);
+
+    let keys = debug_mdb()
+        .scan_prefix_keys(TIMER_DB_PREFIX)
+        .map_err(|e| format!("debug timer reset scan failed: {e}"))?;
+
+    if !keys.is_empty() {
+        debug_mdb()
+            .bulk_write(|wb| {
+                for key in &keys {
+                    wb.delete(key);
+                }
+            })
+            .map_err(|e| format!("debug timer reset delete failed: {e}"))?;
+    }
+
+    guard.totals.clear();
+    guard.dirty.clear();
+    guard.loaded = true;
+    Ok(keys.len())
+}
+
 pub fn get_timer_totals(limit: Option<usize>) -> TimerTotalsSnapshot {
     let mut guard = timer_state().lock().unwrap_or_else(|e| e.into_inner());
     ensure_loaded_locked(&mut guard);

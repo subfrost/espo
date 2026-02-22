@@ -97,6 +97,7 @@ mod tests {
             port: 9090,
             explorer_host: None,
             explorer_base_path: String::from("/"),
+            explorer_pizza_tv_endpoint: String::from("https://tv.pizza.fun"),
             network: bitcoin::Network::Regtest,
             metashrew_db_label: None,
             strict_mode: None,
@@ -106,6 +107,7 @@ mod tests {
             safe_tip_hook_script: None,
             block_source_mode: espo::core::blockfetcher::BlockFetchMode::Auto,
             compact_tx_trace_rows: true,
+            address_index_chunk_size: 512,
             explorer_networks: None,
             modules: std::collections::HashMap::new(),
         };

@@ -109,6 +109,10 @@ fn default_compact_tx_trace_rows() -> bool {
     true
 }
 
+fn default_address_index_chunk_size() -> u32 {
+    512
+}
+
 fn normalize_optional_string(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -248,6 +252,8 @@ pub struct ConfigFile {
     pub block_source_mode: String,
     #[serde(default = "default_compact_tx_trace_rows")]
     pub compact_tx_trace_rows: bool,
+    #[serde(default = "default_address_index_chunk_size")]
+    pub address_index_chunk_size: u32,
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
@@ -282,6 +288,7 @@ pub struct AppConfig {
     pub safe_tip_hook_script: Option<String>,
     pub block_source_mode: BlockFetchMode,
     pub compact_tx_trace_rows: bool,
+    pub address_index_chunk_size: u32,
     pub explorer_networks: Option<ExplorerNetworks>,
     pub modules: HashMap<String, serde_json::Value>,
 }
@@ -343,6 +350,7 @@ impl AppConfig {
             safe_tip_hook_script: normalize_optional_string(file.safe_tip_hook_script),
             block_source_mode,
             compact_tx_trace_rows: file.compact_tx_trace_rows,
+            address_index_chunk_size: file.address_index_chunk_size,
             explorer_networks,
             modules: file.modules,
         })
@@ -402,6 +410,9 @@ pub fn init_config_from(cfg: AppConfig) -> Result<()> {
 
     if cfg.sdb_poll_ms == 0 {
         anyhow::bail!("sdb_poll_ms must be greater than 0");
+    }
+    if cfg.address_index_chunk_size == 0 {
+        anyhow::bail!("address_index_chunk_size must be greater than 0");
     }
 
     cfg.explorer_base_path = normalize_explorer_base_path(&cfg.explorer_base_path)?;
@@ -577,6 +588,10 @@ pub fn get_network() -> Network {
 
 pub fn compact_tx_trace_rows_enabled() -> bool {
     get_config().compact_tx_trace_rows
+}
+
+pub fn get_address_index_chunk_size() -> usize {
+    get_config().address_index_chunk_size.max(1) as usize
 }
 
 pub fn is_strict_mode() -> bool {

@@ -733,9 +733,27 @@ pub fn register_rpc(reg: RpcNsRegistrar, provider: Arc<EssentialsProvider>) {
             reg_debug_timers
                 .register("get_debug_timer_totals", move |_cx, payload| async move {
                     let limit = payload.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+                    let reset_requested =
+                        payload.get("reset").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let reset_deleted = if reset_requested {
+                        match crate::debug::reset_timer_totals() {
+                            Ok(deleted) => Some(deleted),
+                            Err(e) => {
+                                return json!({
+                                    "ok": false,
+                                    "error": "timer_reset_failed",
+                                    "message": e,
+                                });
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let snapshot = crate::debug::get_timer_totals(limit);
                     json!({
                         "ok": true,
+                        "reset": reset_requested,
+                        "reset_deleted": reset_deleted,
                         "timers": snapshot.entries,
                         "returned": snapshot.entries.len(),
                         "total_entries": snapshot.total_entries,

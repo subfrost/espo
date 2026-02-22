@@ -6,7 +6,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::explorer::components::dropdown::{dropdown, DropdownItem, DropdownProps};
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
     icon_left, icon_right, icon_skip_left, icon_skip_right,
 };
@@ -285,8 +285,10 @@ pub async fn alkanes_page(
         html! { div class="alkanes-card" { (alkanes_table(&rows, true, show_creation_block, true)) } }
     };
 
-    layout(
+    layout_with_meta(
         "Alkanes",
+        "/alkanes",
+        None,
         html! {
             div class="row" {
                 h1 class="h1" { "All Alkanes" }

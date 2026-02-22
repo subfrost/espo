@@ -1,4 +1,4 @@
-use super::schemas::{ActivityKind, SchemaCandleV1, SchemaMarketDefs, active_timeframes};
+use super::schemas::{ActivityKind, SchemaCandleV1, SchemaMarketDefs, Timeframe};
 use super::storage::{
     AmmDataProvider, GetListEntriesDescParams, GetPoolDefsParams, GetRawValueParams,
     GetTokenPoolsParams, SetBatchParams,
@@ -10,12 +10,13 @@ use crate::config::{debug_enabled, get_espo_db, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
+    ammdata_genesis_block, canonical_quotes, CanonicalQuoteUnit, AMOUNT_SCALE, PRICE_SCALE,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    AlkaneBalanceTxEntry, EssentialsProvider, GetMultiValuesParams,
-    GetListEntriesDescParams as EssentialsGetListEntriesDescParams, decode_alkane_balance_tx_entry,
+    decode_pointer_idx_u64, load_tx_pointer_blob_v3_by_id, AlkaneBalanceTxEntry,
+    EssentialsProvider, GetListEntriesDescParams as EssentialsGetListEntriesDescParams,
+    GetMultiValuesParams,
 };
 use crate::modules::essentials::utils::balances::SignedU128;
 use crate::modules::essentials::utils::inspections::{
@@ -24,7 +25,7 @@ use crate::modules::essentials::utils::inspections::{
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use bitcoin::Network;
 use bitcoin::{ScriptBuf, Transaction};
 use ordinals::{Artifact, Runestone};
@@ -96,16 +97,24 @@ pub(crate) fn lookup_proxy_target(
 
 pub(crate) fn parse_hex_u32(s: &str) -> Option<u32> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(trimmed, 16)
-        .ok()
-        .and_then(|v| if v > u32::MAX as u128 { None } else { Some(v as u32) })
+    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
+        if v > u32::MAX as u128 {
+            None
+        } else {
+            Some(v as u32)
+        }
+    })
 }
 
 pub(crate) fn parse_hex_u64(s: &str) -> Option<u64> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(trimmed, 16)
-        .ok()
-        .and_then(|v| if v > u64::MAX as u128 { None } else { Some(v as u64) })
+    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
+        if v > u64::MAX as u128 {
+            None
+        } else {
+            Some(v as u64)
+        }
+    })
 }
 
 fn parse_hex_u128(s: &str) -> Option<u128> {
@@ -146,7 +155,11 @@ pub(crate) fn merge_candles(
 }
 
 pub(crate) fn invert_price_value(p: u128) -> Option<u128> {
-    if p == 0 { None } else { Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p) }
+    if p == 0 {
+        None
+    } else {
+        Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p)
+    }
 }
 
 pub(crate) fn parse_factory_create_call(
@@ -206,7 +219,11 @@ pub(crate) fn pool_creator_spk_from_protostone(tx: &Transaction) -> Option<Scrip
 pub(crate) fn signed_from_delta(delta: Option<&SignedU128>) -> i128 {
     let Some(d) = delta else { return 0 };
     let (neg, amt) = d.as_parts();
-    if neg { -(amt as i128) } else { amt as i128 }
+    if neg {
+        -(amt as i128)
+    } else {
+        amt as i128
+    }
 }
 
 pub(crate) fn apply_delta_u128(current: u128, delta: i128) -> u128 {
@@ -230,7 +247,11 @@ pub(crate) fn percent_change_basis_points(prev: u128, now: u128) -> i64 {
     let (neg, delta) = if now >= prev { (false, now - prev) } else { (true, prev - now) };
     let scaled = delta.saturating_mul(1_000_000).saturating_div(prev);
     let mag = if scaled > i64::MAX as u128 { i64::MAX } else { scaled as i64 };
-    if neg { -mag } else { mag }
+    if neg {
+        -mag
+    } else {
+        mag
+    }
 }
 
 #[inline]
@@ -246,7 +267,11 @@ pub(crate) fn apr_basis_points_30d(pool_volume_30d_usd: u128, pool_tvl_usd: u128
         return 0;
     }
     let scaled = pool_volume_30d_usd.saturating_mul(36_000).saturating_div(pool_tvl_usd);
-    if scaled > i64::MAX as u128 { i64::MAX } else { scaled as i64 }
+    if scaled > i64::MAX as u128 {
+        i64::MAX
+    } else {
+        scaled as i64
+    }
 }
 
 #[inline]
@@ -305,7 +330,11 @@ pub(crate) struct TokenTradeWindows {
 }
 
 pub(crate) fn abs_i128(value: i128) -> u128 {
-    if value < 0 { (-value) as u128 } else { value as u128 }
+    if value < 0 {
+        (-value) as u128
+    } else {
+        value as u128
+    }
 }
 
 fn decode_ts_seq_from_index(prefix_len: usize, key: &[u8], val: &[u8]) -> Option<(u64, u32)> {
@@ -530,8 +559,16 @@ pub(crate) fn load_balance_txs_by_height(
         else {
             continue;
         };
-        let Ok(entry) = decode_alkane_balance_tx_entry(&value) else {
+        let Ok(entry_id) = decode_pointer_idx_u64(&value) else {
             continue;
+        };
+        let Some(blob) = load_tx_pointer_blob_v3_by_id(essentials, entry_id) else {
+            continue;
+        };
+        let entry = AlkaneBalanceTxEntry {
+            txid: blob.txid,
+            height: blob.height,
+            outflow: blob.outflows.get(&owner).cloned().unwrap_or_default(),
         };
         parsed_with_idx.entry(owner).or_default().push((tx_idx, entry));
     }
@@ -551,10 +588,7 @@ pub struct AmmData {
 
 impl AmmData {
     pub fn new() -> Self {
-        Self {
-            provider: None,
-            index_height: Arc::new(std::sync::RwLock::new(None)),
-        }
+        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
     }
 
     #[inline]
@@ -678,9 +712,7 @@ impl EspoModule for AmmData {
         let timer = debug::start_if(debug);
         let (amm_factories, amm_factory_writes) =
             crate::modules::ammdata::utils::index_factories::prepare_factories(
-                &block,
-                provider,
-                essentials,
+                &block, provider, essentials,
             )?;
         state.amm_factory_writes = amm_factory_writes;
         debug::log_elapsed(module, "load_factories", timer);
@@ -702,7 +734,7 @@ impl EspoModule for AmmData {
         }
         debug::log_elapsed(module, "bootstrap_pools_from_creation_records", timer);
 
-        let frames = active_timeframes();
+        let frames = vec![Timeframe::M10];
 
         let timer = debug::start_if(debug);
         let discovery = crate::modules::ammdata::utils::index_pools::discover_new_pools(
@@ -764,13 +796,14 @@ impl EspoModule for AmmData {
         let finalize =
             crate::modules::ammdata::utils::index_finalize::prepare_batch(provider, &mut state)?;
         eprintln!(
-            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
+            "[AMMDATA] block #{h} prepare writes: candles={c_cnt}, token_usd_candles={tc_cnt}, token_mcusd_candles={tmc_cnt}, token_derived_usd_candles={tdc_cnt}, token_derived_mcusd_candles={tdmc_cnt}, chart_changes={cc_cnt}, token_metrics={tm_cnt}, token_metrics_index={tmi_cnt}, token_search_index={tsi_cnt}, token_derived_metrics={tdm_cnt}, token_derived_metrics_index={tdmi_cnt}, token_derived_search_index={tdsi_cnt}, btc_usd_price={btc_cnt}, btc_usd_line={btcl_cnt}, canonical_pools={cp_cnt}, pool_name_index={pn_cnt}, amm_factories={af_cnt}, factory_pools={fp_cnt}, pool_factory={pf_cnt}, pool_creation_info={pc_cnt}, pool_creations={pcg_cnt}, token_pools={tp_cnt}, pool_defs={pd_cnt}, pool_metrics={pm_cnt}, pool_metrics_index={pmi_cnt}, pool_lp_supply={pls_cnt}, pool_details_snapshot={pds_cnt}, tvl_versioned={tvl_cnt}, token_swaps={ts_cnt}, address_pool_swaps={aps_cnt}, address_token_swaps={ats_cnt}, address_pool_creations={apc_cnt}, address_pool_mints={apm_cnt}, address_pool_burns={apb_cnt}, address_amm_history={aah_cnt}, amm_history_all={ah_cnt}, activity={a_cnt}, indexes+counts={i_cnt}, reserves_snapshot=1",
             h = block.height,
             c_cnt = finalize.stats.candle_writes,
             tc_cnt = finalize.stats.token_usd_candles,
             tmc_cnt = finalize.stats.token_mcusd_candles,
             tdc_cnt = finalize.stats.token_derived_usd_candles,
             tdmc_cnt = finalize.stats.token_derived_mcusd_candles,
+            cc_cnt = finalize.stats.chart_changes,
             tm_cnt = finalize.stats.token_metrics,
             tmi_cnt = finalize.stats.token_metrics_index,
             tsi_cnt = finalize.stats.token_search_index,

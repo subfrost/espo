@@ -78,6 +78,8 @@ pub struct AmmDataTable<'a> {
     pub BTC_USD_PRICE: KvPointer<'a>,
     pub BTC_USD_LINE: ListPointer<'a>,
     pub TOKEN_DERIVED_MCAP_USD_CANDLES: ListPointer<'a>,
+    pub CHART_CHANGE_EVENTS: KvPointer<'a>,
+    pub CHART_CHANGE_LATEST: KvPointer<'a>,
     // Activity logs + secondary indexes for sort/paging.
     pub ACTIVITY: ListPointer<'a>,
     pub ACTIVITY_INDEX: ListPointer<'a>,
@@ -133,6 +135,8 @@ impl<'a> AmmDataTable<'a> {
             BTC_USD_PRICE: root.keyword("/btc_usd_price/v1/"),
             BTC_USD_LINE: root.list_keyword("btu1:"),
             TOKEN_DERIVED_MCAP_USD_CANDLES: root.list_keyword("tdmc1:"),
+            CHART_CHANGE_EVENTS: root.keyword("/chart_change_events/v1/"),
+            CHART_CHANGE_LATEST: root.keyword("/chart_change_latest/v1/"),
             ACTIVITY: root.list_keyword("activity:v1:"),
             ACTIVITY_INDEX: root.list_keyword("activity:idx:"),
             CANONICAL_POOL: root.list_keyword("/canonical_pool/v2/"),
@@ -356,6 +360,17 @@ pub fn change_basis_points_to_f64(value: i64) -> f64 {
     (value as f64) / 10_000.0
 }
 
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchemaChartChangeValueV1 {
+    pub usd_bp: i64,
+    pub mcusd_bp: i64,
+}
+
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SchemaChartChangeSetV1 {
+    pub timeframe_changes: BTreeMap<String, SchemaChartChangeValueV1>,
+}
+
 pub fn encode_i64_be_ordered(value: i64) -> [u8; 8] {
     let biased = (value as u64) ^ (1u64 << 63);
     biased.to_be_bytes()
@@ -509,6 +524,38 @@ impl<'a> AmmDataTable<'a> {
         let mut k = self.btc_usd_line_ns_prefix(tf);
         k.extend_from_slice(bucket_ts.to_string().as_bytes());
         k
+    }
+
+    pub fn chart_change_events_prefix(&self) -> Vec<u8> {
+        self.CHART_CHANGE_EVENTS.key().to_vec()
+    }
+
+    pub fn chart_change_event_key(&self, height: u64, chart: &str) -> Vec<u8> {
+        let mut k = self.chart_change_events_prefix();
+        k.extend_from_slice(&height.to_be_bytes());
+        k.push(b'/');
+        k.extend_from_slice(chart.as_bytes());
+        k
+    }
+
+    pub fn chart_change_event_height_prefix(&self, height: u64) -> Vec<u8> {
+        let mut k = self.chart_change_events_prefix();
+        k.extend_from_slice(&height.to_be_bytes());
+        k.push(b'/');
+        k
+    }
+
+    pub fn parse_chart_change_event_key_for_height(&self, height: u64, key: &[u8]) -> Option<String> {
+        let prefix = self.chart_change_event_height_prefix(height);
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        std::str::from_utf8(rest).ok().map(|s| s.to_string())
+    }
+
+    pub fn chart_change_latest_key(&self, chart: &str) -> Vec<u8> {
+        self.CHART_CHANGE_LATEST.select(chart.as_bytes()).key().to_vec()
     }
 
     pub fn token_metrics_index_prefix(&self, field: TokenMetricsIndexField) -> Vec<u8> {
@@ -2980,6 +3027,150 @@ impl AmmDataProvider {
         }
     }
 
+    pub fn rpc_get_chart_change_block(
+        &self,
+        params: RpcGetChartChangeBlockParams,
+    ) -> Result<RpcGetChartChangeBlockResult> {
+        let Some(chart) = params.chart.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(RpcGetChartChangeBlockResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_chart"
+                }),
+            });
+        };
+        let height = if let Some(h) = params.height {
+            h
+        } else {
+            self.get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })?
+                .height
+                .map(|v| v as u64)
+                .unwrap_or(0)
+        };
+        if height == 0 {
+            return Ok(RpcGetChartChangeBlockResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_height"
+                }),
+            });
+        }
+        let table = self.table();
+        let key = table.chart_change_event_key(height, chart);
+        let raw = self.get_raw_value(GetRawValueParams {
+            blockhash: StateAt::Latest,
+            key,
+        })?;
+        let Some(bytes) = raw.value else {
+            return Ok(RpcGetChartChangeBlockResult {
+                value: json!({
+                    "ok": true,
+                    "available": false,
+                    "chart": chart,
+                    "height": height,
+                    "changes": {}
+                }),
+            });
+        };
+        let decoded = match decode_chart_change_set_v1(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(RpcGetChartChangeBlockResult {
+                    value: json!({
+                        "ok": false,
+                        "error": "decode_failed"
+                    }),
+                });
+            }
+        };
+
+        let mut changes = Map::new();
+        for (tf, v) in decoded.timeframe_changes {
+            changes.insert(
+                tf,
+                json!({
+                    "usd": format_change_basis_points(v.usd_bp),
+                    "usd_bp": v.usd_bp,
+                    "mcusd": format_change_basis_points(v.mcusd_bp),
+                    "mcusd_bp": v.mcusd_bp
+                }),
+            );
+        }
+
+        Ok(RpcGetChartChangeBlockResult {
+            value: json!({
+                "ok": true,
+                "available": true,
+                "chart": chart,
+                "height": height,
+                "changes": changes
+            }),
+        })
+    }
+
+    pub fn rpc_get_chart_changes_block(
+        &self,
+        params: RpcGetChartChangesBlockParams,
+    ) -> Result<RpcGetChartChangesBlockResult> {
+        let height = if let Some(h) = params.height {
+            h
+        } else {
+            self.get_index_height(GetIndexHeightParams { blockhash: StateAt::Latest })?
+                .height
+                .map(|v| v as u64)
+                .unwrap_or(0)
+        };
+        if height == 0 {
+            return Ok(RpcGetChartChangesBlockResult {
+                value: json!({
+                    "ok": false,
+                    "error": "missing_or_invalid_height"
+                }),
+            });
+        }
+        let table = self.table();
+        let prefix = table.chart_change_event_height_prefix(height);
+        let entries = self
+            .get_list_entries_desc(GetListEntriesDescParams {
+                blockhash: StateAt::Latest,
+                prefix: prefix.clone(),
+            })
+            .map(|resp| resp.entries)
+            .unwrap_or_default();
+
+        let mut charts = Map::new();
+        for (key, value) in entries {
+            let Some(chart) = table.parse_chart_change_event_key_for_height(height, &key) else {
+                continue;
+            };
+            let Ok(decoded) = decode_chart_change_set_v1(&value) else {
+                continue;
+            };
+            let mut changes = Map::new();
+            for (tf, v) in decoded.timeframe_changes {
+                changes.insert(
+                    tf,
+                    json!({
+                        "usd": format_change_basis_points(v.usd_bp),
+                        "usd_bp": v.usd_bp,
+                        "mcusd": format_change_basis_points(v.mcusd_bp),
+                        "mcusd_bp": v.mcusd_bp
+                    }),
+                );
+            }
+            charts.insert(chart, Value::Object(changes));
+        }
+
+        Ok(RpcGetChartChangesBlockResult {
+            value: json!({
+                "ok": true,
+                "available": !charts.is_empty(),
+                "height": height,
+                "charts": charts
+            }),
+        })
+    }
+
     pub fn rpc_get_activity(&self, params: RpcGetActivityParams) -> Result<RpcGetActivityResult> {
         let limit = params.limit.map(|n| n as usize).unwrap_or(50);
         let page = params.page.map(|n| n as usize).unwrap_or(1);
@@ -3995,6 +4186,23 @@ pub struct RpcGetCandlesResult {
     pub value: Value,
 }
 
+pub struct RpcGetChartChangeBlockParams {
+    pub chart: Option<String>,
+    pub height: Option<u64>,
+}
+
+pub struct RpcGetChartChangeBlockResult {
+    pub value: Value,
+}
+
+pub struct RpcGetChartChangesBlockParams {
+    pub height: Option<u64>,
+}
+
+pub struct RpcGetChartChangesBlockResult {
+    pub value: Value,
+}
+
 pub struct RpcGetActivityParams {
     pub pool: Option<String>,
     pub limit: Option<u64>,
@@ -4098,6 +4306,15 @@ pub fn decode_canonical_pools(bytes: &[u8]) -> anyhow::Result<Vec<SchemaCanonica
 
 pub fn encode_canonical_pools(entries: &[SchemaCanonicalPoolEntry]) -> anyhow::Result<Vec<u8>> {
     Ok(borsh::to_vec(entries)?)
+}
+
+pub fn decode_chart_change_set_v1(bytes: &[u8]) -> anyhow::Result<SchemaChartChangeSetV1> {
+    use borsh::BorshDeserialize;
+    Ok(SchemaChartChangeSetV1::try_from_slice(bytes)?)
+}
+
+pub fn encode_chart_change_set_v1(v: &SchemaChartChangeSetV1) -> anyhow::Result<Vec<u8>> {
+    Ok(borsh::to_vec(v)?)
 }
 
 pub fn decode_token_metrics(bytes: &[u8]) -> anyhow::Result<SchemaTokenMetricsV1> {

@@ -1,7 +1,10 @@
 use crate::alkanes::trace::{
     prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
 };
-use crate::config::{get_bitcoind_rpc_client, get_electrum_like, get_metashrew, get_network};
+use crate::config::{
+    get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_metashrew,
+    get_network,
+};
 use crate::modules::essentials::utils::balances::{
     get_address_activity_for_address, get_alkane_balances, get_alkane_balances_at_or_before,
     get_balance_for_address, get_holders_for_alkane, get_outpoint_address,
@@ -38,12 +41,58 @@ const ADDRESS_V2_PREFIX: &[u8] = b"/address/v2/";
 const OUTPOINT_V2_PREFIX: &[u8] = b"/outpoint/v2/";
 const ALKANE_V2_PREFIX: &[u8] = b"/alkane/v2/";
 const TX_V2_PREFIX: &[u8] = b"/tx/v2/";
+const OUTPOINT_V2_APPEND_PREFIX: &[u8] = b"/outpoint/v2a/";
+const TX_V2_APPEND_PREFIX: &[u8] = b"/tx/v2a/";
+const PTR_V1_PREFIX: &[u8] = b"/ptr/v1/";
+const PTR_ENTITY_OUTPOINT: &[u8] = b"outpoint";
+const PTR_ENTITY_ALKANE_TX: &[u8] = b"alkane_tx";
+const PTR_ENTITY_ADDR_OUTPOINT_IDX_CHUNK: &[u8] = b"addr_outpoint_idx_chunk";
+const PTR_ENTITY_ADDR_ALKANE_TX_CHUNK: &[u8] = b"addr_alkane_tx_chunk";
+const PTR_ENTITY_ALKANE_BALANCE_TXS_BY_TOKEN_CHUNK: &[u8] = b"alkane_balance_txs_by_token_chunk";
+const PTR_ENTITY_ALKANE_BLOCK_TXS_CHUNK: &[u8] = b"alkane_block_txs_chunk";
+const ADDRESS_INDEX_V2_PREFIX: &[u8] = b"/address_index/v2/";
+const ADDRESS_INDEX_INLINE_CAP: usize = 8;
 const BALANCE_CHANGES_V2_PREFIX: &[u8] = b"/balance_changes/v2/";
 const ALKANE_LATEST_TRACES_V2_PREFIX: &[u8] = b"/alkane_latest_traces/v2/";
-const TX_LOCATOR_CANDIDATE_BLOB_V2_PREFIX: &[u8] = b"/tx_locator_candidates/v2/";
-const TX_SUMMARY_MARKER_BLOB_V2_PREFIX: &[u8] = b"/tx_summary_marker/v2/";
-const OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX: &[u8] = b"/outpoint_create_candidates/v2/";
-const OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX: &[u8] = b"/outpoint_spend_events/v2/";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressIndexListKind {
+    OutpointIdx,
+    AlkaneTxs,
+    AlkaneBalanceTxsByToken,
+    AlkaneBlockTxs,
+}
+
+impl AddressIndexListKind {
+    fn as_key_segment(self) -> &'static [u8] {
+        match self {
+            Self::OutpointIdx => b"outpoint_idx",
+            Self::AlkaneTxs => b"alkane_txs",
+            Self::AlkaneBalanceTxsByToken => b"alkane_balance_txs_by_token",
+            Self::AlkaneBlockTxs => b"alkane_block_txs",
+        }
+    }
+
+    fn chunk_entity(self) -> &'static [u8] {
+        match self {
+            Self::OutpointIdx => PTR_ENTITY_ADDR_OUTPOINT_IDX_CHUNK,
+            Self::AlkaneTxs => PTR_ENTITY_ADDR_ALKANE_TX_CHUNK,
+            Self::AlkaneBalanceTxsByToken => PTR_ENTITY_ALKANE_BALANCE_TXS_BY_TOKEN_CHUNK,
+            Self::AlkaneBlockTxs => PTR_ENTITY_ALKANE_BLOCK_TXS_CHUNK,
+        }
+    }
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+enum InlineOrExternalU64V1 {
+    Inline { items: Vec<u64> },
+    External { chunk_ids: Vec<u64>, len: u64, chunk_size: u32 },
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct U64ChunkV1 {
+    items: Vec<u64>,
+}
 
 fn encode_alkane_id_be(id: &SchemaAlkaneId) -> [u8; 12] {
     let mut out = [0u8; 12];
@@ -61,6 +110,17 @@ fn decode_alkane_id_be(bytes: &[u8]) -> Option<SchemaAlkaneId> {
     let mut tx = [0u8; 8];
     tx.copy_from_slice(&bytes[4..12]);
     Some(SchemaAlkaneId { block: u32::from_be_bytes(block), tx: u64::from_be_bytes(tx) })
+}
+
+pub fn address_index_list_id_alkane_balance_txs_by_token(
+    owner: &SchemaAlkaneId,
+    token: &SchemaAlkaneId,
+) -> String {
+    format!("{}:{}|{}:{}", owner.block, owner.tx, token.block, token.tx)
+}
+
+pub fn address_index_list_id_alkane_block_txs(height: u64) -> String {
+    height.to_string()
 }
 
 fn creation_seq_bounds(total: u64, offset: u64, limit: u64, desc: bool) -> (u64, u64, bool) {
@@ -98,6 +158,47 @@ fn parse_outpoint_id_bytes(bytes: &[u8]) -> Option<(Vec<u8>, u32)> {
     let mut vout = [0u8; 4];
     vout.copy_from_slice(&bytes[32..36]);
     Some((bytes[..32].to_vec(), u32::from_be_bytes(vout)))
+}
+
+fn parse_paged_cursor_u64(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(hex_str) = s.strip_prefix("0x") {
+        return u64::from_str_radix(hex_str, 16).ok();
+    }
+    if s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(bytes) = hex::decode(s) {
+            if bytes.len() == 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes);
+                return Some(u64::from_be_bytes(arr));
+            }
+        }
+    }
+    s.parse::<u64>().ok()
+}
+
+fn encode_paged_cursor_u64(cursor: u64) -> String {
+    hex::encode(cursor.to_be_bytes())
+}
+
+fn pointer_counter_key(entity: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PTR_V1_PREFIX.len() + entity.len() + 8);
+    key.extend_from_slice(PTR_V1_PREFIX);
+    key.extend_from_slice(entity);
+    key.extend_from_slice(b"/counter");
+    key
+}
+
+fn pointer_blob_key(entity: &[u8], id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PTR_V1_PREFIX.len() + entity.len() + 6 + 8);
+    key.extend_from_slice(PTR_V1_PREFIX);
+    key.extend_from_slice(entity);
+    key.extend_from_slice(b"/blob/");
+    key.extend_from_slice(&id.to_be_bytes());
+    key
 }
 
 fn holder_id_bytes(holder: &HolderId) -> Vec<u8> {
@@ -290,6 +391,39 @@ impl<'a> EssentialsTable<'a> {
         key
     }
 
+    pub fn address_outpoint_idx_list_prefix(&self, address: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(ADDRESS_V2_PREFIX.len() + address.len() + 14);
+        key.extend_from_slice(ADDRESS_V2_PREFIX);
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/outpoint_idx/");
+        key
+    }
+
+    pub fn address_outpoint_idx_list_len_key(&self, address: &str) -> Vec<u8> {
+        let mut key = self.address_outpoint_idx_list_prefix(address);
+        key.extend_from_slice(b"length");
+        key
+    }
+
+    pub fn address_outpoint_idx_list_idx_key(&self, address: &str, idx: u64) -> Vec<u8> {
+        let mut key = self.address_outpoint_idx_list_prefix(address);
+        key.extend_from_slice(&idx.to_be_bytes());
+        key
+    }
+
+    pub fn address_index_meta_key(&self, address: &str, kind: AddressIndexListKind) -> Vec<u8> {
+        let seg = kind.as_key_segment();
+        let mut key = Vec::with_capacity(
+            ADDRESS_INDEX_V2_PREFIX.len() + seg.len() + 1 + address.len() + b"/meta".len(),
+        );
+        key.extend_from_slice(ADDRESS_INDEX_V2_PREFIX);
+        key.extend_from_slice(seg);
+        key.push(b'/');
+        key.extend_from_slice(address.as_bytes());
+        key.extend_from_slice(b"/meta");
+        key
+    }
+
     pub fn address_outpoint_key(&self, address: &str, outp: &EspoOutpoint) -> Result<Vec<u8>> {
         let outpoint_id = outpoint_id_bytes(&outp.txid, outp.vout)
             .ok_or_else(|| anyhow!("invalid outpoint txid length {}", outp.txid.len()))?;
@@ -371,112 +505,48 @@ impl<'a> EssentialsTable<'a> {
         Ok(key)
     }
 
-    pub fn outpoint_row_key(&self, blockhash: &[u8; 32], tx_idx: u32, vout: u32) -> Vec<u8> {
-        let mut key = Vec::with_capacity(OUTPOINT_V2_PREFIX.len() + 2 + 32 + 4 + 4);
-        key.extend_from_slice(OUTPOINT_V2_PREFIX);
-        key.extend_from_slice(b"r/");
-        key.extend_from_slice(blockhash);
-        key.extend_from_slice(&tx_idx.to_be_bytes());
-        key.extend_from_slice(&vout.to_be_bytes());
+    pub fn outpoint_pos_append_family_prefix(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_APPEND_PREFIX.len() + 2);
+        key.extend_from_slice(OUTPOINT_V2_APPEND_PREFIX);
+        key.extend_from_slice(b"p/");
         key
     }
 
-    pub fn outpoint_create_candidate_prefix_from_parts(
-        &self,
-        txid: &[u8],
-        vout: u32,
-    ) -> Result<Vec<u8>> {
+    pub fn outpoint_pos_append_prefix_from_parts(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
         let outpoint_id = outpoint_id_bytes(txid, vout)
             .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
-        let mut key = Vec::with_capacity(OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX.len() + 36);
-        key.extend_from_slice(OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX);
+        let mut key =
+            Vec::with_capacity(OUTPOINT_V2_APPEND_PREFIX.len() + 2 + outpoint_id.len() + 1);
+        key.extend_from_slice(OUTPOINT_V2_APPEND_PREFIX);
+        key.extend_from_slice(b"p/");
         key.extend_from_slice(&outpoint_id);
+        key.push(b'/');
         Ok(key)
     }
 
-    pub fn outpoint_create_candidate_key(
+    pub fn outpoint_pos_append_prefix(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
+        self.outpoint_pos_append_prefix_from_parts(&outp.txid, outp.vout)
+    }
+
+    pub fn outpoint_pos_append_key_from_parts(
         &self,
         txid: &[u8],
         vout: u32,
         height: u32,
-        tx_idx: u32,
         blockhash: &[u8; 32],
     ) -> Result<Vec<u8>> {
-        let mut key = self.outpoint_create_candidate_prefix_from_parts(txid, vout)?;
+        let mut key = self.outpoint_pos_append_prefix_from_parts(txid, vout)?;
         key.extend_from_slice(&height.to_be_bytes());
-        key.extend_from_slice(&tx_idx.to_be_bytes());
         key.extend_from_slice(blockhash);
         Ok(key)
     }
 
-    pub fn parse_outpoint_create_candidate_key(
-        &self,
-        key: &[u8],
-    ) -> Option<(Vec<u8>, u32, u32, u32, [u8; 32])> {
-        if !key.starts_with(OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX) {
-            return None;
-        }
-        let rest = &key[OUTPOINT_CREATE_CANDIDATE_BLOB_V2_PREFIX.len()..];
-        if rest.len() != 36 + 4 + 4 + 32 {
-            return None;
-        }
-        let (txid, vout) = parse_outpoint_id_bytes(&rest[..36])?;
-        let mut h = [0u8; 4];
-        h.copy_from_slice(&rest[36..40]);
-        let mut i = [0u8; 4];
-        i.copy_from_slice(&rest[40..44]);
-        let mut bh = [0u8; 32];
-        bh.copy_from_slice(&rest[44..76]);
-        Some((txid, vout, u32::from_be_bytes(h), u32::from_be_bytes(i), bh))
+    pub fn outpoint_pointer_counter_key(&self) -> Vec<u8> {
+        pointer_counter_key(PTR_ENTITY_OUTPOINT)
     }
 
-    pub fn outpoint_spend_event_prefix_from_parts(
-        &self,
-        txid: &[u8],
-        vout: u32,
-    ) -> Result<Vec<u8>> {
-        let outpoint_id = outpoint_id_bytes(txid, vout)
-            .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
-        let mut key = Vec::with_capacity(OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX.len() + 36);
-        key.extend_from_slice(OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX);
-        key.extend_from_slice(&outpoint_id);
-        Ok(key)
-    }
-
-    pub fn outpoint_spend_event_key(
-        &self,
-        txid: &[u8],
-        vout: u32,
-        height: u32,
-        tx_idx: u32,
-        blockhash: &[u8; 32],
-    ) -> Result<Vec<u8>> {
-        let mut key = self.outpoint_spend_event_prefix_from_parts(txid, vout)?;
-        key.extend_from_slice(&height.to_be_bytes());
-        key.extend_from_slice(&tx_idx.to_be_bytes());
-        key.extend_from_slice(blockhash);
-        Ok(key)
-    }
-
-    pub fn parse_outpoint_spend_event_key(
-        &self,
-        key: &[u8],
-    ) -> Option<(Vec<u8>, u32, u32, u32, [u8; 32])> {
-        if !key.starts_with(OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX) {
-            return None;
-        }
-        let rest = &key[OUTPOINT_SPEND_EVENT_BLOB_V2_PREFIX.len()..];
-        if rest.len() != 36 + 4 + 4 + 32 {
-            return None;
-        }
-        let (txid, vout) = parse_outpoint_id_bytes(&rest[..36])?;
-        let mut h = [0u8; 4];
-        h.copy_from_slice(&rest[36..40]);
-        let mut i = [0u8; 4];
-        i.copy_from_slice(&rest[40..44]);
-        let mut bh = [0u8; 32];
-        bh.copy_from_slice(&rest[44..76]);
-        Some((txid, vout, u32::from_be_bytes(h), u32::from_be_bytes(i), bh))
+    pub fn outpoint_pointer_blob_key(&self, id: u64) -> Vec<u8> {
+        pointer_blob_key(PTR_ENTITY_OUTPOINT, id)
     }
 
     pub fn outpoint_prefix(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
@@ -511,6 +581,42 @@ impl<'a> EssentialsTable<'a> {
         key.extend_from_slice(b"s/");
         key.extend_from_slice(&outpoint_id);
         Ok(key)
+    }
+
+    pub fn outpoint_spent_by_id_key(&self, id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_PREFIX.len() + 4 + 8);
+        key.extend_from_slice(OUTPOINT_V2_PREFIX);
+        key.extend_from_slice(b"sid/");
+        key.extend_from_slice(&id.to_be_bytes());
+        key
+    }
+
+    pub fn outpoint_spent_by_id_append_family_prefix(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_APPEND_PREFIX.len() + 4);
+        key.extend_from_slice(OUTPOINT_V2_APPEND_PREFIX);
+        key.extend_from_slice(b"sid/");
+        key
+    }
+
+    pub fn outpoint_spent_by_id_append_prefix(&self, id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_APPEND_PREFIX.len() + 4 + 8 + 1);
+        key.extend_from_slice(OUTPOINT_V2_APPEND_PREFIX);
+        key.extend_from_slice(b"sid/");
+        key.extend_from_slice(&id.to_be_bytes());
+        key.push(b'/');
+        key
+    }
+
+    pub fn outpoint_spent_by_id_append_key(
+        &self,
+        id: u64,
+        height: u32,
+        blockhash: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut key = self.outpoint_spent_by_id_append_prefix(id);
+        key.extend_from_slice(&height.to_be_bytes());
+        key.extend_from_slice(blockhash);
+        key
     }
 
     pub fn outpoint_balance_prefix(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
@@ -913,67 +1019,48 @@ impl<'a> EssentialsTable<'a> {
         key
     }
 
-    pub fn tx_packed_outflow_row_key(&self, blockhash: &[u8; 32], idx: u32) -> Vec<u8> {
-        let mut key = Vec::with_capacity(TX_V2_PREFIX.len() + 2 + 32 + 4);
-        key.extend_from_slice(TX_V2_PREFIX);
-        key.extend_from_slice(b"r/");
-        key.extend_from_slice(blockhash);
-        key.extend_from_slice(&idx.to_be_bytes());
+    pub fn tx_packed_outflow_pos_append_family_prefix(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_V2_APPEND_PREFIX.len() + 2);
+        key.extend_from_slice(TX_V2_APPEND_PREFIX);
+        key.extend_from_slice(b"l/");
         key
     }
 
-    pub fn tx_packed_outflow_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        self.tx_packed_outflow_pos_key(txid)
-    }
-
-    pub fn tx_locator_candidate_prefix(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(TX_LOCATOR_CANDIDATE_BLOB_V2_PREFIX.len() + txid.len());
-        key.extend_from_slice(TX_LOCATOR_CANDIDATE_BLOB_V2_PREFIX);
+    pub fn tx_packed_outflow_pos_append_prefix(&self, txid: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_V2_APPEND_PREFIX.len() + 2 + txid.len() + 1);
+        key.extend_from_slice(TX_V2_APPEND_PREFIX);
+        key.extend_from_slice(b"l/");
         key.extend_from_slice(txid);
+        key.push(b'/');
         key
     }
 
-    pub fn tx_locator_candidate_key(
+    pub fn tx_packed_outflow_pos_append_key(
         &self,
         txid: &[u8; 32],
         height: u32,
-        tx_idx: u32,
         blockhash: &[u8; 32],
     ) -> Vec<u8> {
-        let mut key = self.tx_locator_candidate_prefix(txid);
+        let mut key = self.tx_packed_outflow_pos_append_prefix(txid);
         key.extend_from_slice(&height.to_be_bytes());
-        key.extend_from_slice(&tx_idx.to_be_bytes());
         key.extend_from_slice(blockhash);
         key
     }
 
-    pub fn parse_tx_locator_candidate_key(
-        &self,
-        txid: &[u8; 32],
-        key: &[u8],
-    ) -> Option<(u32, u32, [u8; 32])> {
-        let prefix = self.tx_locator_candidate_prefix(txid);
-        if !key.starts_with(&prefix) {
-            return None;
-        }
-        let rest = &key[prefix.len()..];
-        if rest.len() != 4 + 4 + 32 {
-            return None;
-        }
-        let mut h = [0u8; 4];
-        h.copy_from_slice(&rest[..4]);
-        let mut i = [0u8; 4];
-        i.copy_from_slice(&rest[4..8]);
-        let mut bh = [0u8; 32];
-        bh.copy_from_slice(&rest[8..40]);
-        Some((u32::from_be_bytes(h), u32::from_be_bytes(i), bh))
+    pub fn tx_pointer_counter_key(&self) -> Vec<u8> {
+        pointer_counter_key(PTR_ENTITY_ALKANE_TX)
     }
 
-    pub fn tx_summary_marker_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        let mut key = Vec::with_capacity(TX_SUMMARY_MARKER_BLOB_V2_PREFIX.len() + txid.len());
-        key.extend_from_slice(TX_SUMMARY_MARKER_BLOB_V2_PREFIX);
-        key.extend_from_slice(txid);
-        key
+    pub fn tx_pointer_blob_key(&self, id: u64) -> Vec<u8> {
+        pointer_blob_key(PTR_ENTITY_ALKANE_TX, id)
+    }
+
+    pub fn address_index_chunk_counter_key(&self, kind: AddressIndexListKind) -> Vec<u8> {
+        pointer_counter_key(kind.chunk_entity())
+    }
+
+    pub fn address_index_chunk_blob_key(&self, kind: AddressIndexListKind, id: u64) -> Vec<u8> {
+        pointer_blob_key(kind.chunk_entity(), id)
     }
 
     pub fn balance_changes_height_prefix(&self, height: u32) -> Vec<u8> {
@@ -1068,12 +1155,12 @@ impl<'a> EssentialsTable<'a> {
         owner: &SchemaAlkaneId,
         height: u32,
         tx_idx: u32,
-        txid: &[u8; 32],
+        entry_id: u64,
     ) -> Vec<u8> {
         let mut key = self.alkane_balance_txs_log_prefix(owner);
         key.extend_from_slice(&height.to_be_bytes());
         key.extend_from_slice(&tx_idx.to_be_bytes());
-        key.extend_from_slice(txid);
+        key.extend_from_slice(&entry_id.to_be_bytes());
         key
     }
 
@@ -1081,22 +1168,22 @@ impl<'a> EssentialsTable<'a> {
         &self,
         owner: &SchemaAlkaneId,
         key: &[u8],
-    ) -> Option<(u32, u32, [u8; 32])> {
+    ) -> Option<(u32, u32, u64)> {
         let prefix = self.alkane_balance_txs_log_prefix(owner);
         if !key.starts_with(&prefix) {
             return None;
         }
         let rest = &key[prefix.len()..];
-        if rest.len() != 4 + 4 + 32 {
+        if rest.len() != 4 + 4 + 8 {
             return None;
         }
         let mut height = [0u8; 4];
         height.copy_from_slice(&rest[..4]);
         let mut tx_idx = [0u8; 4];
         tx_idx.copy_from_slice(&rest[4..8]);
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&rest[8..40]);
-        Some((u32::from_be_bytes(height), u32::from_be_bytes(tx_idx), txid))
+        let mut entry_id = [0u8; 8];
+        entry_id.copy_from_slice(&rest[8..16]);
+        Some((u32::from_be_bytes(height), u32::from_be_bytes(tx_idx), u64::from_be_bytes(entry_id)))
     }
 
     pub fn alkane_balance_txs_by_token_log_prefix(
@@ -1119,12 +1206,12 @@ impl<'a> EssentialsTable<'a> {
         token: &SchemaAlkaneId,
         height: u32,
         tx_idx: u32,
-        txid: &[u8; 32],
+        entry_id: u64,
     ) -> Vec<u8> {
         let mut key = self.alkane_balance_txs_by_token_log_prefix(owner, token);
         key.extend_from_slice(&height.to_be_bytes());
         key.extend_from_slice(&tx_idx.to_be_bytes());
-        key.extend_from_slice(txid);
+        key.extend_from_slice(&entry_id.to_be_bytes());
         key
     }
 
@@ -1133,22 +1220,22 @@ impl<'a> EssentialsTable<'a> {
         owner: &SchemaAlkaneId,
         token: &SchemaAlkaneId,
         key: &[u8],
-    ) -> Option<(u32, u32, [u8; 32])> {
+    ) -> Option<(u32, u32, u64)> {
         let prefix = self.alkane_balance_txs_by_token_log_prefix(owner, token);
         if !key.starts_with(&prefix) {
             return None;
         }
         let rest = &key[prefix.len()..];
-        if rest.len() != 4 + 4 + 32 {
+        if rest.len() != 4 + 4 + 8 {
             return None;
         }
         let mut height = [0u8; 4];
         height.copy_from_slice(&rest[..4]);
         let mut tx_idx = [0u8; 4];
         tx_idx.copy_from_slice(&rest[4..8]);
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&rest[8..40]);
-        Some((u32::from_be_bytes(height), u32::from_be_bytes(tx_idx), txid))
+        let mut entry_id = [0u8; 8];
+        entry_id.copy_from_slice(&rest[8..16]);
+        Some((u32::from_be_bytes(height), u32::from_be_bytes(tx_idx), u64::from_be_bytes(entry_id)))
     }
 
     pub fn alkane_balance_txs_by_height_log_prefix(&self, height: u32) -> Vec<u8> {
@@ -1386,7 +1473,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn alkane_tx_summary_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        self.tx_packed_outflow_pos_key(txid)
+        self.tx_packed_outflow_pos_append_prefix(txid)
     }
 
     pub fn alkane_block_txid_key(&self, height: u64, idx: u64) -> Vec<u8> {
@@ -1434,7 +1521,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn outpoint_balances_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        self.outpoint_pos_key(outp)
+        self.outpoint_pos_append_prefix(outp)
     }
 
     pub fn block_summary_key(&self, height: u32) -> Vec<u8> {
@@ -1446,7 +1533,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn outpoint_balances_prefix(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
-        self.outpoint_pos_key_from_parts(txid, vout)
+        self.outpoint_pos_append_prefix_from_parts(txid, vout)
     }
 }
 
@@ -3055,72 +3142,64 @@ impl EssentialsProvider {
         });
 
         if include_outpoints {
-            let mut pref = b"/balances/".to_vec();
-            pref.extend_from_slice(resp["address"].as_str().unwrap_or_default().as_bytes());
-            pref.push(b'/');
+            let address = resp["address"].as_str().unwrap_or_default();
+            let outpoint_len = get_address_index_list_len(
+                self,
+                StateAt::Latest,
+                AddressIndexListKind::OutpointIdx,
+                address,
+            )
+            .unwrap_or(0) as usize;
 
-            let keys = self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-                    blockhash: StateAt::Latest,
-                    prefix: pref.clone(),
-                })
-                .map(|v| v.keys)
-                .unwrap_or_default();
-
-            let mut parsed: Vec<(String, Txid, u32)> = Vec::new();
-            for k in keys {
-                if k.len() <= pref.len() {
-                    continue;
-                }
-                let Ok(espo_out) = EspoOutpoint::try_from_slice(&k[pref.len()..]) else {
-                    continue;
-                };
-                if espo_out.txid.len() != 32 {
-                    continue;
-                }
-                let outpoint_str = espo_out.as_outpoint_string();
-                let (txid, vout) = match outpoint_str.split_once(':') {
-                    Some((txid_hex, vout_s)) => {
-                        let Ok(tid) = bitcoin::Txid::from_str(txid_hex) else { continue };
-                        let Ok(v) = vout_s.parse::<u32>() else { continue };
-                        (tid, v)
-                    }
-                    None => continue,
-                };
-                parsed.push((outpoint_str, txid, vout));
-            }
-
-            let lookup_inputs: Vec<(Txid, u32)> =
-                parsed.iter().map(|(_, txid, vout)| (*txid, *vout)).collect();
-            let lookups =
-                crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch(
-                    StateAt::Latest,
+            let mut outpoints = Vec::new();
+            if outpoint_len > 0 {
+                let ids = get_address_index_list_range(
                     self,
-                    &lookup_inputs,
+                    StateAt::Latest,
+                    AddressIndexListKind::OutpointIdx,
+                    address,
+                    0,
+                    outpoint_len as u64,
                 )
                 .unwrap_or_default();
-
-            let mut outpoints = Vec::with_capacity(parsed.len());
-            for (idx, (outpoint_str, _txid, _vout)) in parsed.into_iter().enumerate() {
-                let Some(lookup) = lookups.get(&lookup_inputs[idx]) else {
-                    continue;
-                };
-                if lookup.spent_by.is_some() {
-                    continue;
-                }
-                let entries = lookup.balances.clone();
-                let entry_list: Vec<Value> = entries
-                    .into_iter()
-                    .map(|be| {
-                        json!({
-                            "alkane": format!("{}:{}", be.alkane.block, be.alkane.tx),
-                            "amount": be.amount.to_string()
+                for id in ids {
+                    let Some(blob) = load_outpoint_pointer_blob_v3_by_id(self, id) else {
+                        continue;
+                    };
+                    if resolve_outpoint_spent_by_id_v2(self, StateAt::Latest, id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let txid = Txid::from_byte_array(blob.txid);
+                    let entries = blob.balances;
+                    let entry_list: Vec<Value> = entries
+                        .into_iter()
+                        .map(|be| {
+                            json!({
+                                "alkane": format!("{}:{}", be.alkane.block, be.alkane.tx),
+                                "amount": be.amount.to_string()
+                            })
                         })
-                    })
-                    .collect();
-
-                outpoints.push(json!({ "outpoint": outpoint_str, "entries": entry_list }));
+                        .collect();
+                    outpoints.push(json!({
+                        "outpoint": format!("{}:{}", txid, blob.vout),
+                        "entries": entry_list
+                    }));
+                }
             }
+
+            outpoints.sort_by(|a, b| {
+                let sa = a.get("outpoint").and_then(|v| v.as_str()).unwrap_or_default();
+                let sb = b.get("outpoint").and_then(|v| v.as_str()).unwrap_or_default();
+                sa.cmp(sb)
+            });
+            outpoints.dedup_by(|a, b| {
+                a.get("outpoint").and_then(|v| v.as_str())
+                    == b.get("outpoint").and_then(|v| v.as_str())
+            });
 
             resp.as_object_mut()
                 .unwrap()
@@ -3329,16 +3408,17 @@ impl EssentialsProvider {
 
         let mut items: Vec<Value> = Vec::with_capacity(keys_desc.len());
         for key in keys_desc {
-            let Some((height_from_key, _tx_idx, txid_arr)) =
+            let Some((height_from_key, _tx_idx, entry_id)) =
                 table.parse_alkane_balance_txs_log_key(&alk, &key)
             else {
                 continue;
             };
-            let txid = Txid::from_byte_array(txid_arr);
-            let packed = load_tx_packed_outflow_v2(self, &txid);
-            let height = packed.as_ref().map(|p| p.height).unwrap_or(height_from_key);
-            let owner_map =
-                packed.and_then(|p| p.outflows.get(&alk).cloned()).unwrap_or_else(BTreeMap::new);
+            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, entry_id) else {
+                continue;
+            };
+            let txid = Txid::from_byte_array(blob.txid);
+            let height = blob.height.max(height_from_key);
+            let owner_map = blob.outflows.get(&alk).cloned().unwrap_or_else(BTreeMap::new);
 
             let mut outflow: Map<String, Value> = Map::new();
             for (id, delta) in owner_map {
@@ -3394,93 +3474,75 @@ impl EssentialsProvider {
 
         let limit = params.limit.unwrap_or(100).max(1) as usize;
         let page = params.page.unwrap_or(1).max(1) as usize;
-        let table = self.table();
-        let prefix = table.alkane_balance_txs_by_token_log_prefix(&owner, &token);
-
-        let cursor_bytes = match params.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(s) => match hex::decode(s) {
-                Ok(v) => {
-                    if !v.starts_with(&prefix) {
-                        return Ok(RpcGetAlkaneBalanceTxsByTokenResult {
-                            value: json!({"ok": false, "error": "invalid_cursor"}),
-                        });
-                    }
-                    Some(v)
-                }
-                Err(_) => {
+        let list_id = address_index_list_id_alkane_balance_txs_by_token(&owner, &token);
+        let total = get_address_index_list_len(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBalanceTxsByToken,
+            &list_id,
+        )
+        .unwrap_or(0) as usize;
+        let cursor_off =
+            if let Some(raw) = params.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let Some(v) = parse_paged_cursor_u64(raw) else {
                     return Ok(RpcGetAlkaneBalanceTxsByTokenResult {
                         value: json!({"ok": false, "error": "invalid_cursor"}),
                     });
-                }
-            },
-            None => None,
-        };
-
-        let (keys_desc, total_opt, has_more, next_cursor_raw) = if cursor_bytes.is_some() {
-            let page_data = self.get_list_entries_desc_cursor(GetListEntriesDescCursorParams {
-                blockhash: StateAt::Latest,
-                prefix: prefix.clone(),
-                cursor: cursor_bytes.clone(),
-                limit,
-            })?;
-            let keys = page_data.entries.into_iter().map(|(k, _)| k).collect::<Vec<_>>();
-            (keys, None, page_data.has_more, page_data.next_cursor)
+                };
+                Some(v as usize)
+            } else {
+                None
+            };
+        let off = cursor_off.unwrap_or_else(|| limit.saturating_mul(page.saturating_sub(1)));
+        let end = (off + limit).min(total);
+        let range_start = total.saturating_sub(end) as u64;
+        let range_end = total.saturating_sub(off.min(total)) as u64;
+        let ids = if range_end > range_start {
+            get_address_index_list_range(
+                self,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneBalanceTxsByToken,
+                &list_id,
+                range_start,
+                range_end,
+            )
+            .unwrap_or_default()
         } else {
-            let mut all_keys = self
-                .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-                    blockhash: StateAt::Latest,
-                    prefix: prefix.clone(),
-                })
-                .map(|v| v.keys)
-                .unwrap_or_default();
-            all_keys.sort();
-            all_keys.reverse();
-            let total = all_keys.len();
-            let off = limit.saturating_mul(page.saturating_sub(1));
-            let end = (off + limit).min(total);
-            let slice = if off >= total { Vec::new() } else { all_keys[off..end].to_vec() };
-            let has_more = end < total;
-            let next_cursor =
-                if has_more && !slice.is_empty() { slice.last().cloned() } else { None };
-            (slice, Some(total), has_more, next_cursor)
+            Vec::new()
         };
 
-        let mut items: Vec<Value> = Vec::with_capacity(keys_desc.len());
-        for key in keys_desc {
-            let Some((height_from_key, _tx_idx, txid_arr)) =
-                table.parse_alkane_balance_txs_by_token_log_key(&owner, &token, &key)
-            else {
+        let mut items: Vec<Value> = Vec::with_capacity(ids.len());
+        for entry_id in ids.into_iter().rev() {
+            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, entry_id) else {
                 continue;
             };
-            let txid = Txid::from_byte_array(txid_arr);
-            let packed = load_tx_packed_outflow_v2(self, &txid);
-            let height = packed.as_ref().map(|p| p.height).unwrap_or(height_from_key);
-            let owner_map = packed
-                .and_then(|p| p.outflows.get(&owner).cloned())
-                .unwrap_or_else(BTreeMap::new);
-
+            let txid = Txid::from_byte_array(blob.txid);
             let mut outflow: Map<String, Value> = Map::new();
+            let owner_map = blob.outflows.get(&owner).cloned().unwrap_or_else(BTreeMap::new);
             for (id, delta) in owner_map {
                 outflow.insert(format!("{}:{}", id.block, id.tx), Value::String(delta.to_string()));
             }
             items.push(json!({
                 "txid": txid.to_string(),
-                "height": height,
+                "height": blob.height,
                 "outflow": Value::Object(outflow),
             }));
         }
 
-        let next_cursor = next_cursor_raw.map(hex::encode);
+        let consumed = off.saturating_add(items.len());
+        let has_more = consumed < total;
+        let next_cursor =
+            if has_more { Some(encode_paged_cursor_u64(consumed as u64)) } else { None };
         Ok(RpcGetAlkaneBalanceTxsByTokenResult {
             value: json!({
                 "ok": true,
                 "owner": format!("{}:{}", owner.block, owner.tx),
                 "token": format!("{}:{}", token.block, token.tx),
-                "page": if cursor_bytes.is_some() { Value::Null } else { json!(page) },
+                "page": if cursor_off.is_some() { Value::Null } else { json!(page) },
                 "cursor": params.cursor,
                 "next_cursor": next_cursor,
                 "limit": limit,
-                "total": total_opt.map(Value::from).unwrap_or(Value::Null),
+                "total": if cursor_off.is_some() { Value::Null } else { json!(total) },
                 "has_more": has_more,
                 "txids": items
             }),
@@ -3666,86 +3728,52 @@ impl EssentialsProvider {
             });
         };
 
-        let mut pref = b"/balances/".to_vec();
-        pref.extend_from_slice(address.as_bytes());
-        pref.push(b'/');
+        let outpoint_len = get_address_index_list_len(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::OutpointIdx,
+            &address,
+        )
+        .unwrap_or(0) as usize;
 
-        let keys = self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-                blockhash: StateAt::Latest,
-                prefix: pref.clone(),
-            })
-            .map(|v| v.keys)
-            .unwrap_or_default();
-
-        let mut parsed: Vec<(String, Txid, u32)> = Vec::new();
-        for k in keys {
-            if k.len() <= pref.len() {
-                continue;
-            }
-
-            let decoded = EspoOutpoint::try_from_slice(&k[pref.len()..]);
-            let espo_out = match decoded {
-                Ok(op) => op,
-                Err(_) => continue,
-            };
-
-            if espo_out.txid.len() != 32 {
-                continue;
-            }
-
-            let outpoint_str = espo_out.as_outpoint_string();
-            let (txid, vout) = match outpoint_str.split_once(':') {
-                Some((txid_hex, vout_s)) => {
-                    let tid = match bitcoin::Txid::from_str(txid_hex) {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    };
-                    let v = match vout_s.parse::<u32>() {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
-                    (tid, v)
-                }
-                None => continue,
-            };
-            parsed.push((outpoint_str, txid, vout));
-        }
-
-        let lookup_inputs: Vec<(Txid, u32)> =
-            parsed.iter().map(|(_, txid, vout)| (*txid, *vout)).collect();
-        let lookups =
-            crate::modules::essentials::utils::balances::get_outpoint_balances_with_spent_batch(
-                StateAt::Latest,
+        let mut outpoints: Vec<Value> = Vec::new();
+        if outpoint_len > 0 {
+            let ids = get_address_index_list_range(
                 self,
-                &lookup_inputs,
+                StateAt::Latest,
+                AddressIndexListKind::OutpointIdx,
+                &address,
+                0,
+                outpoint_len as u64,
             )
             .unwrap_or_default();
-
-        let mut outpoints: Vec<Value> = Vec::with_capacity(parsed.len());
-        for (idx, (outpoint_str, _txid, _vout)) in parsed.into_iter().enumerate() {
-            let Some(lookup) = lookups.get(&lookup_inputs[idx]) else {
-                continue;
-            };
-            if lookup.spent_by.is_some() {
-                continue;
-            }
-            let entries_vec = lookup.balances.clone();
-
-            let entry_list: Vec<Value> = entries_vec
-                .into_iter()
-                .map(|be| {
-                    json!({
-                        "alkane": format!("{}:{}", be.alkane.block, be.alkane.tx),
-                        "amount": be.amount.to_string()
+            for id in ids {
+                let Some(blob) = load_outpoint_pointer_blob_v3_by_id(self, id) else {
+                    continue;
+                };
+                if resolve_outpoint_spent_by_id_v2(self, StateAt::Latest, id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+                let txid = Txid::from_byte_array(blob.txid);
+                let entry_list: Vec<Value> = blob
+                    .balances
+                    .into_iter()
+                    .map(|be| {
+                        json!({
+                            "alkane": format!("{}:{}", be.alkane.block, be.alkane.tx),
+                            "amount": be.amount.to_string()
+                        })
                     })
-                })
-                .collect();
-
-            outpoints.push(json!({
-                "outpoint": outpoint_str,
-                "entries": entry_list
-            }));
+                    .collect();
+                outpoints.push(json!({
+                    "outpoint": format!("{}:{}", txid, blob.vout),
+                    "entries": entry_list
+                }));
+            }
         }
 
         outpoints.sort_by(|a, b| {
@@ -3829,25 +3857,14 @@ impl EssentialsProvider {
         let page = params.page.unwrap_or(1).max(1) as usize;
         let limit = params.limit.unwrap_or(50).max(1) as usize;
         let off = limit.saturating_mul(page.saturating_sub(1));
-
-        let table = self.table();
-        let total = self
-            .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: table.alkane_block_len_key(height),
-            })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|b| {
-                if b.len() == 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&b);
-                    Some(u64::from_le_bytes(arr) as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
+        let list_id = address_index_list_id_alkane_block_txs(height);
+        let total = get_address_index_list_len(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+        )
+        .unwrap_or(0) as usize;
 
         if total == 0 {
             return Ok(RpcGetAlkaneBlockTxsResult {
@@ -3863,23 +3880,25 @@ impl EssentialsProvider {
         }
 
         let end = (off + limit).min(total);
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        for idx in off..end {
-            keys.push(table.alkane_block_txid_key(height, idx as u64));
-        }
-        let vals = self
-            .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })
-            .map(|r| r.values)
-            .unwrap_or_default();
         let mut txids: Vec<String> = Vec::new();
-        for v in vals {
-            let Some(bytes) = v else { continue };
-            if bytes.len() != 32 {
+        let ids = if end > off {
+            get_address_index_list_range(
+                self,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneBlockTxs,
+                &list_id,
+                off as u64,
+                end as u64,
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for id in ids {
+            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
                 continue;
-            }
-            if let Ok(txid) = Txid::from_slice(&bytes) {
-                txids.push(txid.to_string());
-            }
+            };
+            txids.push(Txid::from_byte_array(blob.txid).to_string());
         }
 
         Ok(RpcGetAlkaneBlockTxsResult {
@@ -3914,24 +3933,13 @@ impl EssentialsProvider {
         let limit = params.limit.unwrap_or(50).max(1) as usize;
         let off = limit.saturating_mul(page.saturating_sub(1));
 
-        let table = self.table();
-        let total = self
-            .get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: table.alkane_address_len_key(&address),
-            })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|b| {
-                if b.len() == 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&b);
-                    Some(u64::from_le_bytes(arr) as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
+        let total = get_address_index_list_len(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneTxs,
+            &address,
+        )
+        .unwrap_or(0) as usize;
 
         if total == 0 {
             return Ok(RpcGetAlkaneAddressTxsResult {
@@ -3949,39 +3957,36 @@ impl EssentialsProvider {
         }
 
         let end = (off + limit).min(total);
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        for idx in off..end {
-            let rev_idx = total - 1 - idx;
-            keys.push(table.alkane_address_txid_key(&address, rev_idx as u64));
-        }
-        let vals = self
-            .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })
-            .map(|r| r.values)
-            .unwrap_or_default();
+        let range_start = total.saturating_sub(end) as u64;
+        let range_end = total.saturating_sub(off) as u64;
+        let ids = get_address_index_list_range(
+            self,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneTxs,
+            &address,
+            range_start,
+            range_end,
+        )
+        .unwrap_or_default();
 
-        let mut txid_rows: Vec<Txid> = Vec::new();
-        for v in vals {
-            let Some(bytes) = v else { continue };
-            if bytes.len() != 32 {
+        let mut tx_rows: Vec<(Txid, u32)> = Vec::new();
+        for id in ids.into_iter().rev() {
+            let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
                 continue;
-            }
-            if let Ok(txid) = Txid::from_slice(&bytes) {
-                txid_rows.push(txid);
-            }
+            };
+            tx_rows.push((Txid::from_byte_array(blob.txid), blob.height));
         }
 
-        let txids: Vec<String> = txid_rows.iter().map(ToString::to_string).collect();
+        let txids: Vec<String> = tx_rows.iter().map(|(txid, _)| txid.to_string()).collect();
         let mut items: Vec<Value> = Vec::new();
 
-        if !txid_rows.is_empty() {
+        if !tx_rows.is_empty() {
             let chain_tip = get_bitcoind_rpc_client()
                 .get_blockchain_info()
                 .ok()
                 .map(|info| info.blocks as u64);
-            let heights: Vec<Option<u64>> = txid_rows
-                .iter()
-                .map(|txid| load_tx_summary_v2(self, txid).map(|summary| summary.height as u64))
-                .collect();
+            let heights: Vec<Option<u64>> = tx_rows.iter().map(|(_, h)| Some(*h as u64)).collect();
+            let txid_rows: Vec<Txid> = tx_rows.iter().map(|(txid, _)| *txid).collect();
             let raw_txs =
                 get_electrum_like().batch_transaction_get_raw(&txid_rows).unwrap_or_default();
 
@@ -4108,25 +4113,14 @@ impl EssentialsProvider {
             .get_blockchain_info()
             .ok()
             .map(|info| info.blocks as u64);
-        let table = self.table();
-
         let mut confirmed_total = if only_alkane_txs {
-            self.get_raw_value(GetRawValueParams {
-                blockhash: StateAt::Latest,
-                key: table.alkane_address_len_key(&address),
-            })
-            .ok()
-            .and_then(|resp| resp.value)
-            .and_then(|b| {
-                if b.len() == 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&b);
-                    Some(u64::from_le_bytes(arr) as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0)
+            get_address_index_list_len(
+                self,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneTxs,
+                &address,
+            )
+            .unwrap_or(0) as usize
         } else {
             0
         };
@@ -4138,28 +4132,23 @@ impl EssentialsProvider {
                 let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
                 if confirmed_slice_end > confirmed_slice_start {
-                    let mut txid_keys: Vec<Vec<u8>> = Vec::new();
-                    for idx in confirmed_slice_start..confirmed_slice_end {
-                        let rev_idx = confirmed_total - 1 - idx;
-                        txid_keys.push(table.alkane_address_txid_key(&address, rev_idx as u64));
-                    }
-                    let txid_vals = self
-                        .get_multi_values(GetMultiValuesParams {
-                            blockhash: StateAt::Latest,
-                            keys: txid_keys,
-                        })
-                        .ok()
-                        .map(|resp| resp.values)
-                        .unwrap_or_default();
                     let mut txids: Vec<Txid> = Vec::new();
-                    for bytes in txid_vals {
-                        if let Some(b) = bytes {
-                            if b.len() == 32 {
-                                if let Ok(txid) = Txid::from_slice(&b) {
-                                    txids.push(txid);
-                                }
-                            }
-                        }
+                    let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
+                    let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
+                    let ids = get_address_index_list_range(
+                        self,
+                        StateAt::Latest,
+                        AddressIndexListKind::AlkaneTxs,
+                        &address,
+                        range_start,
+                        range_end,
+                    )
+                    .unwrap_or_default();
+                    for id in ids.into_iter().rev() {
+                        let Some(blob) = load_tx_pointer_blob_v3_by_id(self, id) else {
+                            continue;
+                        };
+                        txids.push(Txid::from_byte_array(blob.txid));
                     }
 
                     if !txids.is_empty() {
@@ -4960,6 +4949,17 @@ pub struct OutpointRowV2 {
     pub balances: Vec<BalanceEntry>,
 }
 
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
+pub struct OutpointPointerBlobV3 {
+    pub txid: [u8; 32],
+    pub vout: u32,
+    pub blockhash: [u8; 32],
+    pub tx_idx: u32,
+    pub address: String,
+    pub spk: Vec<u8>,
+    pub balances: Vec<BalanceEntry>,
+}
+
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct AlkaneBalanceTxEntry {
     pub txid: [u8; 32],
@@ -4977,6 +4977,16 @@ pub struct AlkaneTxSummary {
 
 #[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
 pub struct TxPackedOutflowRowV2 {
+    pub height: u32,
+    pub traces: Vec<EspoSandshrewLikeTrace>,
+    pub outflows: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+}
+
+#[derive(Clone, Debug, Default, BorshSerialize, BorshDeserialize)]
+pub struct TxPointerBlobV3 {
+    pub txid: [u8; 32],
+    pub blockhash: [u8; 32],
+    pub tx_idx: u32,
     pub height: u32,
     pub traces: Vec<EspoSandshrewLikeTrace>,
     pub outflows: BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
@@ -5123,46 +5133,412 @@ pub fn decode_tx_packed_outflow_row_v2(bytes: &[u8]) -> Result<TxPackedOutflowRo
         .map_err(|e| anyhow!("decode tx packed outflow v2 failed: {e}"))
 }
 
-pub fn encode_tx_packed_outflow_pos_v2(blockhash: &[u8; 32], idx: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(36);
-    out.extend_from_slice(blockhash);
-    out.extend_from_slice(&idx.to_be_bytes());
-    out
+pub fn encode_pointer_idx_u64(id: u64) -> Vec<u8> {
+    id.to_le_bytes().to_vec()
 }
 
-pub fn decode_tx_packed_outflow_pos_v2(bytes: &[u8]) -> Result<([u8; 32], u32)> {
-    if bytes.len() != 36 {
-        return Err(anyhow!(
-            "decode tx packed outflow pos v2 failed: invalid length {}",
-            bytes.len()
-        ));
+pub fn decode_pointer_idx_u64(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() != 8 {
+        return Err(anyhow!("decode pointer idx failed: invalid length {}", bytes.len()));
     }
-    let mut bh = [0u8; 32];
-    bh.copy_from_slice(&bytes[..32]);
-    let mut i = [0u8; 4];
-    i.copy_from_slice(&bytes[32..36]);
-    Ok((bh, u32::from_be_bytes(i)))
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(arr))
 }
 
-pub fn encode_outpoint_pos_v2(blockhash: &[u8; 32], tx_idx: u32, vout: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(40);
-    out.extend_from_slice(blockhash);
-    out.extend_from_slice(&tx_idx.to_be_bytes());
-    out.extend_from_slice(&vout.to_be_bytes());
-    out
-}
-
-pub fn decode_outpoint_pos_v2(bytes: &[u8]) -> Result<([u8; 32], u32, u32)> {
-    if bytes.len() != 40 {
-        return Err(anyhow!("decode outpoint pos v2 failed: invalid length {}", bytes.len()));
+fn parse_append_version_key(key: &[u8], logical_prefix: &[u8]) -> Option<(u32, BlockHash)> {
+    if !key.starts_with(logical_prefix) {
+        return None;
     }
-    let mut bh = [0u8; 32];
-    bh.copy_from_slice(&bytes[..32]);
-    let mut i = [0u8; 4];
-    i.copy_from_slice(&bytes[32..36]);
-    let mut v = [0u8; 4];
-    v.copy_from_slice(&bytes[36..40]);
-    Ok((bh, u32::from_be_bytes(i), u32::from_be_bytes(v)))
+    let rest = &key[logical_prefix.len()..];
+    if rest.len() != 4 + 32 {
+        return None;
+    }
+    let mut height = [0u8; 4];
+    height.copy_from_slice(&rest[..4]);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&rest[4..]);
+    Some((u32::from_be_bytes(height), BlockHash::from_byte_array(hash)))
+}
+
+fn resolve_append_target_blockhash(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+) -> Option<BlockHash> {
+    match blockhash {
+        StateAt::Block(h) => Some(h),
+        StateAt::Latest => provider.resolved_view_blockhash(),
+    }
+}
+
+fn append_version_visible_for_target(
+    provider: &EssentialsProvider,
+    target: Option<BlockHash>,
+    version_blockhash: BlockHash,
+) -> bool {
+    let Some(target_blockhash) = target else {
+        return true;
+    };
+    if version_blockhash == target_blockhash {
+        return true;
+    }
+    provider
+        .blockhash_is_ancestor(&version_blockhash, &target_blockhash)
+        .unwrap_or(false)
+}
+
+fn resolve_append_versioned_blob_value(
+    provider: &EssentialsProvider,
+    logical_prefix: &[u8],
+    blockhash: StateAt,
+) -> Result<Option<Vec<u8>>> {
+    let mut entries = provider
+        .blob_mdb()
+        .scan_prefix_entries(logical_prefix)
+        .map_err(|e| anyhow!("blob_mdb.scan_prefix_entries failed: {e}"))?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let target = resolve_append_target_blockhash(provider, blockhash);
+    for (key, value) in entries {
+        let Some((_height, version_blockhash)) = parse_append_version_key(&key, logical_prefix)
+        else {
+            continue;
+        };
+        if append_version_visible_for_target(provider, target, version_blockhash) {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+pub(crate) fn resolve_outpoint_id_v2(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    txid: &[u8; 32],
+    vout: u32,
+) -> Result<Option<u64>> {
+    let prefix = provider.table().outpoint_pos_append_prefix_from_parts(txid, vout)?;
+    let Some(raw) = resolve_append_versioned_blob_value(provider, &prefix, blockhash)? else {
+        return Ok(None);
+    };
+    Ok(decode_pointer_idx_u64(&raw).ok())
+}
+
+pub(crate) fn resolve_outpoint_spent_by_id_v2(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    outpoint_id: u64,
+) -> Result<Option<[u8; 32]>> {
+    let prefix = provider.table().outpoint_spent_by_id_append_prefix(outpoint_id);
+    let Some(raw) = resolve_append_versioned_blob_value(provider, &prefix, blockhash)? else {
+        return Ok(None);
+    };
+    if raw.len() != 32 {
+        return Ok(None);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(Some(out))
+}
+
+pub(crate) fn resolve_tx_pointer_id_v2(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    txid: &[u8; 32],
+) -> Result<Option<u64>> {
+    let prefix = provider.table().tx_packed_outflow_pos_append_prefix(txid);
+    let Some(raw) = resolve_append_versioned_blob_value(provider, &prefix, blockhash)? else {
+        return Ok(None);
+    };
+    Ok(decode_pointer_idx_u64(&raw).ok())
+}
+
+fn decode_address_index_state(bytes: &[u8]) -> Option<InlineOrExternalU64V1> {
+    InlineOrExternalU64V1::try_from_slice(bytes).ok()
+}
+
+fn encode_address_index_state(state: &InlineOrExternalU64V1) -> Result<Vec<u8>> {
+    borsh::to_vec(state).map_err(|e| anyhow!("encode address index state failed: {e}"))
+}
+
+fn decode_u64_chunk(bytes: &[u8]) -> Vec<u64> {
+    U64ChunkV1::try_from_slice(bytes).map(|chunk| chunk.items).unwrap_or_default()
+}
+
+fn encode_u64_chunk(items: Vec<u64>) -> Result<Vec<u8>> {
+    borsh::to_vec(&U64ChunkV1 { items })
+        .map_err(|e| anyhow!("encode address index chunk failed: {e}"))
+}
+
+fn address_index_total(state: &InlineOrExternalU64V1) -> u64 {
+    match state {
+        InlineOrExternalU64V1::Inline { items } => items.len() as u64,
+        InlineOrExternalU64V1::External { len, .. } => *len,
+    }
+}
+
+pub fn get_address_index_list_len(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    kind: AddressIndexListKind,
+    address: &str,
+) -> Result<u64> {
+    let key = provider.table().address_index_meta_key(address, kind);
+    let raw = provider
+        .get_raw_value(GetRawValueParams { blockhash, key })
+        .map(|resp| resp.value)
+        .ok()
+        .flatten();
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    let Some(state) = decode_address_index_state(&raw) else {
+        return Ok(0);
+    };
+    Ok(address_index_total(&state))
+}
+
+pub fn get_address_index_list_range(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    kind: AddressIndexListKind,
+    address: &str,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u64>> {
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let key = table.address_index_meta_key(address, kind);
+    let raw = provider.get_raw_value(GetRawValueParams { blockhash, key })?.value;
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let Some(state) = decode_address_index_state(&raw) else {
+        return Ok(Vec::new());
+    };
+    let total = address_index_total(&state);
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let start = start.min(total);
+    let end = end.min(total);
+    if end <= start {
+        return Ok(Vec::new());
+    }
+
+    match state {
+        InlineOrExternalU64V1::Inline { items } => {
+            let from = usize::try_from(start).unwrap_or(usize::MAX).min(items.len());
+            let to = usize::try_from(end).unwrap_or(usize::MAX).min(items.len());
+            if to <= from {
+                return Ok(Vec::new());
+            }
+            Ok(items[from..to].to_vec())
+        }
+        InlineOrExternalU64V1::External { chunk_ids, chunk_size, .. } => {
+            let chunk_size_u64 = u64::from(chunk_size.max(1));
+            let first_chunk = usize::try_from(start / chunk_size_u64).unwrap_or(usize::MAX);
+            let mut last_chunk_excl =
+                usize::try_from((end + chunk_size_u64 - 1) / chunk_size_u64).unwrap_or(usize::MAX);
+            if first_chunk >= chunk_ids.len() {
+                return Ok(Vec::new());
+            }
+            last_chunk_excl = last_chunk_excl.min(chunk_ids.len());
+            if last_chunk_excl <= first_chunk {
+                return Ok(Vec::new());
+            }
+
+            let chunk_slice = &chunk_ids[first_chunk..last_chunk_excl];
+            let chunk_keys: Vec<Vec<u8>> = chunk_slice
+                .iter()
+                .map(|id| table.address_index_chunk_blob_key(kind, *id))
+                .collect();
+            let chunk_vals = provider.get_blob_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: chunk_keys,
+            })?;
+
+            let mut out: Vec<u64> =
+                Vec::with_capacity(usize::try_from(end.saturating_sub(start)).unwrap_or(0));
+            for (offset, raw_chunk) in chunk_vals.values.into_iter().enumerate() {
+                let Some(raw_chunk) = raw_chunk else { continue };
+                let items = decode_u64_chunk(&raw_chunk);
+                if items.is_empty() {
+                    continue;
+                }
+                let global_chunk_idx = first_chunk.saturating_add(offset);
+                let chunk_start = (global_chunk_idx as u64).saturating_mul(chunk_size_u64);
+                let from = usize::try_from(start.saturating_sub(chunk_start))
+                    .unwrap_or(usize::MAX)
+                    .min(items.len());
+                let max_to = usize::try_from(end.saturating_sub(chunk_start)).unwrap_or(usize::MAX);
+                let to = max_to.min(items.len());
+                if to > from {
+                    out.extend_from_slice(&items[from..to]);
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+pub fn append_address_index_values(
+    provider: &EssentialsProvider,
+    kind: AddressIndexListKind,
+    address: &str,
+    values: &[u64],
+    next_chunk_id: &mut u64,
+    puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    blob_puts: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<u64> {
+    let table = provider.table();
+    let meta_key = table.address_index_meta_key(address, kind);
+    let current = provider
+        .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: meta_key.clone() })?
+        .value
+        .and_then(|raw| decode_address_index_state(&raw))
+        .unwrap_or_else(|| InlineOrExternalU64V1::Inline { items: Vec::new() });
+
+    if values.is_empty() {
+        return Ok(address_index_total(&current));
+    }
+
+    let next_state = match current {
+        InlineOrExternalU64V1::Inline { mut items } => {
+            if items.len().saturating_add(values.len()) <= ADDRESS_INDEX_INLINE_CAP {
+                items.extend_from_slice(values);
+                InlineOrExternalU64V1::Inline { items }
+            } else {
+                let chunk_size = get_address_index_chunk_size().max(1);
+                let mut merged = Vec::with_capacity(items.len().saturating_add(values.len()));
+                merged.append(&mut items);
+                merged.extend_from_slice(values);
+
+                let mut chunk_ids: Vec<u64> = Vec::new();
+                for chunk in merged.chunks(chunk_size) {
+                    let id = *next_chunk_id;
+                    *next_chunk_id = next_chunk_id.saturating_add(1);
+                    chunk_ids.push(id);
+                    blob_puts.push((
+                        table.address_index_chunk_blob_key(kind, id),
+                        encode_u64_chunk(chunk.to_vec())?,
+                    ));
+                }
+                InlineOrExternalU64V1::External {
+                    chunk_ids,
+                    len: merged.len() as u64,
+                    chunk_size: chunk_size as u32,
+                }
+            }
+        }
+        InlineOrExternalU64V1::External { mut chunk_ids, len, chunk_size } => {
+            let chunk_size_usize = usize::try_from(chunk_size).unwrap_or(0).max(1);
+            let chunk_size_u64 = chunk_size_usize as u64;
+            let mut pending = values;
+
+            if !chunk_ids.is_empty() && !pending.is_empty() {
+                let rem = usize::try_from(len % chunk_size_u64).unwrap_or(0);
+                if rem > 0 {
+                    let last_chunk_id = *chunk_ids.last().unwrap_or(&0);
+                    let last_key = table.address_index_chunk_blob_key(kind, last_chunk_id);
+                    let mut last_items = provider
+                        .get_blob_raw_value(GetRawValueParams {
+                            blockhash: StateAt::Latest,
+                            key: last_key.clone(),
+                        })?
+                        .value
+                        .map(|raw| decode_u64_chunk(&raw))
+                        .unwrap_or_default();
+                    if last_items.len() > chunk_size_usize {
+                        last_items.truncate(chunk_size_usize);
+                    }
+                    if last_items.len() < chunk_size_usize {
+                        let free = chunk_size_usize.saturating_sub(last_items.len());
+                        let take = free.min(pending.len());
+                        last_items.extend_from_slice(&pending[..take]);
+                        blob_puts.push((last_key, encode_u64_chunk(last_items)?));
+                        pending = &pending[take..];
+                    }
+                }
+            }
+
+            while !pending.is_empty() {
+                let take = chunk_size_usize.min(pending.len());
+                let id = *next_chunk_id;
+                *next_chunk_id = next_chunk_id.saturating_add(1);
+                chunk_ids.push(id);
+                blob_puts.push((
+                    table.address_index_chunk_blob_key(kind, id),
+                    encode_u64_chunk(pending[..take].to_vec())?,
+                ));
+                pending = &pending[take..];
+            }
+
+            InlineOrExternalU64V1::External {
+                chunk_ids,
+                len: len.saturating_add(values.len() as u64),
+                chunk_size: chunk_size_usize as u32,
+            }
+        }
+    };
+
+    let new_len = address_index_total(&next_state);
+    puts.push((meta_key, encode_address_index_state(&next_state)?));
+    Ok(new_len)
+}
+
+pub fn encode_tx_pointer_blob_v3(
+    txid: &[u8; 32],
+    blockhash: &[u8; 32],
+    tx_idx: u32,
+    height: u32,
+    traces: &[EspoSandshrewLikeTrace],
+    outflows: &BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
+) -> Result<Vec<u8>> {
+    borsh::to_vec(&TxPointerBlobV3 {
+        txid: *txid,
+        blockhash: *blockhash,
+        tx_idx,
+        height,
+        traces: traces.to_vec(),
+        outflows: outflows.clone(),
+    })
+    .map_err(|e| anyhow!("encode tx pointer blob v3 failed: {e}"))
+}
+
+pub fn decode_tx_pointer_blob_v3(bytes: &[u8]) -> Result<TxPointerBlobV3> {
+    TxPointerBlobV3::try_from_slice(bytes)
+        .map_err(|e| anyhow!("decode tx pointer blob v3 failed: {e}"))
+}
+
+pub fn encode_outpoint_pointer_blob_v3(
+    txid: &[u8; 32],
+    vout: u32,
+    blockhash: &[u8; 32],
+    tx_idx: u32,
+    address: &str,
+    spk: &[u8],
+    balances: &Vec<BalanceEntry>,
+) -> Result<Vec<u8>> {
+    borsh::to_vec(&OutpointPointerBlobV3 {
+        txid: *txid,
+        vout,
+        blockhash: *blockhash,
+        tx_idx,
+        address: address.to_string(),
+        spk: spk.to_vec(),
+        balances: balances.clone(),
+    })
+    .map_err(|e| anyhow!("encode outpoint pointer blob v3 failed: {e}"))
+}
+
+pub fn decode_outpoint_pointer_blob_v3(bytes: &[u8]) -> Result<OutpointPointerBlobV3> {
+    OutpointPointerBlobV3::try_from_slice(bytes)
+        .map_err(|e| anyhow!("decode outpoint pointer blob v3 failed: {e}"))
 }
 
 pub fn encode_outpoint_row_v2(
@@ -5372,75 +5748,45 @@ pub fn encode_tx_trace_row(trace: &EspoSandshrewLikeTrace, compact: bool) -> Res
     Ok(borsh::to_vec(trace)?)
 }
 
-fn resolve_tx_locator_candidate_v2(
-    provider: &EssentialsProvider,
-    txid: &[u8; 32],
-) -> Option<([u8; 32], u32, u32)> {
-    let table = provider.table();
-    let prefix = table.tx_locator_candidate_prefix(txid);
-    let keys = provider.blob_mdb().scan_prefix_keys(&prefix).ok()?;
-    if keys.is_empty() {
-        return None;
-    }
-
-    let target_blockhash = provider.resolved_view_blockhash();
-    let mut best: Option<(u32, u32, [u8; 32])> = None;
-    for key in keys {
-        let Some((height, idx, candidate_hash)) = table.parse_tx_locator_candidate_key(txid, &key)
-        else {
-            continue;
-        };
-        if let Some(target) = target_blockhash {
-            let candidate = BlockHash::from_byte_array(candidate_hash);
-            let Ok(is_ancestor) = provider.blockhash_is_ancestor(&candidate, &target) else {
-                continue;
-            };
-            if !is_ancestor {
-                continue;
-            }
-        }
-        match best {
-            Some((best_h, best_idx, _)) if (height, idx) <= (best_h, best_idx) => {}
-            _ => best = Some((height, idx, candidate_hash)),
-        }
-    }
-    best.map(|(height, idx, blockhash)| (blockhash, idx, height))
-}
-
 pub(crate) fn load_tx_packed_outflow_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
 ) -> Option<TxPackedOutflowRowV2> {
     let mut txid_arr = [0u8; 32];
     txid_arr.copy_from_slice(txid.as_byte_array());
-    let table = provider.table();
-    let pos_key = table.tx_packed_outflow_pos_key(&txid_arr);
-    if let Some(raw_pos) = provider
-        .get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: pos_key })
-        .ok()?
-        .value
-    {
-        if let Ok((blockhash, tx_idx)) = decode_tx_packed_outflow_pos_v2(&raw_pos) {
-            let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
-            if let Some(row_raw) = provider
-                .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
-                .ok()?
-                .value
-            {
-                if let Ok(decoded) = decode_tx_packed_outflow_row_v2(&row_raw) {
-                    return Some(decoded);
-                }
-            }
-        }
+    let id = resolve_tx_pointer_id_v2(provider, StateAt::Latest, &txid_arr).ok().flatten()?;
+    if let Some(blob) = load_tx_pointer_blob_v3_by_id(provider, id) {
+        return Some(TxPackedOutflowRowV2 {
+            height: blob.height,
+            traces: blob.traces,
+            outflows: blob.outflows,
+        });
     }
+    None
+}
 
-    let (blockhash, tx_idx, _height) = resolve_tx_locator_candidate_v2(provider, &txid_arr)?;
-    let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
+pub(crate) fn load_tx_pointer_blob_v3_by_id(
+    provider: &EssentialsProvider,
+    id: u64,
+) -> Option<TxPointerBlobV3> {
+    let row_key = provider.table().tx_pointer_blob_key(id);
     let row_raw = provider
         .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
         .ok()?
         .value?;
-    decode_tx_packed_outflow_row_v2(&row_raw).ok()
+    decode_tx_pointer_blob_v3(&row_raw).ok()
+}
+
+pub(crate) fn load_outpoint_pointer_blob_v3_by_id(
+    provider: &EssentialsProvider,
+    id: u64,
+) -> Option<OutpointPointerBlobV3> {
+    let row_key = provider.table().outpoint_pointer_blob_key(id);
+    let row_raw = provider
+        .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key: row_key })
+        .ok()?
+        .value?;
+    decode_outpoint_pointer_blob_v3(&row_raw).ok()
 }
 
 pub(crate) fn load_tx_summary_v2(

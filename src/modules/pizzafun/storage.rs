@@ -272,29 +272,6 @@ impl PizzafunProvider {
         Ok(out)
     }
 
-    fn build_series_id_list_rewrite(
-        &self,
-        ids: &[String],
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
-        let table = self.table();
-        let existing_ids = self.read_series_ids_all(None)?;
-        let existing_set: HashSet<String> = existing_ids.into_iter().collect();
-        let next_set: HashSet<String> = ids.iter().cloned().collect();
-
-        let mut puts: Vec<(Vec<u8>, Vec<u8>)> = next_set
-            .difference(&existing_set)
-            .map(|series_id| (table.series_all_entry_key(series_id), Vec::new()))
-            .collect();
-        puts.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut deletes: Vec<Vec<u8>> = existing_set
-            .difference(&next_set)
-            .map(|series_id| table.series_all_entry_key(series_id))
-            .collect();
-        deletes.sort();
-        Ok((puts, deletes))
-    }
-
     pub fn get_index_height(&self, _params: GetIndexHeightParams) -> Result<GetIndexHeightResult> {
         crate::debug_timer_log!("pizzafun.get_index_height");
         let table = self.table();
@@ -391,14 +368,23 @@ impl PizzafunProvider {
             }
         }
 
-        let all_ids = self.read_series_ids_all(params.blockhash.resolve(self.view_blockhash))?;
         let mut filtered_ids: Vec<String> = Vec::new();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        for series_id in all_ids {
-            if lookup_names.iter().any(|name| series_id_matches_name(&series_id, name))
-                && seen_ids.insert(series_id.clone())
-            {
-                filtered_ids.push(series_id);
+        for name in &lookup_names {
+            let prefix = table.series_by_id_key(name);
+            let keys = self
+                .with_view_blockhash(params.blockhash.resolve(self.view_blockhash))
+                .raw_scan_prefix_keys(&prefix)?;
+            for key in keys {
+                let Some(suffix) = key.strip_prefix(table.series_by_id_prefix().as_slice()) else {
+                    continue;
+                };
+                let Ok(series_id) = std::str::from_utf8(suffix) else {
+                    continue;
+                };
+                if series_id_matches_name(series_id, name) && seen_ids.insert(series_id.to_string()) {
+                    filtered_ids.push(series_id.to_string());
+                }
             }
         }
 
@@ -423,32 +409,21 @@ impl PizzafunProvider {
         updated: &[SeriesEntry],
     ) -> Result<()> {
         let table = self.table();
-        let mut series_ids = self.read_series_ids_all(None)?;
-        let existing_ids: HashSet<String> = existing.iter().map(|e| e.series_id.clone()).collect();
-        series_ids.retain(|id| !existing_ids.contains(id));
-        let mut seen_ids: HashSet<String> = series_ids.iter().cloned().collect();
-        for entry in updated {
-            if seen_ids.insert(entry.series_id.clone()) {
-                series_ids.push(entry.series_id.clone());
-            }
-        }
-        let (list_puts, list_deletes) = self.build_series_id_list_rewrite(&series_ids)?;
-
-        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 2);
+        let mut deletes: Vec<Vec<u8>> = Vec::with_capacity(existing.len() * 3);
         for entry in existing {
             deletes.push(table.series_by_id_key(&entry.series_id));
             deletes.push(table.series_by_alkane_key(&entry.alkane_id));
+            deletes.push(table.series_all_entry_key(&entry.series_id));
         }
-        deletes.extend(list_deletes);
 
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(updated.len() * 2 + list_puts.len());
+            Vec::with_capacity(updated.len() * 3);
         for entry in updated {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
+            puts.push((table.series_all_entry_key(&entry.series_id), Vec::new()));
         }
-        puts.extend(list_puts);
         let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
         self.mdb
@@ -476,25 +451,23 @@ impl PizzafunProvider {
                 let Some(entry) = maybe_entry else { continue };
                 if let Some(series_id) = existing_ids.get(idx) {
                     deletes.push(table.series_by_id_key(series_id));
+                    deletes.push(table.series_all_entry_key(series_id));
                 } else {
                     deletes.push(table.series_by_id_key(&entry.series_id));
+                    deletes.push(table.series_all_entry_key(&entry.series_id));
                 }
                 deletes.push(table.series_by_alkane_key(&entry.alkane_id));
             }
         }
 
-        let new_ids: Vec<String> = entries.iter().map(|e| e.series_id.clone()).collect();
-        let (list_puts, list_deletes) = self.build_series_id_list_rewrite(&new_ids)?;
-        deletes.extend(list_deletes);
-
         let mut puts: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(entries.len() * 2 + list_puts.len());
+            Vec::with_capacity(entries.len() * 3);
         for entry in entries {
             let encoded = borsh::to_vec(entry)?;
             puts.push((table.series_by_id_key(&entry.series_id), encoded.clone()));
             puts.push((table.series_by_alkane_key(&entry.alkane_id), encoded));
+            puts.push((table.series_all_entry_key(&entry.series_id), Vec::new()));
         }
-        puts.extend(list_puts);
         let (puts, deletes) = dedupe_batch_ops(puts, deletes);
 
         self.mdb

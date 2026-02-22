@@ -1,6 +1,7 @@
 use alkanes_cli_common::alkanes_pb::AlkanesTrace;
 use axum::extract::{Path, Query, State};
-use axum::response::Html;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use bitcoin::address::AddressType;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
@@ -16,19 +17,23 @@ use crate::alkanes::trace::{EspoSandshrewLikeTrace, EspoTrace};
 use crate::config::{get_bitcoind_rpc_client, get_electrum_like};
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
 use crate::explorer::components::header::{header, header_scripts, HeaderProps, HeaderSummaryItem};
-use crate::explorer::components::layout::layout;
+use crate::explorer::components::layout::layout_with_meta;
 use crate::explorer::components::svg_assets::{
-    icon_arrow_up_right, icon_left, icon_right, icon_skip_left, icon_skip_right,
+    icon_arrow_up_right, icon_dropdown_caret, icon_left, icon_right, icon_skip_left,
+    icon_skip_right,
 };
 use crate::explorer::components::tx_view::{
-    alkane_meta, render_tx, AlkaneMetaCache, TxPill, TxPillTone,
+    alkane_meta, icon_bg_style, render_tx, AlkaneMetaCache, TxPill, TxPillTone,
 };
 use crate::explorer::consts::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::explorer::pages::common::fmt_sats;
 use crate::explorer::pages::state::ExplorerState;
-use crate::explorer::paths::{explorer_base_path, explorer_path};
+use crate::explorer::paths::{current_language, explorer_path};
 use crate::modules::essentials::storage::BalanceEntry;
-use crate::modules::essentials::storage::{load_tx_summary_v2, AlkaneTxSummary, EssentialsTable};
+use crate::modules::essentials::storage::{
+    get_address_index_list_len, get_address_index_list_range, load_tx_pointer_blob_v3_by_id,
+    load_tx_summary_v2, AddressIndexListKind, AlkaneTxSummary,
+};
 use crate::modules::essentials::utils::balances::{
     get_balance_for_address, get_outpoint_rows_batch, OutpointLookup,
 };
@@ -54,6 +59,16 @@ struct AddressTxRender {
     is_mempool: bool,
 }
 
+#[derive(Clone)]
+struct AddressChartToken {
+    alkane_id: String,
+    label: String,
+    asset_name: String,
+    symbol: String,
+    icon_url: String,
+    fallback_letter: String,
+}
+
 fn format_with_commas(n: u64) -> String {
     let mut s = n.to_string();
     let mut i = s.len() as isize - 3;
@@ -62,6 +77,24 @@ fn format_with_commas(n: u64) -> String {
         i -= 3;
     }
     s
+}
+
+fn token_fallback_letter(label: &str, fallback: &str) -> String {
+    label
+        .chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .or_else(|| fallback.chars().find(|c| c.is_ascii_alphanumeric()))
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+fn address_chart_token_icon(icon_url: &str, fallback_letter: &str) -> Markup {
+    html! {
+        span class="alk-icon-wrap address-balance-dropdown-alk-icon" aria-hidden="true" {
+            span class="alk-icon-img" style=(icon_bg_style(icon_url)) {}
+            span class="alk-icon-letter" { (fallback_letter) }
+        }
+    }
 }
 
 fn log_address_page_perf(address: &str, step: &str, started: Instant, detail: &str) {
@@ -120,9 +153,10 @@ pub async fn address_page(
     State(state): State<ExplorerState>,
     Path(address_raw): Path<String>,
     Query(q): Query<AddressPageQuery>,
-) -> Html<String> {
+) -> Response {
     let start_time = Instant::now();
     let timeout = Duration::from_secs(10);
+    let canonical_path_fallback = "/address".to_string();
 
     let address = match Address::from_str(address_raw.trim())
         .ok()
@@ -130,10 +164,16 @@ pub async fn address_page(
     {
         Some(a) => a,
         None => {
-            return layout(
-                "Address",
-                html! { p class="error" { "Invalid address for this network." } },
-            );
+            return (
+                StatusCode::NOT_FOUND,
+                layout_with_meta(
+                    "Address",
+                    &canonical_path_fallback,
+                    None,
+                    html! { p class="error" { "Invalid address for this network." } },
+                ),
+            )
+                .into_response();
         }
     };
 
@@ -145,6 +185,7 @@ pub async fn address_page(
         .map(|v| matches!(v, "1" | "true" | "on" | "yes"))
         .unwrap_or(true);
     let traces_param = if traces_only { "1" } else { "0" };
+    let all_range_label = if current_language().is_chinese() { "全部" } else { "All" };
     let cursor_txid = q.cursor.as_ref().and_then(|v| Txid::from_str(v).ok());
     let cursor_stack: Vec<String> = q
         .stack
@@ -158,6 +199,7 @@ pub async fn address_page(
 
     let electrum_like = get_electrum_like();
     let address_str = address.to_string();
+    let canonical_path = format!("/address/{address_str}");
     eprintln!(
         "[address_page][perf] address={} request_start page={} limit={} traces_only={} cursor_present={} stack_depth={}",
         address_str,
@@ -167,7 +209,6 @@ pub async fn address_page(
         cursor_txid.is_some(),
         cursor_stack.len()
     );
-    let table = EssentialsTable::new(&state.essentials_mdb);
     let essentials_provider = state.essentials_provider();
     let address_stats_t0 = Instant::now();
     let address_stats = electrum_like
@@ -206,7 +247,7 @@ pub async fn address_page(
     });
     let chart_tokens_t0 = Instant::now();
     let mut chart_meta_cache: AlkaneMetaCache = HashMap::new();
-    let chart_tokens: Vec<(String, String, String, String)> = balance_entries
+    let chart_tokens: Vec<AddressChartToken> = balance_entries
         .iter()
         .map(|entry| {
             let alkane_id = format!("{}:{}", entry.alkane.block, entry.alkane.tx);
@@ -216,10 +257,17 @@ pub async fn address_page(
             } else {
                 alkane_id.clone()
             };
-            (alkane_id, label, meta.name.value.clone(), meta.symbol.clone())
+            AddressChartToken {
+                alkane_id: alkane_id.clone(),
+                label,
+                asset_name: meta.name.value.clone(),
+                symbol: meta.symbol.clone(),
+                icon_url: meta.icon_url.clone(),
+                fallback_letter: token_fallback_letter(&meta.name.value, &alkane_id),
+            }
         })
         .collect();
-    let default_chart_alkane = chart_tokens.first().map(|(id, _, _, _)| id.clone());
+    let default_chart_alkane = chart_tokens.first().map(|token| token.alkane_id.clone());
     log_address_page_perf(
         &address_str,
         "build_chart_tokens",
@@ -281,24 +329,16 @@ pub async fn address_page(
     let mut next_cursor: Option<Txid> = None;
     if traces_only {
         let confirmed_total_t0 = Instant::now();
-        let confirmed_total = state
-            .essentials_mdb
-            .get(&table.alkane_address_len_key(&address_str))
-            .ok()
-            .flatten()
-            .and_then(|b| {
-                if b.len() == 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&b);
-                    Some(u64::from_le_bytes(arr) as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
+        let confirmed_total = get_address_index_list_len(
+            &essentials_provider,
+            StateAt::Latest,
+            AddressIndexListKind::AlkaneTxs,
+            &address_str,
+        )
+        .unwrap_or(0) as usize;
         log_address_page_perf(
             &address_str,
-            "essentials_mdb.get_alkane_address_len",
+            "essentials.get_address_index_list_len.alkane_txs",
             confirmed_total_t0,
             &format!("confirmed_total={}", confirmed_total),
         );
@@ -306,28 +346,30 @@ pub async fn address_page(
         let confirmed_slice_end = (confirmed_offset + remaining_slots).min(confirmed_total);
 
         if confirmed_slice_end > confirmed_slice_start {
-            let mut txid_keys: Vec<Vec<u8>> = Vec::new();
-            for idx in confirmed_slice_start..confirmed_slice_end {
-                let rev_idx = confirmed_total - 1 - idx;
-                txid_keys.push(table.alkane_address_txid_key(&address_str, rev_idx as u64));
-            }
+            let range_start = confirmed_total.saturating_sub(confirmed_slice_end) as u64;
+            let range_end = confirmed_total.saturating_sub(confirmed_slice_start) as u64;
             let txid_multi_get_t0 = Instant::now();
-            let txid_vals = state.essentials_mdb.multi_get(&txid_keys).unwrap_or_default();
+            let ids = get_address_index_list_range(
+                &essentials_provider,
+                StateAt::Latest,
+                AddressIndexListKind::AlkaneTxs,
+                &address_str,
+                range_start,
+                range_end,
+            )
+            .unwrap_or_default();
             log_address_page_perf(
                 &address_str,
-                "essentials_mdb.multi_get_alkane_address_txids",
+                "essentials.get_address_index_list_range.alkane_txs",
                 txid_multi_get_t0,
-                &format!("keys={} vals={}", txid_keys.len(), txid_vals.len()),
+                &format!("start={} end={} ids={}", range_start, range_end, ids.len()),
             );
             let mut txids: Vec<Txid> = Vec::new();
-            for v in txid_vals {
-                let Some(bytes) = v else { continue };
-                if bytes.len() != 32 {
+            for id in ids.into_iter().rev() {
+                let Some(blob) = load_tx_pointer_blob_v3_by_id(&essentials_provider, id) else {
                     continue;
-                }
-                if let Ok(txid) = Txid::from_slice(&bytes) {
-                    txids.push(txid);
-                }
+                };
+                txids.push(Txid::from_byte_array(blob.txid));
             }
 
             let raw_txs_t0 = Instant::now();
@@ -545,10 +587,16 @@ pub async fn address_page(
             start_time,
             &format!("timed_out_at_ms={}", start_time.elapsed().as_millis()),
         );
-        return layout(
-            "Address",
-            html! { p class="error" { "Address has too many transactions to render quickly." } },
-        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            layout_with_meta(
+                "Address",
+                &canonical_path,
+                None,
+                html! { p class="error" { "Address has too many transactions to render quickly." } },
+            ),
+        )
+            .into_response();
     }
 
     let display_start = if tx_total > 0 && off < tx_total { off + 1 } else { 0 };
@@ -802,8 +850,10 @@ pub async fn address_page(
         ),
     );
     let layout_t0 = Instant::now();
-    let page = layout(
+    let page = layout_with_meta(
         &format!("Address {address_str}"),
+        &canonical_path,
+        None,
         html! {
             (header_markup)
             @if let Some(url) = mempool_url {
@@ -815,40 +865,82 @@ pub async fn address_page(
                 }
             }
 
-            h2 class="h2" { "Alkane Balances" }
-            (balances_markup)
-            @if let Some(default_alkane) = default_chart_alkane.as_ref() {
-                div
-                    class="card address-balance-chart-card"
-                    data-address-chart=""
-                    data-address=(address_str.clone())
-                    data-default-alkane=(default_alkane)
-                    data-default-range="all"
-                {
-                    div class="address-balance-chart-head" {
-                        h2 class="h2" { "Balance History" }
-                        div class="address-balance-chart-controls" {
-                            label class="address-balance-chart-label" for="address-balance-token" { "Alkane" }
-                            select id="address-balance-token" class="address-balance-select" data-address-chart-token="" {
-                                @for (alkane_id, label, asset_name, symbol) in chart_tokens.iter() {
-                                    option value=(alkane_id) data-name=(asset_name) data-symbol=(symbol) { (label) }
+            @if !balance_entries.is_empty() {
+                h2 class="h2" { "Alkane Balances" }
+                (balances_markup)
+                @if let Some(default_alkane) = default_chart_alkane.as_ref() {
+                    div
+                        class="card address-balance-chart-card"
+                        data-address-chart=""
+                        data-address=(address_str.clone())
+                        data-default-alkane=(default_alkane)
+                        data-default-range="all"
+                    {
+                        div class="address-balance-chart-head" {
+                            h2 class="h2" { "Balance History" }
+                            div class="address-balance-chart-controls" {
+                                div class="dropdown address-balance-dropdown" data-dropdown="" data-open="" data-address-chart-token="" {
+                                    button
+                                        class="dropdown-trigger"
+                                        type="button"
+                                        aria-label="Alkane"
+                                        aria-haspopup="true"
+                                        aria-expanded="false"
+                                        data-dropdown-toggle=""
+                                    {
+                                        span class="dropdown-icon dropdown-trigger-icon" data-address-chart-token-trigger-icon="" {
+                                            (address_chart_token_icon(
+                                                &chart_tokens[0].icon_url,
+                                                &chart_tokens[0].fallback_letter
+                                            ))
+                                        }
+                                        span class="dropdown-label" data-address-chart-token-trigger-label="" {
+                                            (chart_tokens[0].label.clone())
+                                        }
+                                        span class="dropdown-caret" { (icon_dropdown_caret()) }
+                                    }
+                                    div class="dropdown-panel address-balance-dropdown-panel" role="menu" aria-hidden="true" {
+                                        @for token in chart_tokens.iter() {
+                                            @let item_class = if token.alkane_id == chart_tokens[0].alkane_id {
+                                                "dropdown-item selected"
+                                            } else {
+                                                "dropdown-item"
+                                            };
+                                            a
+                                                class=(item_class)
+                                                href="#"
+                                                role="menuitem"
+                                                data-address-chart-token-option=""
+                                                data-alkane-id=(token.alkane_id.clone())
+                                                data-name=(token.asset_name.clone())
+                                                data-symbol=(token.symbol.clone())
+                                                data-label=(token.label.clone())
+                                            {
+                                                span class="dropdown-icon" {
+                                                    (address_chart_token_icon(
+                                                        &token.icon_url,
+                                                        &token.fallback_letter
+                                                    ))
+                                                }
+                                                span class="dropdown-label" { (token.label.clone()) }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    div class="address-balance-chart-summary" {
-                        div class="address-balance-chart-main" {
-                            div class="address-balance-chart-value mono" data-address-chart-value { "—" }
+                        div class="address-balance-chart-plot" data-address-chart-root {
+                            div class="address-balance-chart-loading" data-address-chart-loading="" data-spinning="1" {
+                                span class="spinner address-balance-chart-spinner" data-address-chart-loading-spinner="" aria-hidden="true" {}
+                                span data-address-chart-loading-text="" { "Loading chart..." }
+                            }
                         }
-                    }
-                    div class="address-balance-chart-plot" data-address-chart-root {
-                        div class="address-balance-chart-loading" data-address-chart-loading { "Loading chart..." }
-                    }
-                    div class="address-balance-chart-tabs" {
-                        button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
-                        button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
-                        button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
-                        button type="button" class="address-balance-chart-tab active" data-range="all" { "All" }
+                        div class="address-balance-chart-tabs" {
+                            button type="button" class="address-balance-chart-tab" data-range="1d" { "1D" }
+                            button type="button" class="address-balance-chart-tab" data-range="1w" { "1W" }
+                            button type="button" class="address-balance-chart-tab" data-range="1m" { "1M" }
+                            button type="button" class="address-balance-chart-tab active" data-range="all" { (all_range_label) }
+                        }
                     }
                 }
             }
@@ -947,16 +1039,14 @@ pub async fn address_page(
         layout_t0,
         &format!("total_ms={}", start_time.elapsed().as_millis()),
     );
-    page
+    page.into_response()
 }
 
 fn address_chart_scripts() -> Markup {
-    let base_path_js = format!("{:?}", explorer_base_path());
     let script = r#"
 <script>
 (() => {
-  const basePath = __BASE_PATH__;
-  const basePrefix = basePath === '/' ? '' : basePath;
+  const apiPath = '../api/address/chart';
   const card = document.querySelector('[data-address-chart]');
   if (!card) return;
 
@@ -968,8 +1058,12 @@ fn address_chart_scripts() -> Markup {
 
   const root = card.querySelector('[data-address-chart-root]');
   const loadingEl = card.querySelector('[data-address-chart-loading]');
-  const valueEl = card.querySelector('[data-address-chart-value]');
-  const selectEl = card.querySelector('[data-address-chart-token]');
+  const loadingTextEl = card.querySelector('[data-address-chart-loading-text]');
+  const loadingSpinnerEl = card.querySelector('[data-address-chart-loading-spinner]');
+  const dropdownEl = card.querySelector('[data-address-chart-token]');
+  const optionNodes = Array.from(card.querySelectorAll('[data-address-chart-token-option]'));
+  const triggerLabelEl = card.querySelector('[data-address-chart-token-trigger-label]');
+  const triggerIconEl = card.querySelector('[data-address-chart-token-trigger-icon]');
   const tabs = Array.from(card.querySelectorAll('[data-range]'));
   const defaultRange = (card.dataset.defaultRange || 'all').toLowerCase();
 
@@ -978,18 +1072,50 @@ fn address_chart_scripts() -> Markup {
   let chart = null;
   let canvas = null;
   let loading = false;
+  let pillSmallTheme = (() => {
+    const probe = document.createElement('span');
+    probe.className = 'pill small';
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    probe.style.pointerEvents = 'none';
+    document.body.appendChild(probe);
+    const styles = getComputedStyle(probe);
+    const theme = {
+      text: styles.color || '#aac8ff',
+      bg: styles.backgroundColor || 'rgba(158, 161, 228, 0.15)'
+    };
+    probe.remove();
+    return theme;
+  })();
 
-  const selectedAssetName = () => {
-    const option = selectEl && selectEl.selectedOptions && selectEl.selectedOptions[0];
-    if (!option) return activeAlkane;
-    const assetName = (option.dataset && option.dataset.name) || option.textContent || activeAlkane;
-    return (assetName || activeAlkane).trim();
+  const optionById = (alkaneId) => {
+    if (!alkaneId) return null;
+    return (
+      optionNodes.find(
+        (node) => ((node.dataset && node.dataset.alkaneId) || '').trim() === alkaneId
+      ) || null
+    );
   };
 
+  const currentOption = () => optionById(activeAlkane) || optionNodes[0] || null;
+
   const syncSelectedMeta = () => {
-    const option = selectEl && selectEl.selectedOptions && selectEl.selectedOptions[0];
-    activeSymbol = option && option.dataset ? (option.dataset.symbol || '').trim() : '';
-    if (valueEl) valueEl.textContent = selectedAssetName();
+    const option = currentOption();
+    if (!option) {
+      return;
+    }
+    const nextAlkane = ((option.dataset && option.dataset.alkaneId) || '').trim();
+    if (nextAlkane) activeAlkane = nextAlkane;
+    activeSymbol = option.dataset ? (option.dataset.symbol || '').trim() : '';
+    if (triggerLabelEl) {
+      const label = (option.dataset && option.dataset.label) || option.textContent || activeAlkane;
+      triggerLabelEl.textContent = (label || activeAlkane).trim();
+    }
+    if (triggerIconEl) {
+      const icon = option.querySelector('.dropdown-icon');
+      triggerIconEl.innerHTML = icon ? icon.innerHTML : '';
+    }
+    optionNodes.forEach((node) => node.classList.toggle('selected', node === option));
   };
 
   const formatAmount = (value, maxDigits = 8) => {
@@ -1058,7 +1184,11 @@ fn address_chart_scripts() -> Markup {
       canvas = document.createElement('canvas');
       canvas.setAttribute('aria-label', 'Address balance history');
       canvas.setAttribute('role', 'img');
-      root.replaceChildren(canvas);
+      if (loadingEl && loadingEl.parentNode === root) {
+        root.insertBefore(canvas, loadingEl);
+      } else {
+        root.appendChild(canvas);
+      }
     }
     return canvas.getContext('2d');
   };
@@ -1074,9 +1204,17 @@ fn address_chart_scripts() -> Markup {
     }
   };
 
-  const setLoadingText = (message) => {
+  const setLoadingState = (message, spinning) => {
     if (!loadingEl) return;
-    loadingEl.textContent = message;
+    if (loadingTextEl) {
+      loadingTextEl.textContent = message;
+    } else {
+      loadingEl.textContent = message;
+    }
+    loadingEl.dataset.spinning = spinning ? '1' : '0';
+    if (loadingSpinnerEl) {
+      loadingSpinnerEl.style.display = spinning ? '' : 'none';
+    }
     loadingEl.style.display = '';
   };
 
@@ -1084,14 +1222,13 @@ fn address_chart_scripts() -> Markup {
     if (loadingEl) loadingEl.style.display = 'none';
   };
 
-  const renderChart = (points, isUp) => {
+  const renderChart = (points) => {
     if (!window.Chart) return;
     const ctx = ensureCanvas();
     if (!ctx) return;
 
-    const lineColor = isUp
-      ? resolveColor('--chart-green', '#33e183')
-      : resolveColor('--chart-red', '#ff5555');
+    const lineColor = pillSmallTheme.text;
+    const areaColor = pillSmallTheme.bg;
     const tooltipBg = resolveColor('--panel3', '#1f2228');
     const tooltipText = resolveColor('--text', '#ffffff');
     const labels = points.map((p) => p.height);
@@ -1107,6 +1244,8 @@ fn address_chart_scripts() -> Markup {
       chart.data.labels = labels;
       chart.data.datasets[0].data = values;
       chart.data.datasets[0].borderColor = lineColor;
+      chart.data.datasets[0].backgroundColor = areaColor;
+      chart.data.datasets[0].fill = 'start';
       chart.options.scales.y.min = yMin;
       chart.options.scales.y.max = yMax;
       chart.update('none');
@@ -1125,7 +1264,8 @@ fn address_chart_scripts() -> Markup {
             pointRadius: 0,
             tension: 0.35,
             cubicInterpolationMode: 'monotone',
-            fill: false
+            fill: 'start',
+            backgroundColor: areaColor
           }
         ]
       },
@@ -1183,7 +1323,9 @@ fn address_chart_scripts() -> Markup {
       alkane: activeAlkane,
       range
     });
-    const res = await fetch(`${basePrefix}/api/address/chart?${params.toString()}`);
+    const res = await fetch(`${apiPath}?${params.toString()}`, {
+      headers: { Accept: 'application/json' }
+    });
     const data = await res.json();
     if (!data || !data.ok) return null;
     return data;
@@ -1195,7 +1337,7 @@ fn address_chart_scripts() -> Markup {
     if (points.length === 0) {
       clearChart();
       card.removeAttribute('data-tone');
-      setLoadingText('No chart data for this selection');
+      setLoadingState('No chart data for this selection', false);
       return;
     }
 
@@ -1208,22 +1350,22 @@ fn address_chart_scripts() -> Markup {
     hideLoading();
 
     if (canRender) {
-      renderChart(points, isUp);
+      renderChart(points);
     } else {
       clearChart();
-      setLoadingText('Chart unavailable');
+      setLoadingState('Chart unavailable', false);
     }
   };
 
   const load = async (range) => {
     if (loading) return;
     loading = true;
-    setLoadingText('Loading chart...');
+    setLoadingState('Loading chart...', true);
     try {
       const data = await fetchRange(range);
       if (!data) {
         clearChart();
-        setLoadingText('Chart unavailable');
+        setLoadingState('Chart unavailable', false);
         return;
       }
 
@@ -1236,21 +1378,29 @@ fn address_chart_scripts() -> Markup {
       updateCard(data, range, canRender);
     } catch (_) {
       clearChart();
-      setLoadingText('Chart unavailable');
+      setLoadingState('Chart unavailable', false);
     } finally {
       loading = false;
     }
   };
 
-  if (selectEl) {
-    selectEl.addEventListener('change', () => {
-      const selected = (selectEl.value || '').trim();
+  optionNodes.forEach((option) => {
+    option.addEventListener('click', (event) => {
+      event.preventDefault();
+      const selected = ((option.dataset && option.dataset.alkaneId) || '').trim();
       if (!selected || selected === activeAlkane) return;
       activeAlkane = selected;
       syncSelectedMeta();
+      if (dropdownEl) {
+        dropdownEl.dataset.open = '';
+        const toggle = dropdownEl.querySelector('[data-dropdown-toggle]');
+        const panel = dropdownEl.querySelector('.dropdown-panel');
+        if (toggle) toggle.setAttribute('aria-expanded', 'false');
+        if (panel) panel.setAttribute('aria-hidden', 'true');
+      }
       load(activeRange);
     });
-  }
+  });
 
   tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -1269,5 +1419,5 @@ fn address_chart_scripts() -> Markup {
 </script>
 "#;
 
-    PreEscaped(script.replace("__BASE_PATH__", &base_path_js))
+    PreEscaped(script.to_string())
 }

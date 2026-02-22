@@ -1,6 +1,7 @@
 use crate::modules::ammdata::storage::{
     AmmDataProvider, RpcFindBestSwapPathParams, RpcGetActivityParams, RpcGetAmmFactoriesParams,
-    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetPoolsParams, RpcPingParams,
+    RpcGetBestMevSwapParams, RpcGetCandlesParams, RpcGetChartChangeBlockParams,
+    RpcGetChartChangesBlockParams, RpcGetPoolsParams, RpcPingParams,
 };
 use crate::modules::defs::RpcNsRegistrar;
 use serde_json::{Value, json};
@@ -46,6 +47,72 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                         }
                     };
                     view.rpc_get_candles(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_chart_change = reg.clone();
+    let mdb_ptr_chart_change: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_chart_change
+            .register("get_chart_change_block", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_ptr_chart_change);
+                async move {
+                    let params = RpcGetChartChangeBlockParams {
+                        chart: payload
+                            .get("chart")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        height: payload.get("height").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_chart_change_block(params)
+                        .map(|resp| resp.value)
+                        .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
+                }
+            })
+            .await;
+    });
+
+    let reg_chart_changes = reg.clone();
+    let mdb_ptr_chart_changes: Arc<AmmDataProvider> = Arc::clone(&mdb_ptr);
+    tokio::spawn(async move {
+        reg_chart_changes
+            .register("get_chart_changes_block", move |_cx, payload| {
+                let mdb_for_handler = Arc::clone(&mdb_ptr_chart_changes);
+                async move {
+                    let params = RpcGetChartChangesBlockParams {
+                        height: payload.get("height").and_then(|v| v.as_u64()),
+                    };
+                    let view = match mdb_for_handler.with_height(
+                        payload.get("height").and_then(|v| v.as_u64()),
+                        payload.get("height").is_some(),
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return json!({
+                                "ok": false,
+                                "error": "missing_or_invalid_height",
+                                "detail": e.to_string()
+                            });
+                        }
+                    };
+                    view.rpc_get_chart_changes_block(params)
                         .map(|resp| resp.value)
                         .unwrap_or_else(|_| json!({"ok": false, "error": "internal_error"}))
                 }

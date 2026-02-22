@@ -13,6 +13,7 @@ pub struct FinalizeStats {
     pub token_mcusd_candles: usize,
     pub token_derived_usd_candles: usize,
     pub token_derived_mcusd_candles: usize,
+    pub chart_changes: usize,
     pub token_metrics: usize,
     pub token_metrics_index: usize,
     pub token_search_index: usize,
@@ -185,6 +186,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     let tmc_cnt = state.token_mcusd_candle_writes.len();
     let tdc_cnt = state.token_derived_usd_candle_writes.len();
     let tdmc_cnt = state.token_derived_mcusd_candle_writes.len();
+    let cc_cnt = state.chart_change_writes.len();
     let tm_cnt = state.token_metrics_writes.len();
     let tmi_cnt = state.token_metrics_index_writes.len();
     let tsi_cnt = state.token_search_index_writes.len();
@@ -223,6 +225,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         || !state.token_mcusd_candle_writes.is_empty()
         || !state.token_derived_usd_candle_writes.is_empty()
         || !state.token_derived_mcusd_candle_writes.is_empty()
+        || !state.chart_change_writes.is_empty()
         || !state.token_metrics_writes.is_empty()
         || !state.token_metrics_index_writes.is_empty()
         || !state.token_metrics_index_deletes.is_empty()
@@ -268,6 +271,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
     puts.extend(std::mem::take(&mut state.token_mcusd_candle_writes));
     puts.extend(std::mem::take(&mut state.token_derived_usd_candle_writes));
     puts.extend(std::mem::take(&mut state.token_derived_mcusd_candle_writes));
+    puts.extend(std::mem::take(&mut state.chart_change_writes));
     puts.extend(std::mem::take(&mut state.token_metrics_writes));
     puts.extend(std::mem::take(&mut state.token_metrics_index_writes));
     puts.extend(std::mem::take(&mut state.token_search_index_writes));
@@ -319,6 +323,7 @@ pub fn prepare_batch(provider: &AmmDataProvider, state: &mut IndexState) -> Resu
         token_mcusd_candles: tmc_cnt,
         token_derived_usd_candles: tdc_cnt,
         token_derived_mcusd_candles: tdmc_cnt,
+        chart_changes: cc_cnt,
         token_metrics: tm_cnt,
         token_metrics_index: tmi_cnt,
         token_search_index: tsi_cnt,

@@ -16,17 +16,19 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
-    decode_balances_vec, decode_outpoint_pos_v2, decode_outpoint_row_v2, decode_u128_value,
-    encode_alkane_balance_tx_entry, encode_outpoint_pos_v2, encode_outpoint_row_v2,
-    encode_tx_packed_outflow_pos_v2, encode_tx_packed_outflow_row_v2, encode_u128_value,
-    encode_vec, get_holders_count_encoded, mk_outpoint, spk_to_address_str, AddressActivityEntry,
-    AddressAmountEntry, AlkaneBalanceTxEntry, AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
+    address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
+    append_address_index_values, decode_balances_vec, decode_outpoint_pointer_blob_v3,
+    decode_pointer_idx_u64, decode_u128_value, encode_outpoint_pointer_blob_v3,
+    encode_pointer_idx_u64, encode_tx_pointer_blob_v3, encode_u128_value, encode_vec,
+    get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2,
+    resolve_outpoint_spent_by_id_v2, resolve_tx_pointer_id_v2, spk_to_address_str,
+    AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
+    AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
 };
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetMultiValuesParams, GetRawValueParams, SetBatchParams,
-    SetBlobValuesIfMissingParams,
 };
-use crate::runtime::mdb::Mdb;
+use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::state_at::StateAt;
 use crate::schemas::{EspoOutpoint, SchemaAlkaneId};
 use anyhow::{anyhow, Context, Result};
@@ -45,6 +47,78 @@ fn ammdata_mdb() -> Arc<Mdb> {
     AMMDATA_MDB
         .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
         .clone()
+}
+
+#[derive(Default, Clone, Copy)]
+struct FamilyWriteProfile {
+    raw_put_rows: usize,
+    raw_put_key_bytes: usize,
+    raw_put_value_bytes: usize,
+    dedup_put_rows: usize,
+    dedup_put_key_bytes: usize,
+    dedup_put_value_bytes: usize,
+    raw_delete_rows: usize,
+    raw_delete_key_bytes: usize,
+    dedup_delete_rows: usize,
+    dedup_delete_key_bytes: usize,
+}
+
+fn key_starts_with_any(key: &[u8], prefixes: &[&[u8]]) -> bool {
+    prefixes.iter().any(|p| !p.is_empty() && key.starts_with(p))
+}
+
+fn profile_family_writes(
+    puts: &[(Vec<u8>, Vec<u8>)],
+    deletes: &[Vec<u8>],
+    prefixes: &[&[u8]],
+) -> FamilyWriteProfile {
+    let mut stats = FamilyWriteProfile::default();
+
+    for (k, v) in puts {
+        if !key_starts_with_any(k, prefixes) {
+            continue;
+        }
+        stats.raw_put_rows = stats.raw_put_rows.saturating_add(1);
+        stats.raw_put_key_bytes = stats.raw_put_key_bytes.saturating_add(k.len());
+        stats.raw_put_value_bytes = stats.raw_put_value_bytes.saturating_add(v.len());
+    }
+    for k in deletes {
+        if !key_starts_with_any(k, prefixes) {
+            continue;
+        }
+        stats.raw_delete_rows = stats.raw_delete_rows.saturating_add(1);
+        stats.raw_delete_key_bytes = stats.raw_delete_key_bytes.saturating_add(k.len());
+    }
+
+    // Mirror set_batch last-write-wins behavior for per-family profiling.
+    let mut dedup_puts: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
+    for (k, v) in puts.iter().rev() {
+        if !key_starts_with_any(k, prefixes) {
+            continue;
+        }
+        dedup_puts.entry(k.clone()).or_insert((k.len(), v.len()));
+    }
+    stats.dedup_put_rows = dedup_puts.len();
+    for (klen, vlen) in dedup_puts.values() {
+        stats.dedup_put_key_bytes = stats.dedup_put_key_bytes.saturating_add(*klen);
+        stats.dedup_put_value_bytes = stats.dedup_put_value_bytes.saturating_add(*vlen);
+    }
+
+    let mut dedup_deletes_seen: HashSet<Vec<u8>> = HashSet::new();
+    for k in deletes {
+        if !key_starts_with_any(k, prefixes) {
+            continue;
+        }
+        if dedup_puts.contains_key(k) {
+            continue;
+        }
+        if dedup_deletes_seen.insert(k.clone()) {
+            stats.dedup_delete_rows = stats.dedup_delete_rows.saturating_add(1);
+            stats.dedup_delete_key_bytes = stats.dedup_delete_key_bytes.saturating_add(k.len());
+        }
+    }
+
+    stats
 }
 
 pub(crate) fn clean_espo_sandshrew_like_trace(
@@ -1118,13 +1192,8 @@ pub fn bulk_update_balances_for_block(
 
         let mut indexed_external_prev_txids: HashSet<[u8; 32]> = HashSet::new();
         if !external_prev_txids.is_empty() {
-            let summary_keys: Vec<Vec<u8>> = external_prev_txids
-                .iter()
-                .map(|txid| table.tx_summary_marker_key(txid))
-                .collect();
-            let summary_vals = provider.blob_mdb().multi_get(&summary_keys)?;
-            for (txid, summary_raw) in external_prev_txids.iter().zip(summary_vals.into_iter()) {
-                if summary_raw.is_some() {
+            for txid in &external_prev_txids {
+                if resolve_tx_pointer_id_v2(provider, StateAt::Latest, txid)?.is_some() {
                     indexed_external_prev_txids.insert(*txid);
                 }
             }
@@ -1827,34 +1896,6 @@ pub fn bulk_update_balances_for_block(
     }
 
     let timer = debug::start_if(debug);
-    let mut address_offsets: HashMap<String, u64> = HashMap::new();
-    if !alkane_address_txids.is_empty() {
-        let mut addrs: Vec<String> = alkane_address_txids.keys().cloned().collect();
-        addrs.sort();
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(addrs.len());
-        for addr in &addrs {
-            keys.push(table.alkane_address_len_key(addr));
-        }
-        let existing = provider
-            .get_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
-            .values;
-        for (idx, addr) in addrs.iter().enumerate() {
-            let len = existing
-                .get(idx)
-                .and_then(|v| v.as_ref())
-                .and_then(|b| {
-                    if b.len() == 8 {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(b);
-                        Some(u64::from_le_bytes(arr))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            address_offsets.insert(addr.clone(), len);
-        }
-    }
     debug::log_elapsed(module, "process_transactions_address_offsets", timer);
 
     let timer = debug::start_if(debug);
@@ -1984,84 +2025,148 @@ pub fn bulk_update_balances_for_block(
     let mut section_start_puts = 0usize;
     let mut section_start_deletes = 0usize;
 
-    // A) Persist outpoint immutable rows + COW locators/spend edges.
-    let mut addr_spk_updates: HashMap<String, Vec<u8>> = HashMap::new();
-    for row in &new_rows {
-        let outpoint_base = mk_outpoint(row.outpoint.txid.clone(), row.outpoint.vout, None);
+    // A) Persist outpoint pointer blobs + COW id locators/spend edges.
+    let outpoint_counter_key = table.outpoint_pointer_counter_key();
+    let mut next_outpoint_id = provider
+        .blob_mdb()
+        .get(&outpoint_counter_key)?
+        .and_then(|bytes| decode_pointer_idx_u64(&bytes).ok())
+        .unwrap_or(0);
+    let outpoint_idx_chunk_counter_key =
+        table.address_index_chunk_counter_key(AddressIndexListKind::OutpointIdx);
+    let mut next_outpoint_idx_chunk_id = provider
+        .blob_mdb()
+        .get(&outpoint_idx_chunk_counter_key)?
+        .and_then(|bytes| decode_pointer_idx_u64(&bytes).ok())
+        .unwrap_or(0);
 
-        let bkey = match table.balances_key(&row.addr, &outpoint_base) {
-            Ok(k) => k,
-            Err(_) => continue,
+    let mut created_outpoint_ids: HashMap<(Txid, u32), u64> = HashMap::new();
+    let mut created_outpoint_txidx: HashMap<(Txid, u32), u32> = HashMap::new();
+    for row in &new_rows {
+        if row.outpoint.txid.len() != 32 {
+            continue;
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&row.outpoint.txid);
+        let Some(tx_idx) = tx_index_by_txid.get(&txid_arr).copied() else {
+            continue;
         };
-        let mut created_in_block = false;
-        let mut outpoint_tx_idx: Option<u32> = None;
-        if row.outpoint.txid.len() == 32 {
-            let mut txid_arr = [0u8; 32];
-            txid_arr.copy_from_slice(&row.outpoint.txid);
-            if let Some(tx_idx) = tx_index_by_txid.get(&txid_arr).copied() {
-                created_in_block = true;
-                outpoint_tx_idx = Some(tx_idx);
+        let txid = Txid::from_byte_array(txid_arr);
+        let key = (txid, row.outpoint.vout);
+        if created_outpoint_ids.contains_key(&key) {
+            continue;
+        }
+        created_outpoint_ids.insert(key, next_outpoint_id);
+        created_outpoint_txidx.insert((txid, row.outpoint.vout), tx_idx);
+        next_outpoint_id = next_outpoint_id.saturating_add(1);
+    }
+
+    let mut outpoint_idx_appends: HashMap<String, Vec<u64>> = HashMap::new();
+
+    let mut external_spent_candidates: Vec<(Txid, u32)> = Vec::new();
+    let mut external_spent_set: HashSet<(Txid, u32)> = HashSet::new();
+    for row in &new_rows {
+        if row.outpoint.tx_spent.is_none() || row.outpoint.txid.len() != 32 {
+            continue;
+        }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&row.outpoint.txid);
+        let txid = Txid::from_byte_array(txid_arr);
+        let key = (txid, row.outpoint.vout);
+        if created_outpoint_ids.contains_key(&key) {
+            continue;
+        }
+        if external_spent_set.insert(key) {
+            external_spent_candidates.push((txid, row.outpoint.vout));
+        }
+    }
+    let mut external_spent_ids: HashMap<(Txid, u32), u64> = HashMap::new();
+    if !external_spent_candidates.is_empty() {
+        for (txid, vout) in &external_spent_candidates {
+            if let Some(id) =
+                resolve_outpoint_id_v2(provider, StateAt::Latest, txid.as_byte_array(), *vout)?
+            {
+                external_spent_ids.insert((*txid, *vout), id);
             }
         }
+    }
 
-        // Address -> outpoint membership row only for first-seen unspent rows.
-        if created_in_block && row.outpoint.tx_spent.is_none() {
-            puts.push((bkey, Vec::new()));
+    let mut addr_spk_updates: HashMap<String, Vec<u8>> = HashMap::new();
+    for row in &new_rows {
+        if row.outpoint.txid.len() != 32 {
+            continue;
         }
+        let mut txid_arr = [0u8; 32];
+        txid_arr.copy_from_slice(&row.outpoint.txid);
+        let txid = Txid::from_byte_array(txid_arr);
+        let key = (txid, row.outpoint.vout);
 
-        if created_in_block {
-            let Some(tx_idx) = outpoint_tx_idx else {
+        if let Some(outpoint_id) = created_outpoint_ids.get(&key).copied() {
+            let Some(tx_idx) = created_outpoint_txidx.get(&key).copied() else {
                 continue;
             };
-            let Ok(candidate_key) = table.outpoint_create_candidate_key(
-                &row.outpoint.txid,
-                row.outpoint.vout,
-                block.height,
-                tx_idx,
-                &blockhash,
-            ) else {
-                continue;
-            };
-            blob_puts.push((candidate_key, Vec::new()));
             let balances = decode_balances_vec(&row.enc_balances).unwrap_or_default();
             let spk_bytes = row.uspk_val.clone().unwrap_or_default();
-            let row_blob = match encode_outpoint_row_v2(&row.addr, &spk_bytes, &balances) {
+            let row_blob = match encode_outpoint_pointer_blob_v3(
+                &txid_arr,
+                row.outpoint.vout,
+                &blockhash,
+                tx_idx,
+                &row.addr,
+                &spk_bytes,
+                &balances,
+            ) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let row_key = table.outpoint_row_key(&blockhash, tx_idx, row.outpoint.vout);
-            blob_puts.push((row_key, row_blob));
-            if let Ok(pos_key) =
-                table.outpoint_pos_key_from_parts(&row.outpoint.txid, row.outpoint.vout)
-            {
-                puts.push((pos_key, encode_outpoint_pos_v2(&blockhash, tx_idx, row.outpoint.vout)));
+            blob_puts.push((table.outpoint_pointer_blob_key(outpoint_id), row_blob));
+            let pos_key = table.outpoint_pos_append_key_from_parts(
+                txid.as_byte_array(),
+                row.outpoint.vout,
+                block.height,
+                &blockhash,
+            )?;
+            blob_puts.push((pos_key, encode_pointer_idx_u64(outpoint_id)));
+            if row.outpoint.tx_spent.is_none() {
+                outpoint_idx_appends.entry(row.addr.clone()).or_default().push(outpoint_id);
             }
         }
 
         if let Some(ref spent_by) = row.outpoint.tx_spent {
             if spent_by.len() == 32 {
-                if let Ok(spent_by_key) =
-                    table.outpoint_spent_by_key_from_parts(&row.outpoint.txid, row.outpoint.vout)
-                {
-                    puts.push((spent_by_key, spent_by.clone()));
-                }
-                let mut spender_arr = [0u8; 32];
-                spender_arr.copy_from_slice(spent_by);
-                if let Some(spend_tx_idx) = tx_index_by_txid.get(&spender_arr).copied() {
-                    if let Ok(spend_event_key) = table.outpoint_spend_event_key(
-                        &row.outpoint.txid,
-                        row.outpoint.vout,
-                        block.height,
-                        spend_tx_idx,
-                        &blockhash,
-                    ) {
-                        blob_puts.push((spend_event_key, spent_by.clone()));
-                    }
+                let outpoint_id = created_outpoint_ids
+                    .get(&key)
+                    .copied()
+                    .or_else(|| external_spent_ids.get(&key).copied());
+                if let Some(id) = outpoint_id {
+                    blob_puts.push((
+                        table.outpoint_spent_by_id_append_key(id, block.height, &blockhash),
+                        spent_by.clone(),
+                    ));
                 }
             }
         }
         if let Some(ref spk_bytes) = row.uspk_val {
             addr_spk_updates.entry(row.addr.clone()).or_insert_with(|| spk_bytes.clone());
+        }
+    }
+
+    if !outpoint_idx_appends.is_empty() {
+        let mut addrs: Vec<String> = outpoint_idx_appends.keys().cloned().collect();
+        addrs.sort();
+        for addr in addrs {
+            let Some(values) = outpoint_idx_appends.get(&addr) else {
+                continue;
+            };
+            append_address_index_values(
+                provider,
+                AddressIndexListKind::OutpointIdx,
+                &addr,
+                values,
+                &mut next_outpoint_idx_chunk_id,
+                &mut puts,
+                &mut blob_puts,
+            )?;
         }
     }
 
@@ -2479,6 +2584,43 @@ pub fn bulk_update_balances_for_block(
     let mut log_rows_height: usize = 0;
     let mut log_rows_pair: usize = 0;
 
+    let tx_pointer_counter_key = table.tx_pointer_counter_key();
+    let mut next_tx_pointer_id = provider
+        .blob_mdb()
+        .get(&tx_pointer_counter_key)?
+        .and_then(|bytes| decode_pointer_idx_u64(&bytes).ok())
+        .unwrap_or(0);
+    let by_token_chunk_counter_key =
+        table.address_index_chunk_counter_key(AddressIndexListKind::AlkaneBalanceTxsByToken);
+    let mut next_by_token_chunk_id = provider
+        .blob_mdb()
+        .get(&by_token_chunk_counter_key)?
+        .and_then(|bytes| decode_pointer_idx_u64(&bytes).ok())
+        .unwrap_or(0);
+    let alkane_block_chunk_counter_key =
+        table.address_index_chunk_counter_key(AddressIndexListKind::AlkaneBlockTxs);
+    let mut next_alkane_block_chunk_id = provider
+        .blob_mdb()
+        .get(&alkane_block_chunk_counter_key)?
+        .and_then(|bytes| decode_pointer_idx_u64(&bytes).ok())
+        .unwrap_or(0);
+    let alkane_addr_chunk_counter_key =
+        table.address_index_chunk_counter_key(AddressIndexListKind::AlkaneTxs);
+    let mut next_alkane_addr_chunk_id = provider
+        .blob_mdb()
+        .get(&alkane_addr_chunk_counter_key)?
+        .and_then(|bytes| decode_pointer_idx_u64(&bytes).ok())
+        .unwrap_or(0);
+    let mut tx_pointer_id_by_txid: HashMap<[u8; 32], u64> = HashMap::new();
+    for summary in &alkane_tx_summaries {
+        if !tx_index_by_txid.contains_key(&summary.txid) {
+            continue;
+        }
+        if tx_pointer_id_by_txid.insert(summary.txid, next_tx_pointer_id).is_none() {
+            next_tx_pointer_id = next_tx_pointer_id.saturating_add(1);
+        }
+    }
+
     if !alkane_balance_tx_entries.is_empty() {
         let mut tokens: Vec<SchemaAlkaneId> = alkane_balance_tx_entries.keys().copied().collect();
         tokens.sort();
@@ -2488,22 +2630,23 @@ pub fn bulk_update_balances_for_block(
                     let Some(tx_idx) = tx_index_by_txid.get(&entry.txid).copied() else {
                         continue;
                     };
-                    let key =
-                        table.alkane_balance_txs_log_key(tok, entry.height, tx_idx, &entry.txid);
+                    let Some(entry_id) = tx_pointer_id_by_txid.get(&entry.txid).copied() else {
+                        continue;
+                    };
+                    let key = table.alkane_balance_txs_log_key(tok, entry.height, tx_idx, entry_id);
                     puts.push((key, Vec::new()));
                     log_rows_owner = log_rows_owner.saturating_add(1);
 
-                    if let Ok(encoded_entry) = encode_alkane_balance_tx_entry(entry) {
-                        let by_height_key =
-                            table.alkane_balance_txs_by_height_log_key(entry.height, tx_idx, tok);
-                        puts.push((by_height_key, encoded_entry));
-                        log_rows_height = log_rows_height.saturating_add(1);
-                    }
+                    let by_height_key =
+                        table.alkane_balance_txs_by_height_log_key(entry.height, tx_idx, tok);
+                    puts.push((by_height_key, encode_pointer_idx_u64(entry_id)));
+                    log_rows_height = log_rows_height.saturating_add(1);
                 }
             }
         }
     }
 
+    let mut by_token_pointer_appends: HashMap<String, Vec<u64>> = HashMap::new();
     if !alkane_balance_tx_entries_by_token.is_empty() {
         let mut pairs: Vec<(SchemaAlkaneId, SchemaAlkaneId)> =
             alkane_balance_tx_entries_by_token.keys().copied().collect();
@@ -2511,20 +2654,32 @@ pub fn bulk_update_balances_for_block(
         for (owner, token) in &pairs {
             if let Some(new_entries) = alkane_balance_tx_entries_by_token.get(&(*owner, *token)) {
                 for entry in new_entries {
-                    let Some(tx_idx) = tx_index_by_txid.get(&entry.txid).copied() else {
+                    let Some(entry_id) = tx_pointer_id_by_txid.get(&entry.txid).copied() else {
                         continue;
                     };
-                    let key = table.alkane_balance_txs_by_token_log_key(
-                        owner,
-                        token,
-                        entry.height,
-                        tx_idx,
-                        &entry.txid,
-                    );
-                    puts.push((key, Vec::new()));
+                    let list_id = address_index_list_id_alkane_balance_txs_by_token(owner, token);
+                    by_token_pointer_appends.entry(list_id).or_default().push(entry_id);
                     log_rows_pair = log_rows_pair.saturating_add(1);
                 }
             }
+        }
+    }
+    if !by_token_pointer_appends.is_empty() {
+        let mut list_ids: Vec<String> = by_token_pointer_appends.keys().cloned().collect();
+        list_ids.sort();
+        for list_id in list_ids {
+            let Some(values) = by_token_pointer_appends.get(&list_id) else {
+                continue;
+            };
+            append_address_index_values(
+                provider,
+                AddressIndexListKind::AlkaneBalanceTxsByToken,
+                &list_id,
+                values,
+                &mut next_by_token_chunk_id,
+                &mut puts,
+                &mut blob_puts,
+            )?;
         }
     }
 
@@ -2536,7 +2691,7 @@ pub fn bulk_update_balances_for_block(
     }
     debug::log_elapsed(module, "process_transactions_update_balance_txs_append", timer);
 
-    // D2) Persist alkane tx summaries (locator -> blockhash/idx, row -> immutable packed outflow)
+    // D2) Persist alkane tx pointer blobs (txid -> id, id -> immutable blob).
     let mut packed_outflows_by_tx: HashMap<
         [u8; 32],
         BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
@@ -2554,41 +2709,67 @@ pub fn bulk_update_balances_for_block(
         let Some(tx_idx) = tx_index_by_txid.get(&summary.txid).copied() else {
             continue;
         };
-        let summary_marker_key = table.tx_summary_marker_key(&summary.txid);
-        blob_puts.push((summary_marker_key, vec![1]));
-        let tx_pos_key = table.tx_packed_outflow_pos_key(&summary.txid);
-        puts.push((tx_pos_key, encode_tx_packed_outflow_pos_v2(&blockhash, tx_idx)));
-        let candidate_key =
-            table.tx_locator_candidate_key(&summary.txid, summary.height, tx_idx, &blockhash);
-        blob_puts.push((candidate_key, Vec::new()));
-
-        let packed = packed_outflows_by_tx.remove(&summary.txid).unwrap_or_default();
-        let Ok(row_value) =
-            encode_tx_packed_outflow_row_v2(summary.height, &summary.traces, &packed)
-        else {
+        let Some(pointer_id) = tx_pointer_id_by_txid.get(&summary.txid).copied() else {
             continue;
         };
-        let row_key = table.tx_packed_outflow_row_key(&blockhash, tx_idx);
-        blob_puts.push((row_key, row_value));
+        let tx_pos_key =
+            table.tx_packed_outflow_pos_append_key(&summary.txid, block.height, &blockhash);
+        blob_puts.push((tx_pos_key, encode_pointer_idx_u64(pointer_id)));
+
+        let packed = packed_outflows_by_tx.remove(&summary.txid).unwrap_or_default();
+        let Ok(row_value) = encode_tx_pointer_blob_v3(
+            &summary.txid,
+            &blockhash,
+            tx_idx,
+            summary.height,
+            &summary.traces,
+            &packed,
+        ) else {
+            continue;
+        };
+        blob_puts.push((table.tx_pointer_blob_key(pointer_id), row_value));
     }
 
-    let block_len = alkane_block_txids.len() as u64;
-    puts.push((table.alkane_block_len_key(block.height as u64), block_len.to_le_bytes().to_vec()));
-    for (idx, txid_bytes) in alkane_block_txids.iter().enumerate() {
-        puts.push((
-            table.alkane_block_txid_key(block.height as u64, idx as u64),
-            txid_bytes.to_vec(),
-        ));
+    let mut block_pointer_ids: Vec<u64> = Vec::with_capacity(alkane_block_txids.len());
+    for txid_bytes in &alkane_block_txids {
+        let Some(pointer_id) = tx_pointer_id_by_txid.get(txid_bytes).copied() else {
+            continue;
+        };
+        block_pointer_ids.push(pointer_id);
+    }
+    if !block_pointer_ids.is_empty() {
+        let list_id = address_index_list_id_alkane_block_txs(block.height as u64);
+        append_address_index_values(
+            provider,
+            AddressIndexListKind::AlkaneBlockTxs,
+            &list_id,
+            &block_pointer_ids,
+            &mut next_alkane_block_chunk_id,
+            &mut puts,
+            &mut blob_puts,
+        )?;
     }
 
     for (addr, txids) in alkane_address_txids.iter() {
-        let start = address_offsets.get(addr).copied().unwrap_or(0);
-        for (i, txid_bytes) in txids.iter().enumerate() {
-            let idx = start + i as u64;
-            puts.push((table.alkane_address_txid_key(addr, idx), txid_bytes.to_vec()));
+        let mut pointer_ids: Vec<u64> = Vec::with_capacity(txids.len());
+        for txid_bytes in txids {
+            let Some(pointer_id) = tx_pointer_id_by_txid.get(txid_bytes).copied() else {
+                continue;
+            };
+            pointer_ids.push(pointer_id);
         }
-        let new_len = start + txids.len() as u64;
-        puts.push((table.alkane_address_len_key(addr), new_len.to_le_bytes().to_vec()));
+        if pointer_ids.is_empty() {
+            continue;
+        }
+        append_address_index_values(
+            provider,
+            AddressIndexListKind::AlkaneTxs,
+            addr,
+            &pointer_ids,
+            &mut next_alkane_addr_chunk_id,
+            &mut puts,
+            &mut blob_puts,
+        )?;
     }
 
     let latest_traces_new_len = latest_traces.len() as u32;
@@ -3655,10 +3836,100 @@ pub fn bulk_update_balances_for_block(
             blob_put_payload_bytes,
             delete_key_bytes
         );
+
+        let outpoint_pos_prefix = table.outpoint_pos_append_family_prefix();
+        let outpoint_sid_prefix = table.outpoint_spent_by_id_append_family_prefix();
+        let tx_pos_prefix = table.tx_packed_outflow_pos_append_family_prefix();
+        let empty_deletes: &[Vec<u8>] = &[];
+
+        {
+            let prefixes = [outpoint_pos_prefix.as_slice(), outpoint_sid_prefix.as_slice()];
+            let prof = profile_family_writes(&blob_puts, empty_deletes, &prefixes);
+            eprintln!(
+                "[balances][non_cow_profile] block={} family=essentials.outpoint.v2.other raw_put_rows={} raw_put_bytes={} dedup_put_rows={} dedup_put_bytes={} raw_delete_rows={} raw_delete_key_bytes={} dedup_delete_rows={} dedup_delete_key_bytes={}",
+                block.height,
+                prof.raw_put_rows,
+                prof.raw_put_key_bytes.saturating_add(prof.raw_put_value_bytes),
+                prof.dedup_put_rows,
+                prof.dedup_put_key_bytes.saturating_add(prof.dedup_put_value_bytes),
+                prof.raw_delete_rows,
+                prof.raw_delete_key_bytes,
+                prof.dedup_delete_rows,
+                prof.dedup_delete_key_bytes
+            );
+        }
+
+        {
+            let prof =
+                profile_family_writes(&blob_puts, empty_deletes, &[outpoint_pos_prefix.as_slice()]);
+            eprintln!(
+                "[balances][non_cow_profile] block={} family=essentials.outpoint.v2.p raw_put_rows={} raw_put_bytes={} dedup_put_rows={} dedup_put_bytes={} raw_delete_rows={} raw_delete_key_bytes={} dedup_delete_rows={} dedup_delete_key_bytes={}",
+                block.height,
+                prof.raw_put_rows,
+                prof.raw_put_key_bytes.saturating_add(prof.raw_put_value_bytes),
+                prof.dedup_put_rows,
+                prof.dedup_put_key_bytes.saturating_add(prof.dedup_put_value_bytes),
+                prof.raw_delete_rows,
+                prof.raw_delete_key_bytes,
+                prof.dedup_delete_rows,
+                prof.dedup_delete_key_bytes
+            );
+        }
+
+        {
+            let prof =
+                profile_family_writes(&blob_puts, empty_deletes, &[outpoint_sid_prefix.as_slice()]);
+            eprintln!(
+                "[balances][non_cow_profile] block={} family=essentials.outpoint.v2.sid raw_put_rows={} raw_put_bytes={} dedup_put_rows={} dedup_put_bytes={} raw_delete_rows={} raw_delete_key_bytes={} dedup_delete_rows={} dedup_delete_key_bytes={}",
+                block.height,
+                prof.raw_put_rows,
+                prof.raw_put_key_bytes.saturating_add(prof.raw_put_value_bytes),
+                prof.dedup_put_rows,
+                prof.dedup_put_key_bytes.saturating_add(prof.dedup_put_value_bytes),
+                prof.raw_delete_rows,
+                prof.raw_delete_key_bytes,
+                prof.dedup_delete_rows,
+                prof.dedup_delete_key_bytes
+            );
+        }
+
+        {
+            let prof =
+                profile_family_writes(&blob_puts, empty_deletes, &[tx_pos_prefix.as_slice()]);
+            eprintln!(
+                "[balances][non_cow_profile] block={} family=essentials.tx.packed_outflow_pos raw_put_rows={} raw_put_bytes={} dedup_put_rows={} dedup_put_bytes={} raw_delete_rows={} raw_delete_key_bytes={} dedup_delete_rows={} dedup_delete_key_bytes={}",
+                block.height,
+                prof.raw_put_rows,
+                prof.raw_put_key_bytes.saturating_add(prof.raw_put_value_bytes),
+                prof.dedup_put_rows,
+                prof.dedup_put_key_bytes.saturating_add(prof.dedup_put_value_bytes),
+                prof.raw_delete_rows,
+                prof.raw_delete_key_bytes,
+                prof.dedup_delete_rows,
+                prof.dedup_delete_key_bytes
+            );
+        }
     }
-    provider.set_blob_values_if_missing(SetBlobValuesIfMissingParams {
-        blockhash: StateAt::Latest,
-        puts: blob_puts,
+    blob_puts.push((outpoint_counter_key.clone(), encode_pointer_idx_u64(next_outpoint_id)));
+    blob_puts.push((
+        outpoint_idx_chunk_counter_key.clone(),
+        encode_pointer_idx_u64(next_outpoint_idx_chunk_id),
+    ));
+    blob_puts.push((tx_pointer_counter_key.clone(), encode_pointer_idx_u64(next_tx_pointer_id)));
+    blob_puts
+        .push((by_token_chunk_counter_key.clone(), encode_pointer_idx_u64(next_by_token_chunk_id)));
+    blob_puts.push((
+        alkane_block_chunk_counter_key.clone(),
+        encode_pointer_idx_u64(next_alkane_block_chunk_id),
+    ));
+    blob_puts.push((
+        alkane_addr_chunk_counter_key.clone(),
+        encode_pointer_idx_u64(next_alkane_addr_chunk_id),
+    ));
+    provider.blob_mdb().bulk_write(|wb: &mut MdbBatch<'_>| {
+        for (key, value) in &blob_puts {
+            wb.put(key, value);
+        }
     })?;
     provider.set_batch(SetBatchParams { blockhash: StateAt::Latest, puts, deletes })?;
     debug::log_elapsed(module, "write_batch", timer);
@@ -3980,99 +4251,21 @@ pub struct OutpointLookup {
     pub spk: Option<ScriptBuf>,
 }
 
-fn candidate_visible_in_view(
-    provider: &EssentialsProvider,
-    candidate_hash: [u8; 32],
-    target_blockhash: Option<bitcoin::BlockHash>,
-) -> Result<bool> {
-    let Some(target) = target_blockhash else {
-        return Ok(true);
-    };
-    let candidate = bitcoin::BlockHash::from_byte_array(candidate_hash);
-    provider.blockhash_is_ancestor(&candidate, &target)
-}
-
-fn resolve_outpoint_create_position_v2(
-    provider: &EssentialsProvider,
-    txid: &Txid,
-    vout: u32,
-    blockhash: StateAt,
-) -> Result<Option<([u8; 32], u32)>> {
-    let table = provider.table();
-    let prefix = table.outpoint_create_candidate_prefix_from_parts(txid.as_byte_array(), vout)?;
-    let keys = provider.blob_mdb().scan_prefix_keys(&prefix)?;
-    if keys.is_empty() {
-        return Ok(None);
-    }
-    let target_blockhash = blockhash.resolve(provider.resolved_view_blockhash());
-    let mut best: Option<(u32, u32, [u8; 32])> = None;
-    for key in keys {
-        let Some((key_txid, key_vout, height, idx, candidate_blockhash)) =
-            table.parse_outpoint_create_candidate_key(&key)
-        else {
-            continue;
-        };
-        if key_vout != vout || key_txid.as_slice() != txid.as_byte_array() {
-            continue;
-        }
-        if !candidate_visible_in_view(provider, candidate_blockhash, target_blockhash)? {
-            continue;
-        }
-        match best {
-            Some((best_h, best_idx, _)) if (height, idx) <= (best_h, best_idx) => {}
-            _ => best = Some((height, idx, candidate_blockhash)),
-        }
-    }
-    Ok(best.map(|(_h, idx, bh)| (bh, idx)))
-}
-
 fn resolve_outpoint_spent_by_v2(
     provider: &EssentialsProvider,
     txid: &Txid,
     vout: u32,
     blockhash: StateAt,
 ) -> Result<Option<Txid>> {
-    let table = provider.table();
-    if let Ok(spent_key) = table.outpoint_spent_by_key_from_parts(txid.as_byte_array(), vout) {
-        if let Some(raw) =
-            provider.get_raw_value(GetRawValueParams { blockhash, key: spent_key })?.value
-        {
-            if raw.len() == 32 {
-                if let Ok(txid) = Txid::from_slice(&raw) {
-                    return Ok(Some(txid));
-                }
+    let outpoint_id = resolve_outpoint_id_v2(provider, blockhash, txid.as_byte_array(), vout)?;
+    if let Some(outpoint_id) = outpoint_id {
+        if let Some(raw_txid) = resolve_outpoint_spent_by_id_v2(provider, blockhash, outpoint_id)? {
+            if let Ok(txid) = Txid::from_slice(&raw_txid) {
+                return Ok(Some(txid));
             }
         }
     }
-    let prefix = table.outpoint_spend_event_prefix_from_parts(txid.as_byte_array(), vout)?;
-    let entries = provider.blob_mdb().scan_prefix_entries(&prefix)?;
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    let target_blockhash = blockhash.resolve(provider.resolved_view_blockhash());
-    let mut best: Option<(u32, u32, Txid)> = None;
-    for (key, value) in entries {
-        let Some((key_txid, key_vout, height, idx, candidate_blockhash)) =
-            table.parse_outpoint_spend_event_key(&key)
-        else {
-            continue;
-        };
-        if key_vout != vout || key_txid.as_slice() != txid.as_byte_array() {
-            continue;
-        }
-        if !candidate_visible_in_view(provider, candidate_blockhash, target_blockhash)? {
-            continue;
-        }
-        let Some(spent_by) = (if value.len() == 32 { Txid::from_slice(&value).ok() } else { None })
-        else {
-            continue;
-        };
-        match best {
-            Some((best_h, best_idx, _)) if (height, idx) <= (best_h, best_idx) => {}
-            _ => best = Some((height, idx, spent_by)),
-        }
-    }
-    Ok(best.map(|(_, _, txid)| txid))
+    Ok(None)
 }
 
 fn load_outpoint_row_v2(
@@ -4080,38 +4273,22 @@ fn load_outpoint_row_v2(
     txid: &Txid,
     vout: u32,
     blockhash: StateAt,
-) -> Result<Option<crate::modules::essentials::storage::OutpointRowV2>> {
+) -> Result<Option<crate::modules::essentials::storage::OutpointPointerBlobV3>> {
     let table = provider.table();
-    if let Ok(pos_key) = table.outpoint_pos_key_from_parts(txid.as_byte_array(), vout) {
-        if let Some(raw_pos) =
-            provider.get_raw_value(GetRawValueParams { blockhash, key: pos_key })?.value
+    if let Some(outpoint_id) =
+        resolve_outpoint_id_v2(provider, blockhash, txid.as_byte_array(), vout)?
+    {
+        let row_key = table.outpoint_pointer_blob_key(outpoint_id);
+        if let Some(row_raw) = provider
+            .get_blob_raw_value(GetRawValueParams { blockhash, key: row_key })?
+            .value
         {
-            if let Ok((row_blockhash, tx_idx, row_vout)) = decode_outpoint_pos_v2(&raw_pos) {
-                let row_key = table.outpoint_row_key(&row_blockhash, tx_idx, row_vout);
-                if let Some(row_raw) = provider
-                    .get_blob_raw_value(GetRawValueParams { blockhash, key: row_key })?
-                    .value
-                {
-                    if let Ok(row) = decode_outpoint_row_v2(&row_raw) {
-                        return Ok(Some(row));
-                    }
-                }
+            if let Ok(row) = decode_outpoint_pointer_blob_v3(&row_raw) {
+                return Ok(Some(row));
             }
         }
     }
-    let Some((row_blockhash, tx_idx)) =
-        resolve_outpoint_create_position_v2(provider, txid, vout, blockhash)?
-    else {
-        return Ok(None);
-    };
-    let row_key = table.outpoint_row_key(&row_blockhash, tx_idx, vout);
-    let row_raw = provider
-        .get_blob_raw_value(GetRawValueParams { blockhash, key: row_key })?
-        .value;
-    let Some(row_raw) = row_raw else {
-        return Ok(None);
-    };
-    Ok(decode_outpoint_row_v2(&row_raw).ok())
+    Ok(None)
 }
 
 pub fn get_outpoint_balances(
