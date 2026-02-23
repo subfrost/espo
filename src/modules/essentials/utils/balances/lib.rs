@@ -17,11 +17,13 @@ use crate::modules::ammdata::storage::{AmmDataTable, SearchIndexField};
 use crate::modules::ammdata::utils::search::collect_search_prefixes;
 use crate::modules::essentials::storage::{
     address_index_list_id_alkane_balance_txs_by_token, address_index_list_id_alkane_block_txs,
-    append_address_index_values, decode_balances_vec, decode_outpoint_pointer_blob_v3,
-    decode_pointer_idx_u64, decode_u128_value, encode_outpoint_pointer_blob_v3,
-    encode_pointer_idx_u64, encode_tx_pointer_blob_v3, encode_u128_value, encode_vec,
-    get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2,
-    resolve_outpoint_spent_by_id_v2, resolve_tx_pointer_id_v2, spk_to_address_str,
+    append_address_index_values, build_outpoint_pos_versioned_puts,
+    build_outpoint_spent_versioned_puts, build_tx_pos_versioned_puts, decode_balances_vec,
+    decode_outpoint_pointer_blob_v3, decode_pointer_idx_u64, decode_u128_value,
+    encode_outpoint_pointer_blob_v3, encode_pointer_idx_u64, encode_tx_pointer_blob_v3,
+    encode_u128_value, encode_vec, get_holders_count_encoded, mk_outpoint, resolve_outpoint_id_v2,
+    resolve_outpoint_ids_batch_v2, resolve_outpoint_spent_by_id_v2,
+    resolve_outpoint_spent_by_ids_batch_v2, resolve_tx_pointer_ids_batch_v2, spk_to_address_str,
     AddressActivityEntry, AddressAmountEntry, AddressIndexListKind, AlkaneBalanceTxEntry,
     AlkaneTxSummary, BalanceEntry, HolderEntry, HolderId,
 };
@@ -1192,8 +1194,13 @@ pub fn bulk_update_balances_for_block(
 
         let mut indexed_external_prev_txids: HashSet<[u8; 32]> = HashSet::new();
         if !external_prev_txids.is_empty() {
-            for txid in &external_prev_txids {
-                if resolve_tx_pointer_id_v2(provider, StateAt::Latest, txid)?.is_some() {
+            let resolved = resolve_tx_pointer_ids_batch_v2(
+                provider,
+                StateAt::Latest,
+                external_prev_txids.as_slice(),
+            )?;
+            for (txid, pointer_id) in external_prev_txids.iter().zip(resolved.into_iter()) {
+                if pointer_id.is_some() {
                     indexed_external_prev_txids.insert(*txid);
                 }
             }
@@ -2062,6 +2069,8 @@ pub fn bulk_update_balances_for_block(
     }
 
     let mut outpoint_idx_appends: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut outpoint_pos_updates: HashMap<([u8; 32], u32), u64> = HashMap::new();
+    let mut outpoint_spent_updates: HashMap<u64, [u8; 32]> = HashMap::new();
 
     let mut external_spent_candidates: Vec<(Txid, u32)> = Vec::new();
     let mut external_spent_set: HashSet<(Txid, u32)> = HashSet::new();
@@ -2082,10 +2091,13 @@ pub fn bulk_update_balances_for_block(
     }
     let mut external_spent_ids: HashMap<(Txid, u32), u64> = HashMap::new();
     if !external_spent_candidates.is_empty() {
-        for (txid, vout) in &external_spent_candidates {
-            if let Some(id) =
-                resolve_outpoint_id_v2(provider, StateAt::Latest, txid.as_byte_array(), *vout)?
-            {
+        let resolved = resolve_outpoint_ids_batch_v2(
+            provider,
+            StateAt::Latest,
+            external_spent_candidates.as_slice(),
+        )?;
+        for ((txid, vout), id) in external_spent_candidates.iter().zip(resolved.into_iter()) {
+            if let Some(id) = id {
                 external_spent_ids.insert((*txid, *vout), id);
             }
         }
@@ -2120,13 +2132,7 @@ pub fn bulk_update_balances_for_block(
                 Err(_) => continue,
             };
             blob_puts.push((table.outpoint_pointer_blob_key(outpoint_id), row_blob));
-            let pos_key = table.outpoint_pos_append_key_from_parts(
-                txid.as_byte_array(),
-                row.outpoint.vout,
-                block.height,
-                &blockhash,
-            )?;
-            blob_puts.push((pos_key, encode_pointer_idx_u64(outpoint_id)));
+            outpoint_pos_updates.insert((txid_arr, row.outpoint.vout), outpoint_id);
             if row.outpoint.tx_spent.is_none() {
                 outpoint_idx_appends.entry(row.addr.clone()).or_default().push(outpoint_id);
             }
@@ -2139,10 +2145,9 @@ pub fn bulk_update_balances_for_block(
                     .copied()
                     .or_else(|| external_spent_ids.get(&key).copied());
                 if let Some(id) = outpoint_id {
-                    blob_puts.push((
-                        table.outpoint_spent_by_id_append_key(id, block.height, &blockhash),
-                        spent_by.clone(),
-                    ));
+                    let mut spender_arr = [0u8; 32];
+                    spender_arr.copy_from_slice(spent_by);
+                    outpoint_spent_updates.insert(id, spender_arr);
                 }
             }
         }
@@ -2696,6 +2701,7 @@ pub fn bulk_update_balances_for_block(
         [u8; 32],
         BTreeMap<SchemaAlkaneId, BTreeMap<SchemaAlkaneId, SignedU128>>,
     > = HashMap::new();
+    let mut tx_pos_updates: HashMap<[u8; 32], u64> = HashMap::new();
     for (owner, entries) in &alkane_balance_tx_entries {
         for entry in entries {
             packed_outflows_by_tx
@@ -2712,9 +2718,7 @@ pub fn bulk_update_balances_for_block(
         let Some(pointer_id) = tx_pointer_id_by_txid.get(&summary.txid).copied() else {
             continue;
         };
-        let tx_pos_key =
-            table.tx_packed_outflow_pos_append_key(&summary.txid, block.height, &blockhash);
-        blob_puts.push((tx_pos_key, encode_pointer_idx_u64(pointer_id)));
+        tx_pos_updates.insert(summary.txid, pointer_id);
 
         let packed = packed_outflows_by_tx.remove(&summary.txid).unwrap_or_default();
         let Ok(row_value) = encode_tx_pointer_blob_v3(
@@ -2729,6 +2733,25 @@ pub fn bulk_update_balances_for_block(
         };
         blob_puts.push((table.tx_pointer_blob_key(pointer_id), row_value));
     }
+
+    blob_puts.extend(build_outpoint_pos_versioned_puts(
+        provider,
+        block.height,
+        &blockhash,
+        &outpoint_pos_updates,
+    )?);
+    blob_puts.extend(build_outpoint_spent_versioned_puts(
+        provider,
+        block.height,
+        &blockhash,
+        &outpoint_spent_updates,
+    )?);
+    blob_puts.extend(build_tx_pos_versioned_puts(
+        provider,
+        block.height,
+        &blockhash,
+        &tx_pos_updates,
+    )?);
 
     let mut block_pointer_ids: Vec<u64> = Vec::with_capacity(alkane_block_txids.len());
     for txid_bytes in &alkane_block_txids {
@@ -3837,9 +3860,9 @@ pub fn bulk_update_balances_for_block(
             delete_key_bytes
         );
 
-        let outpoint_pos_prefix = table.outpoint_pos_append_family_prefix();
-        let outpoint_sid_prefix = table.outpoint_spent_by_id_append_family_prefix();
-        let tx_pos_prefix = table.tx_packed_outflow_pos_append_family_prefix();
+        let outpoint_pos_prefix = table.outpoint_pos_point_family_prefix();
+        let outpoint_sid_prefix = table.outpoint_spent_by_id_point_family_prefix();
+        let tx_pos_prefix = table.tx_packed_outflow_pos_point_family_prefix();
         let empty_deletes: &[Vec<u8>] = &[];
 
         {
@@ -4338,12 +4361,41 @@ pub fn get_outpoint_rows_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    let table = provider.table();
+    let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
+    let mut unique_ids: Vec<u64> = Vec::new();
+    let mut seen_ids: HashSet<u64> = HashSet::new();
+    for id in ids.iter().flatten() {
+        if seen_ids.insert(*id) {
+            unique_ids.push(*id);
+        }
+    }
+    let mut row_by_id: HashMap<u64, crate::modules::essentials::storage::OutpointPointerBlobV3> =
+        HashMap::new();
+    if !unique_ids.is_empty() {
+        let row_keys: Vec<Vec<u8>> =
+            unique_ids.iter().map(|id| table.outpoint_pointer_blob_key(*id)).collect();
+        let row_vals = provider
+            .get_blob_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: row_keys,
+            })?
+            .values;
+        for (id, row_raw) in unique_ids.iter().copied().zip(row_vals.into_iter()) {
+            let Some(row_raw) = row_raw else { continue };
+            let Ok(row) = decode_outpoint_pointer_blob_v3(&row_raw) else {
+                continue;
+            };
+            row_by_id.insert(id, row);
+        }
+    }
+
     let mut out: HashMap<(Txid, u32), OutpointLookup> = HashMap::new();
-    for (txid, vout) in outpoints {
-        let row = load_outpoint_row_v2(provider, txid, *vout, blockhash)?;
-        let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
-        let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
-        let spk = row.as_ref().and_then(|r| {
+    for ((txid, vout), id) in outpoints.iter().zip(ids.into_iter()) {
+        let row = id.and_then(|rid| row_by_id.get(&rid));
+        let balances = row.map(|r| r.balances.clone()).unwrap_or_default();
+        let address = row.map(|r| r.address.clone()).filter(|s| !s.is_empty());
+        let spk = row.and_then(|r| {
             if r.spk.is_empty() {
                 None
             } else {
@@ -4360,13 +4412,51 @@ pub fn get_outpoint_balances_with_spent_batch(
     provider: &EssentialsProvider,
     outpoints: &[(Txid, u32)],
 ) -> Result<HashMap<(Txid, u32), OutpointLookup>> {
+    let table = provider.table();
+    let ids = resolve_outpoint_ids_batch_v2(provider, blockhash, outpoints)?;
+    let mut unique_ids: Vec<u64> = Vec::new();
+    let mut seen_ids: HashSet<u64> = HashSet::new();
+    for id in ids.iter().flatten() {
+        if seen_ids.insert(*id) {
+            unique_ids.push(*id);
+        }
+    }
+    let mut row_by_id: HashMap<u64, crate::modules::essentials::storage::OutpointPointerBlobV3> =
+        HashMap::new();
+    if !unique_ids.is_empty() {
+        let row_keys: Vec<Vec<u8>> =
+            unique_ids.iter().map(|id| table.outpoint_pointer_blob_key(*id)).collect();
+        let row_vals = provider
+            .get_blob_multi_values(GetMultiValuesParams {
+                blockhash: StateAt::Latest,
+                keys: row_keys,
+            })?
+            .values;
+        for (id, row_raw) in unique_ids.iter().copied().zip(row_vals.into_iter()) {
+            let Some(row_raw) = row_raw else { continue };
+            let Ok(row) = decode_outpoint_pointer_blob_v3(&row_raw) else {
+                continue;
+            };
+            row_by_id.insert(id, row);
+        }
+    }
+    let mut spent_by_id: HashMap<u64, Option<Txid>> = HashMap::new();
+    if !unique_ids.is_empty() {
+        let spent_vals =
+            resolve_outpoint_spent_by_ids_batch_v2(provider, blockhash, unique_ids.as_slice())?;
+        for (id, spent_raw) in unique_ids.iter().copied().zip(spent_vals.into_iter()) {
+            let spent = spent_raw.and_then(|arr| Txid::from_slice(&arr).ok());
+            spent_by_id.insert(id, spent);
+        }
+    }
+
     let mut out: HashMap<(Txid, u32), OutpointLookup> = HashMap::new();
-    for (txid, vout) in outpoints {
-        let spent_by = resolve_outpoint_spent_by_v2(provider, txid, *vout, blockhash)?;
-        let row = load_outpoint_row_v2(provider, txid, *vout, blockhash)?;
-        let balances = row.as_ref().map(|r| r.balances.clone()).unwrap_or_default();
-        let address = row.as_ref().map(|r| r.address.clone()).filter(|s| !s.is_empty());
-        let spk = row.as_ref().and_then(|r| {
+    for ((txid, vout), id) in outpoints.iter().zip(ids.into_iter()) {
+        let spent_by = id.and_then(|rid| spent_by_id.get(&rid).cloned().flatten());
+        let row = id.and_then(|rid| row_by_id.get(&rid));
+        let balances = row.map(|r| r.balances.clone()).unwrap_or_default();
+        let address = row.map(|r| r.address.clone()).filter(|s| !s.is_empty());
+        let spk = row.and_then(|r| {
             if r.spk.is_empty() {
                 None
             } else {

@@ -43,6 +43,8 @@ const ALKANE_V2_PREFIX: &[u8] = b"/alkane/v2/";
 const TX_V2_PREFIX: &[u8] = b"/tx/v2/";
 const OUTPOINT_V2_APPEND_PREFIX: &[u8] = b"/outpoint/v2a/";
 const TX_V2_APPEND_PREFIX: &[u8] = b"/tx/v2a/";
+const OUTPOINT_V2_POINT_PREFIX: &[u8] = b"/outpoint/v2p/";
+const TX_V2_POINT_PREFIX: &[u8] = b"/tx/v2p/";
 const PTR_V1_PREFIX: &[u8] = b"/ptr/v1/";
 const PTR_ENTITY_OUTPOINT: &[u8] = b"outpoint";
 const PTR_ENTITY_ALKANE_TX: &[u8] = b"alkane_tx";
@@ -541,6 +543,23 @@ impl<'a> EssentialsTable<'a> {
         Ok(key)
     }
 
+    pub fn outpoint_pos_point_family_prefix(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_POINT_PREFIX.len() + 2);
+        key.extend_from_slice(OUTPOINT_V2_POINT_PREFIX);
+        key.extend_from_slice(b"p/");
+        key
+    }
+
+    pub fn outpoint_pos_point_key_from_parts(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
+        let outpoint_id = outpoint_id_bytes(txid, vout)
+            .ok_or_else(|| anyhow!("invalid outpoint txid length {}", txid.len()))?;
+        let mut key = Vec::with_capacity(OUTPOINT_V2_POINT_PREFIX.len() + 2 + outpoint_id.len());
+        key.extend_from_slice(OUTPOINT_V2_POINT_PREFIX);
+        key.extend_from_slice(b"p/");
+        key.extend_from_slice(&outpoint_id);
+        Ok(key)
+    }
+
     pub fn outpoint_pointer_counter_key(&self) -> Vec<u8> {
         pointer_counter_key(PTR_ENTITY_OUTPOINT)
     }
@@ -616,6 +635,21 @@ impl<'a> EssentialsTable<'a> {
         let mut key = self.outpoint_spent_by_id_append_prefix(id);
         key.extend_from_slice(&height.to_be_bytes());
         key.extend_from_slice(blockhash);
+        key
+    }
+
+    pub fn outpoint_spent_by_id_point_family_prefix(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_POINT_PREFIX.len() + 4);
+        key.extend_from_slice(OUTPOINT_V2_POINT_PREFIX);
+        key.extend_from_slice(b"sid/");
+        key
+    }
+
+    pub fn outpoint_spent_by_id_point_key(&self, id: u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(OUTPOINT_V2_POINT_PREFIX.len() + 4 + 8);
+        key.extend_from_slice(OUTPOINT_V2_POINT_PREFIX);
+        key.extend_from_slice(b"sid/");
+        key.extend_from_slice(&id.to_be_bytes());
         key
     }
 
@@ -1047,6 +1081,21 @@ impl<'a> EssentialsTable<'a> {
         key
     }
 
+    pub fn tx_packed_outflow_pos_point_family_prefix(&self) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_V2_POINT_PREFIX.len() + 2);
+        key.extend_from_slice(TX_V2_POINT_PREFIX);
+        key.extend_from_slice(b"l/");
+        key
+    }
+
+    pub fn tx_packed_outflow_pos_point_key(&self, txid: &[u8; 32]) -> Vec<u8> {
+        let mut key = Vec::with_capacity(TX_V2_POINT_PREFIX.len() + 2 + txid.len());
+        key.extend_from_slice(TX_V2_POINT_PREFIX);
+        key.extend_from_slice(b"l/");
+        key.extend_from_slice(txid);
+        key
+    }
+
     pub fn tx_pointer_counter_key(&self) -> Vec<u8> {
         pointer_counter_key(PTR_ENTITY_ALKANE_TX)
     }
@@ -1473,7 +1522,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn alkane_tx_summary_key(&self, txid: &[u8; 32]) -> Vec<u8> {
-        self.tx_packed_outflow_pos_append_prefix(txid)
+        self.tx_packed_outflow_pos_point_key(txid)
     }
 
     pub fn alkane_block_txid_key(&self, height: u64, idx: u64) -> Vec<u8> {
@@ -1521,7 +1570,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn outpoint_balances_key(&self, outp: &EspoOutpoint) -> Result<Vec<u8>> {
-        self.outpoint_pos_append_prefix(outp)
+        self.outpoint_pos_point_key_from_parts(&outp.txid, outp.vout)
     }
 
     pub fn block_summary_key(&self, height: u32) -> Vec<u8> {
@@ -1533,7 +1582,7 @@ impl<'a> EssentialsTable<'a> {
     }
 
     pub fn outpoint_balances_prefix(&self, txid: &[u8], vout: u32) -> Result<Vec<u8>> {
-        self.outpoint_pos_append_prefix_from_parts(txid, vout)
+        self.outpoint_pos_point_key_from_parts(txid, vout)
     }
 }
 
@@ -1609,6 +1658,33 @@ impl EssentialsProvider {
         };
         tree.is_ancestor(ancestor, descendant)
             .map_err(|e| anyhow!("tree.is_ancestor failed: {e}"))
+    }
+
+    pub fn blockhash_is_on_active_chain(&self, blockhash: &BlockHash) -> Result<bool> {
+        let Some(tree) = get_global_tree_db() else {
+            return Ok(false);
+        };
+        let Some(height) = tree
+            .height_for_blockhash(blockhash)
+            .map_err(|e| anyhow!("tree.height_for_blockhash failed: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let Some(active_blockhash_at_height) = tree
+            .blockhash_for_height(height)
+            .map_err(|e| anyhow!("tree.blockhash_for_height failed: {e}"))?
+        else {
+            return Ok(false);
+        };
+        Ok(active_blockhash_at_height == *blockhash)
+    }
+
+    pub fn blockhash_for_height(&self, height: u32) -> Result<Option<BlockHash>> {
+        let Some(tree) = get_global_tree_db() else {
+            return Ok(None);
+        };
+        tree.blockhash_for_height(height)
+            .map_err(|e| anyhow!("tree.blockhash_for_height failed: {e}"))
     }
 
     pub fn non_mutating_pointer(&self) -> ListNonMutatePointer<'_> {
@@ -5146,22 +5222,69 @@ pub fn decode_pointer_idx_u64(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(arr))
 }
 
-fn parse_append_version_key(key: &[u8], logical_prefix: &[u8]) -> Option<(u32, BlockHash)> {
-    if !key.starts_with(logical_prefix) {
-        return None;
-    }
-    let rest = &key[logical_prefix.len()..];
-    if rest.len() != 4 + 32 {
-        return None;
-    }
-    let mut height = [0u8; 4];
-    height.copy_from_slice(&rest[..4]);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&rest[4..]);
-    Some((u32::from_be_bytes(height), BlockHash::from_byte_array(hash)))
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct VersionedU64EntryV1 {
+    height: u32,
+    blockhash: [u8; 32],
+    value: u64,
 }
 
-fn resolve_append_target_blockhash(
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct VersionedU64ListV1 {
+    entries: Vec<VersionedU64EntryV1>,
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct VersionedBytes32EntryV1 {
+    height: u32,
+    blockhash: [u8; 32],
+    value: [u8; 32],
+}
+
+#[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
+struct VersionedBytes32ListV1 {
+    entries: Vec<VersionedBytes32EntryV1>,
+}
+
+fn decode_versioned_u64_list(bytes: &[u8]) -> Vec<VersionedU64EntryV1> {
+    VersionedU64ListV1::try_from_slice(bytes)
+        .map(|row| row.entries)
+        .unwrap_or_default()
+}
+
+fn encode_versioned_u64_list(entries: Vec<VersionedU64EntryV1>) -> Result<Vec<u8>> {
+    borsh::to_vec(&VersionedU64ListV1 { entries })
+        .map_err(|e| anyhow!("encode versioned_u64 list failed: {e}"))
+}
+
+fn decode_versioned_bytes32_list(bytes: &[u8]) -> Vec<VersionedBytes32EntryV1> {
+    VersionedBytes32ListV1::try_from_slice(bytes)
+        .map(|row| row.entries)
+        .unwrap_or_default()
+}
+
+fn encode_versioned_bytes32_list(entries: Vec<VersionedBytes32EntryV1>) -> Result<Vec<u8>> {
+    borsh::to_vec(&VersionedBytes32ListV1 { entries })
+        .map_err(|e| anyhow!("encode versioned_bytes32 list failed: {e}"))
+}
+
+fn sort_versioned_u64_entries_desc(entries: &mut [VersionedU64EntryV1]) {
+    entries.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| b.blockhash.as_slice().cmp(a.blockhash.as_slice()))
+    });
+}
+
+fn sort_versioned_bytes32_entries_desc(entries: &mut [VersionedBytes32EntryV1]) {
+    entries.sort_by(|a, b| {
+        b.height
+            .cmp(&a.height)
+            .then_with(|| b.blockhash.as_slice().cmp(a.blockhash.as_slice()))
+    });
+}
+
+fn resolve_target_blockhash(
     provider: &EssentialsProvider,
     blockhash: StateAt,
 ) -> Option<BlockHash> {
@@ -5171,7 +5294,7 @@ fn resolve_append_target_blockhash(
     }
 }
 
-fn append_version_visible_for_target(
+fn version_visible_for_target(
     provider: &EssentialsProvider,
     target: Option<BlockHash>,
     version_blockhash: BlockHash,
@@ -5187,30 +5310,192 @@ fn append_version_visible_for_target(
         .unwrap_or(false)
 }
 
-fn resolve_append_versioned_blob_value(
+fn resolve_visible_u64_entry(
     provider: &EssentialsProvider,
-    logical_prefix: &[u8],
-    blockhash: StateAt,
-) -> Result<Option<Vec<u8>>> {
-    let mut entries = provider
-        .blob_mdb()
-        .scan_prefix_entries(logical_prefix)
-        .map_err(|e| anyhow!("blob_mdb.scan_prefix_entries failed: {e}"))?;
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
-    let target = resolve_append_target_blockhash(provider, blockhash);
-    for (key, value) in entries {
-        let Some((_height, version_blockhash)) = parse_append_version_key(&key, logical_prefix)
-        else {
-            continue;
-        };
-        if append_version_visible_for_target(provider, target, version_blockhash) {
-            return Ok(Some(value));
+    entries: &[VersionedU64EntryV1],
+    target: Option<BlockHash>,
+) -> Option<u64> {
+    let fast_active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    let mut active_visibility_cache: HashMap<BlockHash, bool> = HashMap::new();
+    for entry in entries {
+        let entry_blockhash = BlockHash::from_byte_array(entry.blockhash);
+        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip) {
+            if target_blockhash == active_tip {
+                let visible =
+                    *active_visibility_cache.entry(entry_blockhash).or_insert_with(|| {
+                        provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
+                    });
+                if visible {
+                    return Some(entry.value);
+                }
+                continue;
+            }
+        }
+        if version_visible_for_target(provider, target, entry_blockhash) {
+            return Some(entry.value);
         }
     }
-    Ok(None)
+    None
+}
+
+fn resolve_visible_bytes32_entry(
+    provider: &EssentialsProvider,
+    entries: &[VersionedBytes32EntryV1],
+    target: Option<BlockHash>,
+) -> Option<[u8; 32]> {
+    let fast_active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    let mut active_visibility_cache: HashMap<BlockHash, bool> = HashMap::new();
+    for entry in entries {
+        let entry_blockhash = BlockHash::from_byte_array(entry.blockhash);
+        if let (Some(target_blockhash), Some(active_tip)) = (target, fast_active_tip) {
+            if target_blockhash == active_tip {
+                let visible =
+                    *active_visibility_cache.entry(entry_blockhash).or_insert_with(|| {
+                        provider.blockhash_is_on_active_chain(&entry_blockhash).unwrap_or(false)
+                    });
+                if visible {
+                    return Some(entry.value);
+                }
+                continue;
+            }
+        }
+        if version_visible_for_target(provider, target, entry_blockhash) {
+            return Some(entry.value);
+        }
+    }
+    None
+}
+
+pub(crate) fn build_outpoint_pos_versioned_puts(
+    provider: &EssentialsProvider,
+    height: u32,
+    blockhash: &[u8; 32],
+    updates: &HashMap<([u8; 32], u32), u64>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let mut pairs: Vec<(([u8; 32], u32), u64)> = updates.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let keys: Vec<Vec<u8>> = pairs
+        .iter()
+        .map(|((txid, vout), _)| table.outpoint_pos_point_key_from_parts(txid, *vout))
+        .collect::<Result<Vec<_>>>()?;
+    let prev_vals = provider
+        .get_blob_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest,
+            keys: keys.clone(),
+        })?
+        .values;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (((_txid, _vout), value), prev_raw, key) in pairs
+        .into_iter()
+        .zip(prev_vals.into_iter())
+        .zip(keys.into_iter())
+        .map(|((a, b), c)| (a, b, c))
+    {
+        let mut entries =
+            prev_raw.as_ref().map(|raw| decode_versioned_u64_list(raw)).unwrap_or_default();
+        if let Some(existing) =
+            entries.iter_mut().find(|e| e.height == height && e.blockhash == *blockhash)
+        {
+            existing.value = value;
+        } else {
+            entries.push(VersionedU64EntryV1 { height, blockhash: *blockhash, value });
+        }
+        sort_versioned_u64_entries_desc(&mut entries);
+        out.push((key, encode_versioned_u64_list(entries)?));
+    }
+    Ok(out)
+}
+
+pub(crate) fn build_outpoint_spent_versioned_puts(
+    provider: &EssentialsProvider,
+    height: u32,
+    blockhash: &[u8; 32],
+    updates: &HashMap<u64, [u8; 32]>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let mut pairs: Vec<(u64, [u8; 32])> = updates.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let keys: Vec<Vec<u8>> =
+        pairs.iter().map(|(id, _)| table.outpoint_spent_by_id_point_key(*id)).collect();
+    let prev_vals = provider
+        .get_blob_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest,
+            keys: keys.clone(),
+        })?
+        .values;
+    let mut out = Vec::with_capacity(pairs.len());
+    for ((id_value, prev_raw), key) in
+        pairs.into_iter().zip(prev_vals.into_iter()).zip(keys.into_iter())
+    {
+        let (_id, value) = id_value;
+        let mut entries = prev_raw
+            .as_ref()
+            .map(|raw| decode_versioned_bytes32_list(raw))
+            .unwrap_or_default();
+        if let Some(existing) =
+            entries.iter_mut().find(|e| e.height == height && e.blockhash == *blockhash)
+        {
+            existing.value = value;
+        } else {
+            entries.push(VersionedBytes32EntryV1 { height, blockhash: *blockhash, value });
+        }
+        sort_versioned_bytes32_entries_desc(&mut entries);
+        out.push((key, encode_versioned_bytes32_list(entries)?));
+    }
+    Ok(out)
+}
+
+pub(crate) fn build_tx_pos_versioned_puts(
+    provider: &EssentialsProvider,
+    height: u32,
+    blockhash: &[u8; 32],
+    updates: &HashMap<[u8; 32], u64>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if updates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let mut pairs: Vec<([u8; 32], u64)> = updates.iter().map(|(k, v)| (*k, *v)).collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let keys: Vec<Vec<u8>> = pairs
+        .iter()
+        .map(|(txid, _)| table.tx_packed_outflow_pos_point_key(txid))
+        .collect();
+    let prev_vals = provider
+        .get_blob_multi_values(GetMultiValuesParams {
+            blockhash: StateAt::Latest,
+            keys: keys.clone(),
+        })?
+        .values;
+    let mut out = Vec::with_capacity(pairs.len());
+    for ((tx_value, prev_raw), key) in
+        pairs.into_iter().zip(prev_vals.into_iter()).zip(keys.into_iter())
+    {
+        let (_txid, value) = tx_value;
+        let mut entries =
+            prev_raw.as_ref().map(|raw| decode_versioned_u64_list(raw)).unwrap_or_default();
+        if let Some(existing) =
+            entries.iter_mut().find(|e| e.height == height && e.blockhash == *blockhash)
+        {
+            existing.value = value;
+        } else {
+            entries.push(VersionedU64EntryV1 { height, blockhash: *blockhash, value });
+        }
+        sort_versioned_u64_entries_desc(&mut entries);
+        out.push((key, encode_versioned_u64_list(entries)?));
+    }
+    Ok(out)
 }
 
 pub(crate) fn resolve_outpoint_id_v2(
@@ -5219,11 +5504,16 @@ pub(crate) fn resolve_outpoint_id_v2(
     txid: &[u8; 32],
     vout: u32,
 ) -> Result<Option<u64>> {
-    let prefix = provider.table().outpoint_pos_append_prefix_from_parts(txid, vout)?;
-    let Some(raw) = resolve_append_versioned_blob_value(provider, &prefix, blockhash)? else {
+    let key = provider.table().outpoint_pos_point_key_from_parts(txid, vout)?;
+    let Some(raw) = provider
+        .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+        .value
+    else {
         return Ok(None);
     };
-    Ok(decode_pointer_idx_u64(&raw).ok())
+    let entries = decode_versioned_u64_list(&raw);
+    let target = resolve_target_blockhash(provider, blockhash);
+    Ok(resolve_visible_u64_entry(provider, &entries, target))
 }
 
 pub(crate) fn resolve_outpoint_spent_by_id_v2(
@@ -5231,16 +5521,16 @@ pub(crate) fn resolve_outpoint_spent_by_id_v2(
     blockhash: StateAt,
     outpoint_id: u64,
 ) -> Result<Option<[u8; 32]>> {
-    let prefix = provider.table().outpoint_spent_by_id_append_prefix(outpoint_id);
-    let Some(raw) = resolve_append_versioned_blob_value(provider, &prefix, blockhash)? else {
+    let key = provider.table().outpoint_spent_by_id_point_key(outpoint_id);
+    let Some(raw) = provider
+        .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+        .value
+    else {
         return Ok(None);
     };
-    if raw.len() != 32 {
-        return Ok(None);
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&raw);
-    Ok(Some(out))
+    let entries = decode_versioned_bytes32_list(&raw);
+    let target = resolve_target_blockhash(provider, blockhash);
+    Ok(resolve_visible_bytes32_entry(provider, &entries, target))
 }
 
 pub(crate) fn resolve_tx_pointer_id_v2(
@@ -5248,11 +5538,173 @@ pub(crate) fn resolve_tx_pointer_id_v2(
     blockhash: StateAt,
     txid: &[u8; 32],
 ) -> Result<Option<u64>> {
-    let prefix = provider.table().tx_packed_outflow_pos_append_prefix(txid);
-    let Some(raw) = resolve_append_versioned_blob_value(provider, &prefix, blockhash)? else {
+    let key = provider.table().tx_packed_outflow_pos_point_key(txid);
+    let Some(raw) = provider
+        .get_blob_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?
+        .value
+    else {
         return Ok(None);
     };
-    Ok(decode_pointer_idx_u64(&raw).ok())
+    let entries = decode_versioned_u64_list(&raw);
+    let target = resolve_target_blockhash(provider, blockhash);
+    Ok(resolve_visible_u64_entry(provider, &entries, target))
+}
+
+pub(crate) fn resolve_tx_pointer_ids_batch_v2(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    txids: &[[u8; 32]],
+) -> Result<Vec<Option<u64>>> {
+    if txids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let keys: Vec<Vec<u8>> =
+        txids.iter().map(|txid| table.tx_packed_outflow_pos_point_key(txid)).collect();
+    let raws = provider
+        .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+        .values;
+    let target = resolve_target_blockhash(provider, blockhash);
+    let active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    let fast_active = matches!(target, Some(t) if Some(t) == active_tip);
+    let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
+    let mut out = Vec::with_capacity(txids.len());
+    for raw in raws {
+        let Some(raw) = raw else {
+            out.push(None);
+            continue;
+        };
+        let entries = decode_versioned_u64_list(&raw);
+        if fast_active {
+            let mut chosen: Option<u64> = None;
+            for entry in entries {
+                let active_at_height =
+                    if let Some(cached) = active_blockhash_by_height.get(&entry.height) {
+                        *cached
+                    } else {
+                        let found = provider.blockhash_for_height(entry.height).unwrap_or(None);
+                        active_blockhash_by_height.insert(entry.height, found);
+                        found
+                    };
+                if active_at_height.map(|h| h.to_byte_array()) == Some(entry.blockhash) {
+                    chosen = Some(entry.value);
+                    break;
+                }
+            }
+            out.push(chosen);
+        } else {
+            out.push(resolve_visible_u64_entry(provider, &entries, target));
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn resolve_outpoint_ids_batch_v2(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    outpoints: &[(Txid, u32)],
+) -> Result<Vec<Option<u64>>> {
+    if outpoints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let keys: Vec<Vec<u8>> = outpoints
+        .iter()
+        .map(|(txid, vout)| table.outpoint_pos_point_key_from_parts(txid.as_byte_array(), *vout))
+        .collect::<Result<Vec<_>>>()?;
+    let raws = provider
+        .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+        .values;
+    let target = resolve_target_blockhash(provider, blockhash);
+    let active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    let fast_active = matches!(target, Some(t) if Some(t) == active_tip);
+    let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
+    let mut out = Vec::with_capacity(outpoints.len());
+    for raw in raws {
+        let Some(raw) = raw else {
+            out.push(None);
+            continue;
+        };
+        let entries = decode_versioned_u64_list(&raw);
+        if fast_active {
+            let mut chosen: Option<u64> = None;
+            for entry in entries {
+                let active_at_height =
+                    if let Some(cached) = active_blockhash_by_height.get(&entry.height) {
+                        *cached
+                    } else {
+                        let found = provider.blockhash_for_height(entry.height).unwrap_or(None);
+                        active_blockhash_by_height.insert(entry.height, found);
+                        found
+                    };
+                if active_at_height.map(|h| h.to_byte_array()) == Some(entry.blockhash) {
+                    chosen = Some(entry.value);
+                    break;
+                }
+            }
+            out.push(chosen);
+        } else {
+            out.push(resolve_visible_u64_entry(provider, &entries, target));
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn resolve_outpoint_spent_by_ids_batch_v2(
+    provider: &EssentialsProvider,
+    blockhash: StateAt,
+    outpoint_ids: &[u64],
+) -> Result<Vec<Option<[u8; 32]>>> {
+    if outpoint_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let table = provider.table();
+    let keys: Vec<Vec<u8>> = outpoint_ids
+        .iter()
+        .map(|id| table.outpoint_spent_by_id_point_key(*id))
+        .collect();
+    let raws = provider
+        .get_blob_multi_values(GetMultiValuesParams { blockhash: StateAt::Latest, keys })?
+        .values;
+    let target = resolve_target_blockhash(provider, blockhash);
+    let active_tip = provider
+        .resolved_view_blockhash()
+        .filter(|_| provider.view_blockhash().is_none());
+    let fast_active = matches!(target, Some(t) if Some(t) == active_tip);
+    let mut active_blockhash_by_height: HashMap<u32, Option<BlockHash>> = HashMap::new();
+    let mut out = Vec::with_capacity(outpoint_ids.len());
+    for raw in raws {
+        let Some(raw) = raw else {
+            out.push(None);
+            continue;
+        };
+        let entries = decode_versioned_bytes32_list(&raw);
+        if fast_active {
+            let mut chosen: Option<[u8; 32]> = None;
+            for entry in entries {
+                let active_at_height =
+                    if let Some(cached) = active_blockhash_by_height.get(&entry.height) {
+                        *cached
+                    } else {
+                        let found = provider.blockhash_for_height(entry.height).unwrap_or(None);
+                        active_blockhash_by_height.insert(entry.height, found);
+                        found
+                    };
+                if active_at_height.map(|h| h.to_byte_array()) == Some(entry.blockhash) {
+                    chosen = Some(entry.value);
+                    break;
+                }
+            }
+            out.push(chosen);
+        } else {
+            out.push(resolve_visible_bytes32_entry(provider, &entries, target));
+        }
+    }
+    Ok(out)
 }
 
 fn decode_address_index_state(bytes: &[u8]) -> Option<InlineOrExternalU64V1> {

@@ -984,9 +984,11 @@ fn alkane_balance_chart_scripts() -> Markup {
   const defaultRange = (card.dataset.defaultRange || 'all').toLowerCase();
 
   let activeRange = defaultRange;
-  let activeSymbol = '';
+  let activeName = '';
+  let activeIconHtml = '';
   let chart = null;
   let canvas = null;
+  let tooltipEl = null;
   let loading = false;
   let pillSmallTheme = (() => {
     const probe = document.createElement('span');
@@ -1022,14 +1024,21 @@ fn alkane_balance_chart_scripts() -> Markup {
     }
     const nextAlkane = ((option.dataset && option.dataset.alkaneId) || '').trim();
     if (nextAlkane) activeAlkane = nextAlkane;
-    activeSymbol = option.dataset ? (option.dataset.symbol || '').trim() : '';
+    activeName = option.dataset ? (option.dataset.name || '').trim() : '';
+    if (!activeName) {
+      activeName = option.dataset ? (option.dataset.label || '').trim() : '';
+    }
+    if (!activeName) {
+      activeName = activeAlkane;
+    }
+    const icon = option.querySelector('.dropdown-icon');
+    activeIconHtml = icon ? icon.innerHTML : '';
     if (triggerLabelEl) {
       const label = (option.dataset && option.dataset.label) || option.textContent || activeAlkane;
       triggerLabelEl.textContent = (label || activeAlkane).trim();
     }
     if (triggerIconEl) {
-      const icon = option.querySelector('.dropdown-icon');
-      triggerIconEl.innerHTML = icon ? icon.innerHTML : '';
+      triggerIconEl.innerHTML = activeIconHtml;
     }
     optionNodes.forEach((node) => node.classList.toggle('selected', node === option));
   };
@@ -1046,9 +1055,10 @@ fn alkane_balance_chart_scripts() -> Markup {
     return `Block ${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(height)}`;
   };
 
-  const formatTooltipAmount = (value) => {
+  const formatTooltipValue = (value) => {
     const amount = formatAmount(value, 8);
-    return activeSymbol ? `${amount} ${activeSymbol}` : amount;
+    const tokenName = activeName || activeAlkane;
+    return tokenName ? `${amount} ${tokenName}` : amount;
   };
 
   const setActiveTab = (range) => {
@@ -1089,9 +1099,74 @@ fn alkane_balance_chart_scripts() -> Markup {
     await ensureScript('https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js');
   };
 
-  const resolveColor = (cssVar, fallback) => {
-    const value = getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
-    return value || fallback;
+  const ensureTooltip = () => {
+    if (!root) return null;
+    if (tooltipEl && tooltipEl.isConnected) return tooltipEl;
+    tooltipEl = document.createElement('div');
+    tooltipEl.className = 'address-balance-chart-tooltip';
+    tooltipEl.innerHTML = `
+      <div class="address-balance-chart-tooltip-title" data-address-chart-tooltip-title=""></div>
+      <div class="address-balance-chart-tooltip-row">
+        <span class="address-balance-chart-tooltip-icon" data-address-chart-tooltip-icon="" aria-hidden="true"></span>
+        <span class="address-balance-chart-tooltip-value" data-address-chart-tooltip-value=""></span>
+      </div>
+    `;
+    root.appendChild(tooltipEl);
+    return tooltipEl;
+  };
+
+  const hideTooltip = () => {
+    if (!tooltipEl) return;
+    tooltipEl.dataset.visible = '0';
+    tooltipEl.style.opacity = '0';
+  };
+
+  const renderTooltip = (context) => {
+    const tooltip = context && context.tooltip ? context.tooltip : null;
+    const el = ensureTooltip();
+    if (!tooltip || !el) return;
+
+    if (tooltip.opacity === 0 || !tooltip.dataPoints || tooltip.dataPoints.length === 0) {
+      hideTooltip();
+      return;
+    }
+
+    const dataPoint = tooltip.dataPoints[0];
+    const rawHeight = Number(dataPoint ? dataPoint.label : NaN);
+    const rawValue =
+      dataPoint && dataPoint.parsed && typeof dataPoint.parsed.y === 'number'
+        ? dataPoint.parsed.y
+        : dataPoint
+          ? dataPoint.parsed
+          : NaN;
+
+    const titleEl = el.querySelector('[data-address-chart-tooltip-title]');
+    if (titleEl) {
+      titleEl.textContent = formatBlock(rawHeight);
+    }
+
+    const valueEl = el.querySelector('[data-address-chart-tooltip-value]');
+    if (valueEl) {
+      valueEl.textContent = formatTooltipValue(Number(rawValue));
+    }
+
+    const iconEl = el.querySelector('[data-address-chart-tooltip-icon]');
+    if (iconEl) {
+      iconEl.innerHTML = activeIconHtml;
+    }
+
+    const padding = 8;
+    const width = el.offsetWidth;
+    const height = el.offsetHeight;
+    const maxLeft = Math.max(padding, root.clientWidth - width - padding);
+    const maxTop = Math.max(padding, root.clientHeight - height - padding);
+    const left = Math.min(Math.max(tooltip.caretX + 12, padding), maxLeft);
+    const top = Math.min(Math.max(tooltip.caretY + 12, padding), maxTop);
+
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+    el.dataset.visible = '1';
+    el.style.opacity = '1';
   };
 
   const ensureCanvas = () => {
@@ -1114,6 +1189,7 @@ fn alkane_balance_chart_scripts() -> Markup {
       chart.destroy();
       chart = null;
     }
+    hideTooltip();
     if (canvas) {
       canvas.remove();
       canvas = null;
@@ -1122,6 +1198,7 @@ fn alkane_balance_chart_scripts() -> Markup {
 
   const setLoadingState = (message, spinning) => {
     if (!loadingEl) return;
+    hideTooltip();
     if (loadingTextEl) {
       loadingTextEl.textContent = message;
     } else {
@@ -1145,8 +1222,6 @@ fn alkane_balance_chart_scripts() -> Markup {
 
     const lineColor = pillSmallTheme.text;
     const areaColor = pillSmallTheme.bg;
-    const tooltipBg = resolveColor('--panel3', '#1f2228');
-    const tooltipText = resolveColor('--text', '#ffffff');
     const labels = points.map((p) => p.height);
     const values = points.map((p) => p.value);
     const minValue = Math.min(...values);
@@ -1192,25 +1267,8 @@ fn alkane_balance_chart_scripts() -> Markup {
         plugins: {
           legend: { display: false },
           tooltip: {
-            enabled: true,
-            displayColors: false,
-            backgroundColor: tooltipBg,
-            borderWidth: 0,
-            titleColor: tooltipText,
-            bodyColor: tooltipText,
-            callbacks: {
-              title: (items) => {
-                const raw = Number(items && items[0] ? items[0].label : NaN);
-                return formatBlock(raw);
-              },
-              label: (item) => {
-                const value =
-                  item && item.parsed && typeof item.parsed.y === 'number'
-                    ? item.parsed.y
-                    : item.parsed;
-                return formatTooltipAmount(Number(value));
-              }
-            }
+            enabled: false,
+            external: renderTooltip
           }
         },
         interaction: {

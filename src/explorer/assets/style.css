@@ -1645,6 +1645,49 @@ a:hover {
   [data-address-chart-loading-text] {
   display: none;
 }
+.address-balance-chart-tooltip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 4;
+  pointer-events: none;
+  opacity: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: none;
+  background: var(--panel3);
+  color: var(--text);
+  box-shadow: 0 0px 4px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.address-balance-chart-tooltip-title {
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.address-balance-chart-tooltip-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.address-balance-chart-tooltip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+.address-balance-chart-tooltip-icon .alk-icon-wrap {
+  width: 18px;
+  height: 18px;
+}
+.address-balance-chart-tooltip-icon .alk-icon-letter {
+  font-size: 9px;
+}
+.address-balance-chart-tooltip-value {
+  font-weight: 600;
+}
 .address-balance-chart-tabs {
   display: flex;
   justify-content: flex-end;

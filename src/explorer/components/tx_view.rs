@@ -609,6 +609,14 @@ fn summarize_contract_call(
             effective_name = ResolvedName { value: name, known: true };
         }
     }
+    let contract_meta = alkane_meta(&contract_id, meta_cache, mdb);
+    if factory_pair.is_none() && contract_meta.name.known {
+        // Prefer concrete alkane metadata in tx summaries when available,
+        // but keep factory clone source rows on contract/template metadata.
+        effective_name = contract_meta.name.clone();
+        icon_id = contract_id;
+        link_id = contract_id;
+    }
 
     Some(ContractCallSummary {
         contract_id,
