@@ -539,6 +539,23 @@ pub(crate) fn canonical_quote_amount_tvl_usd(
     }
 }
 
+pub(crate) fn canonical_quote_amount_tvl_sats(
+    amount: u128,
+    unit: CanonicalQuoteUnit,
+    btc_price_usd: Option<u128>,
+) -> Option<u128> {
+    match unit {
+        CanonicalQuoteUnit::Btc => Some(amount),
+        CanonicalQuoteUnit::Usd => {
+            let btc_price = btc_price_usd?;
+            if btc_price == 0 {
+                return Some(0);
+            }
+            Some(amount.saturating_mul(PRICE_SCALE).saturating_div(btc_price))
+        }
+    }
+}
+
 pub(crate) fn load_balance_txs_by_height(
     essentials: &EssentialsProvider,
     height: u32,

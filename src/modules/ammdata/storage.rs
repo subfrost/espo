@@ -1673,45 +1673,10 @@ impl AmmDataProvider {
 
     pub fn get_reserves_snapshot(
         &self,
-        params: GetReservesSnapshotParams,
+        _params: GetReservesSnapshotParams,
     ) -> Result<GetReservesSnapshotResult> {
         crate::debug_timer_log!("get_reserves_snapshot");
-        let table = self.table();
-        let prefix = table.reserves_snapshot_pool_prefix();
-        let keys = self
-            .get_list_keys_by_prefix(GetListKeysByPrefixParams {
-                blockhash: params.blockhash,
-                prefix: prefix.clone(),
-            })
-            .map(|v| v.keys)
-            .unwrap_or_default();
-        if keys.is_empty() {
-            return Ok(GetReservesSnapshotResult { snapshot: None });
-        }
-
-        let values = self
-            .get_multi_values(GetMultiValuesParams {
-                blockhash: params.blockhash,
-                keys: keys.clone(),
-            })
-            .map(|v| v.values)
-            .unwrap_or_default();
-
-        let mut out: HashMap<SchemaAlkaneId, SchemaPoolSnapshot> = HashMap::new();
-        for (key, value) in keys.into_iter().zip(values.into_iter()) {
-            if !key.starts_with(&prefix) {
-                continue;
-            }
-            let Some(pool) = decode_alkane_id_be(&key[prefix.len()..]) else {
-                continue;
-            };
-            let Some(raw) = value else {
-                continue;
-            };
-            if let Ok(snapshot) = decode_pool_snapshot(&raw) {
-                out.insert(pool, snapshot);
-            }
-        }
+        let out = fetch_all_pools(self)?;
         if out.is_empty() {
             return Ok(GetReservesSnapshotResult { snapshot: None });
         }
