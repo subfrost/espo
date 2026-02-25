@@ -257,6 +257,8 @@ pub struct ConfigFile {
     #[serde(default)]
     pub explorer_networks: Option<ExplorerNetworks>,
     #[serde(default)]
+    pub google_analytics_tag: Option<String>,
+    #[serde(default)]
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -290,6 +292,7 @@ pub struct AppConfig {
     pub compact_tx_trace_rows: bool,
     pub address_index_chunk_size: u32,
     pub explorer_networks: Option<ExplorerNetworks>,
+    pub google_analytics_tag: Option<String>,
     pub modules: HashMap<String, serde_json::Value>,
 }
 
@@ -321,6 +324,7 @@ impl AppConfig {
             normalize_optional_string(Some(file.explorer_pizza_tv_endpoint))
                 .unwrap_or_else(default_explorer_pizza_tv_endpoint);
         let explorer_networks = file.explorer_networks.and_then(|n| n.normalized());
+        let google_analytics_tag = normalize_optional_string(file.google_analytics_tag);
         let debug_backup = file.debug_backup;
 
         Ok(Self {
@@ -352,6 +356,7 @@ impl AppConfig {
             compact_tx_trace_rows: file.compact_tx_trace_rows,
             address_index_chunk_size: file.address_index_chunk_size,
             explorer_networks,
+            google_analytics_tag,
             modules: file.modules,
         })
     }
@@ -650,6 +655,10 @@ pub fn get_explorer_pizza_tv_endpoint() -> &'static str {
 
 pub fn get_explorer_networks() -> Option<&'static ExplorerNetworks> {
     get_config().explorer_networks.as_ref()
+}
+
+pub fn get_google_analytics_tag() -> Option<&'static str> {
+    get_config().google_analytics_tag.as_deref()
 }
 
 pub fn get_espo_next_height() -> u32 {

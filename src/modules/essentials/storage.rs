@@ -1,16 +1,16 @@
 use crate::alkanes::trace::{
-    prettyify_protobuf_trace_json, EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace,
+    EspoSandshrewLikeTrace, EspoSandshrewLikeTraceEvent, EspoTrace, prettyify_protobuf_trace_json,
 };
 use crate::config::{
     get_address_index_chunk_size, get_bitcoind_rpc_client, get_electrum_like, get_metashrew,
     get_network,
 };
 use crate::modules::essentials::utils::balances::{
-    get_address_activity_for_address, get_alkane_balances, get_alkane_balances_at_or_before,
-    get_balance_for_address, get_holders_for_alkane, get_outpoint_address,
-    get_total_received_for_alkane, get_transfer_volume_for_alkane, SignedU128,
+    SignedU128, get_address_activity_for_address, get_alkane_balances,
+    get_alkane_balances_at_or_before, get_balance_for_address, get_holders_for_alkane,
+    get_outpoint_address, get_total_received_for_alkane, get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{inspection_to_json, AlkaneCreationRecord};
+use crate::modules::essentials::utils::inspections::{AlkaneCreationRecord, inspection_to_json};
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::runtime::pointers::{CursorScanPage, KvPointer, ListNonMutatePointer, ListPointer};
 use crate::runtime::state_at::StateAt;
@@ -24,13 +24,13 @@ use bitcoincore_rpc::RpcApi;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ordinals::{Artifact, Runestone};
 use protorune_support::protostone::Protostone;
-use serde_json::{json, map::Map, Value};
+use serde_json::{Value, json, map::Map};
 
 use crate::runtime::mempool::{
-    get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address, MempoolEntry,
+    MempoolEntry, get_seen_txids_page, get_tx_from_mempool, pending_by_txid, pending_for_address,
 };
 use crate::utils::electrum_like::AddressHistoryEntry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use hex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -2707,11 +2707,7 @@ impl EssentialsProvider {
             let key_str_val = utf8_or_null(k);
 
             let top_key = if try_decode_utf8 {
-                if let Value::String(s) = &key_str_val {
-                    s.clone()
-                } else {
-                    key_hex.clone()
-                }
+                if let Value::String(s) = &key_str_val { s.clone() } else { key_hex.clone() }
             } else {
                 key_hex.clone()
             };
@@ -4254,11 +4250,7 @@ impl EssentialsProvider {
                                         return None;
                                     }
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h {
-                                            Some(tip - h + 1)
-                                        } else {
-                                            None
-                                        }
+                                        if tip >= h { Some(tip - h + 1) } else { None }
                                     })
                                 });
                             let traces = summary
@@ -4316,11 +4308,7 @@ impl EssentialsProvider {
                                 let summary = load_tx_summary_v2(self, txid);
                                 let confirmations = entries_for_page[idx].height.and_then(|h| {
                                     chain_tip.and_then(|tip| {
-                                        if tip >= h {
-                                            Some(tip - h + 1)
-                                        } else {
-                                            None
-                                        }
+                                        if tip >= h { Some(tip - h + 1) } else { None }
                                     })
                                 });
                                 let traces = summary
@@ -6351,11 +6339,7 @@ fn enriched_transaction_json(
     let has_protostones = !protostones.is_empty();
     let alkanes_traces = render.traces.as_ref().and_then(|traces| {
         let vals = traces.iter().map(enriched_trace_to_value).collect::<Vec<_>>();
-        if vals.is_empty() {
-            None
-        } else {
-            Some(Value::Array(vals))
-        }
+        if vals.is_empty() { None } else { Some(Value::Array(vals)) }
     });
 
     let mut out = Map::new();
@@ -6612,7 +6596,7 @@ mod tests {
     use super::*;
     use crate::runtime::tree_db::{get_global_tree_db, init_global_tree_db};
     use bitcoin::BlockHash;
-    use rocksdb::{Options, DB};
+    use rocksdb::{DB, Options};
     use std::sync::Arc;
     use tempfile::TempDir;
 

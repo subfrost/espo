@@ -152,7 +152,8 @@ impl<'a> AmmDataTable<'a> {
             TOKEN_DERIVED_SEARCH_INDEX: root.list_keyword("/token_search_index/derived/v1/"),
             POOL_NAME_INDEX: root.list_keyword("/pool_name_index/"),
             AMM_FACTORIES: root.list_keyword("/amm_factories/v1/"),
-            FACTORY_BOOTSTRAP_CREATION_COUNT: root.keyword("/bootstrap/factories/creation_count/v1"),
+            FACTORY_BOOTSTRAP_CREATION_COUNT: root
+                .keyword("/bootstrap/factories/creation_count/v1"),
             POOL_BOOTSTRAP_CREATION_COUNT: root.keyword("/bootstrap/pools/creation_count/v1"),
             FACTORY_POOLS: root.list_keyword("/factory_pools/v1/"),
             POOL_FACTORY: root.keyword("/pool_factory/v1/"),
@@ -545,7 +546,11 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
-    pub fn parse_chart_change_event_key_for_height(&self, height: u64, key: &[u8]) -> Option<String> {
+    pub fn parse_chart_change_event_key_for_height(
+        &self,
+        height: u64,
+        key: &[u8],
+    ) -> Option<String> {
         let prefix = self.chart_change_event_height_prefix(height);
         if !key.starts_with(&prefix) {
             return None;
@@ -3022,10 +3027,7 @@ impl AmmDataProvider {
         }
         let table = self.table();
         let key = table.chart_change_event_key(height, chart);
-        let raw = self.get_raw_value(GetRawValueParams {
-            blockhash: StateAt::Latest,
-            key,
-        })?;
+        let raw = self.get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?;
         let Some(bytes) = raw.value else {
             return Ok(RpcGetChartChangeBlockResult {
                 value: json!({

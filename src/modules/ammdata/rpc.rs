@@ -62,10 +62,7 @@ pub fn register_rpc(reg: &RpcNsRegistrar, provider: Arc<AmmDataProvider>) {
                 let mdb_for_handler = Arc::clone(&mdb_ptr_chart_change);
                 async move {
                     let params = RpcGetChartChangeBlockParams {
-                        chart: payload
-                            .get("chart")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
+                        chart: payload.get("chart").and_then(|v| v.as_str()).map(|s| s.to_string()),
                         height: payload.get("height").and_then(|v| v.as_u64()),
                     };
                     let view = match mdb_for_handler.with_height(

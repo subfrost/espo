@@ -3,7 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use hex;
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 
 use crate::explorer::components::alk_balances::render_alkane_balance_cards;
@@ -14,7 +14,7 @@ use crate::explorer::components::svg_assets::{
 };
 use crate::explorer::components::table::holders_table;
 use crate::explorer::components::tx_view::{
-    alkane_icon_url_unfiltered, alkane_meta, icon_bg_style, AlkaneMetaCache,
+    AlkaneMetaCache, alkane_icon_url_unfiltered, alkane_meta, icon_bg_style,
 };
 use crate::explorer::pages::common::fmt_alkane_amount;
 use crate::explorer::pages::state::ExplorerState;
@@ -23,13 +23,13 @@ use crate::modules::ammdata::config::AmmDataConfig;
 use crate::modules::ammdata::schemas::Timeframe;
 use crate::modules::ammdata::storage::{AmmDataProvider, AmmDataTable, GetListKeysByPrefixParams};
 use crate::modules::essentials::storage::{
-    load_creation_record, BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId,
+    BalanceEntry, EssentialsProvider, GetRawValueParams, HolderId, load_creation_record,
 };
 use crate::modules::essentials::utils::balances::{
     get_alkane_balances, get_holders_for_alkane, get_total_received_for_alkane,
     get_transfer_volume_for_alkane,
 };
-use crate::modules::essentials::utils::inspections::{load_inspection, StoredInspectionMethod};
+use crate::modules::essentials::utils::inspections::{StoredInspectionMethod, load_inspection};
 use crate::modules::pizzafun::storage::{GetSeriesByAlkaneParams, PizzafunProvider};
 use crate::runtime::mdb::Mdb;
 use crate::schemas::SchemaAlkaneId;
@@ -849,11 +849,7 @@ fn fmt_activity_amount(raw: u128) -> String {
     let whole = units / unit;
     let rem = units % unit;
     let dec = (rem * 10) / unit;
-    if dec == 0 {
-        format!("{whole}{suffix}")
-    } else {
-        format!("{whole}.{dec}{suffix}")
-    }
+    if dec == 0 { format!("{whole}{suffix}") } else { format!("{whole}.{dec}{suffix}") }
 }
 
 fn split_methods(

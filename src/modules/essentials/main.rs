@@ -646,10 +646,8 @@ impl EspoModule for Essentials {
                 let mut alkane_id_bytes = Vec::with_capacity(12);
                 alkane_id_bytes.extend_from_slice(&rec.alkane.block.to_be_bytes());
                 alkane_id_bytes.extend_from_slice(&rec.alkane.tx.to_be_bytes());
-                creation_rows_seq.insert(
-                    table.alkane_creation_seq_key(next_creation_seq),
-                    alkane_id_bytes,
-                );
+                creation_rows_seq
+                    .insert(table.alkane_creation_seq_key(next_creation_seq), alkane_id_bytes);
                 next_creation_seq = next_creation_seq.saturating_add(1);
                 holders_index_rows.insert(table.alkane_holders_ordered_key(0, &rec.alkane));
             }

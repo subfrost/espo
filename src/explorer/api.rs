@@ -1,11 +1,11 @@
 use crate::runtime::state_at::StateAt;
-use axum::extract::Query;
 use axum::Json;
+use axum::extract::Query;
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::{get_config, get_espo_next_height, get_metashrew_rpc_url, get_network};
-use crate::explorer::components::tx_view::{alkane_meta, AlkaneMetaCache};
+use crate::explorer::components::tx_view::{AlkaneMetaCache, alkane_meta};
 use crate::explorer::consts::{alkane_contract_name_overrides, alkane_name_overrides};
 use crate::explorer::pages::common::ALKANE_SCALE;
 use crate::explorer::paths::explorer_path;
@@ -14,9 +14,8 @@ use crate::modules::ammdata::storage::{
     AmmDataProvider, GetTokenSearchIndexPageParams, RpcGetCandlesParams, SearchIndexField,
 };
 use crate::modules::essentials::storage::{
-    get_cached_block_summary, load_creation_record, BlockSummary, EssentialsProvider,
-    EssentialsTable, GetAlkaneIdsByNamePrefixPageParams, GetListEntriesDescParams,
-    HoldersCountEntry,
+    BlockSummary, EssentialsProvider, EssentialsTable, GetAlkaneIdsByNamePrefixPageParams,
+    GetListEntriesDescParams, HoldersCountEntry, get_cached_block_summary, load_creation_record,
 };
 use crate::modules::essentials::utils::names::normalize_alkane_name;
 use crate::runtime::mdb::Mdb;
@@ -29,8 +28,8 @@ use alkanes_support::proto::alkanes::{
 };
 use anyhow::Context;
 use bitcoin::blockdata::block::Header;
-use bitcoin::consensus::encode::deserialize;
 use bitcoin::consensus::Encodable;
+use bitcoin::consensus::encode::deserialize;
 use bitcoin::locktime::absolute::LockTime;
 use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
 use bitcoin::transaction::Version;
@@ -41,7 +40,7 @@ use ordinals::Runestone;
 use prost::Message;
 use protorune_support::protostone::{Protostone, Protostones};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
@@ -1476,11 +1475,7 @@ fn decode_support_alkane_ids_prefixed(bytes: &[u8], total: usize) -> Option<Alka
         let schema = schema_from_support_id(parsed)?;
         ids.push(schema);
     }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(AlkaneDecodeResult { ids, total })
-    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
 }
 
 fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
@@ -1501,11 +1496,7 @@ fn decode_support_alkane_ids(bytes: &[u8]) -> Option<AlkaneDecodeResult> {
             ids.push(schema);
         }
     }
-    if ids.is_empty() {
-        None
-    } else {
-        Some(AlkaneDecodeResult { ids, total })
-    }
+    if ids.is_empty() { None } else { Some(AlkaneDecodeResult { ids, total }) }
 }
 
 fn decode_proto_alkane_id(bytes: &[u8]) -> Option<SchemaAlkaneId> {
@@ -1524,11 +1515,7 @@ fn schema_from_support_id(id: SupportAlkaneId) -> Option<SchemaAlkaneId> {
 }
 
 fn validate_schema_alkane(id: SchemaAlkaneId) -> Option<SchemaAlkaneId> {
-    if (id.block as u128) <= MAX_ALKANE_BLOCK {
-        Some(id)
-    } else {
-        None
-    }
+    if (id.block as u128) <= MAX_ALKANE_BLOCK { Some(id) } else { None }
 }
 
 fn decode_utf8(bytes: &[u8]) -> Option<String> {
