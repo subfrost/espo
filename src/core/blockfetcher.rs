@@ -108,13 +108,20 @@ impl BlkOrRpcBlockSource {
             None
         };
 
-        // Preload height->hash for everything currently indexed under our namespace.
-        let height_map = Self::build_height_map(&mdb, rpc)?;
-        eprintln!(
-            "[BLOCKFETCHER] preloaded {} height→hash entries from index (~{} KB)",
-            height_map.len(),
-            approx_height_map_kb(height_map.len())
-        );
+        // Preload height->hash only when we might actually use blk files.
+        let height_map = if mode == BlockFetchMode::RpcOnly {
+            eprintln!("[BLOCKFETCHER] rpc-only mode: skipping height-map preload");
+            HashMap::new()
+        } else {
+            Self::build_height_map(&mdb, rpc)?
+        };
+        if mode != BlockFetchMode::RpcOnly {
+            eprintln!(
+                "[BLOCKFETCHER] preloaded {} height→hash entries from index (~{} KB)",
+                height_map.len(),
+                approx_height_map_kb(height_map.len())
+            );
+        }
 
         Ok(Self {
             mdb,
@@ -149,35 +156,26 @@ impl BlkOrRpcBlockSource {
         );
     }
 
-    /// Scan our namespace and build a map {height -> hash} for every hash we’ve indexed.
-    /// We filter out file-markers (5B keys). For each 32B key, query header info once to get height.
+    /// Scan our namespace and build a map {height -> hash} from compact metadata keys.
+    /// This avoids per-hash RPC calls on startup.
     fn build_height_map(mdb: &Mdb, rpc: &CoreClient) -> Result<HashMap<u32, BlockHash>> {
+        let _ = rpc;
         let mut out: HashMap<u32, BlockHash> = HashMap::new();
         eprintln!("[BLOCKFETCHER] Loading height map from DB (first run may take a bit)...");
-        for res in mdb.iter_from(b"") {
-            let (k_full, _v) = res.context("iter_from for block_core_index/")?;
-            let rel = &k_full[mdb.prefix().len()..];
-            if rel.len() != 32 {
-                continue; // skip 'F' markers or anything unexpected
-            }
-            let hash = match BlockHash::from_slice(&rel) {
-                Ok(h) => h,
-                Err(_) => continue,
+        let entries = mdb
+            .scan_prefix_entries(&[b'H'])
+            .context("scan_prefix_entries(H) for block_core_index/")?;
+        for (k_rel, v) in entries {
+            let Some(height) = Self::parse_meta_key_height_to_hash(&k_rel) else {
+                continue;
             };
-            match rpc.get_block_header_info(&hash) {
-                Ok(hdr) => {
-                    // Only map ACTIVE chain blocks (confirmations > 0). Skip stale/orphans here.
-                    if hdr.confirmations > 0 {
-                        out.insert(hdr.height as u32, hash);
-                    }
-                }
-                Err(e) => {
-                    // Best-effort: if pruned or unknown, just skip
-                    eprintln!("[BLOCKFETCHER] build_height_map: header({hash}) err: {:?}", e);
-                }
+            if v.len() != 32 {
+                continue;
+            }
+            if let Ok(hash) = BlockHash::from_slice(&v) {
+                out.insert(height, hash);
             }
         }
-
         Ok(out)
     }
 
@@ -207,6 +205,38 @@ impl BlkOrRpcBlockSource {
         k[0] = b'F';
         k[1..5].copy_from_slice(&file_no.to_le_bytes());
         k
+    }
+
+    /// Metadata key for canonical height -> hash mapping.
+    /// Stored as: b'H' + height_be_u32 => hash_bytes(32)
+    #[inline]
+    fn meta_key_height_to_hash(height: u32) -> [u8; 5] {
+        let mut k = [0u8; 5];
+        k[0] = b'H';
+        k[1..5].copy_from_slice(&height.to_be_bytes());
+        k
+    }
+
+    #[inline]
+    fn parse_meta_key_height_to_hash(key: &[u8]) -> Option<u32> {
+        if key.len() != 5 || key[0] != b'H' {
+            return None;
+        }
+        let mut h = [0u8; 4];
+        h.copy_from_slice(&key[1..5]);
+        Some(u32::from_be_bytes(h))
+    }
+
+    #[inline]
+    fn persist_height_hash_mapping(&self, height: u32, hash: BlockHash) {
+        let key = Self::meta_key_height_to_hash(height);
+        let val = hash.to_byte_array();
+        if let Err(e) = self.mdb.put(&key, &val) {
+            eprintln!(
+                "[BLOCKFETCHER] warn: failed to persist height->hash mapping for {} ({}): {:?}",
+                height, hash, e
+            );
+        }
     }
 
     /// Extract file number from "blk05159.dat" => 5159.
@@ -664,11 +694,32 @@ impl BlockSource for BlkOrRpcBlockSource {
                 .rpc
                 .get_block_hash(height as u64)
                 .with_context(|| format!("bitcoind: getblockhash({height})"))?;
+            self.height_to_hash.lock().unwrap().insert(height, hash);
+            self.persist_height_hash_mapping(height, hash);
             let blk = self
                 .rpc
                 .get_block(&hash)
                 .with_context(|| format!("bitcoind: getblock({hash})"))?;
             eprintln!("[BLOCKFETCHER] height={} RPC-only ok in {:.2?}", height, t0.elapsed());
+            return Ok(blk);
+        }
+
+        // Near-tip guard: direct RPC (avoid tail races on files being appended).
+        if self.mode != BlockFetchMode::BlkOnly
+            && tip.saturating_sub(height) <= NEAR_TIP_RPC_THRESHOLD
+        {
+            let hash: BlockHash = self
+                .rpc
+                .get_block_hash(height as u64)
+                .with_context(|| format!("bitcoind: getblockhash({height})"))?;
+            self.height_to_hash.lock().unwrap().insert(height, hash);
+            self.persist_height_hash_mapping(height, hash);
+            eprintln!("[BLOCKFETCHER] height={} using RPC (near tip)", height);
+            let blk = self
+                .rpc
+                .get_block(&hash)
+                .with_context(|| format!("bitcoind: getblock({hash})"))?;
+            eprintln!("[BLOCKFETCHER] height={} RPC ok in {:.2?}", height, t0.elapsed());
             return Ok(blk);
         }
 
@@ -693,19 +744,7 @@ impl BlockSource for BlkOrRpcBlockSource {
             .with_context(|| format!("bitcoind: getblockhash({height})"))?;
         // Opportunistically cache this mapping for subsequent calls in the same run.
         self.height_to_hash.lock().unwrap().insert(height, hash);
-
-        // Near-tip guard: direct RPC (avoid tail races on a file being appended)
-        if self.mode != BlockFetchMode::BlkOnly
-            && tip.saturating_sub(height) <= NEAR_TIP_RPC_THRESHOLD
-        {
-            eprintln!("[BLOCKFETCHER] height={} using RPC (near tip)", height);
-            let blk = self
-                .rpc
-                .get_block(&hash)
-                .with_context(|| format!("bitcoind: getblock({hash})"))?;
-            eprintln!("[BLOCKFETCHER] height={} RPC ok in {:.2?}", height, t0.elapsed());
-            return Ok(blk);
-        }
+        self.persist_height_hash_mapping(height, hash);
 
         // 2) Try local index → blk file
         if let Some(loc) = self.index_get(&hash)? {

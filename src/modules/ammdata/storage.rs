@@ -516,6 +516,20 @@ impl<'a> AmmDataTable<'a> {
         k
     }
 
+    pub fn parse_btc_usd_price_key(&self, key: &[u8]) -> Option<u64> {
+        let prefix = self.btc_usd_price_prefix();
+        if !key.starts_with(&prefix) {
+            return None;
+        }
+        let rest = &key[prefix.len()..];
+        if rest.len() != 8 {
+            return None;
+        }
+        let mut height = [0u8; 8];
+        height.copy_from_slice(rest);
+        Some(u64::from_be_bytes(height))
+    }
+
     pub fn btc_usd_line_ns_prefix(&self, tf: Timeframe) -> Vec<u8> {
         let suffix = format!("{}:", tf.code());
         self.BTC_USD_LINE.select(suffix.as_bytes()).key().to_vec()
@@ -1495,10 +1509,10 @@ impl AmmDataProvider {
 
     /// Load the most recent BTC/USD price recorded by the ammdata indexer.
     /// This is intended for read-paths (RPC / API), so it never calls external price feeds.
-    pub fn get_latest_btc_usd_price(
+    pub fn get_latest_btc_usd_price_entry(
         &self,
         params: GetLatestBtcUsdPriceParams,
-    ) -> Result<Option<u128>> {
+    ) -> Result<Option<(u64, u128)>> {
         let table = self.table();
         let rel_prefix = table.btc_usd_price_prefix();
         let entries = self
@@ -1508,14 +1522,26 @@ impl AmmDataProvider {
             })
             .map(|resp| resp.entries)
             .unwrap_or_default();
-        for (_k, v) in entries {
+        for (k, v) in entries {
+            let Some(height) = table.parse_btc_usd_price_key(&k) else {
+                continue;
+            };
             if let Ok(price) = decode_u128_value(&v) {
                 if price > 0 {
-                    return Ok(Some(price));
+                    return Ok(Some((height, price)));
                 }
             }
         }
         Ok(None)
+    }
+
+    /// Load the most recent BTC/USD price recorded by the ammdata indexer.
+    /// This is intended for read-paths (RPC / API), so it never calls external price feeds.
+    pub fn get_latest_btc_usd_price(
+        &self,
+        params: GetLatestBtcUsdPriceParams,
+    ) -> Result<Option<u128>> {
+        Ok(self.get_latest_btc_usd_price_entry(params)?.map(|(_, price)| price))
     }
 
     pub fn essentials(&self) -> &EssentialsProvider {
@@ -3592,6 +3618,58 @@ impl AmmDataProvider {
         }
     }
 
+    pub fn rpc_get_btc_usd_price(
+        &self,
+        params: RpcGetBtcUsdPriceParams,
+    ) -> Result<RpcGetBtcUsdPriceResult> {
+        let table = self.table();
+        let out = if let Some(height) = params.height {
+            let key = table.btc_usd_price_key(height);
+            let value =
+                self.get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?;
+            match value.value.and_then(|raw| decode_u128_value(&raw).ok()).filter(|v| *v > 0) {
+                Some(price) => json!({
+                    "ok": true,
+                    "height": height,
+                    "price": price.to_string(),
+                    "source": "ammdata_index"
+                }),
+                None => match self.get_latest_btc_usd_price_entry(GetLatestBtcUsdPriceParams {
+                    blockhash: StateAt::Latest,
+                })? {
+                    Some((fallback_height, price)) => json!({
+                        "ok": true,
+                        "height": fallback_height,
+                        "requested_height": height,
+                        "price": price.to_string(),
+                        "source": "ammdata_index_last_active"
+                    }),
+                    None => json!({
+                        "ok": false,
+                        "error": "price_unavailable",
+                        "height": height
+                    }),
+                },
+            }
+        } else {
+            match self.get_latest_btc_usd_price_entry(GetLatestBtcUsdPriceParams {
+                blockhash: StateAt::Latest,
+            })? {
+                Some((height, price)) => json!({
+                    "ok": true,
+                    "height": height,
+                    "price": price.to_string(),
+                    "source": "ammdata_index"
+                }),
+                None => json!({
+                    "ok": false,
+                    "error": "price_unavailable"
+                }),
+            }
+        };
+        Ok(RpcGetBtcUsdPriceResult { value: out })
+    }
+
     pub fn rpc_ping(&self, _params: RpcPingParams) -> Result<RpcPingResult> {
         Ok(RpcPingResult { value: Value::String("pong".to_string()) })
     }
@@ -4227,6 +4305,14 @@ pub struct RpcGetBestMevSwapParams {
 }
 
 pub struct RpcGetBestMevSwapResult {
+    pub value: Value,
+}
+
+pub struct RpcGetBtcUsdPriceParams {
+    pub height: Option<u64>,
+}
+
+pub struct RpcGetBtcUsdPriceResult {
     pub value: Value,
 }
 
