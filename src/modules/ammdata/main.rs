@@ -6,7 +6,7 @@ use super::storage::{
 use super::utils::activity::decode_activity_v1;
 use crate::alkanes::trace::EspoBlock;
 use crate::alkanes::trace::EspoSandshrewLikeTraceInvokeData;
-use crate::config::{debug_enabled, get_espo_db, get_network};
+use crate::config::{debug_enabled, get_espo_module_mdb, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
@@ -572,12 +572,11 @@ pub(crate) fn load_balance_txs_by_height(
 
 pub struct AmmData {
     provider: Option<Arc<AmmDataProvider>>,
-    index_height: Arc<std::sync::RwLock<Option<u32>>>,
 }
 
 impl AmmData {
     pub fn new() -> Self {
-        Self { provider: None, index_height: Arc::new(std::sync::RwLock::new(None)) }
+        Self { provider: None }
     }
 
     #[inline]
@@ -599,13 +598,12 @@ impl AmmData {
     }
 
     fn set_index_height(&self, new_height: u32, blockhash: StateAt) -> Result<()> {
-        if let Some(prev) = *self.index_height.read().unwrap() {
+        if let Some(prev) = self.load_index_height()? {
             if new_height < prev {
                 eprintln!("[AMMDATA] index height rollback detected ({} -> {})", prev, new_height);
             }
         }
         self.persist_index_height(new_height, blockhash)?;
-        *self.index_height.write().unwrap() = Some(new_height);
         Ok(())
     }
 }
@@ -622,20 +620,21 @@ impl EspoModule for AmmData {
     }
 
     fn set_mdb(&mut self, mdb: Arc<Mdb>) {
-        let essentials_mdb = Mdb::from_db(get_espo_db(), b"essentials:");
-        let essentials_provider = Arc::new(EssentialsProvider::new(Arc::new(essentials_mdb)));
+        let essentials_provider =
+            Arc::new(EssentialsProvider::new(get_espo_module_mdb("essentials")));
         self.provider = Some(Arc::new(AmmDataProvider::new(mdb.clone(), essentials_provider)));
         match self.load_index_height() {
-            Ok(h) => {
-                *self.index_height.write().unwrap() = h;
-                eprintln!("[AMMDATA] loaded index height: {:?}", h);
-            }
+            Ok(h) => eprintln!("[AMMDATA] loaded index height: {:?}", h),
             Err(e) => eprintln!("[AMMDATA] failed to load /index_height: {e:?}"),
         }
     }
 
     fn get_genesis_block(&self, network: Network) -> u32 {
         ammdata_genesis_block(network)
+    }
+
+    fn get_mdb(&self) -> Option<Arc<Mdb>> {
+        self.provider.as_ref().map(|provider| Arc::new(provider.mdb().clone()))
     }
 
     fn index_block(&self, block: EspoBlock) -> Result<()> {
@@ -647,12 +646,6 @@ impl EspoModule for AmmData {
         let blockhash_state = StateAt::Block(block_hash);
         let height = block.height;
         println!("[AMMDATA] Indexing block #{height} for candles and activity...");
-        if let Some(prev) = *self.index_height.read().unwrap() {
-            if height <= prev {
-                eprintln!("[AMMDATA] skipping already indexed block #{height} (last={prev})");
-                return Ok(());
-            }
-        }
 
         let write_provider = self.provider();
         let read_provider = write_provider.with_view_blockhash(Some(block_hash));
@@ -854,7 +847,7 @@ impl EspoModule for AmmData {
     }
 
     fn get_index_height(&self) -> Option<u32> {
-        *self.index_height.read().unwrap()
+        self.load_index_height().ok().flatten()
     }
 
     fn register_rpc(&self, reg: &RpcNsRegistrar) {

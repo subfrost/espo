@@ -8,8 +8,8 @@ use crate::alkanes::trace::{
     EspoSandshrewLikeTraceStatus, EspoTrace,
 };
 use crate::config::{
-    debug_enabled, get_electrum_like, get_espo_db, get_metashrew, get_metashrew_sdb, get_network,
-    strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
+    debug_enabled, get_electrum_like, get_espo_module_mdb, get_metashrew, get_metashrew_sdb,
+    get_network, strict_check_alkane_balances, strict_check_trace_mismatches, strict_check_utxos,
 };
 use crate::debug;
 use crate::modules::ammdata::config::AmmDataConfig;
@@ -46,9 +46,7 @@ use std::time::Instant;
 static AMMDATA_MDB: OnceLock<Arc<Mdb>> = OnceLock::new();
 
 fn ammdata_mdb() -> Arc<Mdb> {
-    AMMDATA_MDB
-        .get_or_init(|| Arc::new(Mdb::from_db(get_espo_db(), b"ammdata:")))
-        .clone()
+    AMMDATA_MDB.get_or_init(|| get_espo_module_mdb("ammdata")).clone()
 }
 
 #[derive(Default, Clone, Copy)]
