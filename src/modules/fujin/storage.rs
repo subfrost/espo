@@ -2,6 +2,8 @@ use super::consts::KEY_INDEX_HEIGHT;
 use super::schemas::*;
 use crate::modules::essentials::storage::{
     EssentialsProvider, GetAlkaneStorageValueParams,
+    GetBlockSummaryParams, RpcGetAddressBalancesParams,
+    GetIndexHeightParams as EssentialsGetIndexHeightParams,
 };
 use crate::runtime::mdb::{Mdb, MdbBatch};
 use crate::schemas::SchemaAlkaneId;
@@ -335,5 +337,31 @@ impl FujinProvider {
             key: key.to_vec(),
         })?;
         Ok(result.value)
+    }
+
+    // ── Essentials cross-read: address balances ──
+
+    pub fn get_address_balances(&self, address: &str) -> Result<serde_json::Value> {
+        let result = self.essentials.rpc_get_address_balances(
+            RpcGetAddressBalancesParams {
+                address: Some(address.to_string()),
+                include_outpoints: Some(false),
+            },
+        )?;
+        Ok(result.value)
+    }
+
+    // ── Essentials cross-read: block summary (header bytes) ──
+
+    pub fn get_essentials_block_summary(&self, height: u32) -> Result<Option<Vec<u8>>> {
+        let result = self.essentials.get_block_summary(GetBlockSummaryParams { height })?;
+        Ok(result.summary.map(|s| s.header))
+    }
+
+    // ── Essentials cross-read: index height ──
+
+    pub fn get_essentials_index_height(&self) -> Result<Option<u32>> {
+        let result = self.essentials.get_index_height(EssentialsGetIndexHeightParams)?;
+        Ok(result.height)
     }
 }
