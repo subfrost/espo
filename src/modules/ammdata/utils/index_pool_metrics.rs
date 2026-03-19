@@ -194,8 +194,8 @@ pub fn derive_pool_metrics(
 
         let mut token0_tvl_usd = token0_amount.saturating_mul(token0_price_usd) / AMOUNT_SCALE;
         let mut token1_tvl_usd = token1_amount.saturating_mul(token1_price_usd) / AMOUNT_SCALE;
-        let token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / AMOUNT_SCALE;
-        let token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / AMOUNT_SCALE;
+        let mut token0_tvl_sats = token0_amount.saturating_mul(token0_price_sats) / AMOUNT_SCALE;
+        let mut token1_tvl_sats = token1_amount.saturating_mul(token1_price_sats) / AMOUNT_SCALE;
 
         if let Some(unit) = canonical_quote_units.get(&defs.base_alkane_id) {
             if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_usd(
@@ -205,6 +205,13 @@ pub fn derive_pool_metrics(
             ) {
                 token0_tvl_usd = value;
             }
+            if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_sats(
+                token0_amount,
+                *unit,
+                state.btc_usd_price,
+            ) {
+                token0_tvl_sats = value;
+            }
         }
         if let Some(unit) = canonical_quote_units.get(&defs.quote_alkane_id) {
             if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_usd(
@@ -213,6 +220,13 @@ pub fn derive_pool_metrics(
                 state.btc_usd_price,
             ) {
                 token1_tvl_usd = value;
+            }
+            if let Some(value) = crate::modules::ammdata::canonical_quote_amount_tvl_sats(
+                token1_amount,
+                *unit,
+                state.btc_usd_price,
+            ) {
+                token1_tvl_sats = value;
             }
         }
 

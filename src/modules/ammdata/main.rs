@@ -10,13 +10,13 @@ use crate::config::{debug_enabled, get_espo_db, get_network};
 use crate::debug;
 use crate::modules::ammdata::config::{AmmDataConfig, DerivedMergeStrategy, DerivedQuoteConfig};
 use crate::modules::ammdata::consts::{
-    ammdata_genesis_block, canonical_quotes, CanonicalQuoteUnit, AMOUNT_SCALE, PRICE_SCALE,
+    AMOUNT_SCALE, CanonicalQuoteUnit, PRICE_SCALE, ammdata_genesis_block, canonical_quotes,
 };
 use crate::modules::defs::{EspoModule, RpcNsRegistrar};
 use crate::modules::essentials::storage::{
-    decode_pointer_idx_u64, load_tx_pointer_blob_v3_by_id, AlkaneBalanceTxEntry,
-    EssentialsProvider, GetListEntriesDescParams as EssentialsGetListEntriesDescParams,
-    GetMultiValuesParams,
+    AlkaneBalanceTxEntry, EssentialsProvider,
+    GetListEntriesDescParams as EssentialsGetListEntriesDescParams, GetMultiValuesParams,
+    decode_pointer_idx_u64, load_tx_pointer_blob_v3_by_id,
 };
 use crate::modules::essentials::utils::balances::SignedU128;
 use crate::modules::essentials::utils::inspections::{
@@ -25,7 +25,7 @@ use crate::modules::essentials::utils::inspections::{
 use crate::runtime::mdb::Mdb;
 use crate::runtime::state_at::StateAt;
 use crate::schemas::SchemaAlkaneId;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bitcoin::Network;
 use bitcoin::{ScriptBuf, Transaction};
 use ordinals::{Artifact, Runestone};
@@ -97,24 +97,16 @@ pub(crate) fn lookup_proxy_target(
 
 pub(crate) fn parse_hex_u32(s: &str) -> Option<u32> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
-        if v > u32::MAX as u128 {
-            None
-        } else {
-            Some(v as u32)
-        }
-    })
+    u128::from_str_radix(trimmed, 16)
+        .ok()
+        .and_then(|v| if v > u32::MAX as u128 { None } else { Some(v as u32) })
 }
 
 pub(crate) fn parse_hex_u64(s: &str) -> Option<u64> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
-    u128::from_str_radix(trimmed, 16).ok().and_then(|v| {
-        if v > u64::MAX as u128 {
-            None
-        } else {
-            Some(v as u64)
-        }
-    })
+    u128::from_str_radix(trimmed, 16)
+        .ok()
+        .and_then(|v| if v > u64::MAX as u128 { None } else { Some(v as u64) })
 }
 
 fn parse_hex_u128(s: &str) -> Option<u128> {
@@ -155,11 +147,7 @@ pub(crate) fn merge_candles(
 }
 
 pub(crate) fn invert_price_value(p: u128) -> Option<u128> {
-    if p == 0 {
-        None
-    } else {
-        Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p)
-    }
+    if p == 0 { None } else { Some(PRICE_SCALE.saturating_mul(PRICE_SCALE) / p) }
 }
 
 pub(crate) fn parse_factory_create_call(
@@ -219,11 +207,7 @@ pub(crate) fn pool_creator_spk_from_protostone(tx: &Transaction) -> Option<Scrip
 pub(crate) fn signed_from_delta(delta: Option<&SignedU128>) -> i128 {
     let Some(d) = delta else { return 0 };
     let (neg, amt) = d.as_parts();
-    if neg {
-        -(amt as i128)
-    } else {
-        amt as i128
-    }
+    if neg { -(amt as i128) } else { amt as i128 }
 }
 
 pub(crate) fn apply_delta_u128(current: u128, delta: i128) -> u128 {
@@ -247,11 +231,7 @@ pub(crate) fn percent_change_basis_points(prev: u128, now: u128) -> i64 {
     let (neg, delta) = if now >= prev { (false, now - prev) } else { (true, prev - now) };
     let scaled = delta.saturating_mul(1_000_000).saturating_div(prev);
     let mag = if scaled > i64::MAX as u128 { i64::MAX } else { scaled as i64 };
-    if neg {
-        -mag
-    } else {
-        mag
-    }
+    if neg { -mag } else { mag }
 }
 
 #[inline]
@@ -267,11 +247,7 @@ pub(crate) fn apr_basis_points_30d(pool_volume_30d_usd: u128, pool_tvl_usd: u128
         return 0;
     }
     let scaled = pool_volume_30d_usd.saturating_mul(36_000).saturating_div(pool_tvl_usd);
-    if scaled > i64::MAX as u128 {
-        i64::MAX
-    } else {
-        scaled as i64
-    }
+    if scaled > i64::MAX as u128 { i64::MAX } else { scaled as i64 }
 }
 
 #[inline]
@@ -330,11 +306,7 @@ pub(crate) struct TokenTradeWindows {
 }
 
 pub(crate) fn abs_i128(value: i128) -> u128 {
-    if value < 0 {
-        (-value) as u128
-    } else {
-        value as u128
-    }
+    if value < 0 { (-value) as u128 } else { value as u128 }
 }
 
 fn decode_ts_seq_from_index(prefix_len: usize, key: &[u8], val: &[u8]) -> Option<(u64, u32)> {
@@ -535,6 +507,23 @@ pub(crate) fn canonical_quote_amount_tvl_usd(
         CanonicalQuoteUnit::Btc => {
             let btc_price = btc_price_usd?;
             Some(amount.saturating_mul(btc_price) / AMOUNT_SCALE)
+        }
+    }
+}
+
+pub(crate) fn canonical_quote_amount_tvl_sats(
+    amount: u128,
+    unit: CanonicalQuoteUnit,
+    btc_price_usd: Option<u128>,
+) -> Option<u128> {
+    match unit {
+        CanonicalQuoteUnit::Btc => Some(amount),
+        CanonicalQuoteUnit::Usd => {
+            let btc_price = btc_price_usd?;
+            if btc_price == 0 {
+                return Some(0);
+            }
+            Some(amount.saturating_mul(PRICE_SCALE).saturating_div(btc_price))
         }
     }
 }

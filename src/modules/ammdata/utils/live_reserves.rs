@@ -1,10 +1,12 @@
 use crate::runtime::state_at::StateAt;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::collections::HashMap;
 
 use crate::config::get_metashrew;
 use crate::modules::ammdata::schemas::{SchemaMarketDefs, SchemaPoolSnapshot};
-use crate::modules::ammdata::storage::{AmmDataProvider, GetReservesSnapshotParams};
+use crate::modules::ammdata::storage::{
+    AmmDataProvider, GetAmmFactoriesParams, GetFactoryPoolsParams, GetPoolDefsParams,
+};
 use crate::schemas::SchemaAlkaneId;
 
 /// Fetch real-time reserves for all pools in `pools` by querying Metashrew balances:
@@ -48,8 +50,31 @@ pub fn fetch_latest_reserves_for_pools(
 pub fn fetch_all_pools(
     provider: &AmmDataProvider,
 ) -> Result<HashMap<SchemaAlkaneId, SchemaPoolSnapshot>> {
-    provider
-        .get_reserves_snapshot(GetReservesSnapshotParams { blockhash: StateAt::Latest })?
-        .snapshot
-        .ok_or(anyhow!("AMMDATA ERROR: Failed to fetch all pools"))
+    let factories = provider
+        .get_amm_factories(GetAmmFactoriesParams { blockhash: StateAt::Latest })?
+        .factories;
+    let mut pools: HashMap<SchemaAlkaneId, SchemaMarketDefs> = HashMap::new();
+
+    for factory in factories {
+        let factory_pools = match provider
+            .get_factory_pools(GetFactoryPoolsParams { blockhash: StateAt::Latest, factory })
+        {
+            Ok(v) => v.pools,
+            Err(_) => continue,
+        };
+        for pool in factory_pools {
+            if pools.contains_key(&pool) {
+                continue;
+            }
+            if let Ok(v) =
+                provider.get_pool_defs(GetPoolDefsParams { blockhash: StateAt::Latest, pool })
+            {
+                if let Some(defs) = v.defs {
+                    pools.insert(pool, defs);
+                }
+            }
+        }
+    }
+
+    fetch_latest_reserves_for_pools(&pools)
 }
