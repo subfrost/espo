@@ -82,6 +82,11 @@ impl BlkOrRpcBlockSource {
     /// Namespace prefix inside ESPO DB for this index. (Literal; includes the trailing slash.)
     pub const MDB_PREFIX: &'static str = "block_core_index/";
 
+    #[inline]
+    fn uses_blk_index(mode: BlockFetchMode) -> bool {
+        mode != BlockFetchMode::RpcOnly
+    }
+
     pub fn new(
         blocks_dir: impl AsRef<Path>,
         network: Network,
@@ -92,36 +97,39 @@ impl BlkOrRpcBlockSource {
         let mdb = Mdb::from_db(db, Self::MDB_PREFIX);
 
         // Precompute the “stop at genesis” hash for this network (if > 0)
-        let genesis_height = alkanes_genesis_block(network);
-        let genesis_stop_hash = if genesis_height > 0 {
-            match rpc.get_block_hash(genesis_height as u64) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    eprintln!(
-                        "[BLOCKFETCHER] warn: failed to fetch genesis stop hash at height {}: {:?}",
-                        genesis_height, e
-                    );
-                    None
+        let genesis_stop_hash = if Self::uses_blk_index(mode) {
+            let genesis_height = alkanes_genesis_block(network);
+            if genesis_height > 0 {
+                match rpc.get_block_hash(genesis_height as u64) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        eprintln!(
+                            "[BLOCKFETCHER] warn: failed to fetch genesis stop hash at height {}: {:?}",
+                            genesis_height, e
+                        );
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
+            eprintln!("[BLOCKFETCHER] rpc-only mode: skipping blk index initialization");
             None
         };
 
-        // Preload height->hash only when we might actually use blk files.
-        let height_map = if mode == BlockFetchMode::RpcOnly {
-            eprintln!("[BLOCKFETCHER] rpc-only mode: skipping height-map preload");
-            HashMap::new()
-        } else {
-            Self::build_height_map(&mdb, rpc)?
-        };
-        if mode != BlockFetchMode::RpcOnly {
+        // Preload height->hash only when blk files may be used during this run.
+        let height_map = if Self::uses_blk_index(mode) {
+            let height_map = Self::build_height_map(&mdb, rpc)?;
             eprintln!(
                 "[BLOCKFETCHER] preloaded {} height→hash entries from index (~{} KB)",
                 height_map.len(),
                 approx_height_map_kb(height_map.len())
             );
-        }
+            height_map
+        } else {
+            HashMap::new()
+        };
 
         Ok(Self {
             mdb,
@@ -794,4 +802,20 @@ impl BlockSource for BlkOrRpcBlockSource {
 fn approx_height_map_kb(entries: usize) -> usize {
     // ~36 bytes per entry (u32 + 32B hash) — HashMap overhead not included.
     ((entries * 36) + 1023) / 1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlkOrRpcBlockSource, BlockFetchMode};
+
+    #[test]
+    fn rpc_only_mode_skips_blk_index_usage() {
+        assert!(!BlkOrRpcBlockSource::uses_blk_index(BlockFetchMode::RpcOnly));
+    }
+
+    #[test]
+    fn auto_and_blk_only_modes_use_blk_index() {
+        assert!(BlkOrRpcBlockSource::uses_blk_index(BlockFetchMode::Auto));
+        assert!(BlkOrRpcBlockSource::uses_blk_index(BlockFetchMode::BlkOnly));
+    }
 }
