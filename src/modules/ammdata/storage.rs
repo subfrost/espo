@@ -3674,58 +3674,6 @@ impl AmmDataProvider {
     pub fn rpc_ping(&self, _params: RpcPingParams) -> Result<RpcPingResult> {
         Ok(RpcPingResult { value: Value::String("pong".to_string()) })
     }
-
-    pub fn rpc_get_btc_usd_price(
-        &self,
-        params: RpcGetBtcUsdPriceParams,
-    ) -> Result<RpcGetBtcUsdPriceResult> {
-        let table = self.table();
-        let out = if let Some(height) = params.height {
-            let key = table.btc_usd_price_key(height);
-            let value =
-                self.get_raw_value(GetRawValueParams { blockhash: StateAt::Latest, key })?;
-            match value.value.and_then(|raw| decode_u128_value(&raw).ok()).filter(|v| *v > 0) {
-                Some(price) => json!({
-                    "ok": true,
-                    "height": height,
-                    "price": price.to_string(),
-                    "source": "ammdata_index"
-                }),
-                None => match self.get_latest_btc_usd_price_entry(GetLatestBtcUsdPriceParams {
-                    blockhash: StateAt::Latest,
-                })? {
-                    Some((fallback_height, price)) => json!({
-                        "ok": true,
-                        "height": fallback_height,
-                        "requested_height": height,
-                        "price": price.to_string(),
-                        "source": "ammdata_index_last_active"
-                    }),
-                    None => json!({
-                        "ok": false,
-                        "error": "price_unavailable",
-                        "height": height
-                    }),
-                },
-            }
-        } else {
-            match self.get_latest_btc_usd_price_entry(GetLatestBtcUsdPriceParams {
-                blockhash: StateAt::Latest,
-            })? {
-                Some((height, price)) => json!({
-                    "ok": true,
-                    "height": height,
-                    "price": price.to_string(),
-                    "source": "ammdata_index"
-                }),
-                None => json!({
-                    "ok": false,
-                    "error": "price_unavailable"
-                }),
-            }
-        };
-        Ok(RpcGetBtcUsdPriceResult { value: out })
-    }
 }
 
 pub struct GetRawValueParams {
