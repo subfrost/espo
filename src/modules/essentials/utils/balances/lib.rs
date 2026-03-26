@@ -1861,12 +1861,21 @@ pub fn bulk_update_balances_for_block(
                                 .map(|entry| Txid::from_byte_array(entry.txid))
                                 .map(|t| t.to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
-                            panic!(
-                                "[balances] negative alkane balance detected (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
-                                txid_str, owner.block, owner.tx, token.block, token.tx, cur, mag
-                            );
+                            if strict_check_alkane_balances() {
+                                panic!(
+                                    "[balances] negative alkane balance detected (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
+                                    txid_str, owner.block, owner.tx, token.block, token.tx, cur, mag
+                                );
+                            } else {
+                                eprintln!(
+                                    "[balances][warn] negative alkane balance clamped to 0 (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
+                                    txid_str, owner.block, owner.tx, token.block, token.tx, cur, mag
+                                );
+                            }
+                            0
+                        } else {
+                            cur - mag
                         }
-                        cur - mag
                     };
                     if updated == 0 {
                         amounts.remove(token);
