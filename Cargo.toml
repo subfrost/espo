@@ -18,8 +18,22 @@ required-features = ["binary"]
 # Feature that's only available for non-WASM builds
 binary = []
 test-utils = ["alkanes", "metashrew-runtime", "rockshrew-runtime", "wasmtime", "protorune/test-utils"]
+# Enable tertiary indexer WASM build (for wasm32 target)
+tertiary = ["qubitcoin-tertiary-support"]
 
 [dependencies]
+# Shared between native and WASM
+prost = "0.12.6"
+
+# Vendored qubitcoin crates for tertiary indexer support
+qubitcoin-support = { path = "vendor/qubitcoin-support" }
+qubitcoin-tertiary-support = { path = "vendor/qubitcoin-tertiary-support", optional = true }
+
+# Non-WASM dependencies (server, network, DB, CLI, etc.)
+# metashrew-core (transitive via metashrew-support) defines conflicting
+# get/set/flush/initialize globals that break the tertiary WASM build,
+# so ALL alkanes-rs deps must be native-only.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 anyhow = "1.0.99"
 hex = "0.4.3"
 serde = { version = "1.0.219", features = ["derive"] }
@@ -28,18 +42,13 @@ serde_json = "1.0.143"
 borsh = { version = "1.5.7", features = ["derive"] }
 futures = "0.3.31"
 bitcoin = "0.32.7"
-prost = "0.12.6"
 maud = "0.26.0"
 wasm-bindgen = "0.2.100"
-
 # All alkanes-rs dependencies from develop branch
 alkanes-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 ordinals = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 protorune-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
 metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop" }
-
-# Non-WASM dependencies (server, network, DB, CLI, etc.)
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 base64 = "0.22.0"
 clap = { version = "4.5.47", features = ["derive"] }
 rocksdb = "0.21.0"
@@ -67,6 +76,9 @@ alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop"
 metashrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
 rockshrew-runtime = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", optional = true }
 wasmtime = { version = "18.0", features = ["async"], optional = true }
+
+[build-dependencies]
+prost-build = "0.12"
 
 [dev-dependencies]
 alkanes = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", features = ["test-utils"] }

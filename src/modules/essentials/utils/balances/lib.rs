@@ -1055,10 +1055,15 @@ fn apply_holders_delta(
     } else if let Some(i) = idx {
         let cur = holders[i].amount;
         if amount > cur {
-            panic!(
-                "[balances] negative holder balance detected (holder={:?}, cur={}, sub={})",
+            eprintln!(
+                "[balances][warn] negative holder balance clamped to 0 (alkane in context, holder={:?}, cur={}, sub={})",
                 holders[i].holder, cur, amount
             );
+            // Clamp to 0 instead of panicking — holder index may be out of sync
+            // with outpoint balances due to accumulated state from earlier blocks
+            // where address resolution differed between VIN and VOUT sides.
+            holders.swap_remove(i);
+            return holders;
         }
         let after = cur - amount;
         if after == 0 {

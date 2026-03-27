@@ -7,7 +7,7 @@ use alkanes_support::cellpack::Cellpack;
 use alkanes_support::id::AlkaneId;
 use anyhow::Result;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, OutPoint};
+use bitcoin::{Block, OutPoint, ScriptBuf};
 use metashrew_support::index_pointer::KeyValuePointer;
 
 // Constants from OYL protocol
@@ -244,11 +244,28 @@ pub fn init_with_cellpack_pairs(cellpack_pairs: Vec<BinaryAndCellpack>) -> Block
     init_with_cellpack_pairs_w_input(cellpack_pairs, OutPoint::null())
 }
 
+/// Create a block with cellpacks where the regular output uses a specific scriptPubKey.
+/// This is needed for testing address-resolved balance tracking.
+pub fn init_with_cellpack_pairs_with_spk(
+    cellpack_pairs: Vec<BinaryAndCellpack>,
+    output_spk: ScriptBuf,
+) -> Block {
+    init_with_cellpack_pairs_w_input_and_spk(cellpack_pairs, OutPoint::null(), output_spk)
+}
+
 /// Create a block with multiple cellpacks and an input outpoint
 
 fn init_with_cellpack_pairs_w_input(
     cellpack_pairs: Vec<BinaryAndCellpack>,
     input_outpoint: OutPoint,
+) -> Block {
+    init_with_cellpack_pairs_w_input_and_spk(cellpack_pairs, input_outpoint, ScriptBuf::new())
+}
+
+fn init_with_cellpack_pairs_w_input_and_spk(
+    cellpack_pairs: Vec<BinaryAndCellpack>,
+    input_outpoint: OutPoint,
+    output_spk: ScriptBuf,
 ) -> Block {
     use alkanes_support::envelope::RawEnvelope;
     use bitcoin::{Amount, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -338,7 +355,7 @@ fn init_with_cellpack_pairs_w_input(
                 // Regular output FIRST (index 0)
                 TxOut {
                     value: Amount::from_sat(100_000_000), // 1 BTC
-                    script_pubkey: ScriptBuf::new(),
+                    script_pubkey: output_spk.clone(),
                 },
                 // OP_RETURN output SECOND (index 1)
                 TxOut { value: Amount::ZERO, script_pubkey: runestone_script },

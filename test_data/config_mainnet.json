@@ -1,0 +1,41 @@
+{
+  "port": 5778,
+  "block_source_mode": "rpc",
+  "readonly_metashrew_db_dir": "/data/metashrew",
+  "metashrew_rpc_url": "http://localhost:8080",
+  "electrs_esplora_url": "http://esplora.mainnet-alkanes:50010",
+  "bitcoind_rpc_url": "http://bitcoind.mainnet-bitcoin:8332",
+  "bitcoind_rpc_user": "bitcoinrpc",
+  "bitcoind_rpc_pass": "bitcoinrpc",
+  "network": "mainnet",
+  "explorer_host": "0.0.0.0:8081",
+  "explorer_base_path": "/mainnet",
+  "db_path": "/data/espo",
+  "enable_aof": true,
+  "sdb_poll_ms": 5000,
+  "explorer_networks": {
+    "mainnet": "https://espo.sh",
+    "regtest": "https://espo.subfrost.io/regtest",
+    "signet": "https://espo.subfrost.io/signet"
+  },
+  "modules": {
+    "oylapi": {
+      "host": "0.0.0.0",
+      "port": 9710,
+      "alkane_icon_cdn": "https://asset.oyl.gg/alkanes/mainnet"
+    },
+    "subfrost": {},
+    "ammdata": {
+      "eth_rpc": "https://mainnet.infura.io/v3/099fc58e0de9451d80b18d7c74caa7c1",
+      "eth_rpc_headers": {
+        "Origin": "https://app.uniswap.org",
+        "Referer": "https://app.uniswap.org/",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+      },
+      "eth_call_throttle": 150,
+      "derived_liquidity": [
+        { "alkane": "2:0", "strategy": "neutral-vwap" }
+      ]
+    }
+  }
+}

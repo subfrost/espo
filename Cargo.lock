@@ -1973,9 +1973,12 @@ dependencies = [
  "metashrew-support",
  "ordinals 10.0.0",
  "prost",
+ "prost-build",
  "protobuf-json-mapping",
  "protorune",
  "protorune-support",
+ "qubitcoin-support",
+ "qubitcoin-tertiary-support",
  "reqwest",
  "rocksdb",
  "rockshrew-runtime",
@@ -3903,6 +3906,19 @@ checksum = "d11f2fedc3b7dafdc2851bc52f277377c5473d378859be234bc7ebb593144d01"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "qubitcoin-support"
+version = "0.1.0"
+
+[[package]]
+name = "qubitcoin-tertiary-support"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "qubitcoin-support",
 ]
 
 [[package]]

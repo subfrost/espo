@@ -19,6 +19,8 @@ pub mod amm_helpers;
 #[cfg(feature = "test-utils")]
 pub mod metashrew_runtime;
 #[cfg(feature = "test-utils")]
+pub mod tertiary_runtime;
+#[cfg(feature = "test-utils")]
 pub mod trace_helpers;
 
 // Re-export commonly used items
@@ -31,13 +33,16 @@ pub use mock_node::MockBitcoinNode;
 
 #[cfg(feature = "test-utils")]
 pub use metashrew_runtime::TestMetashrewRuntime;
+#[cfg(feature = "test-utils")]
+pub use tertiary_runtime::NativeTertiaryRuntime;
 
 // Re-export AMM helpers
 #[cfg(feature = "test-utils")]
 pub use amm_helpers::{
     AMM_FACTORY_ID, AMM_FACTORY_LOGIC_IMPL_TX, AMM_FACTORY_PROXY_TX, AUTH_TOKEN_FACTORY_ID,
     AmmDeployment, BinaryAndCellpack, POOL_BEACON_PROXY_TX, POOL_UPGRADEABLE_BEACON_TX,
-    deploy_amm_infrastructure, deploy_factory_proxy, init_with_cellpack_pairs, setup_amm,
+    deploy_amm_infrastructure, deploy_factory_proxy, init_with_cellpack_pairs,
+    init_with_cellpack_pairs_with_spk, setup_amm,
 };
 
 // Re-export trace helpers
