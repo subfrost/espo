@@ -1055,15 +1055,10 @@ fn apply_holders_delta(
     } else if let Some(i) = idx {
         let cur = holders[i].amount;
         if amount > cur {
-            eprintln!(
-                "[balances][warn] negative holder balance clamped to 0 (alkane in context, holder={:?}, cur={}, sub={})",
+            panic!(
+                "[balances] negative holder balance detected (alkane in context, holder={:?}, cur={}, sub={})",
                 holders[i].holder, cur, amount
             );
-            // Clamp to 0 instead of panicking — holder index may be out of sync
-            // with outpoint balances due to accumulated state from earlier blocks
-            // where address resolution differed between VIN and VOUT sides.
-            holders.swap_remove(i);
-            return holders;
         }
         let after = cur - amount;
         if after == 0 {
@@ -1809,14 +1804,12 @@ pub fn bulk_update_balances_for_block(
                                 .map(|entry| Txid::from_byte_array(entry.txid))
                                 .map(|t| t.to_string())
                                 .unwrap_or_else(|| "unknown".to_string());
-                            eprintln!(
-                                "[balances] WARNING: negative alkane balance clamped to 0 (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
+                            panic!(
+                                "[balances] negative alkane balance detected (txid={}, owner={}:{}, token={}:{}, cur={}, sub={})",
                                 txid_str, owner.block, owner.tx, token.block, token.tx, cur, mag
                             );
-                            0
-                        } else {
-                            cur - mag
                         }
+                        cur - mag
                     };
                     if updated == 0 {
                         amounts.remove(token);
