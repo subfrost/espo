@@ -31,9 +31,22 @@ struct AmmUtxosRequest {
 
 #[derive(Deserialize)]
 struct AddressUtxosRequest {
-    address: String,
+    address: Option<String>,
+    account: Option<AccountParam>,
     #[serde(rename = "spendStrategy")]
     spend_strategy: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct AccountParam {
+    taproot: Option<AccountAddress>,
+    #[serde(rename = "nativeSegwit")]
+    native_segwit: Option<AccountAddress>,
+}
+
+#[derive(Deserialize)]
+struct AccountAddress {
+    address: String,
 }
 
 #[derive(Deserialize)]
@@ -339,7 +352,71 @@ async fn get_address_utxos_handler(
     State(state): State<OylApiState>,
     Json(req): Json<AddressUtxosRequest>,
 ) -> Json<Value> {
-    Json(get_address_utxos_portfolio(&state, &req.address, req.spend_strategy).await)
+    // Support both {"address": "..."} and {"account": {"taproot": {...}, "nativeSegwit": {...}}}
+    if let Some(addr) = &req.address {
+        return Json(get_address_utxos_portfolio(&state, addr, req.spend_strategy).await);
+    }
+
+    if let Some(account) = &req.account {
+        let mut addresses: Vec<&str> = Vec::new();
+        if let Some(ref t) = account.taproot {
+            addresses.push(&t.address);
+        }
+        if let Some(ref ns) = account.native_segwit {
+            addresses.push(&ns.address);
+        }
+
+        if addresses.is_empty() {
+            return Json(serde_json::json!({"data": {
+                "utxos": [], "spendableUtxos": [], "ordUtxos": [], "runeUtxos": [], "alkaneUtxos": [],
+                "totalBalance": 0, "spendableTotalBalance": 0, "pendingTotalBalance": 0, "pendingUtxos": [],
+                "accountSpendableTotalBalance": 0, "accountSpendableTotalUtxos": [], "accountTotalBalance": 0
+            }, "statusCode": 200}));
+        }
+
+        // Query each address and merge
+        let mut all_utxos = Vec::<Value>::new();
+        let mut all_spendable = Vec::<Value>::new();
+        let mut all_ord = Vec::<Value>::new();
+        let mut all_rune = Vec::<Value>::new();
+        let mut all_alkane = Vec::<Value>::new();
+        let mut all_pending = Vec::<Value>::new();
+        let mut total_balance: u64 = 0;
+        let mut spendable_balance: u64 = 0;
+        let mut pending_balance: u64 = 0;
+
+        for addr in &addresses {
+            let result = get_address_utxos_portfolio(&state, addr, req.spend_strategy.clone()).await;
+            if let Some(data) = result.get("data") {
+                total_balance += data.get("totalBalance").and_then(|v| v.as_u64()).unwrap_or(0);
+                spendable_balance += data.get("spendableTotalBalance").and_then(|v| v.as_u64()).unwrap_or(0);
+                pending_balance += data.get("pendingTotalBalance").and_then(|v| v.as_u64()).unwrap_or(0);
+                if let Some(arr) = data.get("utxos").and_then(|v| v.as_array()) { all_utxos.extend(arr.iter().cloned()); }
+                if let Some(arr) = data.get("spendableUtxos").and_then(|v| v.as_array()) { all_spendable.extend(arr.iter().cloned()); }
+                if let Some(arr) = data.get("ordUtxos").and_then(|v| v.as_array()) { all_ord.extend(arr.iter().cloned()); }
+                if let Some(arr) = data.get("runeUtxos").and_then(|v| v.as_array()) { all_rune.extend(arr.iter().cloned()); }
+                if let Some(arr) = data.get("alkaneUtxos").and_then(|v| v.as_array()) { all_alkane.extend(arr.iter().cloned()); }
+                if let Some(arr) = data.get("pendingUtxos").and_then(|v| v.as_array()) { all_pending.extend(arr.iter().cloned()); }
+            }
+        }
+
+        return Json(serde_json::json!({"data": {
+            "utxos": all_utxos,
+            "spendableUtxos": all_spendable,
+            "ordUtxos": all_ord,
+            "runeUtxos": all_rune,
+            "alkaneUtxos": all_alkane,
+            "pendingUtxos": all_pending,
+            "totalBalance": total_balance,
+            "spendableTotalBalance": spendable_balance,
+            "pendingTotalBalance": pending_balance,
+            "accountSpendableTotalBalance": spendable_balance,
+            "accountSpendableTotalUtxos": all_spendable,
+            "accountTotalBalance": total_balance,
+        }, "statusCode": 200}));
+    }
+
+    Json(serde_json::json!({"error": "missing 'address' or 'account' field", "statusCode": 400}))
 }
 
 async fn get_amm_utxos_handler(
